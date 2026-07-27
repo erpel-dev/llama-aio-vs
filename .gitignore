@@ -1,0 +1,12 @@
+node_modules/
+out/
+*.vsix
+.DS_Store
+Thumbs.db
+*.log
+*.tsbuildinfo
+.vscode-test/
+media/icon-source.png
+media/*-preview.png
+media/*-24.png
+media/icon-128.png

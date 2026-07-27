@@ -1,0 +1,13 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Run Llama AIO Extension",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": ["--extensionDevelopmentPath=${workspaceFolder}/llama-aio-vs"],
+      "outFiles": ["${workspaceFolder}/llama-aio-vs/out/**/*.js"],
+      "preLaunchTask": "npm: compile - llama-aio-vs"
+    }
+  ]
+}
