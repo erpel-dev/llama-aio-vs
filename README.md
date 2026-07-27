@@ -1,83 +1,76 @@
 # Llama AIO (VS Code)
 
-All-in-one local **llama.cpp** extension for VS Code:
-
-- Install / upgrade `llama.cpp` (Vulkan, CUDA, or CPU — each kept in its own folder)
-- Browse & download GGUF models from Hugging Face
-- Open local GGUFs or pick from common download caches (LM Studio, Unsloth, HF cache, …)
-- LM Studio–style load settings with memory estimates and auto-recommended defaults on model select
-- Start a **single shared** detached `llama-server` (survives window/folder close)
-- Register the model in **Copilot Chat** via `LanguageModelChatProvider`
+Local **llama.cpp** for VS Code: install binaries, manage GGUF models, tune load settings with memory estimates, run one shared `llama-server`, and use it in **GitHub Copilot Chat**.
 
 ## Requirements
 
-- VS Code **1.109+** (for language model chat providers)
-- Network access to download llama.cpp releases and HF models
-- **Windows:** PowerShell (for zip extract / external terminal). CUDA installs also fetch the matching `cudart` DLL package.
+- VS Code **1.109+** (language model chat providers)
+- Network access for llama.cpp releases and Hugging Face downloads
+- **Windows:** PowerShell (zip extract / external terminal). CUDA installs also fetch the matching `cudart` DLL package.
 
 ## Quick start
 
 ```bash
 cd llama-aio-vs
-make          # compiles TypeScript and builds the .vsix
-# or: make install   # also installs into VS Code / Cursor
+make          # compile + build .vsix
+# or: make install
 ```
 
-Then install the generated `llama-aio-vs-*.vsix` via **Extensions: Install from VSIX…**, or use `make install`. Reload the window after installing.
+Install `llama-aio-vs-*.vsix` via **Extensions: Install from VSIX…** (or `make install`), then reload the window.
 
 1. Open the **Llama AIO** activity bar panel
-2. **Install / switch backend** (once per backend you use)
-3. Get a model using one of:
-   - **Download from Hugging Face…**
-   - **Open GGUF file…**
-   - **Choose from downloaded…** (scans Llama AIO, LM Studio, Unsloth Studio, HF cache, GPT4All, Jan, …)
-4. Tune load settings → **Start server** / **Reload Server (Apply Settings)**
-5. In Copilot Chat, select **Llama AIO: …** in the model picker (a toast offers **Open Chat** / **Open model picker** after start)
+2. Install / switch a backend
+3. Download, open, or pick a GGUF
+4. Start or reload the server
+5. In Copilot Chat, select **Llama AIO: …** in the model picker
 
-## llama.cpp version & backends
+## llama.cpp backends
 
-The sidebar **llama.cpp** card shows the installed build (`llama-server --version`, release tag, asset name).
+Download the newest llama.cpp version directly from within VS Code.
 
-Sidebar backends:
+![llama.cpp install, backend switch, and upgrade](media/screenshot-llamacpp-backend.png)
 
-- **Vulkan** — default GPU path on Linux / Windows (good for AMD)
-- **CUDA** — only offered when an NVIDIA GPU is detected
+- **Vulkan** — default GPU path (Linux / Windows; good for AMD)
+- **CUDA** — when an NVIDIA GPU is detected
 - **CPU** — no GPU (`-ngl` ignored)
 
-Each backend installs under `~/.llama-aio-vs/llama.cpp/<backend>/` (e.g. `vulkan`, `cuda`, `cpu`). Switching reuses a cached install when present; use **Upgrade to latest release** to re-download. Additional families (`rocm`, `openvino`, `sycl`, `auto`) are available via the `llamaAio.backend` setting.
+Installs live under `~/.llama-aio-vs/llama.cpp/<backend>/`. Switching reuses a cached build; **Upgrade to latest release** re-downloads. Extra families (`rocm`, `openvino`, `sycl`, `auto`) via `llamaAio.backend`.
+
+## Models
+
+Download models directly from Hugging Face or pick a model that was downloaded by other tools.
+
+![Model card — Hugging Face download and local libraries](media/screenshot-model-picker.png)
 
 ## Load settings & memory estimates
 
-Primary controls (always visible):
+![Load settings with VRAM / RAM memory estimate](media/screenshot-load-settings.png)
 
-- **Memory estimate** — weights / KV / overhead on VRAM vs system RAM; red warning when estimated GPU use leaves too little headroom (~92%)
-- **Context Length**, **GPU Offload**, **CPU MoE layers**
+Primary controls: memory estimate (VRAM / RAM), context length, GPU offload, and CPU MoE layers. Selecting a model auto-recommends settings aimed at ~2 GiB free VRAM. Threads, batch, KV/mmap/RoPE, and speculative decoding are under **Advanced Settings**.
 
-Selecting a new model auto-recommends context (up to 65 536 when the model allows), GPU layers, and MoE CPU offload aimed at ~2 GiB free VRAM. Threads, batch sizes, KV/mmap/RoPE, and speculative decoding sit under collapsed **Advanced Settings**.
+## GitHub Copilot Chat
 
-KV estimates for hybrid models (e.g. Qwen3.5) count only full-attention layers when metadata provides that.
+Use local LLMs directly in GitHub Copilot Chat.
 
-## Performance & context meter
+![Llama AIO model in the Copilot Chat model picker](media/screenshot-copilot-chat.png)
 
-After each Copilot Chat reply (and roughly at request start):
+## Performance
 
-- **Status bar:** tok/s and context fill (`72% ctx`); warning/error colors at 80% / 90%
-- **Sidebar Performance:** bar + `Context: 48k / 65k (74%)`
-- Toast when crossing ~80% (info) and ~90% (warning)
+Automated context monitoring and performance measurement of the current Chat session.
 
-Context % is `prompt_tokens / slot n_ctx` for the last request (conversation + tools). It is not a live in-chat Copilot widget.
+![Performance panel — context fill and tok/s](media/screenshot-performance.png)
 
-## Shared server design
+Also shown in the status bar (tok/s, context %). Toasts at ~80% / ~90% fill. Context % is `prompt_tokens / slot n_ctx` for the last request.
 
-- Default endpoint: `http://127.0.0.1:8742`
-- Lock file: `~/.llama-aio-vs/runtime/server.lock.json`
-- Log: `~/.llama-aio-vs/runtime/llama-server.log`
-- Default launch: **external terminal** (`llamaAio.launchMode`: `externalTerminal`)
-  - Live logs in a system terminal window
-  - Closing that window stops the server
-  - Set `background` to hide the process instead
-- Not killed on VS Code deactivate (unless you close the terminal / use Stop)
-- Starting again reuses an existing healthy server on the configured port when settings match
+## Shared server
+
+The llama.cpp server is started from within VS Code and is shared between all running VS Code instances.
+
+![Server ready status with shared local endpoint](media/screenshot-server-status.png)
+
+- Endpoint: `http://127.0.0.1:8742` (override with `llamaAio.host` / `llamaAio.port`)
+- Lock / log: `~/.llama-aio-vs/runtime/server.lock.json`, `llama-server.log`
+- Default launch: **external terminal** (`llamaAio.launchMode`); close the window to stop, or use `background`
 
 ## Key load settings → llama.cpp flags
 
@@ -94,7 +87,7 @@ Context % is `prompt_tokens / slot n_ctx` for the last request (conversation + t
 | RoPE base/scale | `--rope-freq-base` / `--rope-freq-scale` |
 | Seed | `--seed` |
 | Context checkpoints | `--cache-reuse` |
-| Speculative MTP | `--spec-type draft-mtp` (+ `--spec-draft-n-max/min`, `--spec-draft-p-min`) |
+| Speculative MTP | `--spec-type draft-mtp` (+ draft n-max/min, p-min) |
 
 ## Commands
 
@@ -103,17 +96,13 @@ Context % is `prompt_tokens / slot n_ctx` for the last request (conversation + t
 - `Llama AIO: Download Model from Hugging Face`
 - `Llama AIO: Open GGUF File…`
 - `Llama AIO: Choose from Downloaded Models`
-- `Llama AIO: Start Server`
-- `Llama AIO: Stop Server`
-- `Llama AIO: Reload Server (Apply Settings)`
+- `Llama AIO: Start Server` / `Stop Server` / `Reload Server (Apply Settings)`
 - `Llama AIO: Show Status`
 
 ## Settings
 
-- `llamaAio.port` (default `8742`)
-- `llamaAio.host` (default `127.0.0.1`)
-- `llamaAio.installDir` / `llamaAio.modelsDir` overrides
-- `llamaAio.extraModelDirs` — extra folders for **Choose from downloaded…**
+- `llamaAio.port` / `llamaAio.host` (defaults `8742` / `127.0.0.1`)
+- `llamaAio.installDir` / `llamaAio.modelsDir` / `llamaAio.extraModelDirs`
 - `llamaAio.hfToken` — gated / private HF models
 - `llamaAio.autoStart`
 - `llamaAio.backend` — `auto` / `vulkan` / `cuda` / `cpu` / `rocm` / `openvino` / `sycl`
@@ -121,10 +110,8 @@ Context % is `prompt_tokens / slot n_ctx` for the last request (conversation + t
 
 ## Notes
 
-- **Keep Model in Memory** pins weights via `--load-mode mlock`; it does not control process lifetime. Lifetime comes from the shared server / terminal window.
-- MTP needs a GGUF with next-n / MTP layers (e.g. Ornith MTP). Plain models often lack that metadata.
-- Copilot **Agent** mode sends very large prompts; prefer GPU backends or Ask mode with a smaller context when testing on CPU.
-- Focus is chat provider + shared server + settings UI (not FIM/RAG/agent UI).
+- **Keep Model in Memory** uses `--load-mode mlock` (mmap on Windows); it does not control process lifetime.
+- MTP needs a GGUF with next-n / MTP layers. Copilot **Agent** prompts are large — prefer a GPU backend or Ask mode on CPU.
 
 ## License
 
