@@ -74,3 +74,37 @@ export function buildServerArgs(
 
   return args;
 }
+
+/**
+ * Stable fingerprint of everything that requires a server restart/reload
+ * to take effect (model path + load settings + launch mode).
+ */
+export function serverConfigFingerprint(
+  modelPath: string,
+  settings: LlamaLoadSettings,
+  launchMode: string = ""
+): string {
+  return JSON.stringify({
+    modelPath: (modelPath || "").trim(),
+    launchMode: launchMode || "",
+    contextLength: settings.contextLength,
+    gpuOffload: settings.gpuOffload,
+    cpuThreads: settings.cpuThreads,
+    evalBatchSize: settings.evalBatchSize,
+    physicalBatchSize: settings.physicalBatchSize,
+    maxConcurrentPredictions: settings.maxConcurrentPredictions,
+    nCpuMoe: settings.nCpuMoe,
+    offloadKvCacheToGpu: !!settings.offloadKvCacheToGpu,
+    keepModelInMemory: !!settings.keepModelInMemory,
+    tryMmap: !!settings.tryMmap,
+    unifiedKvCache: !!settings.unifiedKvCache,
+    contextCheckpoints: settings.contextCheckpoints,
+    ropeFreqBase: settings.ropeFreqBase,
+    ropeFreqScale: settings.ropeFreqScale,
+    seed: settings.seed,
+    speculativeMode: settings.speculativeMode,
+    maxDraftTokens: settings.maxDraftTokens,
+    minDraftTokens: settings.minDraftTokens,
+    draftProbability: settings.draftProbability,
+  });
+}

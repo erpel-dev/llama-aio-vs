@@ -11,13 +11,19 @@ import { getModelsDir } from "./paths";
 import { PerfStats } from "./perfStats";
 import { ProcessManager } from "./processManager";
 import { SettingsStore } from "./settings";
+import { resolveLaunchMode } from "./externalTerminal";
 import { LlamaLoadSettings, RequestSettings } from "./types";
+import { STARTER_MODEL } from "./huggingFace";
 
 export type ModelActions = {
   downloadFromHuggingFace: () => Promise<void>;
+  downloadStarter: () => Promise<void>;
   openGgufFile: () => Promise<void>;
   pickDownloaded: () => Promise<void>;
-  installLlamaCpp: () => Promise<void>;
+  installLlamaCpp: (backend?: UiBackend) => Promise<void>;
+  reinstallLlamaCpp: () => Promise<void>;
+  installLlamaCppByTag: () => Promise<void>;
+  installLlamaCppFromArchive: () => Promise<void>;
   switchBackend: (backend: UiBackend) => Promise<void>;
 };
 
@@ -25,6 +31,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = "llamaAio.settingsView";
 
   private view?: vscode.WebviewView;
+  private updateCheckInFlight = false;
 
   constructor(
     private readonly extensionUri: vscode.Uri,
@@ -56,7 +63,19 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             break;
           case "saveLoad":
             await this.store.updateLoadSettings(msg.payload as Partial<LlamaLoadSettings>);
-            await this.pushState();
+            if (msg.silent) {
+              const status = this.processManager.getStatus();
+              const httpReady = await this.processManager.isHttpReady();
+              this.view?.webview.postMessage({
+                type: "statusPatch",
+                payload: {
+                  configDirty: !!status.configDirty,
+                  running: !!(status.running || httpReady),
+                },
+              });
+            } else {
+              await this.pushState();
+            }
             break;
           case "saveRequest":
             await this.store.updateRequestSettings(msg.payload as Partial<RequestSettings>);
@@ -98,8 +117,20 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           case "refresh":
             await this.pushState();
             break;
+          case "setLaunchMode": {
+            const mode = msg.payload === "background" ? "background" : "externalTerminal";
+            await this.store
+              .getConfig()
+              .update("launchMode", mode, vscode.ConfigurationTarget.Global);
+            await this.pushState();
+            break;
+          }
           case "downloadModel":
             await this.modelActions.downloadFromHuggingFace();
+            await this.pushState();
+            break;
+          case "downloadStarter":
+            await this.modelActions.downloadStarter();
             await this.pushState();
             break;
           case "openModelFile":
@@ -111,7 +142,22 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             await this.pushState();
             break;
           case "installLlamaCpp":
-            await this.modelActions.installLlamaCpp();
+            await this.modelActions.installLlamaCpp(msg.payload as UiBackend | undefined);
+            await this.pushState();
+            break;
+          case "reinstallLlamaCpp":
+            await this.modelActions.reinstallLlamaCpp();
+            await this.pushState();
+            break;
+          case "checkUpdates":
+            await this.refreshUpdateCheck();
+            break;
+          case "installLlamaCppByTag":
+            await this.modelActions.installLlamaCppByTag();
+            await this.pushState();
+            break;
+          case "installLlamaCppFromArchive":
+            await this.modelActions.installLlamaCppFromArchive();
             await this.pushState();
             break;
           case "switchBackend":
@@ -162,10 +208,17 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
 
   private currentMemoryEstimate() {
     const state = this.store.getState();
-    return estimateMemory(state.modelCapabilities, state.loadSettings, detectGpuMemory());
+    const cpuOnly =
+      this.installer.resolveActiveUiBackend() === "cpu" || this.processManager.isCpuBackend();
+    return estimateMemory(
+      state.modelCapabilities,
+      state.loadSettings,
+      cpuOnly ? undefined : detectGpuMemory(),
+      { cpuOnly }
+    );
   }
 
-  /** Ask before start/reload when estimated VRAM exceeds GPU memory. */
+  /** Ask before start/reload when estimated memory is likely to spill (VRAM or RAM). */
   async confirmIfMemorySpill(): Promise<boolean> {
     const est = this.currentMemoryEstimate();
     if (!est?.willSpill) {
@@ -173,7 +226,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     }
     const choice = await vscode.window.showWarningMessage(
       est.warnings[0] ||
-        "These settings leave too little GPU headroom and will often spill to system RAM (much slower).",
+        "These settings leave too little memory headroom and may spill or thrash (much slower).",
       { modal: true },
       "Continue anyway",
       "Cancel"
@@ -218,17 +271,15 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     const caps = state.modelCapabilities;
     const build = this.installer.getInstalledInfo();
     const backendOptions = this.installer.getUiBackendOptions();
-      const selectedUiBackend = (build.activeBackend ||
-        build.resolvedBackend ||
-        (build.configuredBackend === "auto" ? "vulkan" : build.configuredBackend)) as string;
-      const cpuOnly =
-        selectedUiBackend === "cpu" ||
-        build.resolvedBackend === "cpu" ||
-        build.activeBackend === "cpu" ||
-        build.configuredBackend === "cpu" ||
-        this.processManager.isCpuBackend();
+    // Active UI backend only — do not OR stale resolved/configured flags
+    // (those stuck Load settings in CPU mode after switching back to Vulkan).
+    const selectedUiBackend = (build.activeBackend ||
+      build.resolvedBackend ||
+      (build.configuredBackend === "auto" ? "vulkan" : build.configuredBackend)) as string;
+    const cpuOnly = selectedUiBackend === "cpu";
     const gpu = cpuOnly ? undefined : detectGpuMemory();
     const memory = estimateMemory(caps, state.loadSettings, gpu, { cpuOnly });
+    const updateCheck = this.installer.peekUpdateCheck();
 
     this.view.webview.postMessage({
       type: "state",
@@ -249,6 +300,8 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         backendOptions,
         selectedUiBackend,
         cpuOnly,
+        launchMode: resolveLaunchMode(this.store.getConfig().get<string>("launchMode")),
+        updateCheck,
         memory,
         memInputs: memoryEstimateInputs(caps),
         systemRamTotalBytes: os.totalmem(),
@@ -281,6 +334,24 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           : null,
       },
     });
+
+    // Resolve latest tag in the background when cache is cold (no GitHub API).
+    if (updateCheck.pending && !this.updateCheckInFlight) {
+      this.updateCheckInFlight = true;
+      void this.installer
+        .getUpdateCheck(false)
+        .then(() => this.pushState())
+        .catch(() => undefined)
+        .finally(() => {
+          this.updateCheckInFlight = false;
+        });
+    }
+  }
+
+  /** Force-refresh latest release tag and refresh the sidebar. */
+  async refreshUpdateCheck(): Promise<void> {
+    await this.installer.getUpdateCheck(true);
+    await this.pushState();
   }
 
   private getHtml(webview: vscode.Webview): string {
@@ -519,6 +590,12 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     }
     button.primary { background: var(--accent); color: var(--accent-fg); }
     button.secondary { background: var(--secondary); color: var(--secondary-fg); }
+    button:disabled {
+      opacity: 0.55;
+      cursor: default;
+    }
+    .actions .row { margin: 0 0 4px; }
+    .actions select.wide { width: 100%; }
     .model-title { font-weight: 600; margin-bottom: 4px; }
     .model-path, .meta {
       word-break: break-all;
@@ -565,27 +642,42 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
 
   <div class="setup hidden" id="setupBox">
     <strong>Get a model first</strong>
+    <p class="hint" style="margin:8px 0">One-click starter: Unsloth ${STARTER_MODEL.label} (${STARTER_MODEL.approxSizeLabel}, ${STARTER_MODEL.detail}).</p>
+    <div class="btn-col" style="margin-top:4px">
+      <button class="primary" id="setupStarterBtn">⬇ Download starter (${STARTER_MODEL.label})</button>
+    </div>
     <ol>
       <li>Install llama.cpp (once)</li>
-      <li>Download a GGUF from Hugging Face <em>or</em> open one you already have</li>
-      <li>Start / reload the server</li>
+      <li>Download the starter <em>or</em> pick/open any GGUF</li>
+      <li>Start the server</li>
     </ol>
   </div>
 
   <h2>llama.cpp</h2>
   <div class="card">
-    <div class="model-title" id="llamaVersionTitle">Not installed</div>
-    <div class="meta" id="llamaVersionDetail"></div>
-    <div class="meta" id="llamaAssetDetail" style="margin-top:4px"></div>
-    <div class="row" style="margin-top:10px;margin-bottom:6px">
-      <div class="label"><span class="name">Backend build</span></div>
+    <div class="row" style="margin-top:0;margin-bottom:6px">
+      <div class="label"><span class="name">Backend</span></div>
       <select id="backendSelect" class="wide"></select>
-      <div class="hint" id="backendHint">CUDA appears only when an NVIDIA GPU is detected.</div>
+      <div class="hint" id="backendHint"></div>
     </div>
     <div class="btn-col">
-      <button class="primary" id="applyBackendBtn">⬇ Install / switch backend</button>
-      <button class="secondary" id="installLlamaBtn">⬆ Upgrade to latest release</button>
+      <button class="secondary hidden" id="installLlamaBtn">Upgrade to latest</button>
     </div>
+    <details class="advanced" style="margin-top:10px">
+      <summary>More install options<span class="sub">pin a tag, local archive, releases</span></summary>
+      <div class="meta" id="llamaBinaryDetail" style="margin:6px 0 4px"></div>
+      <div class="meta" id="llamaAssetDetail" style="margin:0 0 8px"></div>
+      <div class="btn-col">
+        <button class="secondary" id="checkUpdatesBtn">Check for updates</button>
+        <button class="secondary" id="reinstallLlamaBtn">Reinstall current release</button>
+        <button class="secondary" id="installByTagBtn">Install release tag…</button>
+        <button class="secondary" id="installArchiveBtn">Install from archive…</button>
+      </div>
+      <div class="hint" style="margin-top:8px">
+        Tag / archive installs skip the GitHub API (useful on shared IPs).
+        <a href="https://github.com/ggml-org/llama.cpp/releases" id="releasesLink">Browse releases</a>
+      </div>
+    </details>
   </div>
 
   <h2>Model</h2>
@@ -595,6 +687,8 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     <div class="caps hidden" id="modelCaps"></div>
     <div class="meta" id="modelsDirMeta"></div>
     <div class="btn-col">
+      <button class="primary hidden" id="starterModelBtn">⬇ Download starter (${STARTER_MODEL.label})</button>
+      <div class="hint hidden" id="starterModelHint" style="margin-top:0">${STARTER_MODEL.approxSizeLabel} · ${STARTER_MODEL.detail}</div>
       <button class="primary" id="downloadModelBtn">⬇ Download from Hugging Face…</button>
       <button class="secondary" id="openFileBtn">📂 Open GGUF file…</button>
       <button class="secondary" id="pickDownloadedBtn">📚 Choose from downloaded…</button>
@@ -605,13 +699,14 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
 
   <div class="card" id="memCard">
     <div class="model-title">Memory estimate</div>
+    <div class="hint" style="margin-top:0;margin-bottom:8px">Bars = estimate at <strong>full context</strong>. “Live GPU free” is current occupancy, not the bar.</div>
     <div class="mem-charts" id="memCharts">
       <div>
-        <div class="mem-chart-title"><span>VRAM</span><span class="sub" id="vramChartSub">—</span></div>
+        <div class="mem-chart-title"><span id="vramChartTitle">VRAM · est. at full context</span><span class="sub" id="vramChartSub">—</span></div>
         <div class="mem-stack" id="vramStack"></div>
       </div>
       <div>
-        <div class="mem-chart-title"><span>System RAM</span><span class="sub" id="ramChartSub">—</span></div>
+        <div class="mem-chart-title"><span id="ramChartTitle">System RAM · est. at full context</span><span class="sub" id="ramChartSub">—</span></div>
         <div class="mem-stack" id="ramStack"></div>
       </div>
       <div class="mem-legend">
@@ -726,14 +821,15 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
   </details>
 
   <div class="actions">
-    <button class="primary" id="reloadBtn">↻ Reload to apply changes</button>
-    <button class="secondary" id="startBtn">Start server</button>
-    <button class="secondary" id="stopBtn">Stop server</button>
-    <button class="secondary" id="refreshBtn">Refresh status</button>
-    <div class="hint">
-      By default the server opens in an <strong>external terminal</strong> (logs visible; close window = stop).
-      Change <code>llamaAio.launchMode</code> to <code>background</code> for a hidden process.
+    <div class="row">
+      <div class="label"><span class="name">Launch</span></div>
+      <select id="launchMode" class="wide" title="How llama-server is started">
+        <option value="externalTerminal">External terminal (logs visible)</option>
+        <option value="background">Background (hidden process)</option>
+      </select>
     </div>
+    <button class="primary" id="primaryBtn" data-action="start">Start server</button>
+    <button class="secondary hidden" id="stopBtn">Stop server</button>
   </div>
 
   <script nonce="${nonce}">
@@ -743,7 +839,127 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     let memInputs = null;
     let gpuInfo = null;
     let systemRamTotalBytes = 0;
-    let cpuOnlyBackend = false;
+    let backendOptionsCache = [];
+    let modelIsMoe = false;
+    let moeHintDefault = 'Number of layers to force experts onto CPU (--n-cpu-moe). Only applies to MoE models.';
+    let suppressBackendChange = false;
+    let activeBackendId = '';
+    let serverRunning = false;
+    let configDirty = false;
+    let saveLoadTimer = null;
+    let updateCheck = { latestTag: undefined, installedTag: undefined, updateAvailable: false, checkFailed: false, pending: true };
+
+    function updatePrimaryAction() {
+      const primary = $('primaryBtn');
+      const stop = $('stopBtn');
+      if (!primary || !stop) return;
+      stop.classList.toggle('hidden', !serverRunning);
+      if (!serverRunning) {
+        primary.disabled = false;
+        primary.textContent = 'Start server';
+        primary.dataset.action = 'start';
+      } else if (configDirty) {
+        primary.disabled = false;
+        primary.textContent = '↻ Reload to apply';
+        primary.dataset.action = 'reload';
+      } else {
+        primary.disabled = true;
+        primary.textContent = 'Running';
+        primary.dataset.action = '';
+      }
+    }
+
+    function scheduleSaveLoad() {
+      if (saveLoadTimer) clearTimeout(saveLoadTimer);
+      // Optimistic dirty UI while running — confirmed via silent save + statusPatch.
+      if (serverRunning) {
+        configDirty = true;
+        updatePrimaryAction();
+      }
+      saveLoadTimer = setTimeout(() => {
+        vscode.postMessage({ type: 'saveLoad', payload: readLoad(), silent: true });
+      }, 280);
+    }
+
+    function updateBackendUi() {
+      const sel = $('backendSelect');
+      const installBtn = $('installLlamaBtn');
+      const hint = $('backendHint');
+      const reinstallBtn = $('reinstallLlamaBtn');
+      if (!sel || !installBtn || !hint) return;
+      const selectedOpt = backendOptionsCache.find((o) => o.id === sel.value);
+      const anyInstalled = backendOptionsCache.some((o) => o.installed);
+      const installedTag = (selectedOpt && selectedOpt.installedTag) || updateCheck.installedTag;
+      const latestTag = updateCheck.latestTag;
+      const selectedIsActive = !!(selectedOpt && selectedOpt.active);
+
+      if (reinstallBtn) {
+        reinstallBtn.classList.toggle('hidden', !(selectedOpt && selectedOpt.installed && selectedIsActive));
+        reinstallBtn.textContent = installedTag
+          ? ('Reinstall ' + installedTag)
+          : 'Reinstall current release';
+      }
+
+      if (selectedOpt && selectedOpt.reason && !selectedOpt.available) {
+        hint.textContent = selectedOpt.reason;
+        installBtn.classList.add('hidden');
+        installBtn.disabled = true;
+        return;
+      }
+
+      if (selectedOpt && !selectedOpt.installed) {
+        hint.textContent = 'Not installed — selecting this backend will download it.';
+        installBtn.textContent = 'Install ' + (selectedOpt.label || selectedOpt.id);
+        installBtn.disabled = false;
+        installBtn.classList.remove('hidden');
+        installBtn.dataset.action = 'install';
+        return;
+      }
+
+      if (!selectedOpt) {
+        hint.textContent = anyInstalled ? '' : 'No llama.cpp backend installed yet.';
+        installBtn.textContent = 'Install llama.cpp';
+        installBtn.disabled = false;
+        installBtn.classList.toggle('hidden', !!anyInstalled);
+        installBtn.dataset.action = 'install';
+        return;
+      }
+
+      // Installed backend selected
+      if (!selectedIsActive) {
+        hint.textContent = 'Switching applies immediately. Restart the server if it is running.';
+        installBtn.classList.add('hidden');
+        return;
+      }
+
+      if (updateCheck.pending) {
+        hint.textContent = (installedTag ? (installedTag + ' · ') : '') + 'Checking for updates…';
+        installBtn.classList.add('hidden');
+        return;
+      }
+
+      if (updateCheck.checkFailed) {
+        hint.textContent = (installedTag ? (installedTag + ' · ') : '') + 'Could not check for updates.';
+        installBtn.textContent = 'Check for updates';
+        installBtn.disabled = false;
+        installBtn.classList.remove('hidden');
+        installBtn.dataset.action = 'check';
+        return;
+      }
+
+      if (updateCheck.updateAvailable && latestTag) {
+        hint.textContent = (installedTag ? ('Installed ' + installedTag + ' · ') : '') + 'Update available.';
+        installBtn.textContent = 'Upgrade to ' + latestTag;
+        installBtn.disabled = false;
+        installBtn.classList.remove('hidden');
+        installBtn.dataset.action = 'upgrade';
+        return;
+      }
+
+      hint.textContent = (installedTag || 'Installed') + ' · up to date' + (latestTag ? (' (latest ' + latestTag + ')') : '');
+      installBtn.classList.add('hidden');
+      installBtn.dataset.action = '';
+    }
 
     function fmtBytes(bytes) {
       const GiB = 1024 ** 3, MiB = 1024 ** 2;
@@ -756,26 +972,38 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     function buildCharts(gpuWeights, cpuWeights, kvBytes, kvOnGpu, gpuOverhead, cpuOverhead, totalGpu, totalCpu) {
       return {
         vram: {
-          title: 'VRAM',
+          title: 'VRAM · est. at full context',
           segments: [
             { key: 'weights', label: 'Weights', bytes: gpuWeights },
-            { key: 'kv', label: 'KV cache', bytes: kvOnGpu ? kvBytes : 0 },
+            { key: 'kv', label: 'KV cache (full ctx)', bytes: kvOnGpu ? kvBytes : 0 },
             { key: 'overhead', label: 'Overhead', bytes: gpuOverhead },
           ],
           totalBytes: totalGpu,
           capacityBytes: gpuInfo && gpuInfo.totalBytes ? gpuInfo.totalBytes : undefined,
         },
         ram: {
-          title: 'System RAM',
+          title: 'System RAM · est. at full context',
           segments: [
             { key: 'weights', label: 'Weights', bytes: cpuWeights },
-            { key: 'kv', label: 'KV cache', bytes: kvOnGpu ? 0 : kvBytes },
+            { key: 'kv', label: 'KV cache (full ctx)', bytes: kvOnGpu ? 0 : kvBytes },
             { key: 'overhead', label: 'Overhead', bytes: cpuOverhead },
           ],
           totalBytes: totalCpu,
           capacityBytes: systemRamTotalBytes || undefined,
         },
       };
+    }
+
+    function moeExpertShareOf(inputs) {
+      if (!inputs || !inputs.isMoe) return 0;
+      if (inputs.moeExpertShare != null && isFinite(inputs.moeExpertShare)) {
+        return Math.min(0.98, Math.max(0.05, Number(inputs.moeExpertShare)));
+      }
+      const n = Number(inputs.expertCount) || 0;
+      if (n >= 128) return 0.9;
+      if (n >= 64) return 0.85;
+      if (n >= 16) return 0.8;
+      return 0.75;
     }
 
     function renderStackedBar(stackId, subId, chart) {
@@ -814,12 +1042,14 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       if (!memInputs || !memInputs.fileSizeBytes) return null;
       const L = readLoad();
       const nLayers = Math.max(1, memInputs.blockCount || 1);
-      const cpuOnly = cpuOnlyBackend || $('backendSelect').value === 'cpu';
+      // Follow the dropdown (pending switch), not a sticky flag.
+      const cpuOnly = $('backendSelect').value === 'cpu';
       let onGpu = cpuOnly ? 0 : (L.gpuOffload <= 0 ? 0 : (L.gpuOffload >= 99 ? nLayers : Math.min(L.gpuOffload, nLayers)));
+      const expertShare = moeExpertShareOf(memInputs);
       let gpuWeights = memInputs.fileSizeBytes * (onGpu / nLayers);
-      if (!cpuOnly && memInputs.isMoe && L.nCpuMoe > 0 && onGpu > 0) {
+      if (!cpuOnly && memInputs.isMoe && L.nCpuMoe > 0 && onGpu > 0 && expertShare > 0) {
         const moeCpu = Math.min(L.nCpuMoe, onGpu);
-        gpuWeights = Math.max(0, gpuWeights - memInputs.fileSizeBytes * (moeCpu / nLayers) * 0.7);
+        gpuWeights = Math.max(0, gpuWeights - memInputs.fileSizeBytes * (moeCpu / nLayers) * expertShare);
       }
       const cpuWeights = Math.max(0, memInputs.fileSizeBytes - gpuWeights);
       const heads = Math.max(1, memInputs.attentionHeadCount || 8);
@@ -831,27 +1061,38 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       const perKv = memInputs.attentionHeadCountKvPerLayer;
       const recurrent = memInputs.recurrentLayers;
       const fullInterval = memInputs.fullAttentionInterval > 1 ? memInputs.fullAttentionInterval : 0;
-      let kvBytes = 0;
-      let fullAttnLayers = 0;
-      for (let i = 0; i < nLayers; i++) {
-        const isRecurrent = (recurrent && recurrent.length === nLayers)
-          ? !!recurrent[i]
-          : !!(fullInterval && ((i + 1) % fullInterval !== 0));
-        if (isRecurrent) continue;
-        fullAttnLayers++;
-        const isSwa = !!(swa && pattern && pattern[i]);
-        const nKv = Math.max(1, (perKv && perKv[i]) || defaultKvHeads);
-        const keyDim = isSwa ? Math.max(1, memInputs.keyLengthSwa || Math.floor(defaultKeyDim / 2) || defaultKeyDim) : defaultKeyDim;
-        const valDim = isSwa ? Math.max(1, memInputs.valueLengthSwa || Math.floor(defaultValDim / 2) || defaultValDim) : defaultValDim;
-        const tokens = isSwa ? Math.min(L.contextLength, swa) : L.contextLength;
-        kvBytes += (nKv * keyDim + nKv * valDim) * tokens * 2;
+      function kvAt(ctx) {
+        let bytes = 0;
+        let fullAttnLayers = 0;
+        for (let i = 0; i < nLayers; i++) {
+          const isRecurrent = (recurrent && recurrent.length === nLayers)
+            ? !!recurrent[i]
+            : !!(fullInterval && ((i + 1) % fullInterval !== 0));
+          if (isRecurrent) continue;
+          fullAttnLayers++;
+          const isSwa = !!(swa && pattern && pattern[i]);
+          const nKv = Math.max(1, (perKv && perKv[i]) || defaultKvHeads);
+          const keyDim = isSwa ? Math.max(1, memInputs.keyLengthSwa || Math.floor(defaultKeyDim / 2) || defaultKeyDim) : defaultKeyDim;
+          const valDim = isSwa ? Math.max(1, memInputs.valueLengthSwa || Math.floor(defaultValDim / 2) || defaultValDim) : defaultValDim;
+          const tokens = isSwa ? Math.min(ctx, swa) : ctx;
+          bytes += (nKv * keyDim + nKv * valDim) * tokens * 2;
+        }
+        return { bytes, fullAttnLayers };
       }
+      const fullKv = kvAt(L.contextLength);
+      const warmCtx = Math.min(2048, Math.max(512, L.contextLength));
+      const warmKv = kvAt(warmCtx);
+      const kvBytes = fullKv.bytes;
+      const kvBytesWarm = warmKv.bytes;
+      const fullAttnLayers = fullKv.fullAttnLayers;
       const kvOnGpu = !cpuOnly && !!L.offloadKvCacheToGpu && onGpu > 0;
       const overhead = Math.round(400 * 1024 * 1024 + Math.min(L.evalBatchSize || 512, 4096) * 64 * 1024);
       const gpuOverhead = onGpu > 0 ? overhead : 0;
       const cpuOverhead = onGpu > 0 ? Math.round(overhead * 0.15) : Math.round(overhead * 0.5);
       const totalGpu = gpuWeights + (kvOnGpu ? kvBytes : 0) + gpuOverhead;
       const totalCpu = cpuWeights + (kvOnGpu ? 0 : kvBytes) + cpuOverhead;
+      const totalGpuWarm = gpuWeights + (kvOnGpu ? kvBytesWarm : 0) + gpuOverhead;
+      const totalCpuWarm = cpuWeights + (kvOnGpu ? 0 : kvBytesWarm) + cpuOverhead;
       const warnings = [];
       let willSpill = false;
       if (cpuOnly) {
@@ -861,46 +1102,59 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         warnings.push('Partial GPU offload: ' + (nLayers - onGpu) + '/' + nLayers + ' layers (~' + fmtBytes(cpuWeights) + ') stay in system RAM.');
       }
       if (!cpuOnly && onGpu === 0) warnings.push('GPU offload is 0 — weights run from system RAM.');
-      if (!cpuOnly && !L.offloadKvCacheToGpu) warnings.push('KV cache (~' + fmtBytes(kvBytes) + ') is in system RAM.');
-      if (!cpuOnly && memInputs.isMoe && L.nCpuMoe > 0) warnings.push('CPU MoE layers = ' + L.nCpuMoe + ' keep expert weights in system RAM.');
+      if (!cpuOnly && !L.offloadKvCacheToGpu) warnings.push('KV cache (~' + fmtBytes(kvBytes) + ' at full context) is in system RAM.');
+      if (!cpuOnly && memInputs.isMoe && L.nCpuMoe > 0) {
+        warnings.push('CPU MoE layers = ' + L.nCpuMoe + ': ~' + Math.round(expertShare * 100) + '% of weights are experts; those layers’ experts stay in system RAM.');
+      }
       if (!cpuOnly && gpuInfo && gpuInfo.totalBytes) {
         const usable = gpuInfo.totalBytes * 0.92;
         const pct = Math.round((totalGpu / gpuInfo.totalBytes) * 100);
         if (totalGpu > gpuInfo.totalBytes) {
           willSpill = true;
-          warnings.unshift('Estimated VRAM ~' + fmtBytes(totalGpu) + ' is over the full ' + fmtBytes(gpuInfo.totalBytes) + ' GPU (' + pct + '%). Expect spill to system RAM. Lower Context or GPU Offload.');
+          warnings.unshift('Estimated VRAM at full context ~' + fmtBytes(totalGpu) + ' is over the full ' + fmtBytes(gpuInfo.totalBytes) + ' GPU (' + pct + '%). Expect spill to system RAM. Lower Context or GPU Offload.');
         } else if (totalGpu > usable) {
           willSpill = true;
-          warnings.unshift('Tight on VRAM: ~' + fmtBytes(totalGpu) + ' of ' + fmtBytes(gpuInfo.totalBytes) + ' (' + pct + '%). Only ~' + fmtBytes(gpuInfo.totalBytes - usable) + ' safe headroom for the driver — often spills to system RAM. Lower Context or GPU Offload.');
+          warnings.unshift('Tight on VRAM at full context: ~' + fmtBytes(totalGpu) + ' of ' + fmtBytes(gpuInfo.totalBytes) + ' (' + pct + '%). Only ~' + fmtBytes(gpuInfo.totalBytes - usable) + ' safe headroom for the driver — often spills to system RAM. Lower Context or GPU Offload.');
         } else if (totalGpu > gpuInfo.totalBytes * 0.8) {
-          warnings.push('Getting full: ~' + fmtBytes(totalGpu) + ' of ' + fmtBytes(gpuInfo.totalBytes) + ' VRAM (' + pct + '%).');
+          warnings.push('Getting full at full context: ~' + fmtBytes(totalGpu) + ' of ' + fmtBytes(gpuInfo.totalBytes) + ' VRAM (' + pct + '%).');
         }
       }
       if (cpuOnly && systemRamTotalBytes && totalCpu > systemRamTotalBytes * 0.9) {
         willSpill = true;
-        warnings.unshift('Estimated system RAM ~' + fmtBytes(totalCpu) + ' is very high vs ' + fmtBytes(systemRamTotalBytes) + '. Lower Context Length or use a smaller model/quant.');
+        warnings.unshift('Estimated system RAM at full context ~' + fmtBytes(totalCpu) + ' is very high vs ' + fmtBytes(systemRamTotalBytes) + '. Lower Context Length or use a smaller model/quant.');
       }
       const lines = [];
       if (cpuOnly) {
         lines.push('Backend: CPU — GPU Offload / VRAM not used');
       } else if (gpuInfo && gpuInfo.totalBytes) {
-        lines.push('GPU: ' + fmtBytes(gpuInfo.totalBytes) + (gpuInfo.name ? ' (' + gpuInfo.name + ')' : ''));
+        lines.push('GPU capacity: ' + fmtBytes(gpuInfo.totalBytes) + (gpuInfo.name ? ' (' + gpuInfo.name + ')' : ''));
+        if (gpuInfo.usedBytes != null) {
+          const free = Math.max(0, gpuInfo.totalBytes - gpuInfo.usedBytes);
+          lines.push('Live GPU free now: ~' + fmtBytes(free) + ' (current occupancy — not part of the estimate bars)');
+        }
       } else {
         lines.push('GPU VRAM: unknown');
       }
-      if (systemRamTotalBytes) lines.push('System RAM: ' + fmtBytes(systemRamTotalBytes));
+      if (systemRamTotalBytes) lines.push('System RAM capacity: ' + fmtBytes(systemRamTotalBytes));
       if (cpuOnly) {
         lines.push('Weights in RAM: ~' + fmtBytes(cpuWeights) + ' (' + nLayers + ' layers)');
-        lines.push('KV cache @ ' + Number(L.contextLength).toLocaleString() + ' ctx: ~' + fmtBytes(kvBytes) + ' (system RAM)' +
+        lines.push('KV @ full ' + Number(L.contextLength).toLocaleString() + ' ctx: ~' + fmtBytes(kvBytes) + ' (system RAM)' +
           (fullAttnLayers < nLayers ? (' · ' + fullAttnLayers + '/' + nLayers + ' full-attn layers') : ''));
-        lines.push('Est. total system RAM: ~' + fmtBytes(totalCpu));
+        if (kvBytesWarm < kvBytes) {
+          lines.push('KV @ ~' + Number(warmCtx).toLocaleString() + ' ctx (mid-chat): ~' + fmtBytes(kvBytesWarm) + ' → total ~' + fmtBytes(totalCpuWarm));
+        }
+        lines.push('Est. total system RAM at full context: ~' + fmtBytes(totalCpu));
       } else {
-        lines.push('Weights on GPU: ~' + fmtBytes(gpuWeights) + ' (' + onGpu + '/' + nLayers + ' layers)' + (cpuWeights > 1024*1024 ? ' · RAM: ~' + fmtBytes(cpuWeights) : ''));
-        lines.push('KV cache @ ' + Number(L.contextLength).toLocaleString() + ' ctx: ~' + fmtBytes(kvBytes) + (kvOnGpu ? ' (GPU)' : ' (CPU RAM)') +
+        lines.push('Weights on GPU: ~' + fmtBytes(gpuWeights) + ' (' + onGpu + '/' + nLayers + ' layers)' + (cpuWeights > 1024*1024 ? ' · RAM: ~' + fmtBytes(cpuWeights) : '') +
+          (memInputs.isMoe && expertShare > 0 ? (' · MoE experts ~' + Math.round(expertShare * 100) + '% of file') : ''));
+        lines.push('KV @ full ' + Number(L.contextLength).toLocaleString() + ' ctx: ~' + fmtBytes(kvBytes) + (kvOnGpu ? ' (GPU)' : ' (CPU RAM)') +
           (fullAttnLayers < nLayers ? (' · ' + fullAttnLayers + '/' + nLayers + ' full-attn layers') : ''));
-        lines.push('Est. total VRAM: ~' + fmtBytes(totalGpu) + (totalCpu > 1024*1024 ? ' · system RAM: ~' + fmtBytes(totalCpu) : ''));
+        if (kvBytesWarm < kvBytes) {
+          lines.push('KV @ ~' + Number(warmCtx).toLocaleString() + ' ctx (mid-chat): ~' + fmtBytes(kvBytesWarm) + (kvOnGpu ? ' (GPU)' : ' (CPU RAM)') + ' → VRAM ~' + fmtBytes(totalGpuWarm));
+        }
+        lines.push('Est. total at full context — VRAM: ~' + fmtBytes(totalGpu) + (totalCpu > 1024*1024 ? ' · system RAM: ~' + fmtBytes(totalCpu) : ''));
       }
-      lines.push('Estimate only — actual use varies by quant, MoE, and backend.');
+      lines.push('Bars show estimate at full context. Actual use varies by quant, MoE, and backend.');
       const charts = buildCharts(gpuWeights, cpuWeights, kvBytes, kvOnGpu, gpuOverhead, cpuOverhead, totalGpu, totalCpu);
       if (cpuOnly) {
         charts.vram.capacityBytes = undefined;
@@ -914,7 +1168,6 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     }
 
     function applyCpuOnlyUi(cpuOnly) {
-      cpuOnlyBackend = !!cpuOnly;
       $('gpuOffload').disabled = cpuOnly;
       $('gpuOffloadRange').disabled = cpuOnly;
       $('offloadKvCacheToGpu').disabled = cpuOnly;
@@ -922,6 +1175,17 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         ? 'CPU backend installed — GPU Offload is ignored; everything runs in system RAM.'
         : 'Layers on GPU (-ngl). Use 99/-1 style high values for “all”.';
       $('gpuOffloadRow').style.opacity = cpuOnly ? '0.55' : '1';
+
+      // --n-cpu-moe only splits experts GPU↔CPU; meaningless when everything is already on CPU.
+      $('nCpuMoe').disabled = cpuOnly;
+      $('nCpuMoeRange').disabled = cpuOnly;
+      const showMoe = modelIsMoe && !cpuOnly;
+      $('moeRow').classList.toggle('hidden', !showMoe);
+      if (modelIsMoe) {
+        $('moeHint').textContent = cpuOnly
+          ? 'CPU backend — experts already run in system RAM; CPU MoE layers (--n-cpu-moe) does not apply.'
+          : moeHintDefault;
+      }
     }
 
     function renderMemory(est) {
@@ -971,6 +1235,23 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     $('offloadKvCacheToGpu').addEventListener('change', refreshMemoryLive);
     $('evalBatchSize').addEventListener('input', refreshMemoryLive);
 
+    // Persist load edits so dirty tracking / reload uses the form values.
+    const loadFieldIds = [
+      'contextLength', 'contextLengthRange', 'gpuOffload', 'gpuOffloadRange',
+      'cpuThreads', 'cpuThreadsRange', 'evalBatchSize', 'physicalBatchSize',
+      'maxConcurrentPredictions', 'nCpuMoe', 'nCpuMoeRange', 'offloadKvCacheToGpu',
+      'keepModelInMemory', 'tryMmap', 'unifiedKvCache', 'contextCheckpoints',
+      'ropeBaseAuto', 'ropeFreqBase', 'ropeScaleAuto', 'ropeFreqScale',
+      'seedRandom', 'seed', 'speculativeMode', 'maxDraftTokens', 'minDraftTokens',
+      'draftProbability'
+    ];
+    for (const id of loadFieldIds) {
+      const el = $(id);
+      if (!el) continue;
+      el.addEventListener('change', scheduleSaveLoad);
+      el.addEventListener('input', scheduleSaveLoad);
+    }
+
     function readLoad() {
       const ropeBaseAuto = $('ropeBaseAuto').checked;
       const ropeScaleAuto = $('ropeScaleAuto').checked;
@@ -1011,6 +1292,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       const maxCtx = (caps && caps.maxContextLength) ? caps.maxContextLength : 131072;
       const blocks = (caps && caps.blockCount) ? caps.blockCount : 128;
       const isMoe = !!(caps && caps.isMoe);
+      modelIsMoe = isMoe;
 
       $('contextLength').max = String(maxCtx);
       $('contextLengthRange').max = String(maxCtx);
@@ -1021,7 +1303,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       $('nCpuMoe').max = String(blocks);
       $('nCpuMoeRange').max = String(blocks);
 
-      $('moeRow').classList.toggle('hidden', caps && !isMoe);
+      // Visibility finalized in applyCpuOnlyUi (also hides on CPU backend).
       if (caps) {
         $('ctxHint').textContent = 'Model supports up to ' + maxCtx + ' tokens (from GGUF metadata)';
         $('moeHint').textContent = isMoe
@@ -1029,6 +1311,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
              (caps.expertUsedCount ? (' · ' + caps.expertUsedCount + ' used/token') : '') +
              '. Layers to force experts onto CPU (0–' + blocks + ').')
           : 'Not a MoE model — this setting is hidden.';
+        if (isMoe) {
+          moeHintDefault = $('moeHint').textContent;
+        }
         $('modelCaps').classList.remove('hidden');
         $('modelCaps').innerHTML =
           'Architecture: <strong>' + (caps.architecture || '?') + '</strong><br/>' +
@@ -1087,6 +1372,14 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         });
       }
 
+      serverRunning = ready;
+      configDirty = !!status.configDirty;
+      const lm = $('launchMode');
+      if (lm && payload.launchMode) {
+        lm.value = payload.launchMode === 'background' ? 'background' : 'externalTerminal';
+      }
+      updatePrimaryAction();
+
       const perfLines = Array.isArray(payload.perfLines) ? payload.perfLines : ['No generation yet'];
       const generating = payload.perf && payload.perf.generating;
       const perf = payload.perf || {};
@@ -1111,17 +1404,36 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         (generating ? '<span class="ok">● Generating</span><br/>' : '') +
         perfLines.map((l) => String(l)).join('<br/>');
 
-      $('llamaVersionTitle').textContent = build.tag
-        ? ('Release ' + build.tag)
-        : (payload.binaryExists ? 'Installed' : 'Not installed');
-      $('llamaVersionDetail').textContent = build.binaryVersionDetail || build.binaryVersion || 'Run Install to download llama-server';
+      const binaryDetail = $('llamaBinaryDetail');
+      if (binaryDetail) {
+        if (build.binaryVersionDetail || build.binaryVersion) {
+          binaryDetail.textContent = build.binaryVersionDetail || build.binaryVersion;
+        } else if (build.tag && payload.binaryExists) {
+          binaryDetail.textContent = 'Installed release ' + build.tag;
+        } else if (payload.binaryExists) {
+          binaryDetail.textContent = 'Binary installed (version string unavailable).';
+        } else {
+          binaryDetail.textContent = 'No binary for this backend yet.';
+        }
+      }
       $('llamaAssetDetail').textContent = build.asset
         ? ('Asset: ' + build.asset + (build.configuredBackend ? (' · setting: ' + build.configuredBackend) : ''))
-        : '';
+        : 'No archive recorded for this backend yet.';
+
+      updateCheck = payload.updateCheck || {
+        latestTag: undefined,
+        installedTag: build.tag,
+        updateAvailable: false,
+        checkFailed: false,
+        pending: true,
+      };
 
       const sel = $('backendSelect');
       const options = Array.isArray(payload.backendOptions) ? payload.backendOptions : [];
+      backendOptionsCache = options;
+      activeBackendId = payload.selectedUiBackend || (options.find((o) => o.active) || {}).id || '';
       const prev = sel.value;
+      suppressBackendChange = true;
       sel.innerHTML = '';
       for (const opt of options) {
         const o = document.createElement('option');
@@ -1146,27 +1458,33 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         }
         sel.appendChild(o);
       }
-      const want = payload.selectedUiBackend || prev || 'vulkan';
+      const want = activeBackendId || prev || 'vulkan';
       if ([...sel.options].some((o) => o.value === want && !o.disabled)) {
         sel.value = want;
       } else {
         const first = [...sel.options].find((o) => !o.disabled);
         if (first) sel.value = first.value;
       }
-      const selectedOpt = options.find((o) => o.id === sel.value);
-      if (selectedOpt && selectedOpt.reason && !selectedOpt.available) {
-        $('backendHint').textContent = selectedOpt.reason;
-      } else if (selectedOpt && selectedOpt.installed) {
-        $('backendHint').textContent =
-          'Cached ' + selectedOpt.label +
-          (selectedOpt.installedTag ? (' (' + selectedOpt.installedTag + ')') : '') +
-          ' — switch reuses it without re-downloading. Use the button to activate, or download latest if you want an upgrade.';
-      } else {
-        $('backendHint').textContent =
-          'Not installed yet — applying downloads the official llama.cpp build into its own folder (one install per backend).';
-      }
+      suppressBackendChange = false;
+      updateBackendUi();
 
       $('setupBox').classList.toggle('hidden', hasModel && payload.binaryExists);
+
+      const localCount = payload.localModelCount || 0;
+      const showStarter = !hasModel;
+      const starterBtn = $('starterModelBtn');
+      const starterHint = $('starterModelHint');
+      const downloadBtn = $('downloadModelBtn');
+      const pickBtn = $('pickDownloadedBtn');
+      if (starterBtn) starterBtn.classList.toggle('hidden', !showStarter);
+      if (starterHint) starterHint.classList.toggle('hidden', !showStarter);
+      if (downloadBtn) {
+        downloadBtn.className = showStarter && localCount === 0 ? 'secondary' : 'primary';
+      }
+      if (pickBtn) {
+        // Prefer choosing an existing GGUF when the library already has files.
+        pickBtn.className = showStarter && localCount > 0 ? 'primary' : 'secondary';
+      }
       $('modelTitle').textContent = hasModel
         ? ('Selected: ' + (payload.modelName || 'model'))
         : 'No model selected';
@@ -1283,32 +1601,82 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     });
 
     $('downloadModelBtn').addEventListener('click', () => vscode.postMessage({ type: 'downloadModel' }));
+    const starterModelBtn = $('starterModelBtn');
+    if (starterModelBtn) {
+      starterModelBtn.addEventListener('click', () => vscode.postMessage({ type: 'downloadStarter' }));
+    }
+    const setupStarterBtn = $('setupStarterBtn');
+    if (setupStarterBtn) {
+      setupStarterBtn.addEventListener('click', () => vscode.postMessage({ type: 'downloadStarter' }));
+    }
     $('openFileBtn').addEventListener('click', () => vscode.postMessage({ type: 'openModelFile' }));
     $('pickDownloadedBtn').addEventListener('click', () => vscode.postMessage({ type: 'pickDownloadedModel' }));
-    $('installLlamaBtn').addEventListener('click', () => vscode.postMessage({ type: 'installLlamaCpp' }));
-    $('applyBackendBtn').addEventListener('click', () => {
-      vscode.postMessage({ type: 'switchBackend', payload: $('backendSelect').value });
+    $('installLlamaBtn').addEventListener('click', () => {
+      const action = $('installLlamaBtn').dataset.action;
+      if (action === 'check') {
+        vscode.postMessage({ type: 'checkUpdates' });
+        return;
+      }
+      vscode.postMessage({ type: 'installLlamaCpp', payload: $('backendSelect').value });
     });
+    const checkUpdatesBtn = $('checkUpdatesBtn');
+    if (checkUpdatesBtn) {
+      checkUpdatesBtn.addEventListener('click', () => vscode.postMessage({ type: 'checkUpdates' }));
+    }
+    const reinstallLlamaBtn = $('reinstallLlamaBtn');
+    if (reinstallLlamaBtn) {
+      reinstallLlamaBtn.addEventListener('click', () => vscode.postMessage({ type: 'reinstallLlamaCpp' }));
+    }
+    $('installByTagBtn').addEventListener('click', () => vscode.postMessage({ type: 'installLlamaCppByTag' }));
+    $('installArchiveBtn').addEventListener('click', () => vscode.postMessage({ type: 'installLlamaCppFromArchive' }));
+    const releasesLink = $('releasesLink');
+    if (releasesLink) {
+      releasesLink.addEventListener('click', (e) => {
+        e.preventDefault();
+        vscode.postMessage({ type: 'openExternal', url: 'https://github.com/ggml-org/llama.cpp/releases' });
+      });
+    }
     $('backendSelect').addEventListener('change', () => {
-      applyCpuOnlyUi($('backendSelect').value === 'cpu' || cpuOnlyBackend);
+      if (suppressBackendChange) return;
+      updateBackendUi();
+      applyCpuOnlyUi($('backendSelect').value === 'cpu');
       refreshMemoryLive();
+      const next = $('backendSelect').value;
+      if (!next || next === activeBackendId) return;
+      const opt = backendOptionsCache.find((o) => o.id === next);
+      if (opt && !opt.available) return;
+      vscode.postMessage({ type: 'switchBackend', payload: next });
     });
 
-    $('reloadBtn').addEventListener('click', () => {
-      vscode.postMessage({ type: 'reload', payload: readLoad() });
-      vscode.postMessage({ type: 'saveRequest', payload: readRequest() });
-    });
-    $('startBtn').addEventListener('click', () => {
-      vscode.postMessage({ type: 'saveLoad', payload: readLoad() });
-      vscode.postMessage({ type: 'saveRequest', payload: readRequest() });
-      vscode.postMessage({ type: 'start' });
+    $('primaryBtn').addEventListener('click', () => {
+      const action = $('primaryBtn').dataset.action;
+      if (action === 'reload') {
+        vscode.postMessage({ type: 'reload', payload: readLoad() });
+        vscode.postMessage({ type: 'saveRequest', payload: readRequest() });
+      } else if (action === 'start') {
+        vscode.postMessage({ type: 'saveLoad', payload: readLoad() });
+        vscode.postMessage({ type: 'saveRequest', payload: readRequest() });
+        vscode.postMessage({ type: 'start' });
+      }
     });
     $('stopBtn').addEventListener('click', () => vscode.postMessage({ type: 'stop' }));
-    $('refreshBtn').addEventListener('click', () => vscode.postMessage({ type: 'refresh' }));
+    $('launchMode').addEventListener('change', () => {
+      const mode = $('launchMode').value === 'background' ? 'background' : 'externalTerminal';
+      if (serverRunning) {
+        configDirty = true;
+        updatePrimaryAction();
+      }
+      vscode.postMessage({ type: 'setLaunchMode', payload: mode });
+    });
 
     window.addEventListener('message', (event) => {
       const msg = event.data;
       if (msg.type === 'state') applyState(msg.payload);
+      if (msg.type === 'statusPatch' && msg.payload) {
+        serverRunning = !!msg.payload.running;
+        configDirty = !!msg.payload.configDirty;
+        updatePrimaryAction();
+      }
     });
 
     vscode.postMessage({ type: 'ready' });

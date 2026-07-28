@@ -162,6 +162,39 @@ export class HuggingFaceClient {
   }
 }
 
+/** Curated first-run GGUF — small, public, widely supported. */
+export const STARTER_MODEL = {
+  repoId: "unsloth/Qwen3.5-2B-GGUF",
+  filePath: "Qwen3.5-2B-Q4_K_M.gguf",
+  /** Short label for buttons. */
+  label: "Qwen3.5-2B",
+  /** Approx size for UI (Q4_K_M). */
+  approxSizeLabel: "~1.6 GB",
+  detail: "~2B · Q4_K_M · good for first run",
+} as const;
+
+/**
+ * One-click download of the curated starter GGUF via the HF resolve URL
+ * (no browse/search). Reuses an existing local copy if present.
+ */
+export async function downloadStarterModel(
+  hf: HuggingFaceClient,
+  store: SettingsStore
+): Promise<string | undefined> {
+  const dest = await vscode.window.withProgress(
+    {
+      location: vscode.ProgressLocation.Notification,
+      title: `Llama AIO: Downloading starter ${STARTER_MODEL.label}`,
+      cancellable: false,
+    },
+    async (progress) =>
+      hf.downloadModelFile(STARTER_MODEL.repoId, STARTER_MODEL.filePath, progress)
+  );
+
+  await store.applySelectedModel(dest);
+  return dest;
+}
+
 export async function browseAndDownloadModel(
   hf: HuggingFaceClient,
   store: SettingsStore

@@ -32,6 +32,33 @@ export class SettingsStore {
     };
   }
 
+  /**
+   * Re-read GGUF caps when MoE expert-share (or other newer fields) are missing
+   * from a previously persisted modelCapabilities blob.
+   */
+  async refreshCapabilitiesIfStale(): Promise<boolean> {
+    const state = this.getState();
+    const path = (state.selectedModelPath || "").trim();
+    const caps = state.modelCapabilities;
+    if (!path || !caps?.isMoe) {
+      return false;
+    }
+    if (caps.moeExpertShare !== undefined && Number.isFinite(caps.moeExpertShare)) {
+      return false;
+    }
+    try {
+      const fresh = readModelCapabilities(path);
+      await this.setState({
+        modelCapabilities: fresh,
+        modelMaxContext: fresh.maxContextLength,
+        loadSettings: clampLoadSettingsToModel(state.loadSettings, fresh),
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   /** Effective tokens per parallel slot (what llama-server actually allows per request). */
   getSlotContextSize(load = this.getState().loadSettings): number {
     return Math.floor(load.contextLength / Math.max(1, load.maxConcurrentPredictions));
@@ -147,4 +174,4 @@ export class SettingsStore {
   }
 }
 
-export { buildServerArgs } from "./serverArgs";
+export { buildServerArgs, serverConfigFingerprint } from "./serverArgs";

@@ -100,6 +100,8 @@ export interface ServerStatus {
   endpoint: string;
   ownedByThisExtension: boolean;
   message: string;
+  /** True when running and model/load/launch settings differ from the live server. */
+  configDirty?: boolean;
 }
 
 export interface HfModelHit {

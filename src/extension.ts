@@ -1,7 +1,3 @@
-import * as vscode from "vscode";
-import { LlamaAioChatProvider } from "./chatProvider";
-import { promptUseInCopilotChat } from "./copilotChatPrompt";
-import { browseAndDownloadModel, HuggingFaceClient } from "./huggingFace";
 import { LlamaInstaller, UiBackend } from "./llamaInstaller";
 import { openModelFileDialog, pickDownloadedModel } from "./modelPicker";
 import { ensureDirs, getInstallDir, getLockDir, getModelsDir } from "./paths";
@@ -9,6 +5,11 @@ import { PerfStats } from "./perfStats";
 import { ProcessManager } from "./processManager";
 import { SettingsStore } from "./settings";
 import { SettingsViewProvider } from "./settingsView";
+import * as path from "path";
+import * as vscode from "vscode";
+import { LlamaAioChatProvider } from "./chatProvider";
+import { promptUseInCopilotChat } from "./copilotChatPrompt";
+import { browseAndDownloadModel, downloadStarterModel, HuggingFaceClient } from "./huggingFace";
 
 let chatProvider: LlamaAioChatProvider | undefined;
 
@@ -71,6 +72,7 @@ export function activate(context: vscode.ExtensionContext): void {
       // ignore unreadable models at activate
     });
   }
+  void store.refreshCapabilitiesIfStale().catch(() => undefined);
 
   void store.migrateChatContextIfNeeded().then(async (changed) => {
     if (!changed) {
@@ -113,6 +115,18 @@ export function activate(context: vscode.ExtensionContext): void {
     }
   };
 
+  const downloadStarter = async () => {
+    try {
+      const selected = await downloadStarterModel(hf, store);
+      await afterModelSelected(selected, settingsView, processManager, store);
+    } catch (e) {
+      vscode.window.showErrorMessage(
+        `Starter download failed: ${e instanceof Error ? e.message : String(e)}\n` +
+          `Try “Download from Hugging Face…” instead.`
+      );
+    }
+  };
+
   const openGgufFile = async () => {
     try {
       const selected = await openModelFileDialog(store);
@@ -135,16 +149,52 @@ export function activate(context: vscode.ExtensionContext): void {
     }
   };
 
+  const afterBackendInstall = async (wasReady: boolean) => {
+    const info = installer.getInstalledInfo();
+    const label = info.binaryVersion || info.tag || processManager.resolveBinary();
+    vscode.window.showInformationMessage(
+      `llama.cpp ready: ${label}` + (info.asset ? ` (${info.asset})` : "")
+    );
+    chatProvider?.notifyChanged();
+    await settingsView.pushState();
+    if (wasReady && store.getState().selectedModelPath) {
+      const restart = await vscode.window.showInformationMessage(
+        "Backend ready. Start the server again?",
+        "Start server",
+        "Later"
+      );
+      if (restart === "Start server") {
+        const status = await processManager.start();
+        chatProvider?.notifyChanged();
+        await settingsView.pushState();
+        await promptUseInCopilotChat(store, status.message);
+      }
+    }
+  };
+
   const installLlamaCpp = async (backendOverride?: UiBackend) => {
     try {
       if (backendOverride) {
         await installer.setBackend(backendOverride);
       }
+      const check = await installer.getUpdateCheck(true);
+      if (
+        installer.hasBackendInstalled(installer.resolveActiveUiBackend()) &&
+        !check.updateAvailable &&
+        check.installedTag
+      ) {
+        vscode.window.showInformationMessage(
+          `Llama AIO: already on ${check.installedTag}` +
+            (check.latestTag ? ` (latest ${check.latestTag}).` : ".")
+        );
+        await settingsView.pushState();
+        return;
+      }
       const wasReady = await processManager.isHttpReady();
       if (wasReady) {
         await processManager.stop(true);
       }
-      const binary = await vscode.window.withProgress(
+      await vscode.window.withProgress(
         {
           location: vscode.ProgressLocation.Notification,
           title: backendOverride
@@ -154,29 +204,140 @@ export function activate(context: vscode.ExtensionContext): void {
         },
         async (progress) => installer.installOrUpgrade(progress, backendOverride)
       );
-      const info = installer.getInstalledInfo();
-      const label = info.binaryVersion || info.tag || binary;
-      vscode.window.showInformationMessage(
-        `llama.cpp ready: ${label}` + (info.asset ? ` (${info.asset})` : "")
-      );
-      chatProvider?.notifyChanged();
-      await settingsView.pushState();
-      if (wasReady && store.getState().selectedModelPath) {
-        const restart = await vscode.window.showInformationMessage(
-          "Backend ready. Start the server again?",
-          "Start server",
-          "Later"
-        );
-        if (restart === "Start server") {
-          const status = await processManager.start();
-          chatProvider?.notifyChanged();
-          await settingsView.pushState();
-          await promptUseInCopilotChat(store, status.message);
-        }
-      }
+      await afterBackendInstall(wasReady);
     } catch (e) {
       vscode.window.showErrorMessage(
         `Install failed: ${e instanceof Error ? e.message : String(e)}`
+      );
+    }
+  };
+
+  const reinstallLlamaCpp = async () => {
+    try {
+      const backend = installer.resolveActiveUiBackend();
+      const tag = installer.readBackendVersion(backend).tag;
+      if (!tag) {
+        await installLlamaCpp(backend);
+        return;
+      }
+      const wasReady = await processManager.isHttpReady();
+      if (wasReady) {
+        await processManager.stop(true);
+      }
+      await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: `Llama AIO: Reinstalling ${tag} (${backend})…`,
+          cancellable: false,
+        },
+        async (progress) => installer.installByTag(tag, progress, backend)
+      );
+      await afterBackendInstall(wasReady);
+    } catch (e) {
+      vscode.window.showErrorMessage(
+        `Reinstall failed: ${e instanceof Error ? e.message : String(e)}`
+      );
+    }
+  };
+
+  const installLlamaCppByTag = async () => {
+    try {
+      const backend = installer.resolveActiveUiBackend();
+      const tagInput = await vscode.window.showInputBox({
+        title: "Install llama.cpp by release tag",
+        prompt: `Direct download (no GitHub API). Uses backend “${backend}”. Paste a tag (b10154) or releases URL.`,
+        placeHolder: "b10154",
+        ignoreFocusOut: true,
+        validateInput: (v) => {
+          const t = (v || "").trim();
+          if (!t) {
+            return "Enter a tag or releases URL";
+          }
+          return undefined;
+        },
+      });
+      if (!tagInput) {
+        return;
+      }
+
+      const wasReady = await processManager.isHttpReady();
+      if (wasReady) {
+        await processManager.stop(true);
+      }
+      await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: `Llama AIO: Installing ${tagInput.trim()} (${backend})…`,
+          cancellable: false,
+        },
+        async (progress) => installer.installByTag(tagInput, progress, backend)
+      );
+      await afterBackendInstall(wasReady);
+    } catch (e) {
+      vscode.window.showErrorMessage(
+        `Install by tag failed: ${e instanceof Error ? e.message : String(e)}`
+      );
+    }
+  };
+
+  const installLlamaCppFromArchive = async () => {
+    try {
+      const backend = installer.resolveActiveUiBackend();
+      const picked = await vscode.window.showOpenDialog({
+        canSelectMany: false,
+        openLabel: "Install llama.cpp archive",
+        filters: {
+          Archives: ["zip", "gz", "tgz"],
+          "All files": ["*"],
+        },
+        title: `Select llama.cpp binary archive for ${backend}`,
+      });
+      if (!picked?.length) {
+        return;
+      }
+      const archivePath = picked[0].fsPath;
+      let cudartPath: string | undefined;
+      const base = path.basename(archivePath).toLowerCase();
+      if (process.platform === "win32" && (/cuda/.test(base) || backend === "cuda")) {
+        const addCudart = await vscode.window.showInformationMessage(
+          "Windows CUDA builds usually need a matching cudart-*.zip. Select one now?",
+          "Select cudart…",
+          "Skip"
+        );
+        if (addCudart === "Select cudart…") {
+          const cudart = await vscode.window.showOpenDialog({
+            canSelectMany: false,
+            openLabel: "Use cudart archive",
+            filters: { Archives: ["zip"], "All files": ["*"] },
+            title: "Select cudart-llama-bin-win-cuda-*.zip",
+          });
+          if (cudart?.length) {
+            cudartPath = cudart[0].fsPath;
+          }
+        }
+      }
+
+      const wasReady = await processManager.isHttpReady();
+      if (wasReady) {
+        await processManager.stop(true);
+      }
+      await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: `Llama AIO: Installing from ${path.basename(archivePath)}…`,
+          cancellable: false,
+        },
+        async (progress) =>
+          installer.installFromArchive(archivePath, {
+            uiBackend: backend,
+            cudartArchivePath: cudartPath,
+            progress,
+          })
+      );
+      await afterBackendInstall(wasReady);
+    } catch (e) {
+      vscode.window.showErrorMessage(
+        `Install from archive failed: ${e instanceof Error ? e.message : String(e)}`
       );
     }
   };
@@ -189,34 +350,39 @@ export function activate(context: vscode.ExtensionContext): void {
       );
       return;
     }
+    const previous = installer.resolveActiveUiBackend();
+    if (previous === backend && installer.hasBackendInstalled(backend)) {
+      await settingsView.pushState();
+      return;
+    }
+
     await installer.setBackend(backend);
     const wasReady = await processManager.isHttpReady();
 
     if (installer.hasBackendInstalled(backend)) {
-      const tag = installer.readBackendVersion(backend).tag || "cached";
       chatProvider?.notifyChanged();
       await settingsView.pushState();
-      const upgrade = await vscode.window.showInformationMessage(
-        `Using cached ${backend} build (${tag}) — no download needed.`,
-        wasReady ? "Restart server" : "OK",
-        "Download latest"
-      );
-      if (upgrade === "Download latest") {
-        await installLlamaCpp(backend);
-        return;
-      }
-      if (upgrade === "Restart server" && store.getState().selectedModelPath) {
-        try {
-          await processManager.stop(true);
-          const status = await processManager.start();
-          chatProvider?.notifyChanged();
-          await settingsView.pushState();
-          await promptUseInCopilotChat(store, status.message);
-        } catch (e) {
-          vscode.window.showErrorMessage(
-            `Restart failed: ${e instanceof Error ? e.message : String(e)}`
-          );
+      if (wasReady && store.getState().selectedModelPath) {
+        const restart = await vscode.window.showInformationMessage(
+          `Switched to ${backend}. Restart the server to use this binary?`,
+          "Restart server",
+          "Later"
+        );
+        if (restart === "Restart server") {
+          try {
+            await processManager.stop(true);
+            const status = await processManager.start();
+            chatProvider?.notifyChanged();
+            await settingsView.pushState();
+            await promptUseInCopilotChat(store, status.message);
+          } catch (e) {
+            vscode.window.showErrorMessage(
+              `Restart failed: ${e instanceof Error ? e.message : String(e)}`
+            );
+          }
         }
+      } else {
+        vscode.window.setStatusBarMessage(`Llama AIO: using ${backend} backend`, 4000);
       }
       return;
     }
@@ -248,9 +414,13 @@ export function activate(context: vscode.ExtensionContext): void {
     },
     {
       downloadFromHuggingFace,
+      downloadStarter,
       openGgufFile,
       pickDownloaded,
-      installLlamaCpp: () => installLlamaCpp(),
+      installLlamaCpp: (backend?: UiBackend) => installLlamaCpp(backend),
+      reinstallLlamaCpp,
+      installLlamaCppByTag,
+      installLlamaCppFromArchive,
       switchBackend,
     },
     () => chatProvider?.notifyChanged()
@@ -346,6 +516,8 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
 
     vscode.commands.registerCommand("llamaAio.installLlamaCpp", installLlamaCpp),
+    vscode.commands.registerCommand("llamaAio.installLlamaCppByTag", installLlamaCppByTag),
+    vscode.commands.registerCommand("llamaAio.installLlamaCppFromArchive", installLlamaCppFromArchive),
     vscode.commands.registerCommand("llamaAio.browseModels", downloadFromHuggingFace),
     vscode.commands.registerCommand("llamaAio.openModelFile", openGgufFile),
     vscode.commands.registerCommand("llamaAio.selectLocalModel", pickDownloaded),

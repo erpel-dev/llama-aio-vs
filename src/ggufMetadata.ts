@@ -37,6 +37,12 @@ export interface ModelCapabilities {
   recurrentLayers?: boolean[];
   /** GGUF file size on disk (bytes) — proxy for weight memory */
   fileSizeBytes?: number;
+  /**
+   * Fraction of tensor bytes that are MoE routed-expert weights (`*_exps`).
+   * Used with `--n-cpu-moe` to move expert weight off the GPU estimate.
+   * Undefined when not MoE or scan failed (caller should use a heuristic).
+   */
+  moeExpertShare?: number;
   /** Total MoE experts if present */
   expertCount?: number;
   /** Experts used per token if present */
@@ -168,41 +174,156 @@ function asNumber(v: GgufValue | undefined): number | undefined {
 export function readGgufMetadata(filePath: string): Record<string, GgufValue> {
   const fd = fs.openSync(filePath, "r");
   try {
-    let pos = 0;
-    const magic = readU32(fd, pos);
-    if (magic.value !== GGUF_MAGIC) {
-      throw new Error("Not a GGUF file");
-    }
-    pos = magic.next;
-    const version = readU32(fd, pos);
-    pos = version.next;
-    if (version.value < 2 || version.value > 3) {
-      // Still attempt parse for forward compatibility within known layout.
-    }
-    const tensorCount = readU64(fd, pos);
-    pos = tensorCount.next;
-    const kvCount = readU64(fd, pos);
-    pos = kvCount.next;
-
-    const meta: Record<string, GgufValue> = {};
-    const n = Number(kvCount.value);
-    for (let i = 0; i < n; i++) {
-      const key = readString(fd, pos);
-      pos = key.next;
-      const type = readU32(fd, pos);
-      pos = type.next;
-      const val = readValue(fd, pos, type.value);
-      pos = val.next;
-      meta[key.value] = val.value;
-    }
+    const { meta } = readGgufHeader(fd);
     return meta;
   } finally {
     fs.closeSync(fd);
   }
 }
 
+interface GgufHeaderScan {
+  meta: Record<string, GgufValue>;
+  /** Byte offset of tensor data section (aligned). */
+  dataStart: number;
+  tensors: Array<{ name: string; offset: number }>;
+}
+
+function readGgufHeader(fd: number): GgufHeaderScan {
+  let pos = 0;
+  const magic = readU32(fd, pos);
+  if (magic.value !== GGUF_MAGIC) {
+    throw new Error("Not a GGUF file");
+  }
+  pos = magic.next;
+  const version = readU32(fd, pos);
+  pos = version.next;
+  if (version.value < 2 || version.value > 3) {
+    // Still attempt parse for forward compatibility within known layout.
+  }
+  const tensorCount = readU64(fd, pos);
+  pos = tensorCount.next;
+  const kvCount = readU64(fd, pos);
+  pos = kvCount.next;
+
+  const meta: Record<string, GgufValue> = {};
+  const nKv = Number(kvCount.value);
+  for (let i = 0; i < nKv; i++) {
+    const key = readString(fd, pos);
+    pos = key.next;
+    const type = readU32(fd, pos);
+    pos = type.next;
+    const val = readValue(fd, pos, type.value);
+    pos = val.next;
+    meta[key.value] = val.value;
+  }
+
+  const nTensor = Number(tensorCount.value);
+  const tensors: Array<{ name: string; offset: number }> = [];
+  for (let i = 0; i < nTensor; i++) {
+    const name = readString(fd, pos);
+    pos = name.next;
+    const nDims = readU32(fd, pos);
+    pos = nDims.next;
+    for (let d = 0; d < nDims.value; d++) {
+      const dim = readU64(fd, pos);
+      pos = dim.next;
+    }
+    const type = readU32(fd, pos);
+    pos = type.next;
+    const offset = readU64(fd, pos);
+    pos = offset.next;
+    tensors.push({ name: name.value, offset: Number(offset.value) });
+  }
+
+  const alignmentRaw = meta["general.alignment"];
+  const alignment =
+    typeof alignmentRaw === "number" && alignmentRaw > 0 ? Math.floor(alignmentRaw) : 32;
+  const dataStart = Math.floor((pos + alignment - 1) / alignment) * alignment;
+  return { meta, dataStart, tensors };
+}
+
+/**
+ * Share of GGUF tensor bytes belonging to routed MoE experts (`*_exps` in the name).
+ * Shared-expert tensors (`*shexp*`) are excluded — `--n-cpu-moe` mainly moves `*_exps`.
+ */
+function computeMoeExpertShare(
+  tensors: Array<{ name: string; offset: number }>,
+  dataStart: number,
+  fileSize: number
+): number | undefined {
+  if (!tensors.length || fileSize <= dataStart) {
+    return undefined;
+  }
+  const sorted = [...tensors].sort((a, b) => a.offset - b.offset);
+  let total = 0;
+  let expert = 0;
+  for (let i = 0; i < sorted.length; i++) {
+    const off = sorted[i].offset;
+    const next = i + 1 < sorted.length ? sorted[i + 1].offset : Math.max(off, fileSize - dataStart);
+    const size = Math.max(0, next - off);
+    total += size;
+    if (/_exps(?:\.|$)/i.test(sorted[i].name)) {
+      expert += size;
+    }
+  }
+  if (total <= 0 || expert <= 0) {
+    return undefined;
+  }
+  return Math.min(0.98, Math.max(0.05, expert / total));
+}
+
+/**
+ * Share of GGUF tensor bytes belonging to routed MoE experts (`*_exps` in the name).
+ * Shared-expert tensors (`*shexp*`) are excluded — `--n-cpu-moe` mainly moves `*_exps`.
+ */
+export function measureMoeExpertShare(filePath: string): number | undefined {
+  const fd = fs.openSync(filePath, "r");
+  try {
+    const { dataStart, tensors } = readGgufHeader(fd);
+    let fileSize = 0;
+    try {
+      fileSize = fs.fstatSync(fd).size;
+    } catch {
+      return undefined;
+    }
+    return computeMoeExpertShare(tensors, dataStart, fileSize);
+  } catch {
+    return undefined;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/** Heuristic when tensor scan is unavailable. */
+export function heuristicMoeExpertShare(expertCount?: number): number {
+  if (!expertCount || expertCount <= 0) {
+    return 0.75;
+  }
+  if (expertCount >= 128) {
+    return 0.9;
+  }
+  if (expertCount >= 64) {
+    return 0.85;
+  }
+  if (expertCount >= 16) {
+    return 0.8;
+  }
+  return 0.75;
+}
+
 export function readModelCapabilities(filePath: string): ModelCapabilities {
-  const meta = readGgufMetadata(filePath);
+  const fd = fs.openSync(filePath, "r");
+  let meta: Record<string, GgufValue>;
+  let dataStart = 0;
+  let tensors: Array<{ name: string; offset: number }> = [];
+  try {
+    const header = readGgufHeader(fd);
+    meta = header.meta;
+    dataStart = header.dataStart;
+    tensors = header.tensors;
+  } finally {
+    fs.closeSync(fd);
+  }
   const arch = typeof meta["general.architecture"] === "string" ? meta["general.architecture"] : undefined;
   const name = typeof meta["general.name"] === "string" ? meta["general.name"] : undefined;
 
@@ -293,6 +414,14 @@ export function readModelCapabilities(filePath: string): ModelCapabilities {
     // ignore
   }
 
+  const isMoe = (expertCount || 0) > 0;
+  let moeExpertShare: number | undefined;
+  if (isMoe) {
+    moeExpertShare =
+      computeMoeExpertShare(tensors, dataStart, fileSizeBytes || 0) ??
+      heuristicMoeExpertShare(expertCount);
+  }
+
   return {
     path: filePath,
     name,
@@ -312,9 +441,10 @@ export function readModelCapabilities(filePath: string): ModelCapabilities {
     fullAttentionInterval,
     recurrentLayers,
     fileSizeBytes,
+    moeExpertShare,
     expertCount,
     expertUsedCount,
-    isMoe: (expertCount || 0) > 0,
+    isMoe,
     ropeFreqBase,
     nextnPredictLayers,
     fileType: typeof fileType === "number" || typeof fileType === "string" ? fileType : undefined,

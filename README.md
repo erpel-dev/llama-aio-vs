@@ -34,7 +34,9 @@ Download the newest llama.cpp version directly from within VS Code.
 - **CUDA** — when an NVIDIA GPU is detected
 - **CPU** — no GPU (`-ngl` ignored)
 
-Installs live under `~/.llama-aio-vs/llama.cpp/<backend>/`. Switching reuses a cached build; **Upgrade to latest release** re-downloads. Extra families (`rocm`, `openvino`, `sycl`, `auto`) via `llamaAio.backend`.
+Installs live under `~/.llama-aio-vs/llama.cpp/<backend>/`. Switching reuses a cached build; **Upgrade to latest release** resolves the newest tag from the releases page (no GitHub API), then downloads assets directly.
+
+To pin a build or work offline: **Install release tag…** or **Install from archive…**. Browse builds at [llama.cpp releases](https://github.com/ggml-org/llama.cpp/releases). Extra families (`rocm`, `openvino`, `sycl`, `auto`) via `llamaAio.backend`.
 
 ## Models
 
@@ -46,7 +48,7 @@ Download models directly from Hugging Face or pick a model that was downloaded b
 
 ![Load settings with VRAM / RAM memory estimate](media/screenshot-load-settings.png)
 
-Primary controls: memory estimate (VRAM / RAM), context length, GPU offload, and CPU MoE layers. Selecting a model auto-recommends settings aimed at ~2 GiB free VRAM. Threads, batch, KV/mmap/RoPE, and speculative decoding are under **Advanced Settings**.
+Primary controls: memory estimate (VRAM / RAM at **full context**), context length, GPU offload, and CPU MoE layers. MoE expert weight share is measured from the GGUF (so `--n-cpu-moe` estimates stay closer to real VRAM). Live “GPU free now” is current occupancy and is separate from the bars. Selecting a model auto-recommends settings aimed at ~2 GiB free VRAM. Threads, batch, KV/mmap/RoPE, and speculative decoding are under **Advanced Settings**.
 
 ## GitHub Copilot Chat
 
@@ -70,7 +72,7 @@ The llama.cpp server is started from within VS Code and is shared between all ru
 
 - Endpoint: `http://127.0.0.1:8742` (override with `llamaAio.host` / `llamaAio.port`)
 - Lock / log: `~/.llama-aio-vs/runtime/server.lock.json`, `llama-server.log`
-- Default launch: **external terminal** (`llamaAio.launchMode`); close the window to stop, or use `background`
+- Default launch: **external terminal** (sidebar **Launch** control, or `llamaAio.launchMode`); close the window to stop, or choose **Background**
 
 ## Key load settings → llama.cpp flags
 
@@ -93,6 +95,8 @@ The llama.cpp server is started from within VS Code and is shared between all ru
 
 - `Llama AIO: Open Settings`
 - `Llama AIO: Install / Upgrade llama.cpp`
+- `Llama AIO: Install llama.cpp by Release Tag…`
+- `Llama AIO: Install llama.cpp from Archive…`
 - `Llama AIO: Download Model from Hugging Face`
 - `Llama AIO: Open GGUF File…`
 - `Llama AIO: Choose from Downloaded Models`

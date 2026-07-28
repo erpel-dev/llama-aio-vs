@@ -1,6 +1,6 @@
 import * as os from "os";
 import { GpuMemoryInfo } from "./gpuInfo";
-import { ModelCapabilities } from "./ggufMetadata";
+import { heuristicMoeExpertShare, ModelCapabilities } from "./ggufMetadata";
 import { LlamaLoadSettings } from "./types";
 
 export interface MemoryBarSegment {
@@ -24,13 +24,22 @@ export interface MemoryEstimate {
   layersOnGpu: number;
   gpuWeightsBytes: number;
   cpuWeightsBytes: number;
+  /** KV at configured context length (full). */
   kvBytes: number;
+  /** KV if only a short prompt is in use (~2k tokens). */
+  kvBytesWarm: number;
   kvOnGpu: boolean;
+  /** MoE expert weight fraction used for --n-cpu-moe accounting. */
+  moeExpertShare?: number;
   overheadBytes: number;
   gpuOverheadBytes: number;
   cpuOverheadBytes: number;
+  /** Est. at full configured context (used for spill warnings + primary bars). */
   totalGpuBytes: number;
   totalCpuBytes: number;
+  /** Est. with warm/short context KV (closer to idle / mid-chat). */
+  totalGpuBytesWarm: number;
+  totalCpuBytesWarm: number;
   gpuTotalBytes?: number;
   gpuUsedBytes?: number;
   gpuName?: string;
@@ -50,6 +59,9 @@ export interface MemoryEstimate {
 
 const GiB = 1024 ** 3;
 const MiB = 1024 ** 2;
+
+/** Context length used for "warm / mid-chat" KV (not idle-at-load). */
+export const WARM_KV_CONTEXT = 2048;
 
 export function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes <= 0) {
@@ -164,6 +176,16 @@ export function countFullAttentionLayers(
   return n;
 }
 
+export function resolveMoeExpertShare(caps: ModelCapabilities): number {
+  if (!caps.isMoe) {
+    return 0;
+  }
+  if (caps.moeExpertShare !== undefined && Number.isFinite(caps.moeExpertShare)) {
+    return Math.min(0.98, Math.max(0.05, caps.moeExpertShare));
+  }
+  return heuristicMoeExpertShare(caps.expertCount);
+}
+
 /**
  * Estimate GPU/CPU footprint for current load settings.
  * Intentionally approximate — good enough for spill warnings and UI hints.
@@ -184,17 +206,19 @@ export function estimateMemory(
   const nLayers = caps.blockCount;
   const onGpu = cpuOnly ? 0 : layersOnGpu(settings, nLayers);
   const frac = onGpu / nLayers;
+  const moeExpertShare = resolveMoeExpertShare(caps);
 
-  // MoE experts are a large share of the file; --n-cpu-moe keeps those of the first N layers on CPU.
+  // MoE experts are most of the file; --n-cpu-moe keeps those of the first N layers on CPU.
   let gpuWeights = fileSize * frac;
-  if (!cpuOnly && caps.isMoe && settings.nCpuMoe > 0 && onGpu > 0) {
-    const expertShare = 0.7;
+  if (!cpuOnly && caps.isMoe && settings.nCpuMoe > 0 && onGpu > 0 && moeExpertShare > 0) {
     const moeCpuLayers = Math.min(settings.nCpuMoe, onGpu);
-    gpuWeights = Math.max(0, gpuWeights - fileSize * (moeCpuLayers / nLayers) * expertShare);
+    gpuWeights = Math.max(0, gpuWeights - fileSize * (moeCpuLayers / nLayers) * moeExpertShare);
   }
   const cpuWeights = Math.max(0, fileSize - gpuWeights);
 
   const kvBytes = estimateKvBytes(caps, settings.contextLength);
+  const warmCtx = Math.min(WARM_KV_CONTEXT, Math.max(512, settings.contextLength));
+  const kvBytesWarm = estimateKvBytes(caps, warmCtx);
   const fullAttnLayers = countFullAttentionLayers(caps);
   const kvOnGpu = !cpuOnly && settings.offloadKvCacheToGpu && onGpu > 0;
   // Compute / graph / batch scratch — grows a bit with batch size.
@@ -205,9 +229,13 @@ export function estimateMemory(
   const cpuOverheadBytes = onGpu > 0 ? Math.round(overheadBytes * 0.15) : Math.round(overheadBytes * 0.5);
   const gpuKvBytes = kvOnGpu ? kvBytes : 0;
   const cpuKvBytes = kvOnGpu ? 0 : kvBytes;
+  const gpuKvWarm = kvOnGpu ? kvBytesWarm : 0;
+  const cpuKvWarm = kvOnGpu ? 0 : kvBytesWarm;
 
   const totalGpuBytes = gpuWeights + gpuKvBytes + gpuOverheadBytes;
   const totalCpuBytes = cpuWeights + cpuKvBytes + cpuOverheadBytes;
+  const totalGpuBytesWarm = gpuWeights + gpuKvWarm + gpuOverheadBytes;
+  const totalCpuBytesWarm = cpuWeights + cpuKvWarm + cpuOverheadBytes;
   const systemRamTotalBytes = os.totalmem();
 
   const warnings: string[] = [];
@@ -229,12 +257,12 @@ export function estimateMemory(
   }
   if (!cpuOnly && !settings.offloadKvCacheToGpu) {
     warnings.push(
-      `KV cache (~${formatBytes(kvBytes)} at this context) is in system RAM, not VRAM.`
+      `KV cache (~${formatBytes(kvBytes)} at full context) is in system RAM, not VRAM.`
     );
   }
   if (!cpuOnly && caps.isMoe && settings.nCpuMoe > 0) {
     warnings.push(
-      `CPU MoE layers = ${settings.nCpuMoe}: expert weights for those layers stay in system RAM.`
+      `CPU MoE layers = ${settings.nCpuMoe}: ~${Math.round(moeExpertShare * 100)}% of weights are experts; those layers’ experts stay in system RAM.`
     );
   }
 
@@ -247,16 +275,16 @@ export function estimateMemory(
     if (totalGpuBytes > gpu.totalBytes) {
       willSpill = true;
       warnings.unshift(
-        `Estimated VRAM ~${formatBytes(totalGpuBytes)} is over the full ${formatBytes(gpu.totalBytes)} GPU (${pct}%). Expect spill to system RAM (much slower). Lower Context Length, GPU Offload, or use a smaller quant.`
+        `Estimated VRAM at full context ~${formatBytes(totalGpuBytes)} is over the full ${formatBytes(gpu.totalBytes)} GPU (${pct}%). Expect spill to system RAM (much slower). Lower Context Length, GPU Offload, or use a smaller quant.`
       );
     } else if (totalGpuBytes > usableBytes) {
       willSpill = true;
       warnings.unshift(
-        `Tight on VRAM: ~${formatBytes(totalGpuBytes)} of ${formatBytes(gpu.totalBytes)} (${pct}%). Only ~${formatBytes(gpu.totalBytes - usableBytes)} is left as safe headroom for the driver — llama.cpp often spills to system RAM at this point. Lower Context Length or GPU Offload.`
+        `Tight on VRAM at full context: ~${formatBytes(totalGpuBytes)} of ${formatBytes(gpu.totalBytes)} (${pct}%). Only ~${formatBytes(gpu.totalBytes - usableBytes)} is left as safe headroom for the driver — llama.cpp often spills to system RAM at this point. Lower Context Length or GPU Offload.`
       );
     } else if (totalGpuBytes > gpu.totalBytes * 0.8) {
       warnings.push(
-        `Getting full: ~${formatBytes(totalGpuBytes)} of ${formatBytes(gpu.totalBytes)} VRAM (${pct}%). Leave some free for the display driver.`
+        `Getting full at full context: ~${formatBytes(totalGpuBytes)} of ${formatBytes(gpu.totalBytes)} VRAM (${pct}%). Leave some free for the display driver.`
       );
     }
   }
@@ -264,7 +292,7 @@ export function estimateMemory(
   if (cpuOnly && systemRamTotalBytes && totalCpuBytes > systemRamTotalBytes * 0.9) {
     willSpill = true;
     warnings.unshift(
-      `Estimated system RAM ~${formatBytes(totalCpuBytes)} is very high vs ${formatBytes(systemRamTotalBytes)}. Lower Context Length or use a smaller model/quant.`
+      `Estimated system RAM at full context ~${formatBytes(totalCpuBytes)} is very high vs ${formatBytes(systemRamTotalBytes)}. Lower Context Length or use a smaller model/quant.`
     );
   }
 
@@ -275,54 +303,73 @@ export function estimateMemory(
     const free =
       gpu.usedBytes !== undefined ? Math.max(0, gpu.totalBytes - gpu.usedBytes) : undefined;
     lines.push(
-      `GPU: ${formatBytes(gpu.totalBytes)}` +
-        (gpu.name ? ` (${gpu.name})` : "") +
-        (free !== undefined ? ` · ~${formatBytes(free)} free now` : "")
+      `GPU capacity: ${formatBytes(gpu.totalBytes)}` +
+        (gpu.name ? ` (${gpu.name})` : "")
     );
+    if (free !== undefined) {
+      lines.push(
+        `Live GPU free now: ~${formatBytes(free)} (current occupancy — not part of the estimate bars)`
+      );
+    }
   } else {
     lines.push("GPU VRAM: unknown (could not detect)");
   }
-  lines.push(`System RAM: ${formatBytes(systemRamTotalBytes)}`);
+  lines.push(`System RAM capacity: ${formatBytes(systemRamTotalBytes)}`);
   if (cpuOnly) {
     lines.push(`Weights in RAM: ~${formatBytes(cpuWeights)} (${nLayers} layers)`);
     lines.push(
-      `KV cache @ ${settings.contextLength.toLocaleString()} ctx: ~${formatBytes(kvBytes)} (system RAM)` +
+      `KV @ full ${settings.contextLength.toLocaleString()} ctx: ~${formatBytes(kvBytes)} (system RAM)` +
         (fullAttnLayers < nLayers ? ` · ${fullAttnLayers}/${nLayers} full-attn layers` : "")
     );
-    lines.push(`Est. total system RAM: ~${formatBytes(totalCpuBytes)}`);
+    if (kvBytesWarm < kvBytes) {
+      lines.push(
+        `KV @ ~${warmCtx.toLocaleString()} ctx (mid-chat): ~${formatBytes(kvBytesWarm)} → total ~${formatBytes(totalCpuBytesWarm)}`
+      );
+    }
+    lines.push(`Est. total system RAM at full context: ~${formatBytes(totalCpuBytes)}`);
   } else {
     lines.push(
       `Weights on GPU: ~${formatBytes(gpuWeights)} (${onGpu}/${nLayers} layers)` +
-        (cpuWeights > MiB ? ` · RAM: ~${formatBytes(cpuWeights)}` : "")
+        (cpuWeights > MiB ? ` · RAM: ~${formatBytes(cpuWeights)}` : "") +
+        (caps.isMoe && moeExpertShare > 0
+          ? ` · MoE experts ~${Math.round(moeExpertShare * 100)}% of file`
+          : "")
     );
     lines.push(
-      `KV cache @ ${settings.contextLength.toLocaleString()} ctx: ~${formatBytes(kvBytes)}` +
+      `KV @ full ${settings.contextLength.toLocaleString()} ctx: ~${formatBytes(kvBytes)}` +
         (kvOnGpu ? " (GPU)" : " (CPU RAM)") +
         (fullAttnLayers < nLayers ? ` · ${fullAttnLayers}/${nLayers} full-attn layers` : "")
     );
+    if (kvBytesWarm < kvBytes) {
+      lines.push(
+        `KV @ ~${warmCtx.toLocaleString()} ctx (mid-chat): ~${formatBytes(kvBytesWarm)}` +
+          (kvOnGpu ? " (GPU)" : " (CPU RAM)") +
+          ` → VRAM ~${formatBytes(totalGpuBytesWarm)}`
+      );
+    }
     lines.push(
-      `Est. total VRAM: ~${formatBytes(totalGpuBytes)}` +
+      `Est. total at full context — VRAM: ~${formatBytes(totalGpuBytes)}` +
         (totalCpuBytes > MiB ? ` · system RAM: ~${formatBytes(totalCpuBytes)}` : "")
     );
   }
-  lines.push("Estimate only — actual use varies by quant, MoE, and backend.");
+  lines.push("Bars show estimate at full context. Actual use varies by quant, MoE, and backend.");
 
   const charts = {
     vram: {
-      title: "VRAM",
+      title: "VRAM · est. at full context",
       segments: [
         { key: "weights" as const, label: "Weights", bytes: gpuWeights },
-        { key: "kv" as const, label: "KV cache", bytes: gpuKvBytes },
+        { key: "kv" as const, label: "KV cache (full ctx)", bytes: gpuKvBytes },
         { key: "overhead" as const, label: "Overhead", bytes: gpuOverheadBytes },
       ],
       totalBytes: totalGpuBytes,
       capacityBytes: cpuOnly ? undefined : gpu?.totalBytes,
     },
     ram: {
-      title: "System RAM",
+      title: "System RAM · est. at full context",
       segments: [
         { key: "weights" as const, label: "Weights", bytes: cpuWeights },
-        { key: "kv" as const, label: "KV cache", bytes: cpuKvBytes },
+        { key: "kv" as const, label: "KV cache (full ctx)", bytes: cpuKvBytes },
         { key: "overhead" as const, label: "Overhead", bytes: cpuOverheadBytes },
       ],
       totalBytes: totalCpuBytes,
@@ -337,12 +384,16 @@ export function estimateMemory(
     gpuWeightsBytes: gpuWeights,
     cpuWeightsBytes: cpuWeights,
     kvBytes,
+    kvBytesWarm,
     kvOnGpu,
+    moeExpertShare: caps.isMoe ? moeExpertShare : undefined,
     overheadBytes,
     gpuOverheadBytes,
     cpuOverheadBytes,
     totalGpuBytes,
     totalCpuBytes,
+    totalGpuBytesWarm,
+    totalCpuBytesWarm,
     gpuTotalBytes: gpu?.totalBytes,
     gpuUsedBytes: gpu?.usedBytes,
     gpuName: gpu?.name,
@@ -375,5 +426,7 @@ export function memoryEstimateInputs(caps: ModelCapabilities | undefined): Recor
     fullAttentionInterval: caps.fullAttentionInterval || 0,
     recurrentLayers: caps.recurrentLayers || null,
     isMoe: !!caps.isMoe,
+    moeExpertShare: caps.moeExpertShare ?? null,
+    expertCount: caps.expertCount || 0,
   };
 }

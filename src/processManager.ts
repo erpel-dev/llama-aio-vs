@@ -14,7 +14,7 @@ import {
 import { resolveLaunchMode, spawnInExternalTerminal } from "./externalTerminal";
 import { clampLoadSettingsToModel, readModelCapabilities } from "./ggufMetadata";
 import { LlamaInstaller } from "./llamaInstaller";
-import { buildServerArgs, SettingsStore } from "./settings";
+import { buildServerArgs, serverConfigFingerprint, SettingsStore } from "./settings";
 import { ServerStatus } from "./types";
 
 interface LockFile {
@@ -26,6 +26,8 @@ interface LockFile {
   binary: string;
   args: string[];
   launchMode?: string;
+  /** Fingerprint of model + load settings (+ launch mode) applied at start. */
+  configFingerprint?: string;
 }
 
 function isPidAlive(pid: number): boolean {
@@ -66,6 +68,7 @@ export class ProcessManager {
         endpoint: `http://${lock.host}:${lock.port}`,
         ownedByThisExtension: true,
         message: `Running (pid ${lock.pid})`,
+        configDirty: this.isConfigDirty(lock),
       };
     }
 
@@ -85,6 +88,7 @@ export class ProcessManager {
           endpoint: `http://${lock.host}:${lock.port}`,
           ownedByThisExtension: true,
           message: `Running (pid ${pid})`,
+          configDirty: this.isConfigDirty(lock),
         };
       }
     }
@@ -96,7 +100,34 @@ export class ProcessManager {
       endpoint,
       ownedByThisExtension: false,
       message: "Not running",
+      configDirty: false,
     };
+  }
+
+  /** Current model + load + launch fingerprint (CPU-normalized like start). */
+  private currentConfigFingerprint(modelPath?: string): string {
+    const state = this.store.getState();
+    const model = (modelPath ?? state.selectedModelPath ?? "").trim();
+    let loadSettings = state.loadSettings;
+    if (this.isCpuBackend()) {
+      loadSettings = {
+        ...loadSettings,
+        gpuOffload: 0,
+        offloadKvCacheToGpu: false,
+      };
+    }
+    const launchMode = resolveLaunchMode(this.store.getConfig().get<string>("launchMode"));
+    return serverConfigFingerprint(model, loadSettings, launchMode);
+  }
+
+  private isConfigDirty(lock: LockFile): boolean {
+    const current = this.currentConfigFingerprint();
+    if (lock.configFingerprint) {
+      return lock.configFingerprint !== current;
+    }
+    // Pre-fingerprint locks: dirty if model path changed.
+    const selected = (this.store.getState().selectedModelPath || "").trim();
+    return (lock.modelPath || "").trim() !== selected;
   }
 
   async isHttpReady(endpoint?: string): Promise<boolean> {
@@ -208,15 +239,17 @@ export class ProcessManager {
       // If metadata cannot be read, proceed with stored settings.
     }
     if (this.isCpuBackend()) {
-      // CPU builds ignore -ngl; keep args honest so logs/estimate match reality.
+      // CPU builds ignore -ngl / --n-cpu-moe; keep args honest so logs/estimate match reality.
       loadSettings = {
         ...loadSettings,
         gpuOffload: 0,
         offloadKvCacheToGpu: false,
+        nCpuMoe: 0,
       };
     }
     const args = buildServerArgs(model, host, port, loadSettings);
     const launchMode = resolveLaunchMode(this.store.getConfig().get<string>("launchMode"));
+    const configFingerprint = serverConfigFingerprint(model, loadSettings, launchMode);
 
     ensureDirs(getLockDir(), path.dirname(getLogPath()));
     // Fresh log per start so failures are easy to read.
@@ -269,6 +302,7 @@ export class ProcessManager {
       binary,
       args,
       launchMode,
+      configFingerprint,
     });
 
     // Wait for readiness — fail fast on log fatals / dead process instead of hanging ~45s.
@@ -299,6 +333,7 @@ export class ProcessManager {
           binary,
           args,
           launchMode,
+          configFingerprint,
         });
         return {
           running: true,
@@ -308,6 +343,7 @@ export class ProcessManager {
           modelPath: model,
           endpoint: `http://${host}:${port}`,
           ownedByThisExtension: true,
+          configDirty: false,
           message:
             launchMode === "externalTerminal"
               ? `Started in external terminal (pid ${pid}). Close that window to stop the server.`

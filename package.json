@@ -2,7 +2,7 @@
   "name": "llama-aio-vs",
   "displayName": "Llama AIO",
   "description": "All-in-one local llama.cpp for VS Code: install, HF models, LM Studio-style settings, shared server, Copilot Chat provider.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "erpel-dev",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -43,6 +43,14 @@
       {
         "command": "llamaAio.installLlamaCpp",
         "title": "Llama AIO: Install / Upgrade llama.cpp"
+      },
+      {
+        "command": "llamaAio.installLlamaCppByTag",
+        "title": "Llama AIO: Install llama.cpp by Release Tag…"
+      },
+      {
+        "command": "llamaAio.installLlamaCppFromArchive",
+        "title": "Llama AIO: Install llama.cpp from Archive…"
       },
       {
         "command": "llamaAio.browseModels",

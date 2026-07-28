@@ -78,7 +78,7 @@ function downloadFile(url: string, dest: string, onProgress?: (pct: number) => v
             return;
           }
           if (!res.statusCode || res.statusCode >= 400) {
-            reject(new Error(`Download failed: HTTP ${res.statusCode}`));
+            reject(new Error(`Download failed: HTTP ${res.statusCode} for ${u}`));
             res.resume();
             return;
           }
@@ -100,6 +100,224 @@ function downloadFile(url: string, dest: string, onProgress?: (pct: number) => v
     };
     doGet(url);
   });
+}
+
+/** True when a URL responds with 2xx (follows redirects). Uses a Range GET to avoid full download. */
+function urlExists(url: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const doGet = (u: string) => {
+      const req = https.get(
+        u,
+        { headers: { "User-Agent": "llama-aio-vs", Range: "bytes=0-0" } },
+        (res) => {
+          if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+            res.resume();
+            doGet(res.headers.location);
+            return;
+          }
+          const ok = !!res.statusCode && res.statusCode >= 200 && res.statusCode < 400;
+          res.resume();
+          resolve(ok);
+        }
+      );
+      req.on("error", () => resolve(false));
+      req.setTimeout(8000, () => {
+        req.destroy();
+        resolve(false);
+      });
+    };
+    doGet(url);
+  });
+}
+
+export const LLAMA_CPP_RELEASES_URL = "https://github.com/ggml-org/llama.cpp/releases";
+export const LLAMA_CPP_DOWNLOAD_BASE =
+  "https://github.com/ggml-org/llama.cpp/releases/download";
+
+/** Normalize user input (`b10154`, `10154`, release URL) to a tag like `b10154`. */
+export function normalizeReleaseTag(input: string): string {
+  let s = (input || "").trim();
+  if (!s) {
+    throw new Error("Release tag is empty.");
+  }
+  const fromUrl =
+    /\/releases\/tag\/(b?\d+)/i.exec(s) ||
+    /#release-(b?\d+)/i.exec(s) ||
+    /\/download\/(b\d+)\//i.exec(s);
+  if (fromUrl) {
+    s = fromUrl[1];
+  } else {
+    const bare = /\b(b?\d{3,})\b/i.exec(s);
+    if (bare) {
+      s = bare[1];
+    }
+  }
+  s = s.replace(/^v/i, "");
+  if (/^\d+$/.test(s)) {
+    s = `b${s}`;
+  }
+  if (!/^b\d+$/i.test(s)) {
+    throw new Error(
+      `Invalid release tag "${input}". Use e.g. b10154, or a URL like ${LLAMA_CPP_RELEASES_URL}/tag/b10154`
+    );
+  }
+  return `b${s.slice(1)}`;
+}
+
+/** Direct-download asset name candidates for a tag + backend (no GitHub API). */
+export function candidateAssetNames(tag: string, backend: UiBackend): string[] {
+  const t = normalizeReleaseTag(tag);
+  const arch = process.arch === "arm64" ? "arm64" : "x64";
+  if (process.platform === "darwin") {
+    return [`llama-${t}-bin-macos-${arch}.tar.gz`];
+  }
+  if (process.platform === "win32") {
+    if (backend === "vulkan") {
+      return [`llama-${t}-bin-win-vulkan-${arch}.zip`];
+    }
+    if (backend === "cuda") {
+      return [
+        `llama-${t}-bin-win-cuda-12.4-${arch}.zip`,
+        `llama-${t}-bin-win-cuda-12.5-${arch}.zip`,
+        `llama-${t}-bin-win-cuda-13.3-${arch}.zip`,
+        `llama-${t}-bin-win-cuda-13.0-${arch}.zip`,
+      ];
+    }
+    return [`llama-${t}-bin-win-cpu-${arch}.zip`];
+  }
+  // linux
+  if (backend === "vulkan") {
+    return [`llama-${t}-bin-ubuntu-vulkan-${arch}.tar.gz`];
+  }
+  if (backend === "cuda") {
+    // Official Ubuntu CUDA archives are rare; try common patterns then fail with a clear message.
+    return [
+      `llama-${t}-bin-ubuntu-cuda-12.4-${arch}.tar.gz`,
+      `llama-${t}-bin-ubuntu-${arch}-cuda-12.4.tar.gz`,
+    ];
+  }
+  return [`llama-${t}-bin-ubuntu-${arch}.tar.gz`];
+}
+
+export function candidateCudartNames(mainAssetName?: string): string[] {
+  const m = mainAssetName ? /cuda-(\d+(?:\.\d+)?)/i.exec(mainAssetName) : undefined;
+  const ver = m?.[1];
+  const preferred = ver ? [`cudart-llama-bin-win-cuda-${ver}-x64.zip`] : [];
+  return [
+    ...preferred,
+    "cudart-llama-bin-win-cuda-12.4-x64.zip",
+    "cudart-llama-bin-win-cuda-13.3-x64.zip",
+    "cudart-llama-bin-win-cuda-12.5-x64.zip",
+  ].filter((n, i, arr) => arr.indexOf(n) === i);
+}
+
+export function directAssetUrl(tag: string, assetName: string): string {
+  return `${LLAMA_CPP_DOWNLOAD_BASE}/${normalizeReleaseTag(tag)}/${assetName}`;
+}
+
+/**
+ * Resolve the newest llama.cpp release tag without using api.github.com.
+ * Follows the HTML redirect: `/releases/latest` → `/releases/tag/b#####`.
+ */
+export function resolveLatestReleaseTag(): Promise<string> {
+  const start = `${LLAMA_CPP_RELEASES_URL}/latest`;
+  return new Promise((resolve, reject) => {
+    const visit = (url: string, hops: number) => {
+      if (hops > 8) {
+        reject(new Error("Too many redirects while resolving latest llama.cpp release."));
+        return;
+      }
+      const req = https.get(
+        url,
+        {
+          headers: { "User-Agent": "llama-aio-vs", Accept: "text/html" },
+        },
+        (res) => {
+          const loc = res.headers.location;
+          if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && loc) {
+            res.resume();
+            const next = loc.startsWith("http") ? loc : new URL(loc, url).toString();
+            visit(next, hops + 1);
+            return;
+          }
+
+          // Final URL may already be .../releases/tag/b##### even on 200.
+          const finalUrl = url;
+          res.resume();
+          try {
+            resolve(normalizeReleaseTag(finalUrl));
+          } catch (e) {
+            // Fallback: some responses land on /releases with tag only in body — rare.
+            reject(
+              e instanceof Error
+                ? e
+                : new Error(`Could not parse latest release tag from ${finalUrl}`)
+            );
+          }
+        }
+      );
+      req.on("error", reject);
+      req.setTimeout(12_000, () => {
+        req.destroy();
+        reject(new Error("Timed out resolving latest llama.cpp release tag."));
+      });
+    };
+    visit(start, 0);
+  });
+}
+
+const LATEST_TAG_CACHE_MS = 45 * 60 * 1000;
+let latestTagCache: { tag: string; fetchedAt: number } | undefined;
+
+/** Compare release tags (`b10173`). Positive if `a` is newer than `b`. */
+export function compareReleaseTags(a: string, b: string): number {
+  const na = Number.parseInt(normalizeReleaseTag(a).replace(/^b/i, ""), 10);
+  const nb = Number.parseInt(normalizeReleaseTag(b).replace(/^b/i, ""), 10);
+  if (Number.isFinite(na) && Number.isFinite(nb)) {
+    return na - nb;
+  }
+  return normalizeReleaseTag(a).localeCompare(normalizeReleaseTag(b), undefined, {
+    numeric: true,
+    sensitivity: "base",
+  });
+}
+
+export function peekCachedLatestReleaseTag(): string | undefined {
+  if (!latestTagCache) {
+    return undefined;
+  }
+  if (Date.now() - latestTagCache.fetchedAt > LATEST_TAG_CACHE_MS) {
+    return undefined;
+  }
+  return latestTagCache.tag;
+}
+
+export function invalidateLatestReleaseTagCache(): void {
+  latestTagCache = undefined;
+}
+
+/** Cached latest-tag lookup (redirect only; no GitHub API). */
+export async function getLatestReleaseTagCached(force = false): Promise<string> {
+  if (!force) {
+    const cached = peekCachedLatestReleaseTag();
+    if (cached) {
+      return cached;
+    }
+  }
+  const tag = await resolveLatestReleaseTag();
+  latestTagCache = { tag, fetchedAt: Date.now() };
+  return tag;
+}
+
+export interface UpdateCheckInfo {
+  latestTag?: string;
+  installedTag?: string;
+  /** True when latest is newer than the active backend install. */
+  updateAvailable: boolean;
+  /** Network/parse failed and no usable cache. */
+  checkFailed: boolean;
+  /** Still waiting on first network check. */
+  pending: boolean;
 }
 
 export type LlamaBackend = "auto" | "vulkan" | "rocm" | "cuda" | "cpu" | "openvino" | "sycl";
@@ -650,39 +868,218 @@ export class LlamaInstaller {
     };
   }
 
+  /**
+   * Compare active backend install vs latest release tag (cached ~45 min).
+   * Pass force=true to refresh the network check.
+   */
+  async getUpdateCheck(force = false): Promise<UpdateCheckInfo> {
+    const installedTag = this.readBackendVersion().tag;
+    const cached = force ? undefined : peekCachedLatestReleaseTag();
+    if (cached) {
+      return {
+        latestTag: cached,
+        installedTag,
+        updateAvailable: !installedTag || compareReleaseTags(cached, installedTag) > 0,
+        checkFailed: false,
+        pending: false,
+      };
+    }
+
+    try {
+      const latestTag = await getLatestReleaseTagCached(force);
+      return {
+        latestTag,
+        installedTag,
+        updateAvailable: !installedTag || compareReleaseTags(latestTag, installedTag) > 0,
+        checkFailed: false,
+        pending: false,
+      };
+    } catch {
+      return {
+        installedTag,
+        updateAvailable: false,
+        checkFailed: true,
+        pending: false,
+      };
+    }
+  }
+
+  /** Sync snapshot using cache only (no network). */
+  peekUpdateCheck(): UpdateCheckInfo {
+    const installedTag = this.readBackendVersion().tag;
+    const cached = peekCachedLatestReleaseTag();
+    if (!cached) {
+      return {
+        installedTag,
+        updateAvailable: false,
+        checkFailed: false,
+        pending: true,
+      };
+    }
+    return {
+      latestTag: cached,
+      installedTag,
+      updateAvailable: !installedTag || compareReleaseTags(cached, installedTag) > 0,
+      checkFailed: false,
+      pending: false,
+    };
+  }
+
   async installOrUpgrade(
+    progress?: vscode.Progress<{ message?: string; increment?: number }>,
+    backendOverride?: LlamaBackend,
+    options?: { force?: boolean }
+  ): Promise<string> {
+    progress?.report({ message: "Resolving latest llama.cpp release tag…" });
+    let tag: string;
+    try {
+      tag = await getLatestReleaseTagCached(true);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      throw new Error(
+        `${msg}\n\nCould not resolve the latest tag from ${LLAMA_CPP_RELEASES_URL}/latest.\n` +
+          `Use “Install release tag…” or “Install from archive…” instead.`
+      );
+    }
+    progress?.report({ message: `Latest release: ${tag}` });
+
+    const backendSetting = backendOverride || this.getBackend();
+    const uiBackend =
+      backendSetting === "vulkan" || backendSetting === "cuda" || backendSetting === "cpu"
+        ? backendSetting
+        : this.resolveActiveUiBackend(backendSetting);
+    const current = this.readBackendVersion(uiBackend).tag;
+    if (!options?.force && current && compareReleaseTags(tag, current) <= 0) {
+      progress?.report({ message: `Already on ${current}` });
+      return current;
+    }
+
+    return this.installByTag(tag, progress, backendOverride);
+  }
+
+  /**
+   * Install a specific release tag via direct `releases/download` URLs (no GitHub API).
+   * Tag examples: `b10154`, or a releases page/tag URL.
+   */
+  async installByTag(
+    tagInput: string,
     progress?: vscode.Progress<{ message?: string; increment?: number }>,
     backendOverride?: LlamaBackend
   ): Promise<string> {
     this.migrateLegacyInstallIfNeeded();
+    const tag = normalizeReleaseTag(tagInput);
     const backendSetting = backendOverride || this.getBackend();
     const uiBackend =
       backendSetting === "vulkan" || backendSetting === "cuda" || backendSetting === "cpu"
         ? backendSetting
         : this.resolveActiveUiBackend(backendSetting);
 
-    progress?.report({ message: `Fetching latest llama.cpp release (backend: ${uiBackend})…` });
-    const release = await httpGetJson<GithubRelease>(
-      "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
-    );
+    const candidates = candidateAssetNames(tag, uiBackend);
+    progress?.report({ message: `Looking up ${tag} assets for ${uiBackend}…` });
 
-    const asset = pickAsset(release.assets || [], uiBackend);
-    if (!asset) {
+    let assetName: string | undefined;
+    let assetUrl: string | undefined;
+    for (const name of candidates) {
+      const url = directAssetUrl(tag, name);
+      progress?.report({ message: `Checking ${name}…` });
+      if (await urlExists(url)) {
+        assetName = name;
+        assetUrl = url;
+        break;
+      }
+    }
+    if (!assetName || !assetUrl) {
       throw new Error(
-        `No suitable llama.cpp release asset found for ${process.platform}/${process.arch} backend=${uiBackend}. Tag: ${release.tag_name}`
+        `No ${uiBackend} archive found for ${tag} on this platform (${process.platform}/${process.arch}).\n` +
+          `Tried:\n${candidates.map((n) => `• ${n}`).join("\n")}\n\n` +
+          `Open ${LLAMA_CPP_RELEASES_URL}/tag/${tag} and use “Install from archive…”, ` +
+          `or pick another tag/backend.`
       );
     }
+
+    const tmpDir = path.join(os.tmpdir(), "llama-aio-vs");
+    ensureDirs(tmpDir);
+    const archivePath = path.join(tmpDir, assetName);
+    progress?.report({ message: `Downloading ${assetName}…` });
+    await downloadFile(assetUrl, archivePath, (pct) => {
+      progress?.report({ message: `Downloading ${assetName}… ${pct}%` });
+    });
+
+    let cudartPath: string | undefined;
+    if (uiBackend === "cuda" && process.platform === "win32") {
+      for (const cudartName of candidateCudartNames(assetName)) {
+        const cudartUrl = directAssetUrl(tag, cudartName);
+        if (!(await urlExists(cudartUrl))) {
+          continue;
+        }
+        progress?.report({ message: `Downloading ${cudartName}…` });
+        cudartPath = path.join(tmpDir, cudartName);
+        await downloadFile(cudartUrl, cudartPath, (pct) => {
+          progress?.report({ message: `Downloading ${cudartName}… ${pct}%` });
+        });
+        break;
+      }
+    }
+
+    return this.installFromArchive(archivePath, {
+      uiBackend,
+      tag,
+      assetName,
+      cudartArchivePath: cudartPath,
+      progress,
+    });
+  }
+
+  /**
+   * Install from a local `.zip` / `.tar.gz` (and optional Windows cudart zip).
+   * Does not contact the GitHub API.
+   */
+  async installFromArchive(
+    archivePath: string,
+    options: {
+      uiBackend?: UiBackend;
+      tag?: string;
+      assetName?: string;
+      cudartArchivePath?: string;
+      progress?: vscode.Progress<{ message?: string; increment?: number }>;
+    } = {}
+  ): Promise<string> {
+    this.migrateLegacyInstallIfNeeded();
+    const progress = options.progress;
+    if (!archivePath || !fs.existsSync(archivePath)) {
+      throw new Error(`Archive not found: ${archivePath}`);
+    }
+    const assetName = options.assetName || path.basename(archivePath);
+    if (/cudart/i.test(assetName) && !options.cudartArchivePath) {
+      throw new Error(
+        `"${assetName}" looks like a CUDA runtime pack, not llama-server. ` +
+          `Select the main llama-*-bin-* archive first (optionally add cudart as the second file).`
+      );
+    }
+    if (!isArchive(assetName)) {
+      throw new Error(`Unsupported archive type: ${assetName} (need .zip, .tar.gz, or .tgz)`);
+    }
+
+    const inferred = inferBackendFromAsset(assetName);
+    let uiBackend: UiBackend =
+      options.uiBackend ||
+      (inferred === "vulkan" || inferred === "cuda" || inferred === "cpu"
+        ? inferred
+        : this.resolveActiveUiBackend());
+
+    // Prefer explicit folder when user already selected a UI backend and asset is ambiguous.
+    if (options.uiBackend) {
+      uiBackend = options.uiBackend;
+    }
+
+    const tag =
+      options.tag ||
+      (/b\d+/i.exec(assetName)?.[0] ?? /b\d+/i.exec(options.tag || "")?.[0] ?? "local");
 
     const installDir = getBackendInstallDir(this.store.getConfig(), uiBackend);
     ensureDirs(installDir);
     const tmpDir = path.join(os.tmpdir(), "llama-aio-vs");
     ensureDirs(tmpDir);
-    const archivePath = path.join(tmpDir, asset.name);
-
-    progress?.report({ message: `Downloading ${asset.name}…` });
-    await downloadFile(asset.browser_download_url, archivePath, (pct) => {
-      progress?.report({ message: `Downloading ${asset.name}… ${pct}%` });
-    });
 
     progress?.report({ message: "Extracting…" });
     const extractTo = path.join(tmpDir, `extract-${Date.now()}`);
@@ -691,10 +1088,11 @@ export class LlamaInstaller {
 
     const found = findBinaryAfterExtract(extractTo);
     if (!found) {
-      throw new Error("Extracted archive but could not find llama-server binary.");
+      throw new Error(
+        `Could not find llama-server in ${assetName}. Make sure this is an official llama.cpp binary archive.`
+      );
     }
 
-    // Replace only this backend's bin dir — leave other backends intact.
     const binDir = path.join(installDir, "bin");
     fs.rmSync(binDir, { recursive: true, force: true });
     ensureDirs(binDir);
@@ -719,41 +1117,53 @@ export class LlamaInstaller {
         }
       }
     }
-    // Also pull DLLs / shared libs that may live in nested folders of the archive.
     if (process.platform === "win32") {
       copyFilesIntoBin(extractTo, binDir, [".dll"]);
     }
 
-    // Windows CUDA builds need the matching cudart zip (cudart64_*.dll, cublas, …).
-    if (uiBackend === "cuda" && process.platform === "win32") {
-      const cudart = pickCudartAsset(release.assets || [], asset.name);
-      if (cudart) {
-        progress?.report({ message: `Downloading CUDA runtime ${cudart.name}…` });
-        const cudartArchive = path.join(tmpDir, cudart.name);
-        await downloadFile(cudart.browser_download_url, cudartArchive, (pct) => {
-          progress?.report({ message: `Downloading ${cudart.name}… ${pct}%` });
+    if (options.cudartArchivePath && fs.existsSync(options.cudartArchivePath)) {
+      progress?.report({ message: "Extracting CUDA runtime…" });
+      const cudartExtract = path.join(tmpDir, `cudart-extract-${Date.now()}`);
+      ensureDirs(cudartExtract);
+      await extractArchive(options.cudartArchivePath, cudartExtract);
+      copyFilesIntoBin(cudartExtract, binDir, [".dll"]);
+      try {
+        fs.rmSync(cudartExtract, { recursive: true, force: true });
+      } catch {
+        // ignore
+      }
+    } else if (uiBackend === "cuda" && process.platform === "win32") {
+      const hasCudart = fs.readdirSync(binDir).some((n) => /cudart64|cublas/i.test(n));
+      if (!hasCudart) {
+        progress?.report({
+          message:
+            "Installed CUDA build without cudart DLLs — llama-server may fail until you import cudart-*.zip",
         });
-        const cudartExtract = path.join(tmpDir, `cudart-extract-${Date.now()}`);
-        ensureDirs(cudartExtract);
-        await extractArchive(cudartArchive, cudartExtract);
-        copyFilesIntoBin(cudartExtract, binDir, [".dll"]);
-        try {
-          fs.rmSync(cudartExtract, { recursive: true, force: true });
-          fs.unlinkSync(cudartArchive);
-        } catch {
-          // ignore cleanup
-        }
       }
     }
 
-    const resolved = inferBackendFromAsset(asset.name) || uiBackend;
+    try {
+      fs.rmSync(extractTo, { recursive: true, force: true });
+    } catch {
+      // ignore
+    }
+
+    await this.setBackend(uiBackend);
+    const resolved = inferBackendFromAsset(assetName) || uiBackend;
     fs.writeFileSync(
       path.join(installDir, "VERSION"),
-      `${release.tag_name}\nasset=${asset.name}\nbackend=${uiBackend}\nresolved=${resolved}\n`,
+      `${tag}\nasset=${assetName}\nbackend=${uiBackend}\nresolved=${resolved}\n`,
       "utf8"
     );
+    // Keep update UI in sync when we just installed this tag.
+    if (tag && tag !== "local") {
+      const cached = peekCachedLatestReleaseTag();
+      if (!cached || compareReleaseTags(tag, cached) >= 0) {
+        latestTagCache = { tag, fetchedAt: Date.now() };
+      }
+    }
 
-    progress?.report({ message: `Installed ${release.tag_name} (${asset.name}) → ${uiBackend}` });
+    progress?.report({ message: `Installed ${tag} (${assetName}) → ${uiBackend}` });
     return getLlamaServerBinary(installDir);
   }
 
