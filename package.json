@@ -2,7 +2,7 @@
   "name": "llama-aio-vs",
   "displayName": "Llama AIO",
   "description": "All-in-one local llama.cpp for VS Code: install, HF models, LM Studio-style settings, shared server, Copilot Chat provider.",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "publisher": "erpel-dev",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -79,6 +79,10 @@
       {
         "command": "llamaAio.showStatus",
         "title": "Llama AIO: Show Status"
+      },
+      {
+        "command": "llamaAio.viewLastContext",
+        "title": "Llama AIO: View Last Chat Context"
       }
     ],
     "viewsContainers": {

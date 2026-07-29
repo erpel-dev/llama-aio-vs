@@ -28,6 +28,20 @@ export interface GenerationPerf {
   source?: "server" | "estimate";
 }
 
+/** Snapshot of the last chat completion request sent to llama-server. */
+export interface LastChatRequestContext {
+  capturedAt: string;
+  model: string;
+  slotContext: number;
+  estimatedPromptTokens: number;
+  messageCount: number;
+  toolCount: number;
+  /** OpenAI-style messages forwarded to llama.cpp. */
+  messages: unknown[];
+  /** OpenAI-style tool definitions (may be large). */
+  tools: unknown[];
+}
+
 function formatRate(n: number | undefined): string | undefined {
   if (typeof n !== "number" || !Number.isFinite(n) || n <= 0) {
     return undefined;
@@ -80,9 +94,120 @@ export class PerfStats {
   private current: GenerationPerf = { generating: false };
   /** Highest alert band we've already toasted for this conversation fill. */
   private alertBand: 0 | 80 | 90 = 0;
+  /** Last Copilot → llama.cpp chat request (for debug "View context"). */
+  private lastRequest: LastChatRequestContext | undefined;
 
   get(): GenerationPerf {
     return { ...this.current };
+  }
+
+  hasLastRequestContext(): boolean {
+    return !!this.lastRequest;
+  }
+
+  getLastRequestContext(): LastChatRequestContext | undefined {
+    return this.lastRequest ? structuredClone(this.lastRequest) : undefined;
+  }
+
+  /** Store the outbound chat body for later inspection in an editor. */
+  recordRequestContext(
+    ctx: Omit<LastChatRequestContext, "capturedAt" | "messageCount" | "toolCount"> & {
+      capturedAt?: string;
+    }
+  ): void {
+    this.lastRequest = {
+      capturedAt: ctx.capturedAt || new Date().toISOString(),
+      model: ctx.model,
+      slotContext: ctx.slotContext,
+      estimatedPromptTokens: ctx.estimatedPromptTokens,
+      messageCount: Array.isArray(ctx.messages) ? ctx.messages.length : 0,
+      toolCount: Array.isArray(ctx.tools) ? ctx.tools.length : 0,
+      messages: ctx.messages,
+      tools: ctx.tools,
+    };
+  }
+
+  /** Human-readable dump of the last request (markdown + JSON). */
+  formatLastRequestContext(): string | undefined {
+    const ctx = this.lastRequest;
+    if (!ctx) {
+      return undefined;
+    }
+    const lines: string[] = [
+      "# Llama AIO — last Copilot → llama.cpp request",
+      "",
+      `- Captured: ${ctx.capturedAt}`,
+      `- Model: ${ctx.model}`,
+      `- Slot context: ${ctx.slotContext.toLocaleString()} tokens`,
+      `- Estimated prompt tokens: ${ctx.estimatedPromptTokens.toLocaleString()}`,
+      `- Messages: ${ctx.messageCount}`,
+      `- Tools: ${ctx.toolCount}`,
+      "",
+    ];
+
+    if (Array.isArray(ctx.tools) && ctx.tools.length) {
+      lines.push("## Tool names");
+      lines.push("");
+      for (const t of ctx.tools) {
+        const fn = (t as { function?: { name?: string; description?: string } }).function;
+        const name = fn?.name || "(unnamed)";
+        const desc = (fn?.description || "").replace(/\s+/g, " ").trim();
+        lines.push(`- \`${name}\`${desc ? ` — ${desc.slice(0, 160)}${desc.length > 160 ? "…" : ""}` : ""}`);
+      }
+      lines.push("");
+    }
+
+    if (Array.isArray(ctx.messages)) {
+      lines.push("## Messages");
+      lines.push("");
+      ctx.messages.forEach((m, i) => {
+        const msg = m as {
+          role?: string;
+          content?: string | null;
+          tool_call_id?: string;
+          tool_calls?: unknown;
+        };
+        const role = msg.role || "?";
+        lines.push(`### [${i}] ${role}${msg.tool_call_id ? ` (tool_call_id=${msg.tool_call_id})` : ""}`);
+        lines.push("");
+        if (msg.content != null && msg.content !== "") {
+          lines.push("```");
+          lines.push(String(msg.content));
+          lines.push("```");
+          lines.push("");
+        }
+        if (msg.tool_calls) {
+          lines.push("```json");
+          lines.push(JSON.stringify(msg.tool_calls, null, 2));
+          lines.push("```");
+          lines.push("");
+        }
+        if ((msg.content == null || msg.content === "") && !msg.tool_calls) {
+          lines.push("_(empty)_");
+          lines.push("");
+        }
+      });
+    }
+
+    lines.push("## Raw JSON (messages + tools)");
+    lines.push("");
+    lines.push("```json");
+    lines.push(
+      JSON.stringify(
+        {
+          model: ctx.model,
+          slotContext: ctx.slotContext,
+          estimatedPromptTokens: ctx.estimatedPromptTokens,
+          messages: ctx.messages,
+          tools: ctx.tools,
+        },
+        null,
+        2
+      )
+    );
+    lines.push("```");
+    lines.push("");
+    return lines.join("\n");
   }
 
   begin(opts?: { contextLimit?: number; estimatedPromptTokens?: number }): void {

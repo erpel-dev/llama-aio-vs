@@ -602,6 +602,10 @@ export function activate(context: vscode.ExtensionContext): void {
       ];
       vscode.window.showInformationMessage(lines.join(" | "));
       await settingsView.pushState();
+    }),
+
+    vscode.commands.registerCommand("llamaAio.viewLastContext", async () => {
+      await settingsView.openLastRequestContext();
     })
   );
 

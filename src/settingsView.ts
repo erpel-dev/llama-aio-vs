@@ -152,6 +152,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           case "checkUpdates":
             await this.refreshUpdateCheck();
             break;
+          case "viewLastContext":
+            await this.openLastRequestContext();
+            break;
           case "installLlamaCppByTag":
             await this.modelActions.installLlamaCppByTag();
             await this.pushState();
@@ -288,6 +291,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         status: { ...status, httpReady },
         perf: this.perf.get(),
         perfLines: this.perf.detailLines(),
+        hasLastContext: this.perf.hasLastRequestContext(),
         endpoint: this.store.getEndpoint(),
         binary,
         binaryExists: fs.existsSync(binary),
@@ -352,6 +356,22 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
   async refreshUpdateCheck(): Promise<void> {
     await this.installer.getUpdateCheck(true);
     await this.pushState();
+  }
+
+  /** Open the last Copilot → llama.cpp request dump in an editor. */
+  async openLastRequestContext(): Promise<void> {
+    const text = this.perf.formatLastRequestContext();
+    if (!text) {
+      vscode.window.showInformationMessage(
+        "Llama AIO: No chat context captured yet. Send a Copilot Chat message using Llama AIO first."
+      );
+      return;
+    }
+    const doc = await vscode.workspace.openTextDocument({
+      content: text,
+      language: "markdown",
+    });
+    await vscode.window.showTextDocument(doc, { preview: false, viewColumn: vscode.ViewColumn.Beside });
   }
 
   private getHtml(webview: vscode.Webview): string {
@@ -638,6 +658,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     <div class="ctx-label" id="ctxLabel">Context: — (send a chat to measure)</div>
     <div class="ctx-meter" id="ctxMeter"><span id="ctxMeterFill"></span></div>
     <div class="meta" id="perfLines">No generation yet</div>
+    <div class="btn-col" style="margin-top:8px">
+      <button class="secondary" id="viewContextBtn" disabled title="Open the last Copilot → llama.cpp prompt in an editor">View last context</button>
+    </div>
   </div>
 
   <div class="setup hidden" id="setupBox">
@@ -1403,6 +1426,13 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       $('perfLines').innerHTML =
         (generating ? '<span class="ok">● Generating</span><br/>' : '') +
         perfLines.map((l) => String(l)).join('<br/>');
+      const viewCtx = $('viewContextBtn');
+      if (viewCtx) {
+        viewCtx.disabled = !payload.hasLastContext;
+        viewCtx.title = payload.hasLastContext
+          ? 'Open the last Copilot → llama.cpp prompt in an editor'
+          : 'Send a Copilot Chat message first';
+      }
 
       const binaryDetail = $('llamaBinaryDetail');
       if (binaryDetail) {
@@ -1601,6 +1631,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     });
 
     $('downloadModelBtn').addEventListener('click', () => vscode.postMessage({ type: 'downloadModel' }));
+    const viewContextBtn = $('viewContextBtn');
+    if (viewContextBtn) {
+      viewContextBtn.addEventListener('click', () => vscode.postMessage({ type: 'viewLastContext' }));
+    }
     const starterModelBtn = $('starterModelBtn');
     if (starterModelBtn) {
       starterModelBtn.addEventListener('click', () => vscode.postMessage({ type: 'downloadStarter' }));

@@ -624,6 +624,13 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
     }
 
     const estimatedPromptTokens = estimatePromptTokens(converted);
+    this.perf.recordRequestContext({
+      model: model.id,
+      slotContext: slotCtx,
+      estimatedPromptTokens,
+      messages: converted,
+      tools: tools ?? [],
+    });
     this.perf.begin({ contextLimit: slotCtx, estimatedPromptTokens });
     let sawFinalServerStats = false;
     let lastCompletionTokens = 0;
