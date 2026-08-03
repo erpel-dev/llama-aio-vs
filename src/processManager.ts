@@ -50,25 +50,69 @@ const FATAL_LOG_RE =
 export type StartProgress = (message: string) => void;
 
 export class ProcessManager {
+  /** In-flight start/reload — drives sidebar "Loading model…" until HTTP ready. */
+  private boot:
+    | {
+        kind: "start" | "reload";
+        message: string;
+      }
+    | undefined;
+
   constructor(private readonly store: SettingsStore) {}
+
+  isStarting(): boolean {
+    return !!this.boot;
+  }
+
+  /** Mark boot UI immediately (before awaits / pushState races). */
+  markStarting(kind: "start" | "reload", message?: string): void {
+    this.beginBoot(
+      kind,
+      message || (kind === "reload" ? "Reloading llama-server…" : "Starting llama-server…")
+    );
+  }
+
+  /** Clear boot UI after cancel / error paths that never call start/reload. */
+  clearStarting(): void {
+    this.endBoot();
+  }
+
+  private beginBoot(kind: "start" | "reload", message: string): void {
+    this.boot = { kind, message };
+  }
+
+  private updateBootMessage(message: string): void {
+    if (this.boot) {
+      this.boot = { ...this.boot, message };
+    }
+  }
+
+  private endBoot(): void {
+    this.boot = undefined;
+  }
 
   getStatus(): ServerStatus {
     const host = this.store.getHost();
     const port = this.store.getPort();
     const endpoint = this.store.getEndpoint();
     const lock = this.readLock();
+    const bootFields = this.boot
+      ? { starting: true as const, startMessage: this.boot.message }
+      : { starting: false as const, startMessage: undefined };
 
     if (lock && isPidAlive(lock.pid)) {
       return {
-        running: true,
+        running: !this.boot, // still booting = not yet "ready" for UI purposes
         pid: lock.pid,
         port: lock.port,
         host: lock.host,
         modelPath: lock.modelPath,
         endpoint: `http://${lock.host}:${lock.port}`,
         ownedByThisExtension: true,
-        message: `Running (pid ${lock.pid})`,
-        configDirty: this.isConfigDirty(lock),
+        message: this.boot?.message || `Running (pid ${lock.pid})`,
+        // Don't show dirty while a reload/start is applying the new fingerprint.
+        configDirty: this.boot ? false : this.isConfigDirty(lock),
+        ...bootFields,
       };
     }
 
@@ -80,15 +124,16 @@ export class ProcessManager {
         const pid = portPids[0];
         this.writeLock({ ...lock, pid });
         return {
-          running: true,
+          running: !this.boot,
           pid,
           port: lock.port,
           host: lock.host,
           modelPath: lock.modelPath,
           endpoint: `http://${lock.host}:${lock.port}`,
           ownedByThisExtension: true,
-          message: `Running (pid ${pid})`,
-          configDirty: this.isConfigDirty(lock),
+          message: this.boot?.message || `Running (pid ${pid})`,
+          configDirty: this.boot ? false : this.isConfigDirty(lock),
+          ...bootFields,
         };
       }
     }
@@ -99,8 +144,9 @@ export class ProcessManager {
       host,
       endpoint,
       ownedByThisExtension: false,
-      message: "Not running",
+      message: this.boot?.message || "Not running",
       configDirty: false,
+      ...bootFields,
     };
   }
 
@@ -164,6 +210,19 @@ export class ProcessManager {
   }
 
   async start(modelPath?: string, onProgress?: StartProgress): Promise<ServerStatus> {
+    this.beginBoot("start", "Starting llama-server…");
+    const report = (msg: string) => {
+      this.updateBootMessage(msg);
+      onProgress?.(msg);
+    };
+    try {
+      return await this.startInner(modelPath, report);
+    } finally {
+      this.endBoot();
+    }
+  }
+
+  private async startInner(modelPath: string | undefined, report: StartProgress): Promise<ServerStatus> {
     const state = this.store.getState();
     const model = (modelPath || state.selectedModelPath || "").trim();
     if (!model) {
@@ -172,8 +231,6 @@ export class ProcessManager {
     if (!fs.existsSync(model)) {
       throw new Error(`Model file not found: ${model}`);
     }
-
-    const report = (msg: string) => onProgress?.(msg);
 
     // Reuse existing healthy instance only if its slot context matches settings.
     // (llama.cpp splits --ctx-size across -np slots; a 8k/4 setup yields 2k/request.)
@@ -189,6 +246,8 @@ export class ProcessManager {
         return {
           ...existing,
           running: true,
+          starting: false,
+          startMessage: undefined,
           modelPath: model,
           message: `Reusing server on port ${this.store.getPort()} (${live.nCtx} ctx/slot, ${live.slots} slot(s))`,
         };
@@ -584,10 +643,20 @@ export class ProcessManager {
   }
 
   async reload(onProgress?: StartProgress): Promise<ServerStatus> {
-    onProgress?.("Stopping server for reload…");
-    await this.stop(true);
-    await sleep(400);
-    return this.start(undefined, onProgress);
+    this.beginBoot("reload", "Reloading llama-server…");
+    const report = (msg: string) => {
+      this.updateBootMessage(msg);
+      onProgress?.(msg);
+    };
+    try {
+      report("Stopping server for reload…");
+      await this.stop(true);
+      await sleep(400);
+      // Keep boot active across inner start — don't nest beginBoot/endBoot via start().
+      return await this.startInner(undefined, report);
+    } finally {
+      this.endBoot();
+    }
   }
 
   private readLock(): LockFile | undefined {

@@ -2,7 +2,7 @@
   "name": "llama-aio-vs",
   "displayName": "Llama AIO",
   "description": "All-in-one local llama.cpp for VS Code: install, HF models, LM Studio-style settings, shared server, Copilot Chat provider.",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "publisher": "erpel-dev",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -103,15 +103,6 @@
         }
       ]
     },
-    "menus": {
-      "view/title": [
-        {
-          "command": "llamaAio.reloadServer",
-          "when": "view == llamaAio.settingsView",
-          "group": "navigation"
-        }
-      ]
-    },
     "configuration": {
       "title": "Llama AIO",
       "properties": {
@@ -175,6 +166,16 @@
             "Run llama-server hidden in the background (logs only to ~/.llama-aio-vs/runtime/llama-server.log)."
           ],
           "description": "How to launch llama-server. External terminal is best for seeing request/tool activity."
+        },
+        "llamaAio.promptReplacementsEnabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Strip redundant Copilot system-prompt boilerplate (safety/identity blocks) before sending to llama.cpp. Saves context tokens."
+        },
+        "llamaAio.promptReplacementsFile": {
+          "type": "string",
+          "default": "",
+          "description": "Optional path to a custom prompt-replacements JSON file. Empty uses the bundled defaults."
         }
       }
     },

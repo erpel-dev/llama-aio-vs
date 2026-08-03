@@ -46,11 +46,38 @@ function fitsHeadroom(
 }
 
 /**
- * Pick context / GPU offload / CPU MoE defaults from model + VRAM.
+ * Speculative mode from GGUF: enable MTP when the file reports next-n layers.
+ * Non-MTP models get speculative turned off so a previous MTP selection does not stick.
+ */
+function recommendSpeculative(current: LlamaLoadSettings, caps: ModelCapabilities): Pick<
+  LlamaLoadSettings,
+  "speculativeMode" | "maxDraftTokens" | "minDraftTokens" | "draftProbability"
+> {
+  const mtpCapable = !!(caps.nextnPredictLayers && caps.nextnPredictLayers > 0);
+  if (!mtpCapable) {
+    return {
+      speculativeMode: "off",
+      maxDraftTokens: current.maxDraftTokens,
+      minDraftTokens: current.minDraftTokens,
+      draftProbability: current.draftProbability,
+    };
+  }
+  return {
+    speculativeMode: "mtp",
+    // Keep existing draft knobs if the user already tuned them; otherwise use defaults.
+    maxDraftTokens: current.maxDraftTokens > 0 ? current.maxDraftTokens : 2,
+    minDraftTokens: current.minDraftTokens,
+    draftProbability: current.draftProbability > 0 ? current.draftProbability : 0.75,
+  };
+}
+
+/**
+ * Pick context / GPU offload / CPU MoE / speculative defaults from model + VRAM.
  *
  * - MoE: full GPU offload, minimal --n-cpu-moe that leaves ≥2 GiB VRAM free
  * - Dense: max layers that leave ≥2 GiB VRAM free
- * - CPU backend: context only (GPU settings left alone; start path forces -ngl 0)
+ * - CPU backend: context + speculative only (GPU settings left alone; start path forces -ngl 0)
+ * - MTP: speculativeMode = mtp when GGUF nextn_predict_layers > 0
  */
 export function recommendLoadSettings(
   current: LlamaLoadSettings,
@@ -61,9 +88,15 @@ export function recommendLoadSettings(
   const headroom = options.headroomBytes ?? VRAM_HEADROOM_BYTES;
   const cpuOnly = !!options.cpuOnly;
   const contextLength = targetContext(caps, preferred);
+  const speculative = recommendSpeculative(current, caps);
 
   if (cpuOnly) {
-    return { ...current, contextLength, nCpuMoe: caps.isMoe ? current.nCpuMoe : 0 };
+    return {
+      ...current,
+      contextLength,
+      nCpuMoe: caps.isMoe ? current.nCpuMoe : 0,
+      ...speculative,
+    };
   }
 
   const gpu = options.gpu ?? detectGpuMemory();
@@ -73,6 +106,7 @@ export function recommendLoadSettings(
     contextLength,
     nCpuMoe: 0,
     offloadKvCacheToGpu: current.offloadKvCacheToGpu,
+    ...speculative,
   };
 
   // No VRAM info: prefer “all layers” and no CPU MoE (user can tune).

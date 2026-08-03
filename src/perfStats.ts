@@ -1,4 +1,7 @@
 import * as vscode from "vscode";
+import type { ContextBreakdown } from "./contextBreakdown";
+import { scaleBreakdownToServerPrompt } from "./contextBreakdown";
+import type { PromptReplacementStats } from "./promptReplacer";
 
 export type ContextLevel = "ok" | "warn" | "critical";
 
@@ -26,6 +29,18 @@ export interface GenerationPerf {
   /** True when genTokPerSec came from a live estimate, not server timings. */
   estimated?: boolean;
   source?: "server" | "estimate";
+  /** Speculative / MTP draft tokens generated (`timings.draft_n`). */
+  draftTokens?: number;
+  /** Speculative / MTP draft tokens accepted (`timings.draft_n_accepted`). */
+  draftTokensAccepted?: number;
+  /** 100 * draftTokensAccepted / draftTokens when draftTokens > 0. */
+  draftAcceptancePct?: number;
+  /** Current load-settings speculative mode (`off` | `mtp`). */
+  speculativeMode?: "off" | "mtp";
+  /** System-prompt find/replace savings for the last request. */
+  promptReplacements?: PromptReplacementStats;
+  /** Segmented context-bar breakdown (Tools / System / History / …). */
+  contextBreakdown?: ContextBreakdown;
 }
 
 /** Snapshot of the last chat completion request sent to llama-server. */
@@ -40,6 +55,10 @@ export interface LastChatRequestContext {
   messages: unknown[];
   /** OpenAI-style tool definitions (may be large). */
   tools: unknown[];
+  promptReplacements?: PromptReplacementStats;
+  /** Selected Copilot model mode (e.g. Think / No Think), if any. */
+  modelMode?: string;
+  contextBreakdown?: ContextBreakdown;
 }
 
 function formatRate(n: number | undefined): string | undefined {
@@ -124,6 +143,9 @@ export class PerfStats {
       toolCount: Array.isArray(ctx.tools) ? ctx.tools.length : 0,
       messages: ctx.messages,
       tools: ctx.tools,
+      promptReplacements: ctx.promptReplacements,
+      modelMode: ctx.modelMode,
+      contextBreakdown: ctx.contextBreakdown,
     };
   }
 
@@ -142,8 +164,31 @@ export class PerfStats {
       `- Estimated prompt tokens: ${ctx.estimatedPromptTokens.toLocaleString()}`,
       `- Messages: ${ctx.messageCount}`,
       `- Tools: ${ctx.toolCount}`,
-      "",
     ];
+    if (ctx.modelMode) {
+      lines.push(`- Model mode: ${ctx.modelMode}`);
+    }
+    if (ctx.contextBreakdown) {
+      const parts = ctx.contextBreakdown.segments
+        .filter((s) => s.tokens > 0)
+        .map((s) => `${s.label} ≈${s.tokens.toLocaleString()}`);
+      if (parts.length) {
+        lines.push(`- Context breakdown: ${parts.join(" · ")}`);
+      }
+    }
+    if (ctx.promptReplacements) {
+      const pr = ctx.promptReplacements;
+      lines.push(
+        `- Prompt replacements: ${pr.enabled ? "on" : "off"}` +
+          (pr.enabled
+            ? ` · saved ≈${pr.tokensSaved.toLocaleString()} tokens (${pr.pctSaved}% of request)`
+            : "")
+      );
+      if (pr.matchedRuleNames.length) {
+        lines.push(`- Matched rules: ${pr.matchedRuleNames.join("; ")}`);
+      }
+    }
+    lines.push("", "");
 
     if (Array.isArray(ctx.tools) && ctx.tools.length) {
       lines.push("## Tool names");
@@ -210,7 +255,37 @@ export class PerfStats {
     return lines.join("\n");
   }
 
-  begin(opts?: { contextLimit?: number; estimatedPromptTokens?: number }): void {
+  /** Keep MTP label in sync with Load settings (also clears stale drafts when off). */
+  setSpeculativeMode(mode: "off" | "mtp"): void {
+    const clearDrafts = mode === "off";
+    const hadDrafts =
+      this.current.draftTokens !== undefined ||
+      this.current.draftTokensAccepted !== undefined ||
+      this.current.draftAcceptancePct !== undefined;
+    if (this.current.speculativeMode === mode && !(clearDrafts && hadDrafts)) {
+      return;
+    }
+    this.current = {
+      ...this.current,
+      speculativeMode: mode,
+      ...(clearDrafts
+        ? {
+            draftTokens: undefined,
+            draftTokensAccepted: undefined,
+            draftAcceptancePct: undefined,
+          }
+        : {}),
+    };
+    this._onDidChange.fire(this.get());
+  }
+
+  begin(opts?: {
+    contextLimit?: number;
+    estimatedPromptTokens?: number;
+    promptReplacements?: PromptReplacementStats;
+    speculativeMode?: "off" | "mtp";
+    contextBreakdown?: ContextBreakdown;
+  }): void {
     const prev = this.current;
     const ctx = withContextFields(
       prev,
@@ -226,6 +301,13 @@ export class PerfStats {
       completionTokens: undefined,
       promptTokPerSec: undefined,
       genTokPerSec: undefined,
+      // Clear draft stats so a disabled / no-draft run never shows a prior %.
+      draftTokens: undefined,
+      draftTokensAccepted: undefined,
+      draftAcceptancePct: undefined,
+      speculativeMode: opts?.speculativeMode ?? prev.speculativeMode,
+      promptReplacements: opts?.promptReplacements ?? prev.promptReplacements,
+      contextBreakdown: opts?.contextBreakdown ?? prev.contextBreakdown,
       ...ctx,
     };
     this.maybeResetAlertBand(ctx.contextPct);
@@ -260,7 +342,19 @@ export class PerfStats {
       opts.contextLimit ?? this.current.contextLimit,
       opts.estimated
     );
-    this.current = { ...this.current, ...ctx };
+    let contextBreakdown = this.current.contextBreakdown;
+    if (
+      contextBreakdown &&
+      typeof opts.promptTokens === "number" &&
+      opts.estimated === false
+    ) {
+      contextBreakdown = scaleBreakdownToServerPrompt(
+        contextBreakdown,
+        opts.promptTokens,
+        opts.contextLimit ?? this.current.contextLimit
+      );
+    }
+    this.current = { ...this.current, ...ctx, contextBreakdown };
     this.maybeResetAlertBand(ctx.contextPct);
     this._onDidChange.fire(this.get());
   }
@@ -293,11 +387,53 @@ export class PerfStats {
       ctx.contextEstimated = false;
     }
 
+    let draftTokens: number | undefined;
+    let draftTokensAccepted: number | undefined;
+    let draftAcceptancePct: number | undefined;
+    if ("draftTokens" in partial) {
+      if (typeof partial.draftTokens === "number" && partial.draftTokens > 0) {
+        draftTokens = partial.draftTokens;
+        draftTokensAccepted =
+          typeof partial.draftTokensAccepted === "number" ? partial.draftTokensAccepted : 0;
+        draftAcceptancePct = Math.round((draftTokensAccepted / draftTokens) * 1000) / 10;
+      }
+      // else: timings omitted draft_n / draft_n===0 → leave undefined (MTP: —)
+    } else {
+      draftTokens = this.current.draftTokens;
+      draftTokensAccepted = this.current.draftTokensAccepted;
+      draftAcceptancePct = this.current.draftAcceptancePct;
+    }
+
+    const speculativeMode = partial.speculativeMode ?? this.current.speculativeMode;
+    if (speculativeMode === "off") {
+      draftTokens = undefined;
+      draftTokensAccepted = undefined;
+      draftAcceptancePct = undefined;
+    }
+
+    let contextBreakdown = partial.contextBreakdown ?? this.current.contextBreakdown;
+    if (
+      contextBreakdown &&
+      typeof partial.promptTokens === "number" &&
+      source === "server"
+    ) {
+      contextBreakdown = scaleBreakdownToServerPrompt(
+        contextBreakdown,
+        partial.promptTokens,
+        partial.contextLimit ?? this.current.contextLimit
+      );
+    }
+
     this.current = {
       ...this.current,
       ...partial,
       completionTokens,
       genTokPerSec,
+      draftTokens,
+      draftTokensAccepted,
+      draftAcceptancePct,
+      speculativeMode,
+      contextBreakdown,
       generating: false,
       finishedAt,
       estimated: source === "estimate",
@@ -385,11 +521,30 @@ export class PerfStats {
     return bits.join(" ") || "$(rocket) Llama AIO";
   }
 
+  private mtpDetailLine(p: GenerationPerf): string | undefined {
+    if (p.speculativeMode === undefined) {
+      return undefined;
+    }
+    if (p.speculativeMode === "off") {
+      return "MTP: off";
+    }
+    if (typeof p.draftTokens === "number" && p.draftTokens > 0) {
+      const accepted = p.draftTokensAccepted ?? 0;
+      const pct =
+        typeof p.draftAcceptancePct === "number"
+          ? p.draftAcceptancePct
+          : Math.round((accepted / p.draftTokens) * 1000) / 10;
+      return `MTP: ${pct.toFixed(1)}% accepted (${accepted.toLocaleString()}/${p.draftTokens.toLocaleString()})`;
+    }
+    return "MTP: —";
+  }
+
   /** Multi-line tooltip / sidebar summary. */
   detailLines(): string[] {
     const p = this.current;
     if (!p.startedAt && p.genTokPerSec === undefined && p.contextPct === undefined) {
-      return ["No generation yet"];
+      const mtp = this.mtpDetailLine(p);
+      return mtp ? ["No generation yet", mtp] : ["No generation yet"];
     }
     const lines: string[] = [];
     if (p.generating) {
@@ -423,6 +578,10 @@ export class PerfStats {
       lines.push(
         `Tokens: ${p.promptTokens ?? "—"} prompt · ${p.completionTokens ?? "—"} completion`
       );
+    }
+    const mtp = this.mtpDetailLine(p);
+    if (mtp) {
+      lines.push(mtp);
     }
     if (p.finishedAt && p.startedAt && !p.generating) {
       const sec = ((p.finishedAt - p.startedAt) / 1000).toFixed(1);

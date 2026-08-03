@@ -102,6 +102,10 @@ export interface ServerStatus {
   message: string;
   /** True when running and model/load/launch settings differ from the live server. */
   configDirty?: boolean;
+  /** True while start/reload is in progress (model may be loading; HTTP not ready yet). */
+  starting?: boolean;
+  /** Latest boot progress line for the sidebar (e.g. "Loading model into memory… 12s"). */
+  startMessage?: string;
 }
 
 export interface HfModelHit {

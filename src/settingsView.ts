@@ -63,6 +63,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             break;
           case "saveLoad":
             await this.store.updateLoadSettings(msg.payload as Partial<LlamaLoadSettings>);
+            this.syncSpeculativeMode();
             if (msg.silent) {
               const status = this.processManager.getStatus();
               const httpReady = await this.processManager.isHttpReady();
@@ -71,6 +72,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                 payload: {
                   configDirty: !!status.configDirty,
                   running: !!(status.running || httpReady),
+                  starting: !!status.starting,
+                  startMessage: status.startMessage || status.message,
+                  perfLines: this.perf.detailLines(),
                 },
               });
             } else {
@@ -82,8 +86,12 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             await this.pushState();
             break;
           case "reload":
+            this.processManager.markStarting("reload", "Reloading llama-server…");
+            this.postBootProgress("Reloading llama-server…");
             await this.store.updateLoadSettings(msg.payload as Partial<LlamaLoadSettings>);
+            this.syncSpeculativeMode();
             if (!(await this.confirmIfMemorySpill())) {
+              this.processManager.clearStarting();
               await this.pushState();
               break;
             }
@@ -91,7 +99,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             await this.pushState();
             break;
           case "start":
+            this.processManager.markStarting("start", "Starting llama-server…");
+            this.postBootProgress("Starting llama-server…");
             if (!(await this.confirmIfMemorySpill())) {
+              this.processManager.clearStarting();
               await this.pushState();
               break;
             }
@@ -103,7 +114,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                   cancellable: false,
                 },
                 async (progress) =>
-                  this.processManager.start(undefined, (m) => progress.report({ message: m }))
+                  this.processManager.start(undefined, (m) => {
+                    progress.report({ message: m });
+                    this.postBootProgress(m);
+                  })
               );
               this.notifyChatModels();
               await this.pushState();
@@ -155,6 +169,14 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           case "viewLastContext":
             await this.openLastRequestContext();
             break;
+          case "setPromptReplacementsEnabled": {
+            const enabled = !!(msg.payload && (msg.payload as { enabled?: boolean }).enabled);
+            await this.store
+              .getConfig()
+              .update("promptReplacementsEnabled", enabled, vscode.ConfigurationTarget.Global);
+            await this.pushState();
+            break;
+          }
           case "installLlamaCppByTag":
             await this.modelActions.installLlamaCppByTag();
             await this.pushState();
@@ -221,6 +243,12 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     );
   }
 
+  /** Keep sidebar MTP line in sync with Load settings (clears stale % when off). */
+  private syncSpeculativeMode(): void {
+    const mode = this.store.getState().loadSettings.speculativeMode || "off";
+    this.perf.setSpeculativeMode(mode === "mtp" ? "mtp" : "off");
+  }
+
   /** Ask before start/reload when estimated memory is likely to spill (VRAM or RAM). */
   async confirmIfMemorySpill(): Promise<boolean> {
     const est = this.currentMemoryEstimate();
@@ -241,6 +269,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     if (!this.view) {
       return;
     }
+    this.syncSpeculativeMode();
     let state = this.store.getState();
     // Refresh GGUF caps when older state lacks size / arch dims needed for estimates.
     if (
@@ -292,6 +321,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         perf: this.perf.get(),
         perfLines: this.perf.detailLines(),
         hasLastContext: this.perf.hasLastRequestContext(),
+        promptReplacementsEnabled: this.store.isPromptReplacementsEnabled(),
         endpoint: this.store.getEndpoint(),
         binary,
         binaryExists: fs.existsSync(binary),
@@ -309,6 +339,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         memory,
         memInputs: memoryEstimateInputs(caps),
         systemRamTotalBytes: os.totalmem(),
+        cpuCount: Math.max(1, os.cpus().length || 1),
         isWindows: process.platform === "win32",
         gpu: gpu
           ? { totalBytes: gpu.totalBytes, usedBytes: gpu.usedBytes, name: gpu.name }
@@ -350,6 +381,19 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           this.updateCheckInFlight = false;
         });
     }
+  }
+
+  /** Push live start/reload progress into the Server card without a full state rebuild. */
+  postBootProgress(message: string): void {
+    this.view?.webview.postMessage({
+      type: "bootProgress",
+      payload: {
+        starting: true,
+        message,
+        running: false,
+        configDirty: false,
+      },
+    });
   }
 
   /** Force-refresh latest release tag and refresh the sidebar. */
@@ -396,6 +440,11 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       --secondary: var(--vscode-button-secondaryBackground);
       --secondary-fg: var(--vscode-button-secondaryForeground);
       --warn-bg: color-mix(in srgb, #d29922 18%, transparent);
+      --ok: #3fb950;
+      --bad: #f85149;
+      --warn: #d29922;
+      --starting: #58a6ff;
+      --link: var(--vscode-textLink-foreground);
     }
     body {
       font-family: var(--vscode-font-family);
@@ -407,7 +456,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     }
     h2 { font-size: 13px; margin: 18px 0 8px; font-weight: 600; }
     h2:first-child { margin-top: 4px; }
-    .status, .card {
+    .card {
       padding: 10px;
       border: 1px solid var(--border);
       border-radius: 6px;
@@ -415,20 +464,98 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       margin-bottom: 10px;
       line-height: 1.45;
     }
-    .status .ok { color: #3fb950; }
-    .status .bad { color: #f85149; }
-    .status a.endpoint {
-      color: var(--vscode-textLink-foreground);
-      text-decoration: underline;
-      cursor: pointer;
+    .card.server {
+      border-color: color-mix(in srgb, var(--ok) 28%, var(--border));
     }
-    .status a.endpoint:hover {
-      color: var(--vscode-textLink-activeForeground);
+    .card.server.stopped { border-color: var(--border); }
+    .card.server.dirty {
+      border-color: color-mix(in srgb, var(--warn) 45%, var(--border));
     }
-    .status .endpoint-hint {
+    .card.server.starting {
+      border-color: color-mix(in srgb, var(--starting) 35%, var(--border));
+    }
+    .card.server.error {
+      border-color: color-mix(in srgb, var(--bad) 45%, var(--border));
+    }
+    .srv-head { margin-bottom: 8px; }
+    .srv-title { font-weight: 650; font-size: 13px; }
+    .status-line {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      font-weight: 600;
+      margin-bottom: 2px;
+    }
+    .status-line.ok { color: var(--ok); }
+    .status-line.stopped { color: var(--muted); }
+    .status-line.starting { color: var(--starting); }
+    .status-line.error { color: var(--bad); }
+    .status-line.dirty { color: var(--warn); }
+    .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+    .dot.ok { background: var(--ok); box-shadow: 0 0 0 2px color-mix(in srgb, var(--ok) 25%, transparent); }
+    .dot.stopped { background: #6e7681; }
+    .dot.starting {
+      background: var(--starting);
+      animation: srv-pulse 1.2s ease-in-out infinite;
+    }
+    .dot.error { background: var(--bad); box-shadow: 0 0 0 2px color-mix(in srgb, var(--bad) 25%, transparent); }
+    .dot.dirty { background: var(--warn); box-shadow: 0 0 0 2px color-mix(in srgb, var(--warn) 25%, transparent); }
+    @keyframes srv-pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.45; }
+    }
+    .meta-row {
       color: var(--muted);
       font-size: 11px;
       margin-top: 2px;
+    }
+    .meta-row a.endpoint {
+      color: var(--link);
+      text-decoration: underline;
+      cursor: pointer;
+    }
+    .meta-row a.endpoint:hover {
+      color: var(--vscode-textLink-activeForeground);
+    }
+    .meta-row .pid { color: var(--muted); }
+    .dirty-hint {
+      margin-top: 8px;
+      padding: 6px 8px;
+      border-radius: 5px;
+      border: 1px solid color-mix(in srgb, var(--warn) 50%, var(--border));
+      background: color-mix(in srgb, var(--warn) 12%, transparent);
+      font-size: 11px;
+      color: var(--fg);
+      line-height: 1.4;
+    }
+    .dirty-hint .label {
+      color: var(--warn);
+      font-weight: 650;
+      margin-right: 4px;
+    }
+    .actions-row {
+      display: flex;
+      gap: 6px;
+      margin-top: 10px;
+    }
+    .actions-row button.primary,
+    .actions-row button.warn-primary { flex: 1; text-align: center; }
+    .actions-row button.secondary {
+      flex: 0 0 auto;
+      min-width: 72px;
+      text-align: center;
+    }
+    .launch-row { margin-top: 8px; }
+    .launch-row label {
+      display: block;
+      font-size: 11px;
+      color: var(--muted);
+      margin-bottom: 4px;
     }
     .mem-warn {
       margin-top: 8px;
@@ -449,26 +576,52 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       font-size: 11px;
       line-height: 1.45;
     }
-    .ctx-meter {
-      margin: 8px 0 6px;
-      height: 8px;
+    .ctx-chart-title {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      font-weight: 600;
+      font-size: 11px;
+      margin: 8px 0 4px;
+    }
+    .ctx-chart-title .sub { font-weight: 400; color: var(--muted); }
+    .ctx-stack {
+      display: flex;
+      height: 14px;
       border-radius: 4px;
-      background: color-mix(in srgb, var(--fg) 12%, transparent);
       overflow: hidden;
+      background: color-mix(in srgb, var(--fg) 10%, transparent);
+      border: 1px solid var(--border);
     }
-    .ctx-meter > span {
-      display: block;
-      height: 100%;
-      width: 0%;
-      border-radius: 4px;
-      background: #3fb950;
-      transition: width 0.2s ease;
+    .ctx-stack > span { display: block; height: 100%; min-width: 0; }
+    .ctx-stack.warn { outline: 1px solid #d29922; }
+    .ctx-stack.critical { outline: 1px solid #f85149; }
+    .ctx-stack .seg-tools { background: #3b82f6; }
+    .ctx-stack .seg-system { background: #64748b; }
+    .ctx-stack .seg-history { background: #22c55e; }
+    .ctx-stack .seg-toolResults { background: #a855f7; }
+    .ctx-stack .seg-request { background: #f59e0b; }
+    .ctx-legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 12px;
+      margin-top: 6px;
+      font-size: 10px;
+      color: var(--muted);
     }
-    .ctx-meter.warn > span { background: #d29922; }
-    .ctx-meter.critical > span { background: #f85149; }
-    .ctx-label { font-size: 11px; margin-bottom: 4px; }
-    .ctx-label.warn { color: #d29922; }
-    .ctx-label.critical { color: #f85149; }
+    .ctx-legend i {
+      display: inline-block;
+      width: 8px;
+      height: 8px;
+      border-radius: 2px;
+      margin-right: 4px;
+      vertical-align: middle;
+    }
+    .ctx-legend .seg-tools { background: #3b82f6; }
+    .ctx-legend .seg-system { background: #64748b; }
+    .ctx-legend .seg-history { background: #22c55e; }
+    .ctx-legend .seg-toolResults { background: #a855f7; }
+    .ctx-legend .seg-request { background: #f59e0b; }
     .mem-charts { margin-top: 10px; display: flex; flex-direction: column; gap: 10px; }
     .mem-chart-title {
       display: flex;
@@ -590,16 +743,6 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       gap: 8px;
       margin-top: 8px;
     }
-    .actions {
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
-      margin-top: 16px;
-      position: sticky;
-      bottom: 0;
-      padding-top: 8px;
-      background: linear-gradient(transparent, var(--bg) 30%);
-    }
     button {
       border: none;
       border-radius: 6px;
@@ -607,15 +750,19 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       cursor: pointer;
       font-weight: 600;
       text-align: left;
+      font-size: 12px;
+      font-family: inherit;
     }
     button.primary { background: var(--accent); color: var(--accent-fg); }
     button.secondary { background: var(--secondary); color: var(--secondary-fg); }
+    button.warn-primary {
+      background: color-mix(in srgb, var(--warn) 75%, #8a6a10);
+      color: #1a1a1a;
+    }
     button:disabled {
       opacity: 0.55;
       cursor: default;
     }
-    .actions .row { margin: 0 0 4px; }
-    .actions select.wide { width: 100%; }
     .model-title { font-weight: 600; margin-bottom: 4px; }
     .model-path, .meta {
       word-break: break-all;
@@ -641,6 +788,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       color: var(--vscode-textLink-activeForeground);
     }
     .hidden { display: none !important; }
+    .ok { color: var(--ok); }
     .caps {
       margin-top: 8px;
       padding-top: 8px;
@@ -652,12 +800,52 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
   </style>
 </head>
 <body>
-  <div class="status" id="status">Loading…</div>
-  <div class="card" id="perfCard" style="margin-top:8px">
+  <div class="card server stopped" id="serverCard">
+    <div class="srv-head">
+      <div class="srv-title">Server</div>
+    </div>
+    <div class="status-line stopped" id="statusLine">
+      <span class="dot stopped" id="statusDot"></span>
+      <span id="statusText">Loading…</span>
+    </div>
+    <div class="meta-row" id="statusMeta">—</div>
+    <div class="dirty-hint hidden" id="dirtyHint">
+      <span class="label">Settings changed</span>
+      Reload to apply load settings and launch mode.
+    </div>
+    <div class="actions-row">
+      <button class="primary" id="primaryBtn" data-action="start">Start</button>
+      <button class="secondary" id="stopBtn" disabled>Stop</button>
+    </div>
+    <div class="launch-row">
+      <label for="launchMode">Launch mode</label>
+      <select id="launchMode" class="wide" title="How llama-server is started">
+        <option value="externalTerminal">External terminal (logs visible)</option>
+        <option value="background">Background (hidden process)</option>
+      </select>
+    </div>
+  </div>
+
+  <div class="card" id="perfCard">
     <div class="model-title">Performance</div>
-    <div class="ctx-label" id="ctxLabel">Context: — (send a chat to measure)</div>
-    <div class="ctx-meter" id="ctxMeter"><span id="ctxMeterFill"></span></div>
+    <div class="ctx-chart-title">
+      <span id="ctxLabel">Context</span>
+      <span class="sub" id="ctxSub">— (send a chat to measure)</span>
+    </div>
+    <div class="ctx-stack" id="ctxStack"></div>
+    <div class="ctx-legend" id="ctxLegend">
+      <span><i class="seg-tools"></i>Tools</span>
+      <span><i class="seg-system"></i>System</span>
+      <span><i class="seg-history"></i>History</span>
+      <span><i class="seg-toolResults"></i>Tool results</span>
+      <span><i class="seg-request"></i>Request</span>
+    </div>
     <div class="meta" id="perfLines">No generation yet</div>
+    <div class="toggle" style="margin-top:10px">
+      <span>Prompt replacements</span>
+      <input type="checkbox" id="promptReplacementsEnabled" title="Strip Copilot system-prompt boilerplate before llama.cpp" />
+    </div>
+    <div class="meta" id="replacementStats" style="margin-top:4px">Last call: —</div>
     <div class="btn-col" style="margin-top:8px">
       <button class="secondary" id="viewContextBtn" disabled title="Open the last Copilot → llama.cpp prompt in an editor">View last context</button>
     </div>
@@ -749,9 +937,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     <div class="hint" id="ctxHint">Tokens for prompt + generation</div>
   </div>
   <div class="row" id="gpuOffloadRow">
-    <div class="label"><span class="name">GPU Offload</span><input type="number" id="gpuOffload" min="0" max="999" /></div>
-    <input type="range" id="gpuOffloadRange" min="0" max="999" step="1" />
-    <div class="hint" id="gpuOffloadHint">Layers on GPU (-ngl). Use 99/-1 style high values for “all”.</div>
+    <div class="label"><span class="name">GPU Offload</span><input type="number" id="gpuOffload" min="0" max="128" /></div>
+    <input type="range" id="gpuOffloadRange" min="0" max="128" step="1" />
+    <div class="hint" id="gpuOffloadHint">Layers on GPU (-ngl). Max = all model layers.</div>
   </div>
   <div class="row" id="moeRow">
     <div class="label"><span class="name">CPU MoE layers</span><span class="badge">MoE only</span><input type="number" id="nCpuMoe" min="0" max="256" /></div>
@@ -763,8 +951,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     <summary>Advanced Settings<span class="sub">threads, batch, KV, RoPE, speculative…</span></summary>
 
   <div class="row">
-    <div class="label"><span class="name">CPU Thread Pool Size</span><input type="number" id="cpuThreads" min="1" max="256" /></div>
+    <div class="label"><span class="name">CPU Thread Pool Size</span><input type="number" id="cpuThreads" min="1" max="64" /></div>
     <input type="range" id="cpuThreadsRange" min="1" max="64" step="1" />
+    <div class="hint" id="cpuThreadsHint">llama.cpp -t. Max = CPU logical cores.</div>
   </div>
   <div class="row">
     <div class="label"><span class="name">Evaluation Batch Size</span><input type="number" id="evalBatchSize" min="32" step="32" /></div>
@@ -806,22 +995,22 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
   </div>
 
   <h2>Speculative decoding</h2>
-  <div class="row">
+  <div class="row" id="specModeRow">
     <div class="label"><span class="name">Mode</span>
       <select id="speculativeMode">
         <option value="off">Off</option>
-        <option value="mtp">MTP (draft-mtp)</option>
+        <option value="mtp" id="specMtpOption">MTP (draft-mtp)</option>
       </select>
     </div>
     <div class="hint" id="specHint">MTP needs a model with next-n / MTP layers (e.g. Ornith MTP). Uses --spec-type draft-mtp.</div>
   </div>
-  <div class="row">
+  <div class="row" id="specDraftMaxRow">
     <div class="label"><span class="name">Max draft tokens</span><input type="number" id="maxDraftTokens" min="0" /></div>
   </div>
-  <div class="row">
+  <div class="row" id="specDraftMinRow">
     <div class="label"><span class="name">Min draft tokens</span><input type="number" id="minDraftTokens" min="0" /></div>
   </div>
-  <div class="row">
+  <div class="row" id="specDraftPRow">
     <div class="label"><span class="name">Draft probability</span><input type="number" id="draftProbability" min="0" max="1" step="0.01" /></div>
   </div>
 
@@ -843,18 +1032,6 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
   </div>
   </details>
 
-  <div class="actions">
-    <div class="row">
-      <div class="label"><span class="name">Launch</span></div>
-      <select id="launchMode" class="wide" title="How llama-server is started">
-        <option value="externalTerminal">External terminal (logs visible)</option>
-        <option value="background">Background (hidden process)</option>
-      </select>
-    </div>
-    <button class="primary" id="primaryBtn" data-action="start">Start server</button>
-    <button class="secondary hidden" id="stopBtn">Stop server</button>
-  </div>
-
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
     const $ = (id) => document.getElementById(id);
@@ -864,27 +1041,125 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     let systemRamTotalBytes = 0;
     let backendOptionsCache = [];
     let modelIsMoe = false;
+    let modelBlockCount = 128;
+    let cpuLogicalCores = 64;
     let moeHintDefault = 'Number of layers to force experts onto CPU (--n-cpu-moe). Only applies to MoE models.';
     let suppressBackendChange = false;
     let activeBackendId = '';
     let serverRunning = false;
     let configDirty = false;
+    let serverStarting = false;
     let saveLoadTimer = null;
     let updateCheck = { latestTag: undefined, installedTag: undefined, updateAvailable: false, checkFailed: false, pending: true };
+
+    function setServerCardKind(kind) {
+      const card = $('serverCard');
+      if (!card) return;
+      card.className = 'card server' + (kind && kind !== 'ok' ? ' ' + kind : '');
+    }
+
+    function renderStatusUi(opts) {
+      const ready = !!opts.ready;
+      const dirty = !!opts.dirty;
+      const starting = !!opts.starting;
+      const endpoint = opts.endpoint || '';
+      const pid = opts.pid;
+      const message = String(opts.message || '');
+      const looksError = !ready && !starting && /error|fail|exit|crash/i.test(message);
+
+      let kind = 'stopped';
+      let label = 'Stopped';
+      if (starting) {
+        kind = 'starting';
+        if (/Loading model/i.test(message)) {
+          label = 'Loading model…';
+        } else if (/Stopping/i.test(message)) {
+          label = 'Stopping…';
+        } else if (/Reload/i.test(message)) {
+          label = 'Reloading…';
+        } else {
+          label = 'Starting…';
+        }
+      } else if (ready && dirty) {
+        kind = 'dirty';
+        label = 'Server ready';
+      } else if (ready) {
+        kind = 'ok';
+        label = 'Server ready';
+      } else if (looksError) {
+        kind = 'error';
+        label = 'Error';
+      }
+
+      setServerCardKind(kind);
+      const line = $('statusLine');
+      const dot = $('statusDot');
+      const text = $('statusText');
+      const meta = $('statusMeta');
+      if (line) line.className = 'status-line ' + kind;
+      if (dot) dot.className = 'dot ' + kind;
+      if (text) text.textContent = label;
+
+      if (meta) {
+        meta.innerHTML = '';
+        if (starting) {
+          meta.textContent = message || 'Waiting for HTTP ready…';
+        } else if (ready && endpoint) {
+          const a = document.createElement('a');
+          a.className = 'endpoint';
+          a.href = endpoint;
+          a.setAttribute('data-url', endpoint);
+          a.title = 'Open llama-server web UI';
+          a.textContent = endpoint;
+          a.addEventListener('click', (e) => {
+            e.preventDefault();
+            const url = a.getAttribute('data-url');
+            if (url) vscode.postMessage({ type: 'openExternal', url: url });
+          });
+          meta.appendChild(a);
+          if (pid) {
+            const pidEl = document.createElement('span');
+            pidEl.className = 'pid';
+            pidEl.textContent = ' · pid ' + pid;
+            meta.appendChild(pidEl);
+          }
+        } else if (looksError && message) {
+          meta.textContent = message;
+        } else if (endpoint && !ready) {
+          meta.textContent = endpoint + ' · not running';
+        } else {
+          meta.textContent = 'No endpoint · not running';
+        }
+      }
+
+      const hint = $('dirtyHint');
+      // Hide dirty while loading — settings are being applied right now.
+      if (hint) hint.classList.toggle('hidden', starting || !(ready && dirty));
+    }
 
     function updatePrimaryAction() {
       const primary = $('primaryBtn');
       const stop = $('stopBtn');
       if (!primary || !stop) return;
-      stop.classList.toggle('hidden', !serverRunning);
-      if (!serverRunning) {
+      stop.disabled = !serverRunning && !serverStarting;
+      primary.classList.remove('warn-primary');
+      primary.classList.add('primary');
+      if (serverStarting) {
+        primary.disabled = true;
+        primary.textContent = 'Loading…';
+        primary.dataset.action = '';
+        primary.classList.remove('warn-primary');
+        primary.classList.add('primary');
+      } else if (!serverRunning) {
         primary.disabled = false;
-        primary.textContent = 'Start server';
+        primary.textContent = 'Start';
         primary.dataset.action = 'start';
       } else if (configDirty) {
         primary.disabled = false;
-        primary.textContent = '↻ Reload to apply';
+        primary.textContent = 'Reload to apply';
         primary.dataset.action = 'reload';
+        primary.classList.remove('primary');
+        primary.classList.add('warn-primary');
       } else {
         primary.disabled = true;
         primary.textContent = 'Running';
@@ -898,6 +1173,13 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       if (serverRunning) {
         configDirty = true;
         updatePrimaryAction();
+        const hint = $('dirtyHint');
+        if (hint) hint.classList.remove('hidden');
+        setServerCardKind('dirty');
+        const line = $('statusLine');
+        const dot = $('statusDot');
+        if (line) line.className = 'status-line dirty';
+        if (dot) dot.className = 'dot dirty';
       }
       saveLoadTimer = setTimeout(() => {
         vscode.postMessage({ type: 'saveLoad', payload: readLoad(), silent: true });
@@ -1027,6 +1309,54 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       if (n >= 64) return 0.85;
       if (n >= 16) return 0.8;
       return 0.75;
+    }
+
+    function renderContextStack(perf) {
+      const stack = $('ctxStack');
+      const label = $('ctxLabel');
+      const sub = $('ctxSub');
+      if (!stack || !label || !sub) return;
+
+      const breakdown = perf && perf.contextBreakdown;
+      const ctxPct = typeof perf?.contextPct === 'number' ? perf.contextPct : undefined;
+      const ctxLevel = perf?.contextLevel || 'ok';
+      const promptTokens = typeof perf?.promptTokens === 'number' ? perf.promptTokens : undefined;
+      const contextLimit = typeof perf?.contextLimit === 'number' ? perf.contextLimit : undefined;
+      const approx = perf?.contextEstimated ? '≈' : '';
+
+      stack.className = 'ctx-stack' + (ctxLevel === 'warn' || ctxLevel === 'critical' ? ' ' + ctxLevel : '');
+      label.className = '';
+      if (ctxLevel === 'warn' || ctxLevel === 'critical') {
+        label.style.color = ctxLevel === 'critical' ? '#f85149' : '#d29922';
+      } else {
+        label.style.color = '';
+      }
+
+      if (typeof promptTokens === 'number' && typeof contextLimit === 'number' && typeof ctxPct === 'number') {
+        label.textContent = 'Context';
+        sub.textContent =
+          approx + promptTokens.toLocaleString() + ' / ' +
+          contextLimit.toLocaleString() + ' (' + ctxPct + '%)' +
+          (ctxLevel === 'critical' ? ' · nearly full' : ctxLevel === 'warn' ? ' · running low' : '');
+      } else {
+        label.textContent = 'Context';
+        sub.textContent = '— (send a chat to measure)';
+      }
+
+      stack.innerHTML = '';
+      if (!breakdown || !Array.isArray(breakdown.segments)) {
+        return;
+      }
+      const scale = Math.max(1, breakdown.limitTokens || contextLimit || 1);
+      for (const seg of breakdown.segments) {
+        if (!seg || seg.key === 'free' || !(seg.tokens > 0)) continue;
+        const el = document.createElement('span');
+        el.className = 'seg-' + seg.key;
+        el.style.width = Math.max(0.4, (seg.tokens / scale) * 100) + '%';
+        const pct = Math.round((seg.tokens / scale) * 1000) / 10;
+        el.title = seg.label + ': ≈' + Number(seg.tokens).toLocaleString() + ' tok (' + pct + '% of slot)';
+        stack.appendChild(el);
+      }
     }
 
     function renderStackedBar(stackId, subId, chart) {
@@ -1196,7 +1526,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       $('offloadKvCacheToGpu').disabled = cpuOnly;
       $('gpuOffloadHint').textContent = cpuOnly
         ? 'CPU backend installed — GPU Offload is ignored; everything runs in system RAM.'
-        : 'Layers on GPU (-ngl). Use 99/-1 style high values for “all”.';
+        : ('Layers on GPU (-ngl). Range 0–' + modelBlockCount + '; max = all model layers.');
       $('gpuOffloadRow').style.opacity = cpuOnly ? '0.55' : '1';
 
       // --n-cpu-moe only splits experts GPU↔CPU; meaningless when everything is already on CPU.
@@ -1279,6 +1609,14 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       const ropeBaseAuto = $('ropeBaseAuto').checked;
       const ropeScaleAuto = $('ropeScaleAuto').checked;
       const seedRandom = $('seedRandom').checked;
+      const modeSel = $('speculativeMode');
+      const mtpOpt = $('specMtpOption');
+      let speculativeMode = modeSel ? modeSel.value : 'off';
+      // Never persist MTP when the option is unavailable for this GGUF.
+      if (speculativeMode === 'mtp' && mtpOpt && (mtpOpt.disabled || mtpOpt.hidden)) {
+        speculativeMode = 'off';
+        if (modeSel) modeSel.value = 'off';
+      }
       return {
         contextLength: Number($('contextLength').value),
         gpuOffload: Number($('gpuOffload').value),
@@ -1295,7 +1633,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         ropeFreqBase: ropeBaseAuto ? null : Number($('ropeFreqBase').value),
         ropeFreqScale: ropeScaleAuto ? null : Number($('ropeFreqScale').value),
         seed: seedRandom ? null : Number($('seed').value),
-        speculativeMode: $('speculativeMode').value,
+        speculativeMode,
         maxDraftTokens: Number($('maxDraftTokens').value),
         minDraftTokens: Number($('minDraftTokens').value),
         draftProbability: Number($('draftProbability').value),
@@ -1316,15 +1654,16 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       const blocks = (caps && caps.blockCount) ? caps.blockCount : 128;
       const isMoe = !!(caps && caps.isMoe);
       modelIsMoe = isMoe;
+      modelBlockCount = Math.max(1, blocks);
 
       $('contextLength').max = String(maxCtx);
       $('contextLengthRange').max = String(maxCtx);
       $('contextLengthRange').min = '512';
-      // Allow 99 as "all layers" sentinel above block count.
-      $('gpuOffload').max = String(Math.max(blocks, 99));
-      $('gpuOffloadRange').max = String(Math.max(blocks, 99));
-      $('nCpuMoe').max = String(blocks);
-      $('nCpuMoeRange').max = String(blocks);
+      // Slider max = actual layer count (legacy 99/"all" is shown as all layers).
+      $('gpuOffload').max = String(modelBlockCount);
+      $('gpuOffloadRange').max = String(modelBlockCount);
+      $('nCpuMoe').max = String(modelBlockCount);
+      $('nCpuMoeRange').max = String(modelBlockCount);
 
       // Visibility finalized in applyCpuOnlyUi (also hides on CPU backend).
       if (caps) {
@@ -1348,15 +1687,44 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           (caps.nextnPredictLayers > 0
             ? (' · MTP next-n: <strong>' + caps.nextnPredictLayers + '</strong>')
             : '');
-        const specHint = $('specHint');
-        if (specHint) {
-          specHint.textContent = caps.nextnPredictLayers > 0
-            ? ('This model reports MTP next-n = ' + caps.nextnPredictLayers + '. Mode MTP passes --spec-type draft-mtp.')
-            : 'This GGUF has no nextn_predict_layers metadata — MTP may be ignored or fail. Prefer an MTP-tagged model (e.g. Ornith MTP).';
-        }
+        applyMtpUi(!!(caps.nextnPredictLayers > 0));
       } else {
         $('modelCaps').classList.add('hidden');
         $('ctxHint').textContent = 'Tokens for prompt + generation';
+        applyMtpUi(false);
+      }
+    }
+
+    /** Hide/disable MTP when the GGUF has no next-n layers (avoids llama-server crash). */
+    function applyMtpUi(mtpCapable) {
+      const modeSel = $('speculativeMode');
+      const mtpOpt = $('specMtpOption');
+      const hint = $('specHint');
+      if (mtpOpt) {
+        mtpOpt.disabled = !mtpCapable;
+        mtpOpt.hidden = !mtpCapable;
+      }
+      if (modeSel) {
+        if (!mtpCapable && modeSel.value === 'mtp') {
+          modeSel.value = 'off';
+        }
+      }
+      const draftDisabled = !mtpCapable || (modeSel && modeSel.value !== 'mtp');
+      for (const id of ['maxDraftTokens', 'minDraftTokens', 'draftProbability']) {
+        const el = $(id);
+        if (el) el.disabled = draftDisabled;
+      }
+      for (const id of ['specDraftMaxRow', 'specDraftMinRow', 'specDraftPRow']) {
+        const row = $(id);
+        if (row) {
+          row.style.opacity = draftDisabled ? '0.55' : '1';
+          row.classList.toggle('hidden', !mtpCapable);
+        }
+      }
+      if (hint) {
+        hint.textContent = mtpCapable
+          ? 'This model reports MTP next-n layers. Mode MTP passes --spec-type draft-mtp.'
+          : 'This GGUF has no MTP / nextn_predict_layers — MTP is unavailable (would crash llama-server). Use an MTP-tagged GGUF (e.g. Ornith MTP).';
       }
     }
 
@@ -1370,33 +1738,32 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
 
       applyCapabilities(caps);
 
-      const build = payload.build || {};
-      const ready = !!(status.httpReady || status.running);
-      const endpoint = payload.endpoint || '';
-      const endpointHtml = endpoint
-        ? (ready
-            ? '<a class="endpoint" href="' + endpoint + '" data-url="' + endpoint + '" title="Open llama-server web UI">' + endpoint + '</a>' +
-              '<div class="endpoint-hint">Open in browser to chat with the model directly (llama.cpp web UI).</div>'
-            : '<span>' + endpoint + '</span>' +
-              '<div class="endpoint-hint">Start the server, then click the link to chat in the browser.</div>')
-        : '';
-      $('status').innerHTML =
-        (ready
-          ? '<span class="ok">● Server ready</span>'
-          : '<span class="bad">● Server stopped</span>') +
-        '<br/>' + (status.message || '') +
-        (endpointHtml ? '<br/>' + endpointHtml : '');
-      const ep = $('status').querySelector('a.endpoint');
-      if (ep) {
-        ep.addEventListener('click', (e) => {
-          e.preventDefault();
-          const url = ep.getAttribute('data-url');
-          if (url) vscode.postMessage({ type: 'openExternal', url: url });
-        });
+      const cores = Math.max(1, Number(payload.cpuCount) || cpuLogicalCores);
+      cpuLogicalCores = cores;
+      $('cpuThreads').max = String(cores);
+      $('cpuThreadsRange').max = String(cores);
+      const cpuHint = $('cpuThreadsHint');
+      if (cpuHint) {
+        cpuHint.textContent = 'llama.cpp -t. Range 1–' + cores + ' (logical CPU cores).';
       }
 
+      const build = payload.build || {};
+      const starting = !!(status.starting || payload.starting);
+      const ready = !starting && !!(status.httpReady || status.running);
+      const endpoint = payload.endpoint || status.endpoint || '';
+      const startMessage = status.startMessage || status.message || '';
+
+      serverStarting = starting;
       serverRunning = ready;
-      configDirty = !!status.configDirty;
+      configDirty = starting ? false : !!status.configDirty;
+      renderStatusUi({
+        ready,
+        dirty: configDirty,
+        starting,
+        endpoint,
+        pid: status.pid,
+        message: starting ? startMessage : (status.message || ''),
+      });
       const lm = $('launchMode');
       if (lm && payload.launchMode) {
         lm.value = payload.launchMode === 'background' ? 'background' : 'externalTerminal';
@@ -1406,23 +1773,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       const perfLines = Array.isArray(payload.perfLines) ? payload.perfLines : ['No generation yet'];
       const generating = payload.perf && payload.perf.generating;
       const perf = payload.perf || {};
-      const ctxPct = typeof perf.contextPct === 'number' ? perf.contextPct : undefined;
-      const ctxLevel = perf.contextLevel || 'ok';
-      const ctxMeter = $('ctxMeter');
-      const ctxLabel = $('ctxLabel');
-      ctxMeter.className = 'ctx-meter' + (ctxLevel === 'warn' || ctxLevel === 'critical' ? ' ' + ctxLevel : '');
-      ctxLabel.className = 'ctx-label' + (ctxLevel === 'warn' || ctxLevel === 'critical' ? ' ' + ctxLevel : '');
-      if (typeof ctxPct === 'number' && typeof perf.promptTokens === 'number' && typeof perf.contextLimit === 'number') {
-        const approx = perf.contextEstimated ? '≈' : '';
-        ctxLabel.textContent =
-          'Context: ' + approx + perf.promptTokens.toLocaleString() + ' / ' +
-          perf.contextLimit.toLocaleString() + ' (' + ctxPct + '%)' +
-          (ctxLevel === 'critical' ? ' · nearly full' : ctxLevel === 'warn' ? ' · running low' : '');
-        $('ctxMeterFill').style.width = Math.min(100, ctxPct) + '%';
-      } else {
-        ctxLabel.textContent = 'Context: — (send a chat to measure)';
-        $('ctxMeterFill').style.width = '0%';
-      }
+      renderContextStack(perf);
       $('perfLines').innerHTML =
         (generating ? '<span class="ok">● Generating</span><br/>' : '') +
         perfLines.map((l) => String(l)).join('<br/>');
@@ -1432,6 +1783,29 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         viewCtx.title = payload.hasLastContext
           ? 'Open the last Copilot → llama.cpp prompt in an editor'
           : 'Send a Copilot Chat message first';
+      }
+
+      const prToggle = $('promptReplacementsEnabled');
+      if (prToggle) {
+        prToggle.checked = !!payload.promptReplacementsEnabled;
+      }
+      const prStats = $('replacementStats');
+      if (prStats) {
+        const pr = perf.promptReplacements;
+        if (!payload.promptReplacementsEnabled) {
+          prStats.textContent = 'Last call: replacements off';
+        } else if (!pr) {
+          prStats.textContent = 'Last call: — (send a chat to measure)';
+        } else if (!pr.enabled) {
+          prStats.textContent = 'Last call: replacements were off';
+        } else if (pr.tokensSaved > 0) {
+          prStats.textContent =
+            'Last call: saved ≈' + Number(pr.tokensSaved).toLocaleString() +
+            ' tokens (' + pr.pctSaved + '% of request)';
+        } else {
+          prStats.textContent = 'Last call: no matching boilerplate (' +
+            Number(pr.tokensBefore || 0).toLocaleString() + ' tok request)';
+        }
       }
 
       const binaryDetail = $('llamaBinaryDetail');
@@ -1566,15 +1940,18 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       const maxCtx = (caps && caps.maxContextLength) ? caps.maxContextLength : 131072;
       const blocks = (caps && caps.blockCount) ? caps.blockCount : 128;
       const ctx = Math.min(L.contextLength, maxCtx);
-      const ngl = L.gpuOffload >= 99 ? L.gpuOffload : Math.min(L.gpuOffload, blocks);
+      // Normalize legacy 99/"all" sentinel to the model's layer count for the slider.
+      const ngl =
+        L.gpuOffload <= 0 ? 0 : L.gpuOffload >= 99 || L.gpuOffload >= blocks ? blocks : Math.min(L.gpuOffload, blocks);
       const moe = (caps && !caps.isMoe) ? 0 : Math.min(L.nCpuMoe, blocks);
+      const threads = Math.min(Math.max(1, L.cpuThreads || 1), cpuLogicalCores);
 
       $('contextLength').value = ctx;
       $('contextLengthRange').value = ctx;
       $('gpuOffload').value = ngl;
-      $('gpuOffloadRange').value = Math.min(ngl, Number($('gpuOffloadRange').max));
-      $('cpuThreads').value = L.cpuThreads;
-      $('cpuThreadsRange').value = L.cpuThreads;
+      $('gpuOffloadRange').value = ngl;
+      $('cpuThreads').value = threads;
+      $('cpuThreadsRange').value = threads;
       $('evalBatchSize').value = L.evalBatchSize;
       $('physicalBatchSize').value = L.physicalBatchSize;
       $('maxConcurrentPredictions').value = L.maxConcurrentPredictions;
@@ -1604,6 +1981,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       $('maxDraftTokens').value = L.maxDraftTokens;
       $('minDraftTokens').value = L.minDraftTokens;
       $('draftProbability').value = L.draftProbability;
+      applyMtpUi(!!(caps && caps.nextnPredictLayers > 0));
       $('temperature').value = R.temperature;
       $('topP').value = R.topP;
       $('topK').value = R.topK;
@@ -1629,11 +2007,28 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     $('seedRandom').addEventListener('change', () => {
       $('seed').disabled = $('seedRandom').checked;
     });
+    const speculativeModeEl = $('speculativeMode');
+    if (speculativeModeEl) {
+      speculativeModeEl.addEventListener('change', () => {
+        const mtpOpt = $('specMtpOption');
+        const capable = !!(mtpOpt && !mtpOpt.disabled && !mtpOpt.hidden);
+        applyMtpUi(capable);
+      });
+    }
 
     $('downloadModelBtn').addEventListener('click', () => vscode.postMessage({ type: 'downloadModel' }));
     const viewContextBtn = $('viewContextBtn');
     if (viewContextBtn) {
       viewContextBtn.addEventListener('click', () => vscode.postMessage({ type: 'viewLastContext' }));
+    }
+    const prToggle = $('promptReplacementsEnabled');
+    if (prToggle) {
+      prToggle.addEventListener('change', () => {
+        vscode.postMessage({
+          type: 'setPromptReplacementsEnabled',
+          payload: { enabled: !!prToggle.checked },
+        });
+      });
     }
     const starterModelBtn = $('starterModelBtn');
     if (starterModelBtn) {
@@ -1685,9 +2080,27 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     $('primaryBtn').addEventListener('click', () => {
       const action = $('primaryBtn').dataset.action;
       if (action === 'reload') {
+        serverStarting = true;
+        updatePrimaryAction();
+        renderStatusUi({
+          ready: false,
+          dirty: false,
+          starting: true,
+          endpoint: '',
+          message: '',
+        });
         vscode.postMessage({ type: 'reload', payload: readLoad() });
         vscode.postMessage({ type: 'saveRequest', payload: readRequest() });
       } else if (action === 'start') {
+        serverStarting = true;
+        updatePrimaryAction();
+        renderStatusUi({
+          ready: false,
+          dirty: false,
+          starting: true,
+          endpoint: '',
+          message: '',
+        });
         vscode.postMessage({ type: 'saveLoad', payload: readLoad() });
         vscode.postMessage({ type: 'saveRequest', payload: readRequest() });
         vscode.postMessage({ type: 'start' });
@@ -1699,6 +2112,13 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       if (serverRunning) {
         configDirty = true;
         updatePrimaryAction();
+        const hint = $('dirtyHint');
+        if (hint) hint.classList.remove('hidden');
+        setServerCardKind('dirty');
+        const line = $('statusLine');
+        const dot = $('statusDot');
+        if (line) line.className = 'status-line dirty';
+        if (dot) dot.className = 'dot dirty';
       }
       vscode.postMessage({ type: 'setLaunchMode', payload: mode });
     });
@@ -1706,10 +2126,55 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     window.addEventListener('message', (event) => {
       const msg = event.data;
       if (msg.type === 'state') applyState(msg.payload);
+      if (msg.type === 'bootProgress' && msg.payload) {
+        serverStarting = true;
+        serverRunning = false;
+        configDirty = false;
+        updatePrimaryAction();
+        renderStatusUi({
+          ready: false,
+          dirty: false,
+          starting: true,
+          endpoint: '',
+          message: msg.payload.message || 'Starting…',
+        });
+      }
       if (msg.type === 'statusPatch' && msg.payload) {
+        if (msg.payload.starting) {
+          serverStarting = true;
+          serverRunning = false;
+          configDirty = false;
+          updatePrimaryAction();
+          renderStatusUi({
+            ready: false,
+            dirty: false,
+            starting: true,
+            endpoint: '',
+            message: msg.payload.startMessage || msg.payload.message || 'Starting…',
+          });
+          return;
+        }
         serverRunning = !!msg.payload.running;
         configDirty = !!msg.payload.configDirty;
+        serverStarting = false;
         updatePrimaryAction();
+        if (serverRunning) {
+          const hint = $('dirtyHint');
+          if (hint) hint.classList.toggle('hidden', !configDirty);
+          setServerCardKind(configDirty ? 'dirty' : 'ok');
+          const line = $('statusLine');
+          const dot = $('statusDot');
+          if (line) line.className = 'status-line ' + (configDirty ? 'dirty' : 'ok');
+          if (dot) dot.className = 'dot ' + (configDirty ? 'dirty' : 'ok');
+          const text = $('statusText');
+          if (text) text.textContent = 'Server ready';
+        }
+        if (Array.isArray(msg.payload.perfLines)) {
+          const el = $('perfLines');
+          if (el) {
+            el.innerHTML = msg.payload.perfLines.map((l) => String(l)).join('<br/>');
+          }
+        }
       }
     });
 

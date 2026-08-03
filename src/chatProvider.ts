@@ -1,7 +1,23 @@
 import * as http from "http";
+import * as path from "path";
 import * as vscode from "vscode";
 import { PerfStats } from "./perfStats";
 import { ProcessManager } from "./processManager";
+import {
+  applyReplacementsToSystemMessages,
+  buildReplacementStats,
+  estimateRequestTokens,
+  loadPromptReplacements,
+  type PromptReplacement,
+  type PromptReplacementStats,
+} from "./promptReplacer";
+import {
+  applyModeToRequestBody,
+  buildModeConfigurationSchema,
+  resolveModeParams,
+  resolveModelModes,
+} from "./modelModes";
+import { estimateContextBreakdown } from "./contextBreakdown";
 import { SettingsStore } from "./settings";
 
 interface OpenAiModel {
@@ -38,6 +54,8 @@ type StreamEvent =
       completionTokens?: number;
       promptTokPerSec?: number;
       genTokPerSec?: number;
+      draftTokens?: number;
+      draftTokensAccepted?: number;
     };
 
 interface LlamaTimings {
@@ -47,6 +65,10 @@ interface LlamaTimings {
   predicted_n?: number;
   predicted_ms?: number;
   predicted_per_second?: number;
+  /** Speculative / MTP draft tokens generated. */
+  draft_n?: number;
+  /** Speculative / MTP draft tokens accepted. */
+  draft_n_accepted?: number;
 }
 
 interface LlamaUsage {
@@ -131,23 +153,6 @@ function formatHttpError(status: number, text: string): string {
   } catch {
     return `HTTP ${status}: ${text.slice(0, 400)}`;
   }
-}
-
-/** Rough prompt size for the context meter before server usage arrives. */
-function estimatePromptTokens(messages: OpenAiChatMessage[]): number {
-  let chars = 0;
-  for (const m of messages) {
-    chars += (m.role?.length || 0) + 8;
-    if (typeof m.content === "string") {
-      chars += m.content.length;
-    }
-    if (m.role === "assistant" && Array.isArray(m.tool_calls)) {
-      for (const tc of m.tool_calls) {
-        chars += (tc.function?.name?.length || 0) + (tc.function?.arguments?.length || 0) + 24;
-      }
-    }
-  }
-  return Math.max(1, Math.ceil(chars / 4));
 }
 
 function extractTextFromPart(part: unknown): string {
@@ -449,6 +454,8 @@ async function* streamChatCompletions(
       completionTokens: lastUsage?.completion_tokens ?? lastTimings?.predicted_n,
       promptTokPerSec: lastTimings?.prompt_per_second,
       genTokPerSec: lastTimings?.predicted_per_second,
+      draftTokens: lastTimings?.draft_n,
+      draftTokensAccepted: lastTimings?.draft_n_accepted,
     };
   } else if (assembledText) {
     yield {
@@ -503,8 +510,66 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
   constructor(
     private readonly store: SettingsStore,
     private readonly processManager: ProcessManager,
-    private readonly perf: PerfStats
+    private readonly perf: PerfStats,
+    private readonly extensionPath: string
   ) {}
+
+  private cachedRules: PromptReplacement[] | undefined;
+  private cachedRulesKey: string | undefined;
+
+  private async getReplacementRules(): Promise<PromptReplacement[]> {
+    const custom = this.store.getPromptReplacementsFile();
+    const file =
+      custom ||
+      path.join(this.extensionPath, "prompt-replacements", "default-prompt-replacements.json");
+    if (this.cachedRules && this.cachedRulesKey === file) {
+      return this.cachedRules;
+    }
+    try {
+      this.cachedRules = await loadPromptReplacements(file);
+      this.cachedRulesKey = file;
+      return this.cachedRules;
+    } catch (e) {
+      console.warn(
+        `Llama AIO: failed to load prompt replacements from ${file}:`,
+        e instanceof Error ? e.message : e
+      );
+      this.cachedRules = [];
+      this.cachedRulesKey = file;
+      return [];
+    }
+  }
+
+  private async prepareMessagesWithReplacements(
+    messages: OpenAiChatMessage[],
+    tools: unknown[] | undefined
+  ): Promise<{ messages: OpenAiChatMessage[]; stats: PromptReplacementStats }> {
+    const tokensBefore = estimateRequestTokens(messages, tools);
+    const enabled = this.store.isPromptReplacementsEnabled();
+    if (!enabled) {
+      return {
+        messages,
+        stats: buildReplacementStats({
+          enabled: false,
+          tokensBefore,
+          tokensAfter: tokensBefore,
+          matchedRuleNames: [],
+        }),
+      };
+    }
+    const rules = await this.getReplacementRules();
+    const { messages: next, matchedRuleNames } = applyReplacementsToSystemMessages(messages, rules);
+    const tokensAfter = estimateRequestTokens(next, tools);
+    return {
+      messages: next,
+      stats: buildReplacementStats({
+        enabled: true,
+        tokensBefore,
+        tokensAfter,
+        matchedRuleNames,
+      }),
+    };
+  }
 
   notifyChanged(): void {
     this._onDidChangeModelInformation.fire();
@@ -550,23 +615,29 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
     const maxOutput = Math.min(state.requestSettings.maxTokens, Math.floor(serverSlotCtx / 4));
     const maxInput = Math.max(1024, serverSlotCtx - maxOutput);
     const shortName = modelId.split(/[/\\]/).pop() || modelId;
-
-    return [
-      {
-        id: modelId,
-        name: `Llama AIO: ${shortName}`,
-        family: "llama-aio",
-        version: "1.0.0",
-        maxInputTokens: maxInput,
-        maxOutputTokens: maxOutput,
-        tooltip: `Local llama.cpp at ${this.store.getEndpoint()} · slot context ${serverSlotCtx}`,
-        detail: `${serverSlotCtx} ctx/slot · ${state.selectedModelPath || this.store.getEndpoint()}`,
-        capabilities: {
-          toolCalling: true,
-          imageInput: false,
-        },
+    const modeSet = resolveModelModes(state.modelCapabilities, modelId);
+    const info: vscode.LanguageModelChatInformation & {
+      configurationSchema?: { properties: Record<string, unknown> };
+    } = {
+      id: modelId,
+      name: `Llama AIO: ${shortName}`,
+      family: "llama-aio",
+      version: "1.0.0",
+      maxInputTokens: maxInput,
+      maxOutputTokens: maxOutput,
+      tooltip: modeSet
+        ? `Local llama.cpp at ${this.store.getEndpoint()} · slot context ${serverSlotCtx} · modes: ${Object.keys(modeSet.modes).join(", ")}`
+        : `Local llama.cpp at ${this.store.getEndpoint()} · slot context ${serverSlotCtx}`,
+      detail: `${serverSlotCtx} ctx/slot · ${state.selectedModelPath || this.store.getEndpoint()}`,
+      capabilities: {
+        toolCalling: true,
+        imageInput: false,
       },
-    ];
+    };
+    if (modeSet) {
+      info.configurationSchema = buildModeConfigurationSchema(modeSet);
+    }
+    return [info];
   }
 
   async provideLanguageModelChatResponse(
@@ -597,7 +668,7 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
       );
     }
 
-    const converted = toOpenAiMessages(messages);
+    const convertedRaw = toOpenAiMessages(messages);
     const tools =
       options.tools?.map((t) => ({
         type: "function",
@@ -607,6 +678,9 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
           parameters: t.inputSchema,
         },
       })) ?? undefined;
+
+    const { messages: converted, stats: replacementStats } =
+      await this.prepareMessagesWithReplacements(convertedRaw, tools);
 
     const body: Record<string, unknown> = {
       model: model.id,
@@ -623,15 +697,39 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
       body.tool_choice = "auto";
     }
 
-    const estimatedPromptTokens = estimatePromptTokens(converted);
+    const modeSet = resolveModelModes(state.modelCapabilities, model.id);
+    const modelConfiguration = (options as { modelConfiguration?: Record<string, unknown> })
+      .modelConfiguration;
+    let appliedModeName: string | undefined;
+    if (modeSet) {
+      const { modeName, params } = resolveModeParams(modeSet, modelConfiguration);
+      appliedModeName = modeName;
+      applyModeToRequestBody(body, params);
+    }
+
+    const estimatedPromptTokens = estimateRequestTokens(converted, tools);
+    const contextBreakdown = estimateContextBreakdown(
+      converted,
+      tools ?? [],
+      slotCtx
+    );
     this.perf.recordRequestContext({
       model: model.id,
       slotContext: slotCtx,
       estimatedPromptTokens,
       messages: converted,
       tools: tools ?? [],
+      promptReplacements: replacementStats,
+      modelMode: appliedModeName,
+      contextBreakdown,
     });
-    this.perf.begin({ contextLimit: slotCtx, estimatedPromptTokens });
+    this.perf.begin({
+      contextLimit: slotCtx,
+      estimatedPromptTokens,
+      promptReplacements: replacementStats,
+      speculativeMode: state.loadSettings.speculativeMode || "off",
+      contextBreakdown,
+    });
     let sawFinalServerStats = false;
     let lastCompletionTokens = 0;
     let lastPromptTokens: number | undefined;
@@ -667,6 +765,8 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
                 (event.completionTokens ?? lastCompletionTokens) || undefined,
               promptTokPerSec: event.promptTokPerSec,
               genTokPerSec: event.genTokPerSec,
+              draftTokens: event.draftTokens,
+              draftTokensAccepted: event.draftTokensAccepted,
               contextLimit: slotCtx,
               source: "server",
             });

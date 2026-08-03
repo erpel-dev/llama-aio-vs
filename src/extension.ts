@@ -64,6 +64,9 @@ export function activate(context: vscode.ExtensionContext): void {
 
   const processManager = new ProcessManager(store);
   const perf = new PerfStats();
+  perf.setSpeculativeMode(
+    store.getState().loadSettings.speculativeMode === "mtp" ? "mtp" : "off"
+  );
   context.subscriptions.push(perf);
   // Refresh GGUF capability limits for the already-selected model.
   const existingModel = store.getState().selectedModelPath;
@@ -404,9 +407,10 @@ export function activate(context: vscode.ExtensionContext): void {
           cancellable: false,
         },
         async (progress) => {
-          const status = await processManager.reload((msg) =>
-            progress.report({ message: msg })
-          );
+          const status = await processManager.reload((msg) => {
+            progress.report({ message: msg });
+            settingsView.postBootProgress(msg);
+          });
           chatProvider?.notifyChanged();
           await promptUseInCopilotChat(store, status.message);
         }
@@ -430,7 +434,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.window.registerWebviewViewProvider(SettingsViewProvider.viewType, settingsView)
   );
 
-  chatProvider = new LlamaAioChatProvider(store, processManager, perf);
+  chatProvider = new LlamaAioChatProvider(store, processManager, perf, context.extensionPath);
   context.subscriptions.push(
     vscode.lm.registerLanguageModelChatProvider("llama-aio", chatProvider)
   );

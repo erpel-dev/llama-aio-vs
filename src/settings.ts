@@ -127,7 +127,8 @@ export class SettingsStore {
   /**
    * Read GGUF metadata for a model, clamp settings, and persist capabilities.
    * When the selected path changes (or `recommendDefaults` is true), also apply
-   * MoE/dense/CPU recommended context + offload defaults.
+   * MoE/dense/CPU recommended context + offload defaults, and enable MTP when
+   * the GGUF reports nextn_predict_layers > 0.
    */
   async applySelectedModel(
     modelPath: string,
@@ -171,6 +172,14 @@ export class SettingsStore {
 
   getEndpoint(): string {
     return `http://${this.getHost()}:${this.getPort()}`;
+  }
+
+  isPromptReplacementsEnabled(): boolean {
+    return this.getConfig().get<boolean>("promptReplacementsEnabled", true);
+  }
+
+  getPromptReplacementsFile(): string {
+    return (this.getConfig().get<string>("promptReplacementsFile", "") || "").trim();
   }
 }
 

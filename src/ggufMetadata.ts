@@ -468,8 +468,9 @@ export function clampLoadSettingsToModel(
     : 0;
 
   let speculativeMode = settings.speculativeMode;
+  // MTP without next-n layers crashes llama-server ("model doesn't contain MTP layers").
   if (speculativeMode === "mtp" && !(caps.nextnPredictLayers && caps.nextnPredictLayers > 0)) {
-    // Keep selection but it's best-effort; leave as-is so user can still try if build supports draft.
+    speculativeMode = "off";
   }
 
   return {
