@@ -43,7 +43,7 @@ export interface GenerationPerf {
   contextBreakdown?: ContextBreakdown;
 }
 
-/** Snapshot of the last chat completion request sent to llama-server. */
+/** Snapshot of the last Copilot → llama.cpp chat request (for debug "View context"). */
 export interface LastChatRequestContext {
   capturedAt: string;
   model: string;
@@ -59,6 +59,28 @@ export interface LastChatRequestContext {
   /** Selected Copilot model mode (e.g. Think / No Think), if any. */
   modelMode?: string;
   contextBreakdown?: ContextBreakdown;
+}
+
+/** Snapshot of the last streamed assistant reply (for empty-response debugging). */
+export interface LastChatResponseTrace {
+  capturedAt: string;
+  model: string;
+  toolsEnabled: boolean;
+  /** Raw concatenated delta/message content from the stream. */
+  assembledText: string;
+  /** Raw reasoning_content from the stream (think models). */
+  assembledReasoning: string;
+  /** Text after stripping think tags + recognized <tool_call> XML blocks. */
+  visibleText: string;
+  /** OpenAI-style tool_calls assembled from the stream. */
+  structuredToolCalls: Array<{ id: string; name: string; arguments: string }>;
+  /** Qwen/Hermes XML tool calls parsed from assembledText. */
+  xmlToolCalls: Array<{ name: string; input: object; raw: string }>;
+  /** Parts actually reported to Copilot Chat. */
+  emittedTextChars: number;
+  emittedToolCallCount: number;
+  emptyToChat: boolean;
+  note?: string;
 }
 
 function formatRate(n: number | undefined): string | undefined {
@@ -115,6 +137,8 @@ export class PerfStats {
   private alertBand: 0 | 80 | 90 = 0;
   /** Last Copilot → llama.cpp chat request (for debug "View context"). */
   private lastRequest: LastChatRequestContext | undefined;
+  /** Last streamed assistant payload (for debug "View last response"). */
+  private lastResponse: LastChatResponseTrace | undefined;
 
   get(): GenerationPerf {
     return { ...this.current };
@@ -124,8 +148,16 @@ export class PerfStats {
     return !!this.lastRequest;
   }
 
+  hasLastResponseTrace(): boolean {
+    return !!this.lastResponse;
+  }
+
   getLastRequestContext(): LastChatRequestContext | undefined {
     return this.lastRequest ? structuredClone(this.lastRequest) : undefined;
+  }
+
+  getLastResponseTrace(): LastChatResponseTrace | undefined {
+    return this.lastResponse ? structuredClone(this.lastResponse) : undefined;
   }
 
   /** Store the outbound chat body for later inspection in an editor. */
@@ -149,6 +181,33 @@ export class PerfStats {
     };
   }
 
+  /** Store the last streamed assistant payload (including empty-to-Chat cases). */
+  recordResponseTrace(
+    trace: Omit<LastChatResponseTrace, "capturedAt" | "emptyToChat"> & {
+      capturedAt?: string;
+      emptyToChat?: boolean;
+    }
+  ): void {
+    const emptyToChat =
+      trace.emptyToChat ??
+      (trace.emittedTextChars <= 0 && trace.emittedToolCallCount <= 0);
+    this.lastResponse = {
+      capturedAt: trace.capturedAt || new Date().toISOString(),
+      model: trace.model,
+      toolsEnabled: trace.toolsEnabled,
+      assembledText: trace.assembledText,
+      assembledReasoning: trace.assembledReasoning || "",
+      visibleText: trace.visibleText,
+      structuredToolCalls: trace.structuredToolCalls,
+      xmlToolCalls: trace.xmlToolCalls,
+      emittedTextChars: trace.emittedTextChars,
+      emittedToolCallCount: trace.emittedToolCallCount,
+      emptyToChat,
+      note: trace.note,
+    };
+    this._onDidChange.fire(this.get());
+  }
+
   /** Human-readable dump of the last request (markdown + JSON). */
   formatLastRequestContext(): string | undefined {
     const ctx = this.lastRequest;
@@ -156,7 +215,7 @@ export class PerfStats {
       return undefined;
     }
     const lines: string[] = [
-      "# Llama AIO — last Copilot → llama.cpp request",
+      "# Llama AIO — last Copilot → llama.cpp call",
       "",
       `- Captured: ${ctx.capturedAt}`,
       `- Model: ${ctx.model}`,
@@ -251,6 +310,106 @@ export class PerfStats {
       )
     );
     lines.push("```");
+    lines.push("");
+    return lines.join("\n");
+  }
+
+  /** Human-readable dump of the last assistant stream (markdown). */
+  formatLastResponseTrace(): string | undefined {
+    const ctx = this.lastResponse;
+    if (!ctx) {
+      return undefined;
+    }
+    const lines: string[] = [
+      "# Llama AIO — last llama.cpp → Copilot response",
+      "",
+      `- Captured: ${ctx.capturedAt}`,
+      `- Model: ${ctx.model}`,
+      `- Tools enabled: ${ctx.toolsEnabled ? "yes" : "no"}`,
+      `- Emitted to Chat: ${ctx.emittedTextChars.toLocaleString()} text chars, ${ctx.emittedToolCallCount} tool call(s)`,
+      `- Empty to Chat: ${ctx.emptyToChat ? "yes" : "no"}`,
+    ];
+    if (ctx.note) {
+      lines.push(`- Note: ${ctx.note}`);
+    }
+    lines.push("");
+
+    lines.push("## Assembled stream text (raw content)");
+    lines.push("");
+    if (ctx.assembledText) {
+      lines.push("```");
+      lines.push(ctx.assembledText);
+      lines.push("```");
+    } else {
+      lines.push("_(empty — no delta/message content in the SSE stream)_");
+    }
+    lines.push("");
+
+    lines.push("## Assembled reasoning_content");
+    lines.push("");
+    if (ctx.assembledReasoning) {
+      lines.push("```");
+      lines.push(ctx.assembledReasoning);
+      lines.push("```");
+    } else {
+      lines.push("_(empty)_");
+    }
+    lines.push("");
+
+    lines.push("## Visible text (after stripping think tags + tool XML)");
+    lines.push("");
+    if (ctx.visibleText) {
+      lines.push("```");
+      lines.push(ctx.visibleText);
+      lines.push("```");
+    } else {
+      lines.push("_(empty)_");
+    }
+    lines.push("");
+
+    lines.push("## Structured tool_calls (OpenAI stream)");
+    lines.push("");
+    if (ctx.structuredToolCalls.length) {
+      lines.push("```json");
+      lines.push(JSON.stringify(ctx.structuredToolCalls, null, 2));
+      lines.push("```");
+    } else {
+      lines.push("_(none)_");
+    }
+    lines.push("");
+
+    lines.push("## Parsed XML tool_calls");
+    lines.push("");
+    if (ctx.xmlToolCalls.length) {
+      for (const [i, call] of ctx.xmlToolCalls.entries()) {
+        lines.push(`### [${i}] \`${call.name}\``);
+        lines.push("");
+        lines.push("```json");
+        lines.push(JSON.stringify(call.input, null, 2));
+        lines.push("```");
+        lines.push("");
+        lines.push("<details><summary>Raw XML</summary>");
+        lines.push("");
+        lines.push("```");
+        lines.push(call.raw);
+        lines.push("```");
+        lines.push("");
+        lines.push("</details>");
+        lines.push("");
+      }
+    } else {
+      lines.push("_(none matched `<tool_call><function=…>` / `<parameter=…>`)_");
+      lines.push("");
+    }
+
+    lines.push("## Tips");
+    lines.push("");
+    lines.push(
+      "- If **Empty to Chat** is yes but Assembled text/reasoning is not empty, the model likely used a tool format we do not parse, or tools were enabled and everything was stripped without a valid parse."
+    );
+    lines.push(
+      "- If both content and reasoning are empty while the terminal showed tokens, the stream may use a field we still do not read."
+    );
     lines.push("");
     return lines.join("\n");
   }

@@ -2,7 +2,7 @@ import { LlamaInstaller, UiBackend } from "./llamaInstaller";
 import { openModelFileDialog, pickDownloadedModel } from "./modelPicker";
 import { ensureDirs, getInstallDir, getLockDir, getModelsDir } from "./paths";
 import { PerfStats } from "./perfStats";
-import { ProcessManager } from "./processManager";
+import { LaunchToken, LAUNCH_IN_PROGRESS_MSG, ProcessManager } from "./processManager";
 import { SettingsStore } from "./settings";
 import { SettingsViewProvider } from "./settingsView";
 import * as path from "path";
@@ -31,19 +31,32 @@ async function afterModelSelected(
     "Later"
   );
   if (choice === "Start / reload server") {
+    const ready = await processManager.isHttpReady();
+    const kind = ready ? "reload" : "start";
+    const token = processManager.claimLaunch(
+      kind,
+      kind === "reload" ? "Reloading llama-server…" : "Starting llama-server…"
+    );
+    if (!token) {
+      void vscode.window.showWarningMessage(LAUNCH_IN_PROGRESS_MSG);
+      return;
+    }
     try {
       const status = await vscode.window.withProgress(
         {
           location: vscode.ProgressLocation.Notification,
-          title: "Llama AIO: Starting llama-server…",
+          title:
+            kind === "reload"
+              ? "Llama AIO: Reloading llama-server…"
+              : "Llama AIO: Starting llama-server…",
           cancellable: false,
         },
         async (progress) => {
           const report = (msg: string) => progress.report({ message: msg });
-          if (await processManager.isHttpReady()) {
-            return processManager.reload(report);
+          if (ready) {
+            return processManager.reload(report, token);
           }
-          return processManager.start(undefined, report);
+          return processManager.start(undefined, report, token);
         }
       );
       chatProvider?.notifyChanged();
@@ -53,6 +66,8 @@ async function afterModelSelected(
       vscode.window.showErrorMessage(
         `Start failed: ${e instanceof Error ? e.message : String(e)}`
       );
+    } finally {
+      processManager.releaseLaunch(token);
     }
   }
 }
@@ -399,22 +414,24 @@ export function activate(context: vscode.ExtensionContext): void {
     processManager,
     installer,
     perf,
-    async () => {
-      await vscode.window.withProgress(
+    async (token?: LaunchToken) => {
+      // Sidebar may already hold `token`; commands claim inside reload when omitted.
+      const status = await vscode.window.withProgress(
         {
           location: vscode.ProgressLocation.Notification,
           title: "Llama AIO: Reloading llama-server…",
           cancellable: false,
         },
-        async (progress) => {
-          const status = await processManager.reload((msg) => {
+        async (progress) =>
+          processManager.reload((msg) => {
             progress.report({ message: msg });
             settingsView.postBootProgress(msg);
-          });
-          chatProvider?.notifyChanged();
-          await promptUseInCopilotChat(store, status.message);
-        }
+          }, token)
       );
+      // Keep the Copilot prompt outside withProgress — awaiting the info dialog
+      // inside would leave the "Reloading…" toast up while the server is already ready.
+      chatProvider?.notifyChanged();
+      await promptUseInCopilotChat(store, status.message);
     },
     {
       downloadFromHuggingFace,
@@ -527,6 +544,11 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("llamaAio.selectLocalModel", pickDownloaded),
 
     vscode.commands.registerCommand("llamaAio.startServer", async () => {
+      const token = processManager.claimLaunch("start", "Starting llama-server…");
+      if (!token) {
+        void vscode.window.showWarningMessage(LAUNCH_IN_PROGRESS_MSG);
+        return;
+      }
       try {
         if (!(await settingsView.confirmIfMemorySpill())) {
           return;
@@ -538,7 +560,11 @@ export function activate(context: vscode.ExtensionContext): void {
             cancellable: false,
           },
           async (progress) =>
-            processManager.start(undefined, (msg) => progress.report({ message: msg }))
+            processManager.start(
+              undefined,
+              (msg) => progress.report({ message: msg }),
+              token
+            )
         );
         chatProvider?.notifyChanged();
         await settingsView.pushState();
@@ -548,6 +574,8 @@ export function activate(context: vscode.ExtensionContext): void {
         vscode.window.showErrorMessage(
           `Start failed: ${e instanceof Error ? e.message : String(e)}`
         );
+      } finally {
+        processManager.releaseLaunch(token);
       }
     }),
 
@@ -560,6 +588,11 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
 
     vscode.commands.registerCommand("llamaAio.reloadServer", async () => {
+      const token = processManager.claimLaunch("reload", "Reloading llama-server…");
+      if (!token) {
+        void vscode.window.showWarningMessage(LAUNCH_IN_PROGRESS_MSG);
+        return;
+      }
       try {
         if (!(await settingsView.confirmIfMemorySpill())) {
           return;
@@ -571,7 +604,7 @@ export function activate(context: vscode.ExtensionContext): void {
             cancellable: false,
           },
           async (progress) =>
-            processManager.reload((msg) => progress.report({ message: msg }))
+            processManager.reload((msg) => progress.report({ message: msg }), token)
         );
         chatProvider?.notifyChanged();
         await settingsView.pushState();
@@ -581,6 +614,8 @@ export function activate(context: vscode.ExtensionContext): void {
         vscode.window.showErrorMessage(
           `Reload failed: ${e instanceof Error ? e.message : String(e)}`
         );
+      } finally {
+        processManager.releaseLaunch(token);
       }
     }),
 
@@ -608,8 +643,16 @@ export function activate(context: vscode.ExtensionContext): void {
       await settingsView.pushState();
     }),
 
+    vscode.commands.registerCommand("llamaAio.viewLastCall", async () => {
+      await settingsView.openLastRequestContext();
+    }),
+    // Keep old id as alias for any saved keybindings.
     vscode.commands.registerCommand("llamaAio.viewLastContext", async () => {
       await settingsView.openLastRequestContext();
+    }),
+
+    vscode.commands.registerCommand("llamaAio.viewLastResponse", async () => {
+      await settingsView.openLastResponseTrace();
     })
   );
 

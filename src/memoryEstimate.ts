@@ -1,7 +1,7 @@
 import * as os from "os";
 import { GpuMemoryInfo } from "./gpuInfo";
 import { heuristicMoeExpertShare, ModelCapabilities } from "./ggufMetadata";
-import { LlamaLoadSettings } from "./types";
+import { KvCacheType, LlamaLoadSettings } from "./types";
 
 export interface MemoryBarSegment {
   key: "weights" | "kv" | "overhead";
@@ -87,7 +87,24 @@ function layersOnGpu(settings: LlamaLoadSettings, blockCount: number): number {
 }
 
 /**
- * Rough KV-cache size (default f16 K/V in llama.cpp).
+ * Approximate bytes per KV element for llama.cpp cache types.
+ * Block-quant formats include small scale overhead; these are close enough for UI estimates.
+ */
+export function kvCacheTypeElemBytes(type: KvCacheType | undefined): number {
+  switch (type) {
+    case "q4_0":
+      return 0.5;
+    case "q8_0":
+      return 1;
+    case "bf16":
+    case "f16":
+    default:
+      return 2;
+  }
+}
+
+/**
+ * Rough KV-cache size for the given K/V cache dtypes (default f16).
  * Handles GQA, per-layer KV heads, and sliding-window attention (e.g. Gemma 4).
  */
 export function estimateKvBytes(
@@ -107,7 +124,9 @@ export function estimateKvBytes(
     | "fullAttentionInterval"
     | "recurrentLayers"
   >,
-  contextLength: number
+  contextLength: number,
+  cacheTypeK: KvCacheType = "q8_0",
+  cacheTypeV: KvCacheType = "q8_0"
 ): number {
   const layers = Math.max(1, caps.blockCount || 1);
   const qHeads = Math.max(1, caps.attentionHeadCount || 8);
@@ -125,7 +144,8 @@ export function estimateKvBytes(
     caps.fullAttentionInterval && caps.fullAttentionInterval > 1
       ? caps.fullAttentionInterval
       : undefined;
-  const elemBytes = 2; // f16
+  const kBytes = kvCacheTypeElemBytes(cacheTypeK);
+  const vBytes = kvCacheTypeElemBytes(cacheTypeV);
 
   let total = 0;
   for (let i = 0; i < layers; i++) {
@@ -148,7 +168,7 @@ export function estimateKvBytes(
       ? Math.max(1, caps.valueLengthSwa || Math.floor(defaultValDim / 2) || defaultValDim)
       : defaultValDim;
     const tokens = isSwa && swa ? Math.min(contextLength, swa) : contextLength;
-    total += (nKv * keyDim + nKv * valDim) * tokens * elemBytes;
+    total += (nKv * keyDim * kBytes + nKv * valDim * vBytes) * tokens;
   }
   return total;
 }
@@ -216,9 +236,14 @@ export function estimateMemory(
   }
   const cpuWeights = Math.max(0, fileSize - gpuWeights);
 
-  const kvBytes = estimateKvBytes(caps, settings.contextLength);
+  const kvBytes = estimateKvBytes(
+    caps,
+    settings.contextLength,
+    settings.cacheTypeK,
+    settings.cacheTypeV
+  );
   const warmCtx = Math.min(WARM_KV_CONTEXT, Math.max(512, settings.contextLength));
-  const kvBytesWarm = estimateKvBytes(caps, warmCtx);
+  const kvBytesWarm = estimateKvBytes(caps, warmCtx, settings.cacheTypeK, settings.cacheTypeV);
   const fullAttnLayers = countFullAttentionLayers(caps);
   const kvOnGpu = !cpuOnly && settings.offloadKvCacheToGpu && onGpu > 0;
   // Compute / graph / batch scratch — grows a bit with batch size.

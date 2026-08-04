@@ -8,6 +8,7 @@ import {
   DEFAULT_REQUEST_SETTINGS,
   ExtensionState,
   LlamaLoadSettings,
+  normalizeKvCacheType,
   RequestSettings,
 } from "./types";
 
@@ -19,6 +20,11 @@ export class SettingsStore {
   getState(): ExtensionState {
     const raw = this.context.globalState.get<Partial<ExtensionState>>(STATE_KEY) || {};
     let loadSettings = { ...DEFAULT_LOAD_SETTINGS, ...(raw.loadSettings || {}) };
+    loadSettings = {
+      ...loadSettings,
+      cacheTypeK: normalizeKvCacheType(loadSettings.cacheTypeK),
+      cacheTypeV: normalizeKvCacheType(loadSettings.cacheTypeV),
+    };
     const caps = raw.modelCapabilities;
     if (caps?.maxContextLength) {
       loadSettings = clampLoadSettingsToModel(loadSettings, caps);
@@ -112,6 +118,11 @@ export class SettingsStore {
   async updateLoadSettings(patch: Partial<LlamaLoadSettings>): Promise<ExtensionState> {
     const state = this.getState();
     let loadSettings = { ...state.loadSettings, ...patch };
+    loadSettings = {
+      ...loadSettings,
+      cacheTypeK: normalizeKvCacheType(loadSettings.cacheTypeK),
+      cacheTypeV: normalizeKvCacheType(loadSettings.cacheTypeV),
+    };
     if (state.modelCapabilities) {
       loadSettings = clampLoadSettingsToModel(loadSettings, state.modelCapabilities);
     }

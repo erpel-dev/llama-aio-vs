@@ -9,10 +9,10 @@ import { estimateMemory, memoryEstimateInputs } from "./memoryEstimate";
 import { listActiveModelSourceDirs, listLocalModelEntries } from "./modelLibrary";
 import { getModelsDir } from "./paths";
 import { PerfStats } from "./perfStats";
-import { ProcessManager } from "./processManager";
+import { LaunchToken, LAUNCH_IN_PROGRESS_MSG, ProcessManager } from "./processManager";
 import { SettingsStore } from "./settings";
 import { resolveLaunchMode } from "./externalTerminal";
-import { LlamaLoadSettings, RequestSettings } from "./types";
+import { DEFAULT_LOAD_SETTINGS, DEFAULT_REQUEST_SETTINGS, LlamaLoadSettings, RequestSettings } from "./types";
 import { STARTER_MODEL } from "./huggingFace";
 
 export type ModelActions = {
@@ -39,7 +39,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     private readonly processManager: ProcessManager,
     private readonly installer: LlamaInstaller,
     private readonly perf: PerfStats,
-    private readonly onReload: () => Promise<void>,
+    private readonly onReload: (token?: LaunchToken) => Promise<void>,
     private readonly modelActions: ModelActions,
     private readonly notifyChatModels: () => void = () => undefined
   ) {}
@@ -83,30 +83,70 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             break;
           case "saveRequest":
             await this.store.updateRequestSettings(msg.payload as Partial<RequestSettings>);
-            await this.pushState();
+            // Don't pushState — the webview already shows the edited values, and a
+            // full state round-trip can overwrite in-progress typing.
             break;
-          case "reload":
-            this.processManager.markStarting("reload", "Reloading llama-server…");
-            this.postBootProgress("Reloading llama-server…");
-            await this.store.updateLoadSettings(msg.payload as Partial<LlamaLoadSettings>);
+          case "resetAdvancedLoad": {
+            const d = DEFAULT_LOAD_SETTINGS;
+            await this.store.updateLoadSettings({
+              cpuThreads: d.cpuThreads,
+              evalBatchSize: d.evalBatchSize,
+              physicalBatchSize: d.physicalBatchSize,
+              maxConcurrentPredictions: d.maxConcurrentPredictions,
+              offloadKvCacheToGpu: d.offloadKvCacheToGpu,
+              cacheTypeK: d.cacheTypeK,
+              cacheTypeV: d.cacheTypeV,
+              keepModelInMemory: d.keepModelInMemory,
+              tryMmap: d.tryMmap,
+              unifiedKvCache: d.unifiedKvCache,
+              contextCheckpoints: d.contextCheckpoints,
+              ropeFreqBase: d.ropeFreqBase,
+              ropeFreqScale: d.ropeFreqScale,
+              seed: d.seed,
+              speculativeMode: d.speculativeMode,
+              maxDraftTokens: d.maxDraftTokens,
+              minDraftTokens: d.minDraftTokens,
+              draftProbability: d.draftProbability,
+            });
             this.syncSpeculativeMode();
-            if (!(await this.confirmIfMemorySpill())) {
-              this.processManager.clearStarting();
-              await this.pushState();
-              break;
-            }
-            await this.onReload();
             await this.pushState();
             break;
-          case "start":
-            this.processManager.markStarting("start", "Starting llama-server…");
-            this.postBootProgress("Starting llama-server…");
-            if (!(await this.confirmIfMemorySpill())) {
-              this.processManager.clearStarting();
-              await this.pushState();
+          }
+          case "resetRequestDefaults":
+            await this.store.updateRequestSettings({ ...DEFAULT_REQUEST_SETTINGS });
+            await this.pushState();
+            break;
+          case "reload": {
+            const token = this.processManager.claimLaunch("reload", "Reloading llama-server…");
+            if (!token) {
+              void vscode.window.showWarningMessage(LAUNCH_IN_PROGRESS_MSG);
               break;
             }
-            {
+            this.postBootProgress("Reloading llama-server…");
+            try {
+              await this.store.updateLoadSettings(msg.payload as Partial<LlamaLoadSettings>);
+              this.syncSpeculativeMode();
+              if (!(await this.confirmIfMemorySpill())) {
+                break;
+              }
+              await this.onReload(token);
+            } finally {
+              this.processManager.releaseLaunch(token);
+              await this.pushState();
+            }
+            break;
+          }
+          case "start": {
+            const token = this.processManager.claimLaunch("start", "Starting llama-server…");
+            if (!token) {
+              void vscode.window.showWarningMessage(LAUNCH_IN_PROGRESS_MSG);
+              break;
+            }
+            this.postBootProgress("Starting llama-server…");
+            try {
+              if (!(await this.confirmIfMemorySpill())) {
+                break;
+              }
               const status = await vscode.window.withProgress(
                 {
                   location: vscode.ProgressLocation.Notification,
@@ -114,16 +154,23 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                   cancellable: false,
                 },
                 async (progress) =>
-                  this.processManager.start(undefined, (m) => {
-                    progress.report({ message: m });
-                    this.postBootProgress(m);
-                  })
+                  this.processManager.start(
+                    undefined,
+                    (m) => {
+                      progress.report({ message: m });
+                      this.postBootProgress(m);
+                    },
+                    token
+                  )
               );
               this.notifyChatModels();
-              await this.pushState();
               await promptUseInCopilotChat(this.store, status.message);
+            } finally {
+              this.processManager.releaseLaunch(token);
+              await this.pushState();
             }
             break;
+          }
           case "stop":
             await this.processManager.stop(true);
             await this.pushState();
@@ -166,8 +213,11 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           case "checkUpdates":
             await this.refreshUpdateCheck();
             break;
-          case "viewLastContext":
+          case "viewLastCall":
             await this.openLastRequestContext();
+            break;
+          case "viewLastResponse":
+            await this.openLastResponseTrace();
             break;
           case "setPromptReplacementsEnabled": {
             const enabled = !!(msg.payload && (msg.payload as { enabled?: boolean }).enabled);
@@ -321,6 +371,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         perf: this.perf.get(),
         perfLines: this.perf.detailLines(),
         hasLastContext: this.perf.hasLastRequestContext(),
+        hasLastResponse: this.perf.hasLastResponseTrace(),
         promptReplacementsEnabled: this.store.isPromptReplacementsEnabled(),
         endpoint: this.store.getEndpoint(),
         binary,
@@ -407,7 +458,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     const text = this.perf.formatLastRequestContext();
     if (!text) {
       vscode.window.showInformationMessage(
-        "Llama AIO: No chat context captured yet. Send a Copilot Chat message using Llama AIO first."
+        "Llama AIO: No chat call captured yet. Send a Copilot Chat message using Llama AIO first."
       );
       return;
     }
@@ -415,7 +466,23 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       content: text,
       language: "markdown",
     });
-    await vscode.window.showTextDocument(doc, { preview: false, viewColumn: vscode.ViewColumn.Beside });
+    await vscode.window.showTextDocument(doc, { preview: false, viewColumn: vscode.ViewColumn.Active });
+  }
+
+  /** Open the last assistant stream dump (empty-response debugging). */
+  async openLastResponseTrace(): Promise<void> {
+    const text = this.perf.formatLastResponseTrace();
+    if (!text) {
+      vscode.window.showInformationMessage(
+        "Llama AIO: No chat response captured yet. Send a Copilot Chat message using Llama AIO first."
+      );
+      return;
+    }
+    const doc = await vscode.workspace.openTextDocument({
+      content: text,
+      language: "markdown",
+    });
+    await vscode.window.showTextDocument(doc, { preview: false, viewColumn: vscode.ViewColumn.Active });
   }
 
   private getHtml(webview: vscode.Webview): string {
@@ -690,6 +757,52 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       padding: 0 4px;
     }
     .hint { color: var(--muted); font-size: 11px; margin-top: 2px; }
+    /* Hover help: llama.cpp flag + short description */
+    .tip {
+      position: relative;
+      border-bottom: 1px dotted color-mix(in srgb, var(--muted) 70%, transparent);
+      cursor: help;
+    }
+    .tip::after {
+      content: attr(data-flag) "\\A" attr(data-help);
+      white-space: pre-wrap;
+      position: absolute;
+      left: 0;
+      top: calc(100% + 6px);
+      z-index: 40;
+      width: max-content;
+      max-width: min(260px, 70vw);
+      padding: 8px 10px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--vscode-editorWidget-background, var(--input-bg));
+      color: var(--fg);
+      font-size: 11px;
+      font-weight: 400;
+      line-height: 1.45;
+      box-shadow: 0 4px 14px rgba(0, 0, 0, 0.28);
+      opacity: 0;
+      visibility: hidden;
+      pointer-events: none;
+      transition: opacity 0.08s ease;
+    }
+    /* First line (flag) reads as code; description wraps below via \\A */
+    .name.tip,
+    .toggle > span.tip {
+      font-weight: 500;
+    }
+    .tip:hover::after,
+    .tip:focus-visible::after {
+      opacity: 1;
+      visibility: visible;
+    }
+    details.advanced,
+    details.advanced > summary,
+    .row,
+    .toggle,
+    .label {
+      overflow: visible;
+    }
     input[type="number"], input[type="text"],     select {
       width: 88px;
       background: var(--input-bg);
@@ -847,7 +960,8 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     </div>
     <div class="meta" id="replacementStats" style="margin-top:4px">Last call: —</div>
     <div class="btn-col" style="margin-top:8px">
-      <button class="secondary" id="viewContextBtn" disabled title="Open the last Copilot → llama.cpp prompt in an editor">View last context</button>
+      <button class="secondary" id="viewContextBtn" disabled title="Open the last Copilot → llama.cpp request (messages + tools) in an editor">View last call</button>
+      <button class="secondary" id="viewResponseBtn" disabled title="Open the last llama.cpp assistant stream (helps debug empty Chat replies)">View last response</button>
     </div>
   </div>
 
@@ -932,63 +1046,83 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
   </div>
 
   <div class="row">
-    <div class="label"><span class="name">Context Length</span><input type="number" id="contextLength" min="512" step="512" /></div>
+    <div class="label"><span class="name tip" data-flag="-c, --ctx-size" data-help="Size of the prompt context (default: 0 = loaded from model).">Context Length</span><input type="number" id="contextLength" min="512" step="512" /></div>
     <input type="range" id="contextLengthRange" min="512" max="131072" step="512" />
     <div class="hint" id="ctxHint">Tokens for prompt + generation</div>
   </div>
   <div class="row" id="gpuOffloadRow">
-    <div class="label"><span class="name">GPU Offload</span><input type="number" id="gpuOffload" min="0" max="128" /></div>
+    <div class="label"><span class="name tip" data-flag="-ngl, --n-gpu-layers" data-help="Max number of layers to store in VRAM (exact number, auto, or all).">GPU Offload</span><input type="number" id="gpuOffload" min="0" max="128" /></div>
     <input type="range" id="gpuOffloadRange" min="0" max="128" step="1" />
-    <div class="hint" id="gpuOffloadHint">Layers on GPU (-ngl). Max = all model layers.</div>
+    <div class="hint" id="gpuOffloadHint">Max = all model layers.</div>
   </div>
   <div class="row" id="moeRow">
-    <div class="label"><span class="name">CPU MoE layers</span><span class="badge">MoE only</span><input type="number" id="nCpuMoe" min="0" max="256" /></div>
+    <div class="label"><span class="name tip" data-flag="-ncmoe, --n-cpu-moe" data-help="Keep the Mixture of Experts (MoE) weights of the first N layers in the CPU.">CPU MoE layers</span><span class="badge">MoE only</span><input type="number" id="nCpuMoe" min="0" max="256" /></div>
     <input type="range" id="nCpuMoeRange" min="0" max="128" step="1" />
-    <div class="hint" id="moeHint">Number of layers to force experts onto CPU (--n-cpu-moe). Only applies to MoE models.</div>
+    <div class="hint" id="moeHint">Only applies to MoE models.</div>
   </div>
 
   <details class="advanced">
     <summary>Advanced Settings<span class="sub">threads, batch, KV, RoPE, speculative…</span></summary>
 
   <div class="row">
-    <div class="label"><span class="name">CPU Thread Pool Size</span><input type="number" id="cpuThreads" min="1" max="64" /></div>
+    <div class="label"><span class="name tip" data-flag="-t, --threads" data-help="Number of CPU threads to use during generation (default: -1).">CPU Thread Pool Size</span><input type="number" id="cpuThreads" min="1" max="64" /></div>
     <input type="range" id="cpuThreadsRange" min="1" max="64" step="1" />
-    <div class="hint" id="cpuThreadsHint">llama.cpp -t. Max = CPU logical cores.</div>
+    <div class="hint" id="cpuThreadsHint">Max = CPU logical cores.</div>
   </div>
   <div class="row">
-    <div class="label"><span class="name">Evaluation Batch Size</span><input type="number" id="evalBatchSize" min="32" step="32" /></div>
+    <div class="label"><span class="name tip" data-flag="-b, --batch-size" data-help="Logical maximum batch size (default: 2048).">Evaluation Batch Size</span><input type="number" id="evalBatchSize" min="32" step="32" /></div>
   </div>
   <div class="row">
-    <div class="label"><span class="name">Physical Batch Size</span><input type="number" id="physicalBatchSize" min="32" step="32" /></div>
+    <div class="label"><span class="name tip" data-flag="-ub, --ubatch-size" data-help="Physical maximum batch size (default: 512).">Physical Batch Size</span><input type="number" id="physicalBatchSize" min="32" step="32" /></div>
   </div>
   <div class="row">
-    <div class="label"><span class="name">Max Concurrent Predictions</span><span class="badge">Splits context</span><input type="number" id="maxConcurrentPredictions" min="1" max="64" /></div>
+    <div class="label"><span class="name tip" data-flag="-np, --parallel" data-help="Number of server slots (default: -1 = auto). Context is split across slots.">Max Concurrent Predictions</span><span class="badge">Splits context</span><input type="number" id="maxConcurrentPredictions" min="1" max="64" /></div>
     <div class="hint">Use <strong>1</strong> for Copilot Chat. Values &gt; 1 split Context Length across slots (e.g. 8192/4 = 2048 per request).</div>
   </div>
 
-  <div class="toggle"><span>Offload KV Cache to GPU Memory</span><input type="checkbox" id="offloadKvCacheToGpu" /></div>
-  <div class="toggle"><span id="keepModelLabel">Keep Model in Memory (--mlock)</span><input type="checkbox" id="keepModelInMemory" /></div>
-  <div class="hint" id="keepModelHint" style="display:none">On Windows this uses mmap (--load-mode mmap); mlock is not reliable.</div>
-  <div class="toggle"><span>Try mmap()</span><input type="checkbox" id="tryMmap" /></div>
-  <div class="toggle"><span>Unified KV Cache</span><input type="checkbox" id="unifiedKvCache" /></div>
-
+  <div class="toggle"><span class="tip" data-flag="-nkvo, --no-kv-offload" data-help="Whether to enable KV cache offloading to GPU (default: enabled). Uncheck to keep KV in system RAM.">Offload KV Cache to GPU Memory</span><input type="checkbox" id="offloadKvCacheToGpu" /></div>
   <div class="row">
-    <div class="label"><span class="name">Context Checkpoints</span><input type="number" id="contextCheckpoints" min="0" /></div>
+    <div class="label"><span class="name tip" data-flag="-ctk, --cache-type-k" data-help="KV cache data type for K. Allowed: f32, f16, bf16, q8_0, q4_0, … (default: q8_0). q8_0 halves KV size with little quality loss.">KV Cache Type (K)</span>
+      <select id="cacheTypeK">
+        <option value="q8_0">q8_0 (~½ size, default)</option>
+        <option value="f16">f16</option>
+        <option value="bf16">bf16</option>
+        <option value="q4_0">q4_0 (~¼ size)</option>
+      </select>
+    </div>
   </div>
   <div class="row">
-    <div class="label"><span class="name">RoPE Frequency Base</span>
+    <div class="label"><span class="name tip" data-flag="-ctv, --cache-type-v" data-help="KV cache data type for V. Same types as K (default: q8_0). q4_0 saves more VRAM but can hurt long-context prompt speed.">KV Cache Type (V)</span>
+      <select id="cacheTypeV">
+        <option value="q8_0">q8_0 (~½ size, default)</option>
+        <option value="f16">f16</option>
+        <option value="bf16">bf16</option>
+        <option value="q4_0">q4_0 (~¼ size)</option>
+      </select>
+    </div>
+  </div>
+  <div class="toggle"><span id="keepModelLabel" class="tip" data-flag="--load-mode mlock" data-help="Force the system to keep the model in RAM rather than swapping (load-mode mlock). On Windows this falls back to mmap.">Keep Model in Memory (--mlock)</span><input type="checkbox" id="keepModelInMemory" /></div>
+  <div class="hint" id="keepModelHint" style="display:none">On Windows this uses mmap (--load-mode mmap); mlock is not reliable.</div>
+  <div class="toggle"><span class="tip" data-flag="--load-mode mmap | none" data-help="Memory-map the model (mmap). If disabled and mlock is off, uses load-mode none (slower load, may reduce pageouts).">Try mmap()</span><input type="checkbox" id="tryMmap" /></div>
+  <div class="toggle"><span class="tip" data-flag="-kvu, --kv-unified" data-help="Use a single unified KV buffer shared across all sequences (default: enabled if slot count is auto). Uncheck passes --no-kv-unified.">Unified KV Cache</span><input type="checkbox" id="unifiedKvCache" /></div>
+
+  <div class="row">
+    <div class="label"><span class="name tip" data-flag="--cache-reuse" data-help="Min chunk size to attempt reusing from the cache via KV shifting (requires prompt caching; default: 0).">Context Checkpoints</span><input type="number" id="contextCheckpoints" min="0" /></div>
+  </div>
+  <div class="row">
+    <div class="label"><span class="name tip" data-flag="--rope-freq-base" data-help="RoPE base frequency, used by NTK-aware scaling (default: loaded from model).">RoPE Frequency Base</span>
       <label><input type="checkbox" id="ropeBaseAuto" /> Auto</label>
     </div>
     <input type="number" id="ropeFreqBase" step="1" />
   </div>
   <div class="row">
-    <div class="label"><span class="name">RoPE Frequency Scale</span>
+    <div class="label"><span class="name tip" data-flag="--rope-freq-scale" data-help="RoPE frequency scaling factor; expands context by a factor of 1/N.">RoPE Frequency Scale</span>
       <label><input type="checkbox" id="ropeScaleAuto" /> Auto</label>
     </div>
     <input type="number" id="ropeFreqScale" step="0.01" />
   </div>
   <div class="row">
-    <div class="label"><span class="name">Seed</span>
+    <div class="label"><span class="name tip" data-flag="-s, --seed" data-help="RNG seed (default: -1 = random).">Seed</span>
       <label><input type="checkbox" id="seedRandom" /> Random</label>
     </div>
     <input type="number" id="seed" step="1" />
@@ -996,22 +1130,26 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
 
   <h2>Speculative decoding</h2>
   <div class="row" id="specModeRow">
-    <div class="label"><span class="name">Mode</span>
+    <div class="label"><span class="name tip" data-flag="--spec-type" data-help="Speculative decoding type (e.g. none, draft-mtp). MTP needs a GGUF with next-n / MTP layers.">Mode</span>
       <select id="speculativeMode">
         <option value="off">Off</option>
         <option value="mtp" id="specMtpOption">MTP (draft-mtp)</option>
       </select>
     </div>
-    <div class="hint" id="specHint">MTP needs a model with next-n / MTP layers (e.g. Ornith MTP). Uses --spec-type draft-mtp.</div>
+    <div class="hint" id="specHint">MTP needs a model with next-n / MTP layers (e.g. Ornith MTP).</div>
   </div>
   <div class="row" id="specDraftMaxRow">
-    <div class="label"><span class="name">Max draft tokens</span><input type="number" id="maxDraftTokens" min="0" /></div>
+    <div class="label"><span class="name tip" data-flag="--spec-draft-n-max" data-help="Number of tokens to draft for speculative decoding (default: 3).">Max draft tokens</span><input type="number" id="maxDraftTokens" min="0" /></div>
   </div>
   <div class="row" id="specDraftMinRow">
-    <div class="label"><span class="name">Min draft tokens</span><input type="number" id="minDraftTokens" min="0" /></div>
+    <div class="label"><span class="name tip" data-flag="--spec-draft-n-min" data-help="Minimum number of draft tokens to use for speculative decoding (default: 0).">Min draft tokens</span><input type="number" id="minDraftTokens" min="0" /></div>
   </div>
   <div class="row" id="specDraftPRow">
-    <div class="label"><span class="name">Draft probability</span><input type="number" id="draftProbability" min="0" max="1" step="0.01" /></div>
+    <div class="label"><span class="name tip" data-flag="--spec-draft-p-min" data-help="Minimum speculative decoding probability / greedy threshold (default: 0.00).">Draft probability</span><input type="number" id="draftProbability" min="0" max="1" step="0.01" /></div>
+  </div>
+
+  <div class="btn-col" style="margin:12px 0 8px">
+    <button class="secondary" id="resetAdvancedBtn" title="Restore Advanced Settings to Llama AIO defaults (does not change Context Length / GPU Offload / MoE)">Reset advanced to defaults</button>
   </div>
 
   </details>
@@ -1019,16 +1157,20 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
   <details class="advanced">
     <summary>Request defaults<span class="sub">temperature, top-p/k, max tokens</span></summary>
   <div class="row">
-    <div class="label"><span class="name">Temperature</span><input type="number" id="temperature" min="0" max="2" step="0.05" /></div>
+    <div class="label"><span class="name tip" data-flag="Chat / API request body" data-help="Sampling temperature for completions (extension request default, not a llama-server load flag).">Temperature</span><input type="number" id="temperature" min="0" max="2" step="0.05" /></div>
   </div>
   <div class="row">
-    <div class="label"><span class="name">Top P</span><input type="number" id="topP" min="0" max="1" step="0.01" /></div>
+    <div class="label"><span class="name tip" data-flag="Chat / API request body" data-help="Nucleus sampling top-p (extension request default).">Top P</span><input type="number" id="topP" min="0" max="1" step="0.01" /></div>
   </div>
   <div class="row">
-    <div class="label"><span class="name">Top K</span><input type="number" id="topK" min="0" step="1" /></div>
+    <div class="label"><span class="name tip" data-flag="Chat / API request body" data-help="Top-k sampling (extension request default).">Top K</span><input type="number" id="topK" min="0" step="1" /></div>
   </div>
   <div class="row">
-    <div class="label"><span class="name">Max tokens</span><input type="number" id="maxTokens" min="16" step="16" /></div>
+    <div class="label"><span class="name tip" data-flag="Chat / API request body" data-help="Max tokens to generate per reply (extension request default / n_predict-style cap).">Max tokens</span><input type="number" id="maxTokens" min="16" step="16" /></div>
+  </div>
+
+  <div class="btn-col" style="margin:12px 0 8px">
+    <button class="secondary" id="resetRequestBtn" title="Restore temperature, top-p/k, and max tokens to Llama AIO defaults">Reset request defaults</button>
   </div>
   </details>
 
@@ -1414,7 +1556,14 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       const perKv = memInputs.attentionHeadCountKvPerLayer;
       const recurrent = memInputs.recurrentLayers;
       const fullInterval = memInputs.fullAttentionInterval > 1 ? memInputs.fullAttentionInterval : 0;
+      function kvElemBytes(t) {
+        if (t === 'q4_0') return 0.5;
+        if (t === 'q8_0') return 1;
+        return 2; // f16 / bf16
+      }
       function kvAt(ctx) {
+        const kBytes = kvElemBytes(L.cacheTypeK);
+        const vBytes = kvElemBytes(L.cacheTypeV);
         let bytes = 0;
         let fullAttnLayers = 0;
         for (let i = 0; i < nLayers; i++) {
@@ -1428,7 +1577,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           const keyDim = isSwa ? Math.max(1, memInputs.keyLengthSwa || Math.floor(defaultKeyDim / 2) || defaultKeyDim) : defaultKeyDim;
           const valDim = isSwa ? Math.max(1, memInputs.valueLengthSwa || Math.floor(defaultValDim / 2) || defaultValDim) : defaultValDim;
           const tokens = isSwa ? Math.min(ctx, swa) : ctx;
-          bytes += (nKv * keyDim + nKv * valDim) * tokens * 2;
+          bytes += (nKv * keyDim * kBytes + nKv * valDim * vBytes) * tokens;
         }
         return { bytes, fullAttnLayers };
       }
@@ -1586,6 +1735,8 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     bindRange('cpuThreads', 'cpuThreadsRange');
     bindRange('nCpuMoe', 'nCpuMoeRange');
     $('offloadKvCacheToGpu').addEventListener('change', refreshMemoryLive);
+    $('cacheTypeK').addEventListener('change', refreshMemoryLive);
+    $('cacheTypeV').addEventListener('change', refreshMemoryLive);
     $('evalBatchSize').addEventListener('input', refreshMemoryLive);
 
     // Persist load edits so dirty tracking / reload uses the form values.
@@ -1593,6 +1744,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       'contextLength', 'contextLengthRange', 'gpuOffload', 'gpuOffloadRange',
       'cpuThreads', 'cpuThreadsRange', 'evalBatchSize', 'physicalBatchSize',
       'maxConcurrentPredictions', 'nCpuMoe', 'nCpuMoeRange', 'offloadKvCacheToGpu',
+      'cacheTypeK', 'cacheTypeV',
       'keepModelInMemory', 'tryMmap', 'unifiedKvCache', 'contextCheckpoints',
       'ropeBaseAuto', 'ropeFreqBase', 'ropeScaleAuto', 'ropeFreqScale',
       'seedRandom', 'seed', 'speculativeMode', 'maxDraftTokens', 'minDraftTokens',
@@ -1603,6 +1755,21 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       if (!el) continue;
       el.addEventListener('change', scheduleSaveLoad);
       el.addEventListener('input', scheduleSaveLoad);
+    }
+
+    // Request defaults apply to the next chat call (no server reload). Persist on edit.
+    let saveRequestTimer = null;
+    function scheduleSaveRequest() {
+      if (saveRequestTimer) clearTimeout(saveRequestTimer);
+      saveRequestTimer = setTimeout(() => {
+        vscode.postMessage({ type: 'saveRequest', payload: readRequest() });
+      }, 250);
+    }
+    for (const id of ['temperature', 'topP', 'topK', 'maxTokens']) {
+      const el = $(id);
+      if (!el) continue;
+      el.addEventListener('change', scheduleSaveRequest);
+      el.addEventListener('input', scheduleSaveRequest);
     }
 
     function readLoad() {
@@ -1626,6 +1793,8 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         maxConcurrentPredictions: Number($('maxConcurrentPredictions').value),
         nCpuMoe: Number($('nCpuMoe').value),
         offloadKvCacheToGpu: $('offloadKvCacheToGpu').checked,
+        cacheTypeK: $('cacheTypeK').value || 'q8_0',
+        cacheTypeV: $('cacheTypeV').value || 'q8_0',
         keepModelInMemory: $('keepModelInMemory').checked,
         tryMmap: $('tryMmap').checked,
         unifiedKvCache: $('unifiedKvCache').checked,
@@ -1781,7 +1950,14 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       if (viewCtx) {
         viewCtx.disabled = !payload.hasLastContext;
         viewCtx.title = payload.hasLastContext
-          ? 'Open the last Copilot → llama.cpp prompt in an editor'
+          ? 'Open the last Copilot → llama.cpp request (messages + tools) in an editor'
+          : 'Send a Copilot Chat message first';
+      }
+      const viewResp = $('viewResponseBtn');
+      if (viewResp) {
+        viewResp.disabled = !payload.hasLastResponse;
+        viewResp.title = payload.hasLastResponse
+          ? 'Open the last llama.cpp → Copilot response stream in an editor'
           : 'Send a Copilot Chat message first';
       }
 
@@ -1958,6 +2134,8 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       $('nCpuMoe').value = moe;
       $('nCpuMoeRange').value = moe;
       $('offloadKvCacheToGpu').checked = !!L.offloadKvCacheToGpu;
+      $('cacheTypeK').value = L.cacheTypeK || 'q8_0';
+      $('cacheTypeV').value = L.cacheTypeV || 'q8_0';
       $('keepModelInMemory').checked = !!L.keepModelInMemory;
       if (payload.isWindows) {
         const label = $('keepModelLabel');
@@ -2019,7 +2197,19 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     $('downloadModelBtn').addEventListener('click', () => vscode.postMessage({ type: 'downloadModel' }));
     const viewContextBtn = $('viewContextBtn');
     if (viewContextBtn) {
-      viewContextBtn.addEventListener('click', () => vscode.postMessage({ type: 'viewLastContext' }));
+      viewContextBtn.addEventListener('click', () => vscode.postMessage({ type: 'viewLastCall' }));
+    }
+    const viewResponseBtn = $('viewResponseBtn');
+    if (viewResponseBtn) {
+      viewResponseBtn.addEventListener('click', () => vscode.postMessage({ type: 'viewLastResponse' }));
+    }
+    const resetAdvancedBtn = $('resetAdvancedBtn');
+    if (resetAdvancedBtn) {
+      resetAdvancedBtn.addEventListener('click', () => vscode.postMessage({ type: 'resetAdvancedLoad' }));
+    }
+    const resetRequestBtn = $('resetRequestBtn');
+    if (resetRequestBtn) {
+      resetRequestBtn.addEventListener('click', () => vscode.postMessage({ type: 'resetRequestDefaults' }));
     }
     const prToggle = $('promptReplacementsEnabled');
     if (prToggle) {

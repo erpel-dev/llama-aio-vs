@@ -49,6 +49,11 @@ const FATAL_LOG_RE =
 
 export type StartProgress = (message: string) => void;
 
+/** Opaque handle from {@link ProcessManager.claimLaunch}; pass into start/reload. */
+export type LaunchToken = { readonly id: number };
+
+export const LAUNCH_IN_PROGRESS_MSG = "A server start/reload is already in progress.";
+
 export class ProcessManager {
   /** In-flight start/reload — drives sidebar "Loading model…" until HTTP ready. */
   private boot:
@@ -58,22 +63,49 @@ export class ProcessManager {
       }
     | undefined;
 
+  /** Exclusive launch lock — prevents overlapping start/reload (and dual progress toasts). */
+  private launchToken: LaunchToken | undefined;
+  private nextLaunchId = 1;
+
   constructor(private readonly store: SettingsStore) {}
 
   isStarting(): boolean {
-    return !!this.boot;
+    return !!this.boot || !!this.launchToken;
   }
 
-  /** Mark boot UI immediately (before awaits / pushState races). */
-  markStarting(kind: "start" | "reload", message?: string): void {
+  /**
+   * Claim exclusive start/reload before any awaits (confirm dialogs, withProgress).
+   * Returns undefined if another launch is already in flight.
+   */
+  claimLaunch(kind: "start" | "reload", message?: string): LaunchToken | undefined {
+    if (this.launchToken) {
+      return undefined;
+    }
+    const token: LaunchToken = { id: this.nextLaunchId++ };
+    this.launchToken = token;
     this.beginBoot(
       kind,
       message || (kind === "reload" ? "Reloading llama-server…" : "Starting llama-server…")
     );
+    return token;
+  }
+
+  /** Mark boot UI immediately (before awaits / pushState races). Prefer {@link claimLaunch}. */
+  markStarting(kind: "start" | "reload", message?: string): void {
+    this.claimLaunch(kind, message);
   }
 
   /** Clear boot UI after cancel / error paths that never call start/reload. */
   clearStarting(): void {
+    this.releaseLaunch(this.launchToken);
+  }
+
+  /** Release a claim when canceling before start/reload, or after they finish. */
+  releaseLaunch(token: LaunchToken | undefined): void {
+    if (!token || this.launchToken !== token) {
+      return;
+    }
+    this.launchToken = undefined;
     this.endBoot();
   }
 
@@ -89,6 +121,28 @@ export class ProcessManager {
 
   private endBoot(): void {
     this.boot = undefined;
+  }
+
+  /**
+   * Ensure this call owns the launch lock. If `token` was claimed by the UI, verifies it;
+   * otherwise claims a new one. Throws if another launch owns the lock.
+   */
+  private takeLaunch(kind: "start" | "reload", token?: LaunchToken): LaunchToken {
+    if (token) {
+      if (this.launchToken !== token) {
+        throw new Error(LAUNCH_IN_PROGRESS_MSG);
+      }
+      this.beginBoot(
+        kind,
+        kind === "reload" ? "Reloading llama-server…" : "Starting llama-server…"
+      );
+      return token;
+    }
+    const claimed = this.claimLaunch(kind);
+    if (!claimed) {
+      throw new Error(LAUNCH_IN_PROGRESS_MSG);
+    }
+    return claimed;
   }
 
   getStatus(): ServerStatus {
@@ -209,8 +263,12 @@ export class ProcessManager {
     return new LlamaInstaller(this.store).resolveActiveUiBackend() === "cpu";
   }
 
-  async start(modelPath?: string, onProgress?: StartProgress): Promise<ServerStatus> {
-    this.beginBoot("start", "Starting llama-server…");
+  async start(
+    modelPath?: string,
+    onProgress?: StartProgress,
+    token?: LaunchToken
+  ): Promise<ServerStatus> {
+    const owned = this.takeLaunch("start", token);
     const report = (msg: string) => {
       this.updateBootMessage(msg);
       onProgress?.(msg);
@@ -218,7 +276,7 @@ export class ProcessManager {
     try {
       return await this.startInner(modelPath, report);
     } finally {
-      this.endBoot();
+      this.releaseLaunch(owned);
     }
   }
 
@@ -642,8 +700,8 @@ export class ProcessManager {
     }
   }
 
-  async reload(onProgress?: StartProgress): Promise<ServerStatus> {
-    this.beginBoot("reload", "Reloading llama-server…");
+  async reload(onProgress?: StartProgress, token?: LaunchToken): Promise<ServerStatus> {
+    const owned = this.takeLaunch("reload", token);
     const report = (msg: string) => {
       this.updateBootMessage(msg);
       onProgress?.(msg);
@@ -655,7 +713,7 @@ export class ProcessManager {
       // Keep boot active across inner start — don't nest beginBoot/endBoot via start().
       return await this.startInner(undefined, report);
     } finally {
-      this.endBoot();
+      this.releaseLaunch(owned);
     }
   }
 

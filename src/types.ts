@@ -3,6 +3,17 @@ import type { ModelCapabilities } from "./ggufMetadata";
 
 export type { ModelCapabilities };
 
+/** llama.cpp --cache-type-k / --cache-type-v */
+export type KvCacheType = "f16" | "bf16" | "q8_0" | "q4_0";
+
+export const KV_CACHE_TYPES: readonly KvCacheType[] = ["f16", "bf16", "q8_0", "q4_0"];
+
+export function normalizeKvCacheType(value: unknown, fallback: KvCacheType = "q8_0"): KvCacheType {
+  return typeof value === "string" && (KV_CACHE_TYPES as readonly string[]).includes(value)
+    ? (value as KvCacheType)
+    : fallback;
+}
+
 export interface LlamaLoadSettings {
   /** Context length (--ctx-size) */
   contextLength: number;
@@ -20,11 +31,15 @@ export interface LlamaLoadSettings {
   nCpuMoe: number;
   /** Offload KV cache to GPU (default true; false => --no-kv-offload) */
   offloadKvCacheToGpu: boolean;
+  /** Key cache dtype (--cache-type-k / -ctk); default q8_0 */
+  cacheTypeK: KvCacheType;
+  /** Value cache dtype (--cache-type-v / -ctv); default q8_0 */
+  cacheTypeV: KvCacheType;
   /** Keep model in memory (--mlock) */
   keepModelInMemory: boolean;
   /** Use mmap (--mmap / --no-mmap) */
   tryMmap: boolean;
-  /** Unified KV cache (experimental; passed when supported) */
+  /** Unified KV cache (-kvu / --kv-unified; false => --no-kv-unified) */
   unifiedKvCache: boolean;
   /** Context checkpoints / cache reuse */
   contextCheckpoints: number;
@@ -71,6 +86,8 @@ export const DEFAULT_LOAD_SETTINGS: LlamaLoadSettings = {
   maxConcurrentPredictions: 1,
   nCpuMoe: 0,
   offloadKvCacheToGpu: true,
+  cacheTypeK: "q8_0",
+  cacheTypeV: "q8_0",
   keepModelInMemory: false,
   tryMmap: true,
   unifiedKvCache: true,
@@ -88,7 +105,7 @@ export const DEFAULT_REQUEST_SETTINGS: RequestSettings = {
   temperature: 0.2,
   topP: 0.95,
   topK: 40,
-  maxTokens: 2048,
+  maxTokens: 8192,
 };
 
 export interface ServerStatus {

@@ -56,6 +56,15 @@ type StreamEvent =
       genTokPerSec?: number;
       draftTokens?: number;
       draftTokensAccepted?: number;
+    }
+  | {
+      kind: "trace";
+      assembledText: string;
+      assembledReasoning: string;
+      visibleText: string;
+      structuredToolCalls: Array<{ id: string; name: string; arguments: string }>;
+      xmlToolCalls: Array<{ name: string; input: object; raw: string }>;
+      toolsEnabled: boolean;
     };
 
 interface LlamaTimings {
@@ -288,6 +297,15 @@ function stripXmlToolCalls(text: string): string {
   return text.replace(/<tool_call>[\s\S]*?<\/tool_call>/gi, "").trim();
 }
 
+/** Remove model "thinking" blocks from assistant text (Qwen / DeepSeek-style). */
+function stripThinkTags(text: string): string {
+  return text
+    .replace(/<think\b[^>]*>[\s\S]*?<\/think>/gi, "")
+    .replace(/<thinking\b[^>]*>[\s\S]*?<\/thinking>/gi, "")
+    .replace(/<\/?think\b[^>]*>/gi, "")
+    .trim();
+}
+
 /**
  * Streams OpenAI-compatible SSE and yields text / tool-call events.
  * When tools are enabled, content is buffered until the end so Qwen-style
@@ -340,6 +358,7 @@ async function* streamChatCompletions(
 
   let buffer = "";
   let assembledText = "";
+  let assembledReasoning = "";
   const toolCalls: Array<{ id: string; name: string; arguments: string }> = [];
   let lastTimings: LlamaTimings | undefined;
   let lastUsage: LlamaUsage | undefined;
@@ -368,6 +387,7 @@ async function* streamChatCompletions(
             finish_reason?: string | null;
             delta?: {
               content?: string | null;
+              reasoning_content?: string | null;
               tool_calls?: Array<{
                 index?: number;
                 id?: string;
@@ -376,6 +396,7 @@ async function* streamChatCompletions(
             };
             message?: {
               content?: string | null;
+              reasoning_content?: string | null;
               tool_calls?: Array<{
                 id?: string;
                 function?: { name?: string; arguments?: string };
@@ -398,6 +419,21 @@ async function* streamChatCompletions(
         }
 
         const delta = choice.delta;
+        if (typeof delta?.reasoning_content === "string" && delta.reasoning_content.length) {
+          assembledReasoning += delta.reasoning_content;
+          completionChars += delta.reasoning_content.length;
+          if (!toolsEnabled) {
+            // Live-stream reasoning when the server only emits reasoning_content
+            // (deepseek format). deepseek-legacy also puts tags in content.
+            if (!delta.content) {
+              yield { kind: "text", text: delta.reasoning_content };
+              yield {
+                kind: "stats",
+                completionTokens: Math.max(1, Math.ceil(completionChars / 4)),
+              };
+            }
+          }
+        }
         if (typeof delta?.content === "string" && delta.content.length) {
           assembledText += delta.content;
           completionChars += delta.content.length;
@@ -429,6 +465,9 @@ async function* streamChatCompletions(
           }
         }
 
+        if (choice.message?.reasoning_content && !assembledReasoning) {
+          assembledReasoning = choice.message.reasoning_content;
+        }
         if (choice.message?.content && !assembledText) {
           assembledText = choice.message.content;
         }
@@ -457,20 +496,29 @@ async function* streamChatCompletions(
       draftTokens: lastTimings?.draft_n,
       draftTokensAccepted: lastTimings?.draft_n_accepted,
     };
-  } else if (assembledText) {
+  } else if (assembledText || assembledReasoning) {
     yield {
       kind: "stats",
-      completionTokens: Math.max(1, Math.ceil(assembledText.length / 4)),
+      completionTokens: Math.max(
+        1,
+        Math.ceil((assembledText.length + assembledReasoning.length) / 4)
+      ),
     };
   }
 
   // Emit OpenAI-structured tool calls first.
   let emittedStructured = false;
+  const structuredOut: Array<{ id: string; name: string; arguments: string }> = [];
   for (const [idx, tc] of toolCalls.entries()) {
     if (!tc?.name) {
       continue;
     }
     emittedStructured = true;
+    structuredOut.push({
+      id: tc.id || `call_${idx}`,
+      name: tc.name,
+      arguments: tc.arguments || "",
+    });
     let input: object = {};
     try {
       input = JSON.parse(tc.arguments || "{}") as object;
@@ -485,12 +533,20 @@ async function* streamChatCompletions(
     };
   }
 
-  const xmlCalls = emittedStructured ? [] : parseXmlToolCalls(assembledText);
-  const visible = stripXmlToolCalls(assembledText);
+  // Prefer content; fall back to reasoning_content when the server used deepseek format.
+  const textForParse = stripThinkTags(assembledText || assembledReasoning);
+  const xmlCalls = emittedStructured ? [] : parseXmlToolCalls(textForParse);
+  const visible = stripXmlToolCalls(textForParse);
 
   // When tools were enabled we buffered; emit clean visible text once.
   if (toolsEnabled && visible) {
     yield { kind: "text", text: visible };
+  } else if (toolsEnabled && !visible && !emittedStructured && !xmlCalls.length && assembledReasoning) {
+    // Still thinking-only after the budget — surface it so Chat is not empty.
+    const reasoningVisible = stripThinkTags(assembledReasoning);
+    if (reasoningVisible) {
+      yield { kind: "text", text: reasoningVisible };
+    }
   }
 
   for (const [idx, call] of xmlCalls.entries()) {
@@ -501,6 +557,16 @@ async function* streamChatCompletions(
       input: call.input,
     };
   }
+
+  yield {
+    kind: "trace",
+    assembledText,
+    assembledReasoning,
+    visibleText: visible,
+    structuredToolCalls: structuredOut,
+    xmlToolCalls: xmlCalls,
+    toolsEnabled,
+  };
 }
 
 export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
@@ -734,14 +800,30 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
     let lastCompletionTokens = 0;
     let lastPromptTokens: number | undefined;
     let lastTickAt = 0;
+    let emittedTextChars = 0;
+    let emittedToolCallCount = 0;
+    let lastTrace:
+      | {
+          assembledText: string;
+          assembledReasoning: string;
+          visibleText: string;
+          structuredToolCalls: Array<{ id: string; name: string; arguments: string }>;
+          xmlToolCalls: Array<{ name: string; input: object; raw: string }>;
+          toolsEnabled: boolean;
+        }
+      | undefined;
     try {
       for await (const event of streamChatCompletions(this.store.getEndpoint(), body, token)) {
         if (event.kind === "text") {
+          emittedTextChars += event.text.length;
           progress.report(new vscode.LanguageModelTextPart(event.text));
         } else if (event.kind === "tool_call") {
+          emittedToolCallCount += 1;
           progress.report(
             new vscode.LanguageModelToolCallPart(event.callId, event.name, event.input)
           );
+        } else if (event.kind === "trace") {
+          lastTrace = event;
         } else if (event.kind === "stats") {
           if (typeof event.completionTokens === "number") {
             lastCompletionTokens = event.completionTokens;
@@ -786,6 +868,45 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
           contextLimit: slotCtx,
           source: lastPromptTokens !== undefined ? "server" : "estimate",
         });
+      }
+
+      const emptyToChat = emittedTextChars <= 0 && emittedToolCallCount <= 0;
+      if (lastTrace) {
+        this.perf.recordResponseTrace({
+          model: model.id,
+          toolsEnabled: lastTrace.toolsEnabled,
+          assembledText: lastTrace.assembledText,
+          assembledReasoning: lastTrace.assembledReasoning,
+          visibleText: lastTrace.visibleText,
+          structuredToolCalls: lastTrace.structuredToolCalls,
+          xmlToolCalls: lastTrace.xmlToolCalls,
+          emittedTextChars,
+          emittedToolCallCount,
+          emptyToChat,
+          note: emptyToChat
+            ? "No text/tool calls emitted to Chat."
+            : undefined,
+        });
+      } else if (emptyToChat) {
+        this.perf.recordResponseTrace({
+          model: model.id,
+          toolsEnabled: !!(tools && tools.length),
+          assembledText: "",
+          assembledReasoning: "",
+          visibleText: "",
+          structuredToolCalls: [],
+          xmlToolCalls: [],
+          emittedTextChars,
+          emittedToolCallCount,
+          emptyToChat: true,
+          note: "Stream ended without a response trace (cancelled or failed before completion).",
+        });
+      }
+
+      if (emptyToChat) {
+        throw new Error(
+          "Empty reply to Chat (no text or tool calls). Open Llama AIO → View last response."
+        );
       }
     } catch (e) {
       this.perf.abort();

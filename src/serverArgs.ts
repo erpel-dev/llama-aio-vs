@@ -38,6 +38,17 @@ export function buildServerArgs(
     args.push("--no-kv-offload");
   }
 
+  // KV cache quantization (default q8_0 — ~½ KV size vs f16, good for long agent ctx).
+  args.push("--cache-type-k", settings.cacheTypeK || "q8_0");
+  args.push("--cache-type-v", settings.cacheTypeV || "q8_0");
+
+  // Unified KV buffer across sequences (-kvu / -no-kvu).
+  args.push(settings.unifiedKvCache ? "--kv-unified" : "--no-kv-unified");
+
+  // Keep thoughts in message.content (with <think> tags) and reasoning_content so
+  // Copilot Chat providers that only read `content` still see the stream.
+  args.push("--reasoning-format", "deepseek-legacy");
+
   // Prefer current --load-mode over deprecated --mmap / --mlock / --no-mmap.
   // mlock is poorly supported on Windows — fall back to mmap when pinning is requested.
   if (settings.keepModelInMemory && process.platform !== "win32") {
@@ -95,9 +106,13 @@ export function serverConfigFingerprint(
     maxConcurrentPredictions: settings.maxConcurrentPredictions,
     nCpuMoe: settings.nCpuMoe,
     offloadKvCacheToGpu: !!settings.offloadKvCacheToGpu,
+    cacheTypeK: settings.cacheTypeK || "q8_0",
+    cacheTypeV: settings.cacheTypeV || "q8_0",
     keepModelInMemory: !!settings.keepModelInMemory,
     tryMmap: !!settings.tryMmap,
     unifiedKvCache: !!settings.unifiedKvCache,
+    /** Fixed Copilot-friendly reasoning extraction (see buildServerArgs). */
+    reasoningFormat: "deepseek-legacy",
     contextCheckpoints: settings.contextCheckpoints,
     ropeFreqBase: settings.ropeFreqBase,
     ropeFreqScale: settings.ropeFreqScale,
