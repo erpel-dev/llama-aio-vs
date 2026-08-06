@@ -1,19 +1,11 @@
 # Llama AIO (VS Code)
 
-Local **llama.cpp** for VS Code: install binaries, manage GGUF models, tune load settings with memory estimates, run one shared `llama-server`, and use it in **GitHub Copilot Chat**.
+Local **llama.cpp** for VS Code: install newest llama.cpp binaries, manage GGUF models, tune load settings with memory estimates, run one shared `llama-server`, and use it in **GitHub Copilot Chat**.
 
 <p align="center">
   <img src="media/screenshot-panel.png" alt="Llama AIO panel — server status, live performance, backend install, and model selection" width="38%">
   <img src="media/screenshot-load-settings.png" alt="Load settings — VRAM / RAM estimate, presets, context length, GPU offload, and CPU MoE layers" width="59%">
 </p>
-
-Everything lives in one sidebar panel: server control and live token/s on the left, memory estimates and load settings on the right.
-
-## Requirements
-
-- VS Code **1.109+** (language model chat providers)
-- Network access for llama.cpp releases and Hugging Face downloads
-- **Windows:** PowerShell (zip extract / external terminal). CUDA installs also fetch the matching `cudart` DLL package.
 
 ## Quick start
 
@@ -89,25 +81,25 @@ Only llama-servers are ever adopted or stopped — anything else holding the por
 
 ## Key load settings → llama.cpp flags
 
-| UI | Flag |
-|---|---|
-| Context Length | `--ctx-size` |
-| GPU Offload | `-ngl` |
-| CPU Threads | `-t` |
-| Eval / Physical batch | `-b` / `-ub` |
-| Max concurrent predictions | `-np` |
-| CPU MoE layers | `--n-cpu-moe` |
-| KV cache type K / V | `--cache-type-k` / `--cache-type-v` |
-| Flash attention | `--flash-attn` |
-| Unified KV cache | `--kv-unified` / `--no-kv-unified` |
-| Offload KV to GPU | default / `--no-kv-offload` |
-| Cache reuse (KV shift) | `--cache-reuse` |
-| Context checkpoints | `--ctx-checkpoints` |
-| Reasoning format / budget | `--reasoning-format` / `--reasoning-budget` |
-| Keep model in memory / Try mmap | `--load-mode mlock` / `mmap` / `none` |
-| RoPE base/scale | `--rope-freq-base` / `--rope-freq-scale` |
-| Seed | `--seed` |
-| Speculative MTP | `--spec-type draft-mtp` (+ draft n-max/min, p-min) |
+| UI                              | Flag                                                 |
+| ------------------------------- | ---------------------------------------------------- |
+| Context Length                  | `--ctx-size`                                       |
+| GPU Offload                     | `-ngl`                                             |
+| CPU Threads                     | `-t`                                               |
+| Eval / Physical batch           | `-b` / `-ub`                                     |
+| Max concurrent predictions      | `-np`                                              |
+| CPU MoE layers                  | `--n-cpu-moe`                                      |
+| KV cache type K / V             | `--cache-type-k` / `--cache-type-v`              |
+| Flash attention                 | `--flash-attn`                                     |
+| Unified KV cache                | `--kv-unified` / `--no-kv-unified`               |
+| Offload KV to GPU               | default /`--no-kv-offload`                         |
+| Cache reuse (KV shift)          | `--cache-reuse`                                    |
+| Context checkpoints             | `--ctx-checkpoints`                                |
+| Reasoning format / budget       | `--reasoning-format` / `--reasoning-budget`      |
+| Keep model in memory / Try mmap | `--load-mode mlock` / `mmap` / `none`          |
+| RoPE base/scale                 | `--rope-freq-base` / `--rope-freq-scale`         |
+| Seed                            | `--seed`                                           |
+| Speculative MTP                 | `--spec-type draft-mtp` (+ draft n-max/min, p-min) |
 
 ## Commands
 
