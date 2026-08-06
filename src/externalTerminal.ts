@@ -199,9 +199,12 @@ function spawnWindows(
     return child;
   }
 
+  // No `/D binDir`: the spawn cwd below already puts cmd (and therefore the
+  // started process) in the binary directory, and dropping the flag avoids
+  // `start` mis-parsing an install path that contains spaces.
   const child = spawn(
     "cmd.exe",
-    ["/c", "start", "Llama AIO - llama-server", "/D", binDir, "powershell.exe", ...psArgs],
+    ["/c", "start", "Llama AIO - llama-server", "powershell.exe", ...psArgs],
     {
       detached: true,
       stdio: "ignore",

@@ -35,6 +35,12 @@ export interface GenerationPerf {
   draftTokensAccepted?: number;
   /** 100 * draftTokensAccepted / draftTokens when draftTokens > 0. */
   draftAcceptancePct?: number;
+  /** Prompt tokens reused from the KV prefix cache (`timings.cache_n`). */
+  cachedPromptTokens?: number;
+  /** Prompt tokens evaluated this call (`timings.prompt_n`). */
+  processedPromptTokens?: number;
+  /** 100 * cached / (cached + processed) — prompt cache hit rate. */
+  cacheHitPct?: number;
   /** Current load-settings speculative mode (`off` | `mtp`). */
   speculativeMode?: "off" | "mtp";
   /** System-prompt find/replace savings for the last request. */
@@ -563,6 +569,22 @@ export class PerfStats {
       draftAcceptancePct = this.current.draftAcceptancePct;
     }
 
+    let cachedPromptTokens: number | undefined;
+    let processedPromptTokens: number | undefined;
+    let cacheHitPct: number | undefined;
+    if ("cachedPromptTokens" in partial || "processedPromptTokens" in partial) {
+      cachedPromptTokens = partial.cachedPromptTokens;
+      processedPromptTokens = partial.processedPromptTokens;
+      const total = (cachedPromptTokens ?? 0) + (processedPromptTokens ?? 0);
+      if (typeof cachedPromptTokens === "number" && total > 0) {
+        cacheHitPct = Math.round((cachedPromptTokens / total) * 1000) / 10;
+      }
+    } else {
+      cachedPromptTokens = this.current.cachedPromptTokens;
+      processedPromptTokens = this.current.processedPromptTokens;
+      cacheHitPct = this.current.cacheHitPct;
+    }
+
     const speculativeMode = partial.speculativeMode ?? this.current.speculativeMode;
     if (speculativeMode === "off") {
       draftTokens = undefined;
@@ -591,6 +613,9 @@ export class PerfStats {
       draftTokens,
       draftTokensAccepted,
       draftAcceptancePct,
+      cachedPromptTokens,
+      processedPromptTokens,
+      cacheHitPct,
       speculativeMode,
       contextBreakdown,
       generating: false,
@@ -735,7 +760,16 @@ export class PerfStats {
     }
     if (typeof p.promptTokens === "number" || typeof p.completionTokens === "number") {
       lines.push(
-        `Tokens: ${p.promptTokens ?? "—"} prompt · ${p.completionTokens ?? "—"} completion`
+        `Tokens: ${p.promptTokens?.toLocaleString() ?? "—"} prompt · ${
+          p.completionTokens?.toLocaleString() ?? "—"
+        } completion`
+      );
+    }
+    if (typeof p.cacheHitPct === "number") {
+      lines.push(
+        `Prompt reuse: ${p.cacheHitPct}% (${(p.cachedPromptTokens ?? 0).toLocaleString()} cached · ${(
+          p.processedPromptTokens ?? 0
+        ).toLocaleString()} evaluated)`
       );
     }
     const mtp = this.mtpDetailLine(p);

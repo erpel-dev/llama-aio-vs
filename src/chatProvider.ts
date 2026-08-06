@@ -18,6 +18,7 @@ import {
   resolveModelModes,
 } from "./modelModes";
 import { estimateContextBreakdown } from "./contextBreakdown";
+import { decodeSseLines, toolCallSlot } from "./sseStream";
 import { SettingsStore } from "./settings";
 
 interface OpenAiModel {
@@ -56,6 +57,10 @@ type StreamEvent =
       genTokPerSec?: number;
       draftTokens?: number;
       draftTokensAccepted?: number;
+      /** Prompt tokens reused from the KV prefix cache (`timings.cache_n`). */
+      cachedPromptTokens?: number;
+      /** Prompt tokens actually evaluated this call (`timings.prompt_n`). */
+      processedPromptTokens?: number;
     }
   | {
       kind: "trace";
@@ -68,6 +73,8 @@ type StreamEvent =
     };
 
 interface LlamaTimings {
+  /** Prompt tokens served from the KV prefix cache (-1 / absent on older builds). */
+  cache_n?: number;
   prompt_n?: number;
   prompt_ms?: number;
   prompt_per_second?: number;
@@ -84,6 +91,7 @@ interface LlamaUsage {
   prompt_tokens?: number;
   completion_tokens?: number;
   total_tokens?: number;
+  prompt_tokens_details?: { cached_tokens?: number };
 }
 
 function httpJson<T>(
@@ -356,7 +364,6 @@ async function* streamChatCompletions(
     req.end();
   });
 
-  let buffer = "";
   let assembledText = "";
   let assembledReasoning = "";
   const toolCalls: Array<{ id: string; name: string; arguments: string }> = [];
@@ -364,125 +371,126 @@ async function* streamChatCompletions(
   let lastUsage: LlamaUsage | undefined;
   let completionChars = 0;
 
-  for await (const chunk of stream) {
+  for await (const line of decodeSseLines(stream)) {
     if (token.isCancellationRequested) {
       stream.destroy();
       return;
     }
-    buffer += chunk.toString("utf8");
-    const parts = buffer.split("\n");
-    buffer = parts.pop() || "";
-    for (const line of parts) {
-      const trimmed = line.trim();
-      if (!trimmed.startsWith("data:")) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("data:")) {
+      continue;
+    }
+    const data = trimmed.slice(5).trim();
+    if (data === "[DONE]") {
+      continue;
+    }
+    try {
+      const json = JSON.parse(data) as {
+        choices?: Array<{
+          finish_reason?: string | null;
+          delta?: {
+            content?: string | null;
+            reasoning_content?: string | null;
+            tool_calls?: Array<{
+              index?: number;
+              id?: string;
+              function?: { name?: string; arguments?: string };
+            }>;
+          };
+          message?: {
+            content?: string | null;
+            reasoning_content?: string | null;
+            tool_calls?: Array<{
+              id?: string;
+              function?: { name?: string; arguments?: string };
+            }>;
+          };
+        }>;
+        timings?: LlamaTimings;
+        usage?: LlamaUsage;
+      };
+      if (json.timings) {
+        lastTimings = json.timings;
+      }
+      if (json.usage) {
+        lastUsage = json.usage;
+      }
+
+      const choice = json.choices?.[0];
+      if (!choice) {
         continue;
       }
-      const data = trimmed.slice(5).trim();
-      if (data === "[DONE]") {
-        continue;
-      }
-      try {
-        const json = JSON.parse(data) as {
-          choices?: Array<{
-            finish_reason?: string | null;
-            delta?: {
-              content?: string | null;
-              reasoning_content?: string | null;
-              tool_calls?: Array<{
-                index?: number;
-                id?: string;
-                function?: { name?: string; arguments?: string };
-              }>;
-            };
-            message?: {
-              content?: string | null;
-              reasoning_content?: string | null;
-              tool_calls?: Array<{
-                id?: string;
-                function?: { name?: string; arguments?: string };
-              }>;
-            };
-          }>;
-          timings?: LlamaTimings;
-          usage?: LlamaUsage;
-        };
-        if (json.timings) {
-          lastTimings = json.timings;
-        }
-        if (json.usage) {
-          lastUsage = json.usage;
-        }
 
-        const choice = json.choices?.[0];
-        if (!choice) {
-          continue;
-        }
-
-        const delta = choice.delta;
-        if (typeof delta?.reasoning_content === "string" && delta.reasoning_content.length) {
-          assembledReasoning += delta.reasoning_content;
-          completionChars += delta.reasoning_content.length;
-          if (!toolsEnabled) {
-            // Live-stream reasoning when the server only emits reasoning_content
-            // (deepseek format). deepseek-legacy also puts tags in content.
-            if (!delta.content) {
-              yield { kind: "text", text: delta.reasoning_content };
-              yield {
-                kind: "stats",
-                completionTokens: Math.max(1, Math.ceil(completionChars / 4)),
-              };
-            }
-          }
-        }
-        if (typeof delta?.content === "string" && delta.content.length) {
-          assembledText += delta.content;
-          completionChars += delta.content.length;
-          // Live-stream only when tools are not involved (no XML tool-call risk).
-          if (!toolsEnabled) {
-            yield { kind: "text", text: delta.content };
+      const delta = choice.delta;
+      if (typeof delta?.reasoning_content === "string" && delta.reasoning_content.length) {
+        assembledReasoning += delta.reasoning_content;
+        completionChars += delta.reasoning_content.length;
+        if (!toolsEnabled) {
+          // Live-stream reasoning when the server only emits reasoning_content
+          // (deepseek format). deepseek-legacy also puts tags in content.
+          if (!delta.content) {
+            yield { kind: "text", text: delta.reasoning_content };
             yield {
               kind: "stats",
               completionTokens: Math.max(1, Math.ceil(completionChars / 4)),
             };
           }
         }
-
-        if (Array.isArray(delta?.tool_calls)) {
-          for (const tc of delta.tool_calls) {
-            const idx = typeof tc.index === "number" ? tc.index : 0;
-            if (!toolCalls[idx]) {
-              toolCalls[idx] = { id: "", name: "", arguments: "" };
-            }
-            if (tc.id) {
-              toolCalls[idx].id = tc.id;
-            }
-            if (tc.function?.name) {
-              toolCalls[idx].name = tc.function.name;
-            }
-            if (tc.function?.arguments) {
-              toolCalls[idx].arguments += tc.function.arguments;
-            }
-          }
-        }
-
-        if (choice.message?.reasoning_content && !assembledReasoning) {
-          assembledReasoning = choice.message.reasoning_content;
-        }
-        if (choice.message?.content && !assembledText) {
-          assembledText = choice.message.content;
-        }
-        if (Array.isArray(choice.message?.tool_calls)) {
-          for (const [idx, tc] of choice.message.tool_calls.entries()) {
-            toolCalls[idx] = {
-              id: tc.id || `call_${idx}`,
-              name: tc.function?.name || "",
-              arguments: tc.function?.arguments || "",
-            };
-          }
-        }
-      } catch {
-        // ignore partial JSON
       }
+      if (typeof delta?.content === "string" && delta.content.length) {
+        assembledText += delta.content;
+        completionChars += delta.content.length;
+        // Live-stream only when tools are not involved (no XML tool-call risk).
+        if (!toolsEnabled) {
+          yield { kind: "text", text: delta.content };
+          yield {
+            kind: "stats",
+            completionTokens: Math.max(1, Math.ceil(completionChars / 4)),
+          };
+        }
+      }
+
+      if (Array.isArray(delta?.tool_calls)) {
+        for (const tc of delta.tool_calls) {
+          const idx = toolCallSlot(toolCalls, tc);
+          if (!toolCalls[idx]) {
+            toolCalls[idx] = { id: "", name: "", arguments: "" };
+          }
+          if (tc.id) {
+            toolCalls[idx].id = tc.id;
+          }
+          if (tc.function?.name) {
+            toolCalls[idx].name = tc.function.name;
+          }
+          if (tc.function?.arguments) {
+            toolCalls[idx].arguments += tc.function.arguments;
+          }
+        }
+      }
+
+      if (choice.message?.reasoning_content && !assembledReasoning) {
+        assembledReasoning = choice.message.reasoning_content;
+      }
+      if (choice.message?.content && !assembledText) {
+        assembledText = choice.message.content;
+      }
+      if (Array.isArray(choice.message?.tool_calls)) {
+        for (const [idx, tc] of choice.message.tool_calls.entries()) {
+          toolCalls[idx] = {
+            id: tc.id || `call_${idx}`,
+            name: tc.function?.name || "",
+            arguments: tc.function?.arguments || "",
+          };
+        }
+      }
+    } catch (err) {
+      // A truncated line can no longer happen here (decodeSseLines only yields
+      // complete lines), so this is a real protocol problem worth surfacing.
+      console.warn(
+        "Llama AIO: could not parse SSE event:",
+        data.slice(0, 300),
+        err instanceof Error ? err.message : err
+      );
     }
   }
 
@@ -495,6 +503,13 @@ async function* streamChatCompletions(
       genTokPerSec: lastTimings?.predicted_per_second,
       draftTokens: lastTimings?.draft_n,
       draftTokensAccepted: lastTimings?.draft_n_accepted,
+      cachedPromptTokens:
+        lastUsage?.prompt_tokens_details?.cached_tokens ??
+        // cache_n is -1 on builds that don't report prefix reuse.
+        (typeof lastTimings?.cache_n === "number" && lastTimings.cache_n >= 0
+          ? lastTimings.cache_n
+          : undefined),
+      processedPromptTokens: lastTimings?.prompt_n,
     };
   } else if (assembledText || assembledReasoning) {
     yield {
@@ -849,6 +864,8 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
               genTokPerSec: event.genTokPerSec,
               draftTokens: event.draftTokens,
               draftTokensAccepted: event.draftTokensAccepted,
+              cachedPromptTokens: event.cachedPromptTokens,
+              processedPromptTokens: event.processedPromptTokens,
               contextLimit: slotCtx,
               source: "server",
             });

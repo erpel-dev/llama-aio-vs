@@ -14,6 +14,7 @@ import {
 import { resolveLaunchMode, spawnInExternalTerminal } from "./externalTerminal";
 import { clampLoadSettingsToModel, readModelCapabilities } from "./ggufMetadata";
 import { LlamaInstaller } from "./llamaInstaller";
+import { isLlamaServerProcess, sameModelFile, uniquePids } from "./processIdentity";
 import { buildServerArgs, serverConfigFingerprint, SettingsStore } from "./settings";
 import { ServerStatus } from "./types";
 
@@ -173,7 +174,9 @@ export class ProcessManager {
     // Recover after external-terminal launchers exit (common on Windows `start` /
     // Windows Terminal) while llama-server still owns the port.
     if (lock) {
-      const portPids = this.findPidsOnPort(lock.port);
+      // Only adopt a port occupant that is actually a llama-server; otherwise
+      // an unrelated listener would be reported as our running server.
+      const portPids = this.findPidsOnPort(lock.port).filter(isLlamaServerProcess);
       if (portPids.length) {
         const pid = portPids[0];
         this.writeLock({ ...lock, pid });
@@ -295,10 +298,8 @@ export class ProcessManager {
     if (await this.isHttpReady()) {
       const desiredSlot = this.store.getSlotContextSize(state.loadSettings);
       const live = await this.fetchLiveSlotContext();
-      const modelMatches =
-        !live?.modelPath ||
-        path.basename(live.modelPath) === path.basename(model) ||
-        live.modelPath === model;
+      // Two different quants can share a basename, so require the same file.
+      const modelMatches = !live?.modelPath || sameModelFile(live.modelPath, model);
       if (live && live.nCtx >= desiredSlot * 0.9 && live.slots <= state.loadSettings.maxConcurrentPredictions && modelMatches) {
         const existing = this.getStatus();
         return {
@@ -341,6 +342,17 @@ export class ProcessManager {
 
     const host = this.store.getHost();
     const port = this.store.getPort();
+
+    // Fail fast instead of waiting out the readiness timeout when something
+    // that is not ours already holds the port.
+    const blockers = (this.queryPidsOnPort(port) ?? []).filter((pid) => !isLlamaServerProcess(pid));
+    if (blockers.length) {
+      throw new Error(
+        `Port ${port} is already in use by another process (pid ${blockers.join(", ")}). ` +
+          `Close it, or change "llamaAio.port" in settings.`
+      );
+    }
+
     let loadSettings = state.loadSettings;
     try {
       const caps = state.modelCapabilities || readModelCapabilities(model);
@@ -574,9 +586,22 @@ export class ProcessManager {
     if (lock?.pid) {
       pids.add(lock.pid);
     }
-    // Also kill whatever currently owns our port (stale processes / missed locks).
-    for (const pid of this.findPidsOnPort(port)) {
-      pids.add(pid);
+    // Also clean up stale llama-servers holding our port (missed locks, crashed
+    // launchers). Anything else on the port belongs to another application and
+    // is left running — the caller is told instead.
+    const occupants = this.queryPidsOnPort(port) ?? [];
+    const foreign: number[] = [];
+    for (const pid of occupants) {
+      if (pid === lock?.pid || isLlamaServerProcess(pid)) {
+        pids.add(pid);
+      } else {
+        foreign.push(pid);
+      }
+    }
+    if (foreign.length) {
+      console.warn(
+        `Llama AIO: leaving non-llama process(es) ${foreign.join(", ")} on port ${port} alone.`
+      );
     }
     for (const pid of pids) {
       if (!isPidAlive(pid)) {
@@ -620,7 +645,12 @@ export class ProcessManager {
     this.clearLock();
   }
 
-  private findPidsOnPort(port: number): number[] {
+  /**
+   * PIDs listening on `port`, or undefined when we could not find out (no
+   * tooling, permission denied). Callers must treat undefined as "unknown"
+   * rather than "nothing there" — the difference decides whether we kill.
+   */
+  private queryPidsOnPort(port: number): number[] | undefined {
     try {
       if (process.platform === "win32") {
         const out = execFileSync("netstat", ["-ano", "-p", "tcp"], {
@@ -651,18 +681,37 @@ export class ProcessManager {
         return [...pids];
       }
 
+      if (process.platform === "darwin") {
+        // macOS has no `ss`; lsof prints one PID per line with -t.
+        const out = execFileSync(
+          "lsof",
+          ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-t"],
+          { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 8000 }
+        );
+        return uniquePids(out.split(/\s+/));
+      }
+
       const out = execFileSync("ss", ["-ltnp", `sport = :${port}`], {
         encoding: "utf8",
         stdio: ["ignore", "pipe", "ignore"],
+        timeout: 8000,
       });
-      const pids = new Set<number>();
-      for (const match of out.matchAll(/pid=(\d+)/g)) {
-        pids.add(Number(match[1]));
+      return uniquePids([...out.matchAll(/pid=(\d+)/g)].map((m) => m[1]));
+    } catch (err) {
+      // `lsof -t` exits 1 with no output when nothing is listening — that is a
+      // real "port is free", not a tooling failure.
+      const e = err as { status?: number; stdout?: string };
+      if (process.platform === "darwin" && e?.status === 1 && !e?.stdout) {
+        return [];
       }
-      return [...pids];
-    } catch {
-      return [];
+      console.warn(`Llama AIO: could not determine what is listening on port ${port}:`, err);
+      return undefined;
     }
+  }
+
+  /** Best-effort variant for callers that only need a list to iterate. */
+  private findPidsOnPort(port: number): number[] {
+    return this.queryPidsOnPort(port) ?? [];
   }
 
   private async fetchLiveSlotContext(): Promise<

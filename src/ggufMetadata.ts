@@ -1,4 +1,5 @@
 import * as fs from "fs";
+import * as path from "path";
 import { LlamaLoadSettings } from "./types";
 
 export interface ModelCapabilities {
@@ -35,8 +36,12 @@ export interface ModelCapabilities {
   fullAttentionInterval?: number;
   /** Per-layer: true = recurrent / linear-attention (no context-scaled KV) */
   recurrentLayers?: boolean[];
-  /** GGUF file size on disk (bytes) — proxy for weight memory */
+  /** Total size on disk (bytes), summed over all shards — proxy for weight memory */
   fileSizeBytes?: number;
+  /** Number of shards the split GGUF declares (1 for a single file) */
+  shardCount?: number;
+  /** Shards actually present next to the selected file */
+  shardsFound?: number;
   /**
    * Fraction of tensor bytes that are MoE routed-expert weights (`*_exps`).
    * Used with `--n-cpu-moe` to move expert weight off the GPU estimate.
@@ -57,6 +62,23 @@ export interface ModelCapabilities {
 }
 
 const GGUF_MAGIC = 0x46554747; // "GGUF" little-endian
+
+/**
+ * Sanity ceilings for counts read out of the file header. Without these a
+ * corrupt or truncated download can claim billions of entries and freeze the
+ * extension host in a synchronous read loop.
+ */
+const MAX_KV_ENTRIES = 100_000;
+const MAX_TENSORS = 1_000_000;
+const MAX_ARRAY_ITEMS = 4_000_000;
+const MAX_TENSOR_DIMS = 8;
+
+function checkedCount(value: bigint, limit: number, what: string): number {
+  if (value < 0n || value > BigInt(limit)) {
+    throw new Error(`Invalid GGUF ${what} count: ${value} (limit ${limit}) — file may be corrupt`);
+  }
+  return Number(value);
+}
 
 type GgufValue = number | boolean | string | GgufValue[];
 
@@ -132,7 +154,7 @@ function readValue(fd: number, pos: number, type: number): { value: GgufValue; n
       const n = readU64(fd, at.next);
       let p = n.next;
       const arr: GgufValue[] = [];
-      const count = Number(n.value);
+      const count = checkedCount(n.value, MAX_ARRAY_ITEMS, "array length");
       for (let i = 0; i < count; i++) {
         const v = readValue(fd, p, at.value);
         arr.push(v.value);
@@ -206,7 +228,7 @@ function readGgufHeader(fd: number): GgufHeaderScan {
   pos = kvCount.next;
 
   const meta: Record<string, GgufValue> = {};
-  const nKv = Number(kvCount.value);
+  const nKv = checkedCount(kvCount.value, MAX_KV_ENTRIES, "metadata");
   for (let i = 0; i < nKv; i++) {
     const key = readString(fd, pos);
     pos = key.next;
@@ -217,13 +239,16 @@ function readGgufHeader(fd: number): GgufHeaderScan {
     meta[key.value] = val.value;
   }
 
-  const nTensor = Number(tensorCount.value);
+  const nTensor = checkedCount(tensorCount.value, MAX_TENSORS, "tensor");
   const tensors: Array<{ name: string; offset: number }> = [];
   for (let i = 0; i < nTensor; i++) {
     const name = readString(fd, pos);
     pos = name.next;
     const nDims = readU32(fd, pos);
     pos = nDims.next;
+    if (nDims.value > MAX_TENSOR_DIMS) {
+      throw new Error(`Invalid GGUF tensor dimensions: ${nDims.value} — file may be corrupt`);
+    }
     for (let d = 0; d < nDims.value; d++) {
       const dim = readU64(fd, pos);
       pos = dim.next;
@@ -407,12 +432,7 @@ export function readModelCapabilities(filePath: string): ModelCapabilities {
   const nextnPredictLayers = pickArchNumber("nextn_predict_layers");
   const fileType = meta["general.file_type"];
 
-  let fileSizeBytes: number | undefined;
-  try {
-    fileSizeBytes = fs.statSync(filePath).size;
-  } catch {
-    // ignore
-  }
+  const { bytes: fileSizeBytes, shardCount, shardsFound } = totalModelBytes(filePath);
 
   const isMoe = (expertCount || 0) > 0;
   let moeExpertShare: number | undefined;
@@ -441,6 +461,8 @@ export function readModelCapabilities(filePath: string): ModelCapabilities {
     fullAttentionInterval,
     recurrentLayers,
     fileSizeBytes,
+    shardCount,
+    shardsFound,
     moeExpertShare,
     expertCount,
     expertUsedCount,
@@ -451,14 +473,67 @@ export function readModelCapabilities(filePath: string): ModelCapabilities {
   };
 }
 
+/** `Qwen3-30B-Q4_K_M-00001-of-00003.gguf` → every shard name in the set. */
+export function shardFileNames(fileName: string): string[] | undefined {
+  const m = /^(.*)-(\d{5})-of-(\d{5})\.gguf$/i.exec(fileName);
+  if (!m) {
+    return undefined;
+  }
+  const [, stem, , totalRaw] = m;
+  const total = Number(totalRaw);
+  if (!Number.isFinite(total) || total < 1 || total > 999) {
+    return undefined;
+  }
+  return Array.from(
+    { length: total },
+    (_, i) => `${stem}-${String(i + 1).padStart(5, "0")}-of-${totalRaw}.gguf`
+  );
+}
+
+/**
+ * Total on-disk size of a model, summing every shard of a split GGUF.
+ * Sizing only the selected shard made a 3-part model look a third of its real
+ * weight, which fed straight into the VRAM estimate and the offload advice.
+ */
+export function totalModelBytes(filePath: string): {
+  bytes: number | undefined;
+  shardCount: number;
+  shardsFound: number;
+} {
+  const names = shardFileNames(path.basename(filePath));
+  if (!names) {
+    try {
+      return { bytes: fs.statSync(filePath).size, shardCount: 1, shardsFound: 1 };
+    } catch {
+      return { bytes: undefined, shardCount: 1, shardsFound: 0 };
+    }
+  }
+  const dir = path.dirname(filePath);
+  let bytes = 0;
+  let shardsFound = 0;
+  for (const name of names) {
+    try {
+      bytes += fs.statSync(path.join(dir, name)).size;
+      shardsFound++;
+    } catch {
+      // Missing shard — reported via shardsFound so callers can warn.
+    }
+  }
+  return { bytes: bytes || undefined, shardCount: names.length, shardsFound };
+}
+
+function finite(value: number | undefined, fallback: number): number {
+  return Number.isFinite(value) ? (value as number) : fallback;
+}
+
 /** Clamp load settings to what the GGUF model actually supports. */
 export function clampLoadSettingsToModel(
   settings: LlamaLoadSettings,
   caps: ModelCapabilities
 ): LlamaLoadSettings {
   const contextLength = Math.min(
-    Math.max(512, settings.contextLength),
-    caps.maxContextLength
+    Math.max(512, finite(settings.contextLength, 512)),
+    Math.max(512, finite(caps.maxContextLength, 512))
   );
   // -ngl 99/999 means "all"; keep that, otherwise clamp to block count.
   const gpuOffload =

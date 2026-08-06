@@ -91,6 +91,7 @@ export function activate(context: vscode.ExtensionContext): void {
     });
   }
   void store.refreshCapabilitiesIfStale().catch(() => undefined);
+  void store.migrateCacheReuseIfNeeded().catch(() => undefined);
 
   void store.migrateChatContextIfNeeded().then(async (changed) => {
     if (!changed) {
@@ -657,11 +658,19 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   if (store.getConfig().get<boolean>("autoStart", false) && store.getState().selectedModelPath) {
-    void processManager.start().then(async (status) => {
-      chatProvider?.notifyChanged();
-      void refreshStatusBar();
-      await promptUseInCopilotChat(store, status.message);
-    });
+    void processManager
+      .start()
+      .then(async (status) => {
+        chatProvider?.notifyChanged();
+        void refreshStatusBar();
+        await promptUseInCopilotChat(store, status.message);
+      })
+      .catch((err) => {
+        void refreshStatusBar();
+        void vscode.window.showErrorMessage(
+          `Llama AIO could not auto-start llama-server: ${err instanceof Error ? err.message : String(err)}`
+        );
+      });
   }
 }
 

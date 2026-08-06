@@ -2,7 +2,7 @@
   "name": "llama-aio-vs",
   "displayName": "Llama AIO",
   "description": "All-in-one local llama.cpp for VS Code: install, HF models, LM Studio-style settings, shared server, Copilot Chat provider.",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "publisher": "erpel-dev",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -196,6 +196,7 @@
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "lint": "tsc --noEmit -p ./",
+    "test": "tsc -p tsconfig.test.json && node --require ./src/test/vscodeShim.js --test \"out-test/test/*.test.js\"",
     "package": "vsce package --no-dependencies"
   },
   "devDependencies": {

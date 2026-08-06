@@ -2,6 +2,13 @@ import * as fs from "fs";
 import * as https from "https";
 import * as path from "path";
 import * as vscode from "vscode";
+import {
+  formatLicenseQuickPick,
+  licenseFromModelDetail,
+  licenseFromTags,
+  resolveLicenseUrl,
+  type ModelLicenseInfo,
+} from "./hfLicense";
 import { listLocalModelEntries } from "./modelLibrary";
 import { ensureDirs, getModelsDir } from "./paths";
 import { SettingsStore } from "./settings";
@@ -115,6 +122,59 @@ export class HuggingFaceClient {
     return results;
   }
 
+  /**
+   * Model-card license from `/api/models/{id}` (cardData + tags).
+   * Falls back to tag-only classification when the detail call fails.
+   */
+  async getModelLicense(modelId: string, tags?: string[]): Promise<ModelLicenseInfo> {
+    try {
+      const url = `https://huggingface.co/api/models/${modelId}`;
+      const detail = await requestJson<{
+        id?: string;
+        tags?: string[];
+        cardData?: { license?: string; license_name?: string; license_link?: string };
+      }>(url, this.token());
+      return licenseFromModelDetail(detail);
+    } catch {
+      return licenseFromTags(tags);
+    }
+  }
+
+  /**
+   * Enrich search hits with licenses. Tag-only for clear SPDX ids;
+   * detail fetch when tag is missing/`other` (e.g. LFM → lfm1.0).
+   */
+  async enrichLicenses(models: HfModelHit[]): Promise<Map<string, ModelLicenseInfo>> {
+    const out = new Map<string, ModelLicenseInfo>();
+    const needDetail: HfModelHit[] = [];
+    for (const m of models) {
+      const fromTag = licenseFromTags(m.tags);
+      const tagId = (m.tags || [])
+        .map((t) => /^license:(.+)$/i.exec(t)?.[1]?.toLowerCase())
+        .find(Boolean);
+      if (!tagId || tagId === "other" || fromTag.bucket === "unknown") {
+        needDetail.push(m);
+      } else {
+        out.set(m.id, fromTag);
+      }
+    }
+    // Parallel but capped to avoid hammering HF on shared IPs.
+    const concurrency = 6;
+    for (let i = 0; i < needDetail.length; i += concurrency) {
+      const slice = needDetail.slice(i, i + concurrency);
+      const settled = await Promise.all(
+        slice.map(async (m) => {
+          const info = await this.getModelLicense(m.id, m.tags);
+          return [m.id, info] as const;
+        })
+      );
+      for (const [id, info] of settled) {
+        out.set(id, info);
+      }
+    }
+    return out;
+  }
+
   async listGgufFiles(modelId: string): Promise<HfFileHit[]> {
     const url = `https://huggingface.co/api/models/${modelId}/tree/main`;
     const tree = await requestJson<Array<{ path: string; type: string; size?: number }>>(
@@ -223,16 +283,38 @@ export async function browseAndDownloadModel(
     return undefined;
   }
 
+  const licenses = await vscode.window.withProgress(
+    {
+      location: vscode.ProgressLocation.Notification,
+      title: "Llama AIO: Resolving model licenses…",
+      cancellable: false,
+    },
+    async () => hf.enrichLicenses(models)
+  );
+
   const pickedModel = await vscode.window.showQuickPick(
-    models.map((m) => ({
-      label: m.id,
-      description: `${m.downloads?.toLocaleString?.() || m.downloads} downloads`,
-      detail: (m.tags || []).slice(0, 8).join(", "),
-      model: m,
-    })),
-    { title: "Select a Hugging Face model repo", matchOnDescription: true, matchOnDetail: true }
+    models.map((m) => {
+      const license = licenses.get(m.id) || licenseFromTags(m.tags);
+      const row = formatLicenseQuickPick(m.id, m.downloads, license);
+      return {
+        label: row.label,
+        description: row.description,
+        detail: (m.tags || []).filter((t) => !/^license:/i.test(t)).slice(0, 6).join(", "),
+        model: m,
+        license,
+      };
+    }),
+    {
+      title: "Select a Hugging Face model repo  ·  ✓ permissive · ⚠ limited · § custom",
+      matchOnDescription: true,
+      matchOnDetail: true,
+    }
   );
   if (!pickedModel) {
+    return undefined;
+  }
+
+  if (!(await confirmLicenseIfNeeded(pickedModel.model.id, pickedModel.license))) {
     return undefined;
   }
 
@@ -273,11 +355,42 @@ export async function browseAndDownloadModel(
 
   const state = await store.applySelectedModel(dest);
   const caps = state.modelCapabilities;
+  const lic = pickedModel.license.badge;
   vscode.window.showInformationMessage(
     `Model ready: ${caps?.name || dest}` +
       (caps
         ? ` (${caps.maxContextLength} max ctx, ${caps.blockCount} layers${caps.isMoe ? ", MoE" : ""})`
-        : "")
+        : "") +
+      ` · ${lic}`
   );
   return dest;
+}
+
+/** Warn before download when the license is limited, custom, or unknown. */
+async function confirmLicenseIfNeeded(
+  modelId: string,
+  license: ModelLicenseInfo
+): Promise<boolean> {
+  if (!license.needsConfirm) {
+    return true;
+  }
+  const licenseUrl = resolveLicenseUrl(modelId, license);
+  const choice = await vscode.window.showWarningMessage(
+    `${modelId}\n\n${license.summary}\n\nThis is not legal advice — review the license before commercial use.`,
+    { modal: true },
+    "Download anyway",
+    "View license"
+  );
+  if (choice === "View license") {
+    if (licenseUrl) {
+      await vscode.env.openExternal(vscode.Uri.parse(licenseUrl));
+    }
+    const again = await vscode.window.showWarningMessage(
+      `Continue downloading ${modelId}?`,
+      { modal: true },
+      "Download anyway"
+    );
+    return again === "Download anyway";
+  }
+  return choice === "Download anyway";
 }

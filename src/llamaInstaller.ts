@@ -12,7 +12,7 @@ const execFileAsync = promisify(execFile);
 
 const UI_BACKENDS: UiBackend[] = ["vulkan", "cuda", "cpu"];
 
-interface GithubAsset {
+export interface GithubAsset {
   name: string;
   browser_download_url: string;
   size: number;
@@ -103,7 +103,18 @@ function downloadFile(url: string, dest: string, onProgress?: (pct: number) => v
 }
 
 /** True when a URL responds with 2xx (follows redirects). Uses a Range GET to avoid full download. */
-function urlExists(url: string): Promise<boolean> {
+/**
+ * Probe result for a release asset. `status` distinguishes "GitHub says this
+ * asset does not exist" from "we could not reach GitHub" — collapsing both into
+ * false made a missing upload and a dead network produce the same error.
+ */
+interface UrlProbe {
+  exists: boolean;
+  status?: number;
+  error?: string;
+}
+
+function probeUrl(url: string): Promise<UrlProbe> {
   return new Promise((resolve) => {
     const doGet = (u: string) => {
       const req = https.get(
@@ -115,19 +126,23 @@ function urlExists(url: string): Promise<boolean> {
             doGet(res.headers.location);
             return;
           }
-          const ok = !!res.statusCode && res.statusCode >= 200 && res.statusCode < 400;
+          const status = res.statusCode || 0;
           res.resume();
-          resolve(ok);
+          resolve({ exists: status >= 200 && status < 400, status });
         }
       );
-      req.on("error", () => resolve(false));
+      req.on("error", (err) => resolve({ exists: false, error: err.message }));
       req.setTimeout(8000, () => {
         req.destroy();
-        resolve(false);
+        resolve({ exists: false, error: "timed out after 8s" });
       });
     };
     doGet(url);
   });
+}
+
+async function urlExists(url: string): Promise<boolean> {
+  return (await probeUrl(url)).exists;
 }
 
 export const LLAMA_CPP_RELEASES_URL = "https://github.com/ggml-org/llama.cpp/releases";
@@ -532,6 +547,98 @@ function scoreAsset(name: string, platform: NodeJS.Platform, arch: string, backe
     }
   }
   return -1;
+}
+
+/**
+ * Explain an install failure in terms of what the release actually contains.
+ * `listed` is undefined when the API could not be reached at all.
+ */
+export function describeMissingAsset(
+  tag: string,
+  backend: UiBackend,
+  probes: Array<{ name: string; probe: { status?: number; error?: string } }>,
+  listed: GithubAsset[] | undefined
+): string {
+  const reachedGithub = probes.some((p) => typeof p.probe.status === "number");
+  const lines: string[] = [];
+
+  if (!reachedGithub && listed === undefined) {
+    lines.push(
+      `Could not reach GitHub while looking for ${tag} (${backend}, ${process.platform}/${process.arch}).`,
+      `Check your network or proxy, then try again.`
+    );
+    const firstError = probes.find((p) => p.probe.error)?.probe.error;
+    if (firstError) {
+      lines.push(`Last error: ${firstError}`);
+    }
+    return lines.join("\n");
+  }
+
+  lines.push(
+    `No ${backend} archive for ${process.platform}/${process.arch} in llama.cpp release ${tag}.`
+  );
+
+  if (listed && listed.length === 0) {
+    lines.push(
+      "",
+      "GitHub reports this release has no downloadable assets at all — the build is",
+      "probably still uploading, or was published incomplete. Pick an earlier tag."
+    );
+  } else if (listed) {
+    const names = listed.map((a) => a.name);
+    lines.push("", `The release does contain ${names.length} asset(s):`);
+    lines.push(...names.slice(0, 12).map((n) => `• ${n}`));
+    if (names.length > 12) {
+      lines.push(`…and ${names.length - 12} more.`);
+    }
+    lines.push("", "None of them match this platform and backend.");
+  } else {
+    lines.push("", "Tried these names:", ...probes.map((p) => `• ${p.name} → ${describeProbe(p.probe)}`));
+  }
+
+  lines.push(
+    "",
+    `Open ${LLAMA_CPP_RELEASES_URL}/tag/${tag} and use “Install from archive…”, or pick another tag/backend.`
+  );
+  return lines.join("\n");
+}
+
+function describeProbe(probe: { status?: number; error?: string }): string {
+  if (probe.error) {
+    return probe.error;
+  }
+  if (probe.status === 404) {
+    return "404 (not uploaded)";
+  }
+  if (probe.status === 403) {
+    return "403 (rate limited or blocked)";
+  }
+  return `HTTP ${probe.status ?? "?"}`;
+}
+
+/**
+ * Move a fully staged `bin.new-*` tree into place.
+ * The old tree is kept until the new one is in position, and restored if the
+ * final rename fails (Windows can refuse while a DLL is still mapped).
+ */
+function swapInstallDir(stageDir: string, binDir: string): void {
+  const backupDir = `${binDir}.old-${Date.now()}`;
+  const hadPrevious = fs.existsSync(binDir);
+  if (hadPrevious) {
+    fs.renameSync(binDir, backupDir);
+  }
+  try {
+    fs.renameSync(stageDir, binDir);
+  } catch (err) {
+    if (hadPrevious) {
+      fs.renameSync(backupDir, binDir);
+    }
+    fs.rmSync(stageDir, { recursive: true, force: true });
+    throw err;
+  }
+  if (hadPrevious) {
+    fs.rmSync(backupDir, { recursive: true, force: true });
+  }
 }
 
 export function pickAsset(
@@ -961,6 +1068,23 @@ export class LlamaInstaller {
    * Install a specific release tag via direct `releases/download` URLs (no GitHub API).
    * Tag examples: `b10154`, or a releases page/tag URL.
    */
+  /**
+   * Assets GitHub reports for a release, or undefined when the API is
+   * unreachable/rate-limited. Only used as a fallback after name probing fails,
+   * so routine installs still cost zero API calls.
+   */
+  private async listReleaseAssets(tag: string): Promise<GithubAsset[] | undefined> {
+    try {
+      const release = await httpGetJson<GithubRelease>(
+        `https://api.github.com/repos/ggml-org/llama.cpp/releases/tags/${encodeURIComponent(tag)}`,
+        { Accept: "application/vnd.github+json" }
+      );
+      return Array.isArray(release?.assets) ? release.assets : [];
+    } catch {
+      return undefined;
+    }
+  }
+
   async installByTag(
     tagInput: string,
     progress?: vscode.Progress<{ message?: string; increment?: number }>,
@@ -979,22 +1103,31 @@ export class LlamaInstaller {
 
     let assetName: string | undefined;
     let assetUrl: string | undefined;
+    const probes: Array<{ name: string; probe: UrlProbe }> = [];
     for (const name of candidates) {
       const url = directAssetUrl(tag, name);
       progress?.report({ message: `Checking ${name}…` });
-      if (await urlExists(url)) {
+      const probe = await probeUrl(url);
+      probes.push({ name, probe });
+      if (probe.exists) {
         assetName = name;
         assetUrl = url;
         break;
       }
     }
+
+    // Name guessing failed. Ask the API what the release really contains — this
+    // is the difference between "no CPU archive found" and "this release only
+    // published 3 assets, none of them for linux/x64".
     if (!assetName || !assetUrl) {
-      throw new Error(
-        `No ${uiBackend} archive found for ${tag} on this platform (${process.platform}/${process.arch}).\n` +
-          `Tried:\n${candidates.map((n) => `• ${n}`).join("\n")}\n\n` +
-          `Open ${LLAMA_CPP_RELEASES_URL}/tag/${tag} and use “Install from archive…”, ` +
-          `or pick another tag/backend.`
-      );
+      progress?.report({ message: `Asking GitHub what ${tag} actually published…` });
+      const listed = await this.listReleaseAssets(tag);
+      const picked = listed && pickAsset(listed, uiBackend);
+      if (!picked) {
+        throw new Error(describeMissingAsset(tag, uiBackend, probes, listed));
+      }
+      assetName = picked.name;
+      assetUrl = picked.browser_download_url;
     }
 
     const tmpDir = path.join(os.tmpdir(), "llama-aio-vs");
@@ -1093,33 +1226,46 @@ export class LlamaInstaller {
       );
     }
 
+    // Stage the new tree next to the live one and swap at the end, so a failed
+    // copy can never leave the user without a working llama-server.
     const binDir = path.join(installDir, "bin");
-    fs.rmSync(binDir, { recursive: true, force: true });
-    ensureDirs(binDir);
-    const destBin = path.join(binDir, path.basename(found));
+    const stageDir = path.join(installDir, `bin.new-${process.pid}-${Date.now()}`);
+    fs.rmSync(stageDir, { recursive: true, force: true });
+    ensureDirs(stageDir);
+    const destBin = path.join(stageDir, path.basename(found));
     fs.copyFileSync(found, destBin);
     if (process.platform !== "win32") {
       fs.chmodSync(destBin, 0o755);
     }
 
     const srcDir = path.dirname(found);
+    const copyFailures: string[] = [];
     for (const name of fs.readdirSync(srcDir)) {
       const src = path.join(srcDir, name);
-      const dst = path.join(binDir, name);
+      const dst = path.join(stageDir, name);
       if (fs.statSync(src).isFile() && src !== found) {
         try {
           fs.copyFileSync(src, dst);
-          if (process.platform !== "win32" && !name.includes(".")) {
+          // Ship every llama-* tool executable, not just llama-server.
+          if (process.platform !== "win32" && (!name.includes(".") || /^llama-/i.test(name))) {
             fs.chmodSync(dst, 0o755);
           }
-        } catch {
-          // ignore
+        } catch (err) {
+          copyFailures.push(`${name}: ${err instanceof Error ? err.message : String(err)}`);
         }
       }
     }
     if (process.platform === "win32") {
-      copyFilesIntoBin(extractTo, binDir, [".dll"]);
+      copyFilesIntoBin(extractTo, stageDir, [".dll"]);
     }
+    if (copyFailures.length) {
+      fs.rmSync(stageDir, { recursive: true, force: true });
+      throw new Error(
+        `Install aborted — could not copy ${copyFailures.length} file(s) from ${assetName}; ` +
+          `the previous install is untouched.\n${copyFailures.slice(0, 5).join("\n")}`
+      );
+    }
+    swapInstallDir(stageDir, binDir);
 
     if (options.cudartArchivePath && fs.existsSync(options.cudartArchivePath)) {
       progress?.report({ message: "Extracting CUDA runtime…" });

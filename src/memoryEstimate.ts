@@ -55,6 +55,8 @@ export interface MemoryEstimate {
   warnings: string[];
   /** Short human lines for the sidebar. */
   lines: string[];
+  /** One-line headline shown above the collapsed details. */
+  summary: string;
 }
 
 const GiB = 1024 ** 3;
@@ -74,6 +76,22 @@ export function formatBytes(bytes: number): string {
     return `${(bytes / MiB).toFixed(0)} MiB`;
   }
   return `${Math.round(bytes / 1024)} KiB`;
+}
+
+/**
+ * Compute / graph scratch. The activation buffers scale with the *physical*
+ * batch (-ub) and hidden size; -b only adds a smaller scheduling buffer.
+ */
+export function computeOverheadBytes(
+  embeddingLength: number,
+  physicalBatchSize: number,
+  evalBatchSize: number
+): number {
+  const safe = (v: number, fallback: number) => (Number.isFinite(v) && v > 0 ? v : fallback);
+  const embed = Math.max(2048, safe(embeddingLength, 4096));
+  const ubatch = Math.min(Math.max(32, safe(physicalBatchSize, 512)), 8192);
+  const batch = Math.min(Math.max(32, safe(evalBatchSize, 2048)), 8192);
+  return Math.round(400 * MiB + ubatch * embed * 24 + batch * 8 * 1024);
 }
 
 function layersOnGpu(settings: LlamaLoadSettings, blockCount: number): number {
@@ -246,9 +264,10 @@ export function estimateMemory(
   const kvBytesWarm = estimateKvBytes(caps, warmCtx, settings.cacheTypeK, settings.cacheTypeV);
   const fullAttnLayers = countFullAttentionLayers(caps);
   const kvOnGpu = !cpuOnly && settings.offloadKvCacheToGpu && onGpu > 0;
-  // Compute / graph / batch scratch — grows a bit with batch size.
-  const overheadBytes = Math.round(
-    400 * MiB + Math.min(settings.evalBatchSize, 4096) * 64 * 1024
+  const overheadBytes = computeOverheadBytes(
+    caps.embeddingLength || 0,
+    settings.physicalBatchSize,
+    settings.evalBatchSize
   );
   const gpuOverheadBytes = onGpu > 0 ? overheadBytes : 0;
   const cpuOverheadBytes = onGpu > 0 ? Math.round(overheadBytes * 0.15) : Math.round(overheadBytes * 0.5);
@@ -265,6 +284,19 @@ export function estimateMemory(
 
   const warnings: string[] = [];
   let willSpill = false;
+
+  const shardCount = caps.shardCount ?? 1;
+  if (shardCount > 1) {
+    const found = caps.shardsFound ?? shardCount;
+    if (found < shardCount) {
+      warnings.unshift(
+        `Split model: only ${found} of ${shardCount} shards were found next to this file. ` +
+          `The estimate below covers just those — llama-server needs every shard to load.`
+      );
+    } else {
+      warnings.push(`Split model: ${shardCount} shards totalling ${formatBytes(fileSize)}.`);
+    }
+  }
 
   if (cpuOnly) {
     warnings.push(
@@ -379,6 +411,17 @@ export function estimateMemory(
   }
   lines.push("Bars show estimate at full context. Actual use varies by quant, MoE, and backend.");
 
+  const summary = cpuOnly
+    ? `System RAM ~${formatBytes(totalCpuBytes)}` +
+      (systemRamTotalBytes ? ` of ${formatBytes(systemRamTotalBytes)}` : "") +
+      ` · KV ~${formatBytes(kvBytes)} at full context`
+    : `VRAM ~${formatBytes(totalGpuBytes)}` +
+      (gpu?.totalBytes
+        ? ` of ${formatBytes(gpu.totalBytes)} (${Math.round((totalGpuBytes / gpu.totalBytes) * 100)}%)`
+        : "") +
+      ` · KV ~${formatBytes(kvBytes)}${kvOnGpu ? " on GPU" : " in RAM"}` +
+      ` · ${onGpu}/${nLayers} layers offloaded`;
+
   const charts = {
     vram: {
       title: "VRAM · est. at full context",
@@ -427,6 +470,7 @@ export function estimateMemory(
     willSpill,
     warnings,
     lines,
+    summary,
   };
 }
 

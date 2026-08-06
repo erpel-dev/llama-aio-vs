@@ -45,6 +45,39 @@ function fitsHeadroom(
   return free !== undefined && free >= headroom;
 }
 
+/** Physical batch to aim for when prefill is fully GPU-bound. */
+const FAST_PREFILL_UBATCH = 1024;
+/** Extra VRAM (beyond the normal headroom) required before raising -ub. */
+const UBATCH_EXTRA_HEADROOM = 1 * GiB;
+
+/**
+ * Agent prompts are prefill-heavy, so a larger physical batch (-ub) is the main
+ * lever on time-to-first-token — but only when the whole model is on the GPU and
+ * there is room to spare. Partial offload is CPU-bound anyway.
+ */
+function tuneBatchSizes(
+  settings: LlamaLoadSettings,
+  caps: ModelCapabilities,
+  gpu: GpuMemoryInfo | undefined,
+  headroom: number
+): LlamaLoadSettings {
+  const fullyOffloaded =
+    settings.gpuOffload >= 99 || settings.gpuOffload >= Math.max(1, caps.blockCount || 1);
+  if (
+    !gpu?.totalBytes ||
+    !fullyOffloaded ||
+    settings.nCpuMoe > 0 ||
+    settings.evalBatchSize < FAST_PREFILL_UBATCH ||
+    settings.physicalBatchSize >= FAST_PREFILL_UBATCH
+  ) {
+    return settings;
+  }
+  const candidate = { ...settings, physicalBatchSize: FAST_PREFILL_UBATCH };
+  return fitsHeadroom(caps, candidate, gpu, false, headroom + UBATCH_EXTRA_HEADROOM)
+    ? candidate
+    : settings;
+}
+
 /**
  * Speculative mode from GGUF: enable MTP when the file reports next-n layers.
  * Non-MTP models get speculative turned off so a previous MTP selection does not stick.
@@ -118,6 +151,17 @@ export function recommendLoadSettings(
     };
   }
 
+  const fitted = fitOffload(base, caps, gpu, nLayers, headroom);
+  return tuneBatchSizes(fitted, caps, gpu, headroom);
+}
+
+function fitOffload(
+  base: LlamaLoadSettings,
+  caps: ModelCapabilities,
+  gpu: GpuMemoryInfo,
+  nLayers: number,
+  headroom: number
+): LlamaLoadSettings {
   if (caps.isMoe) {
     // Max GPU offload; raise CPU MoE only as needed for headroom.
     const withAllGpu: LlamaLoadSettings = { ...base, gpuOffload: 99, nCpuMoe: 0 };

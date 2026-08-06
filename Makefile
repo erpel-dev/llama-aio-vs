@@ -1,4 +1,4 @@
-.PHONY: all compile package clean install deps
+.PHONY: all compile test package clean install deps
 
 all: package
 
@@ -8,11 +8,14 @@ deps:
 compile: deps
 	npm run compile
 
-package: compile
+test: deps
+	npm test
+
+package: compile test
 	npx --yes @vscode/vsce package --no-dependencies
 
 install: package
 	code --install-extension $$(ls -1t *.vsix | head -n1) --force
 
 clean:
-	rm -rf out *.vsix
+	rm -rf out out-test *.vsix

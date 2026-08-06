@@ -1,0 +1,131 @@
+import assert from "node:assert/strict";
+import { describe, it } from "node:test";
+import {
+  DEFAULT_LOAD_SETTINGS,
+  DEFAULT_REQUEST_SETTINGS,
+  normalizeLoadSettings,
+  normalizeRequestSettings,
+} from "../types";
+
+describe("normalizeLoadSettings", () => {
+  it("returns the defaults for empty or missing input", () => {
+    assert.deepEqual(normalizeLoadSettings(undefined), DEFAULT_LOAD_SETTINGS);
+    assert.deepEqual(normalizeLoadSettings({}), DEFAULT_LOAD_SETTINGS);
+  });
+
+  it("keeps every numeric field finite whatever it is fed", () => {
+    const junk = {
+      contextLength: NaN,
+      gpuOffload: undefined,
+      cpuThreads: null,
+      evalBatchSize: "abc",
+      physicalBatchSize: Infinity,
+      maxConcurrentPredictions: -5,
+      nCpuMoe: NaN,
+      contextCheckpoints: -1,
+      cacheReuse: NaN,
+      reasoningBudget: NaN,
+      maxDraftTokens: "x",
+      draftProbability: NaN,
+    } as never;
+    const s = normalizeLoadSettings(junk);
+    for (const [key, value] of Object.entries(s)) {
+      if (typeof value === "number") {
+        assert.ok(Number.isFinite(value), `${key} is ${value}`);
+      }
+    }
+  });
+
+  it("clamps an out-of-range number to the nearest legal value", () => {
+    assert.equal(normalizeLoadSettings({ physicalBatchSize: 0 }).physicalBatchSize, 32);
+    assert.equal(normalizeLoadSettings({ contextLength: 0 }).contextLength, 512);
+  });
+
+  it("treats a missing value as absent rather than as zero", () => {
+    // Number(null) is 0, which would silently become the minimum (-t 1) instead
+    // of the configured default.
+    const s = normalizeLoadSettings({
+      cpuThreads: null as unknown as number,
+      evalBatchSize: undefined,
+      contextLength: "" as unknown as number,
+    });
+    assert.equal(s.cpuThreads, DEFAULT_LOAD_SETTINGS.cpuThreads);
+    assert.equal(s.evalBatchSize, DEFAULT_LOAD_SETTINGS.evalBatchSize);
+    assert.equal(s.contextLength, DEFAULT_LOAD_SETTINGS.contextLength);
+  });
+
+  it("never lets the physical batch exceed the logical batch", () => {
+    const s = normalizeLoadSettings({ evalBatchSize: 512, physicalBatchSize: 4096 });
+    assert.equal(s.physicalBatchSize, 512);
+  });
+
+  it("collapses non-finite nullable fields to auto", () => {
+    const s = normalizeLoadSettings({
+      ropeFreqBase: NaN,
+      ropeFreqScale: undefined,
+      seed: NaN as unknown as number,
+    });
+    assert.equal(s.ropeFreqBase, null);
+    assert.equal(s.ropeFreqScale, null);
+    assert.equal(s.seed, -1);
+  });
+
+  it("preserves explicit auto/random selections", () => {
+    const s = normalizeLoadSettings({ ropeFreqBase: null, ropeFreqScale: null, seed: null });
+    assert.equal(s.ropeFreqBase, null);
+    assert.equal(s.ropeFreqScale, null);
+    assert.equal(s.seed, null);
+  });
+
+  it("falls back on unknown enum values", () => {
+    const s = normalizeLoadSettings({
+      cacheTypeK: "q3_k" as never,
+      flashAttention: "yes" as never,
+      reasoningFormat: "chatml" as never,
+      speculativeMode: "eagle" as never,
+    });
+    assert.equal(s.cacheTypeK, "q8_0");
+    assert.equal(s.flashAttention, "auto");
+    assert.equal(s.reasoningFormat, "deepseek-legacy");
+    assert.equal(s.speculativeMode, "off");
+  });
+
+  it("keeps valid values untouched", () => {
+    const wanted = {
+      contextLength: 32768,
+      physicalBatchSize: 1024,
+      cacheTypeK: "f16" as const,
+      cacheTypeV: "q4_0" as const,
+      flashAttention: "on" as const,
+      reasoningBudget: 2048,
+      seed: 42,
+      ropeFreqBase: 1000000,
+    };
+    const s = normalizeLoadSettings(wanted);
+    for (const [k, v] of Object.entries(wanted)) {
+      assert.equal(s[k as keyof typeof s], v, k);
+    }
+  });
+
+  it("treats reasoningBudget -1 as a valid unlimited marker", () => {
+    assert.equal(normalizeLoadSettings({ reasoningBudget: -1 }).reasoningBudget, -1);
+    assert.equal(normalizeLoadSettings({ reasoningBudget: -99 }).reasoningBudget, -1);
+  });
+});
+
+describe("normalizeRequestSettings", () => {
+  it("returns defaults for junk", () => {
+    assert.deepEqual(
+      normalizeRequestSettings({ temperature: NaN, topP: undefined, topK: "x" } as never),
+      DEFAULT_REQUEST_SETTINGS
+    );
+  });
+
+  it("clamps to valid sampling ranges", () => {
+    const s = normalizeRequestSettings({ temperature: 9, topP: 5, topK: -3, maxTokens: 1 });
+    assert.equal(s.temperature, 2);
+    assert.equal(s.topP, 1);
+    assert.equal(s.topK, 0);
+    assert.equal(s.maxTokens, 16);
+  });
+});

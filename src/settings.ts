@@ -5,10 +5,10 @@ import { LlamaInstaller } from "./llamaInstaller";
 import { recommendLoadSettings } from "./recommendSettings";
 import {
   DEFAULT_LOAD_SETTINGS,
-  DEFAULT_REQUEST_SETTINGS,
   ExtensionState,
   LlamaLoadSettings,
-  normalizeKvCacheType,
+  normalizeLoadSettings,
+  normalizeRequestSettings,
   RequestSettings,
 } from "./types";
 
@@ -19,12 +19,7 @@ export class SettingsStore {
 
   getState(): ExtensionState {
     const raw = this.context.globalState.get<Partial<ExtensionState>>(STATE_KEY) || {};
-    let loadSettings = { ...DEFAULT_LOAD_SETTINGS, ...(raw.loadSettings || {}) };
-    loadSettings = {
-      ...loadSettings,
-      cacheTypeK: normalizeKvCacheType(loadSettings.cacheTypeK),
-      cacheTypeV: normalizeKvCacheType(loadSettings.cacheTypeV),
-    };
+    let loadSettings = normalizeLoadSettings(raw.loadSettings);
     const caps = raw.modelCapabilities;
     if (caps?.maxContextLength) {
       loadSettings = clampLoadSettingsToModel(loadSettings, caps);
@@ -32,7 +27,7 @@ export class SettingsStore {
     return {
       selectedModelPath: raw.selectedModelPath || "",
       loadSettings,
-      requestSettings: { ...DEFAULT_REQUEST_SETTINGS, ...(raw.requestSettings || {}) },
+      requestSettings: normalizeRequestSettings(raw.requestSettings),
       modelMaxContext: caps?.maxContextLength ?? raw.modelMaxContext,
       modelCapabilities: caps,
     };
@@ -98,6 +93,30 @@ export class SettingsStore {
     return changed;
   }
 
+  /**
+   * One-time migration: "Context Checkpoints" used to be passed as --cache-reuse.
+   * Move a customized value to the new cacheReuse setting so behaviour is kept,
+   * and hand contextCheckpoints back to --ctx-checkpoints at its default.
+   */
+  async migrateCacheReuseIfNeeded(): Promise<boolean> {
+    const key = "llamaAio.migratedCacheReuseV1";
+    if (this.context.globalState.get<boolean>(key)) {
+      return false;
+    }
+    const raw = this.context.globalState.get<Partial<ExtensionState>>(STATE_KEY) || {};
+    const previous = raw.loadSettings?.contextCheckpoints;
+    let changed = false;
+    if (typeof previous === "number" && previous !== DEFAULT_LOAD_SETTINGS.contextCheckpoints) {
+      await this.updateLoadSettings({
+        cacheReuse: Math.max(0, previous),
+        contextCheckpoints: DEFAULT_LOAD_SETTINGS.contextCheckpoints,
+      });
+      changed = true;
+    }
+    await this.context.globalState.update(key, true);
+    return changed;
+  }
+
   async setState(patch: Partial<ExtensionState>): Promise<ExtensionState> {
     const next: ExtensionState = {
       ...this.getState(),
@@ -117,12 +136,7 @@ export class SettingsStore {
 
   async updateLoadSettings(patch: Partial<LlamaLoadSettings>): Promise<ExtensionState> {
     const state = this.getState();
-    let loadSettings = { ...state.loadSettings, ...patch };
-    loadSettings = {
-      ...loadSettings,
-      cacheTypeK: normalizeKvCacheType(loadSettings.cacheTypeK),
-      cacheTypeV: normalizeKvCacheType(loadSettings.cacheTypeV),
-    };
+    let loadSettings = normalizeLoadSettings({ ...state.loadSettings, ...patch });
     if (state.modelCapabilities) {
       loadSettings = clampLoadSettingsToModel(loadSettings, state.modelCapabilities);
     }
@@ -131,7 +145,7 @@ export class SettingsStore {
 
   async updateRequestSettings(patch: Partial<RequestSettings>): Promise<ExtensionState> {
     return this.setState({
-      requestSettings: { ...this.getState().requestSettings, ...patch },
+      requestSettings: normalizeRequestSettings({ ...this.getState().requestSettings, ...patch }),
     });
   }
 

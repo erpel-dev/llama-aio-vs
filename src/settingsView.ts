@@ -6,6 +6,7 @@ import { promptUseInCopilotChat } from "./copilotChatPrompt";
 import { detectGpuMemory } from "./gpuInfo";
 import { LlamaInstaller, UiBackend } from "./llamaInstaller";
 import { estimateMemory, memoryEstimateInputs } from "./memoryEstimate";
+import { resolveModelModes } from "./modelModes";
 import { listActiveModelSourceDirs, listLocalModelEntries } from "./modelLibrary";
 import { getModelsDir } from "./paths";
 import { PerfStats } from "./perfStats";
@@ -26,6 +27,29 @@ export type ModelActions = {
   installLlamaCppFromArchive: () => Promise<void>;
   switchBackend: (backend: UiBackend) => Promise<void>;
 };
+
+/**
+ * Curated model modes overwrite temperature/top_p/top_k on every request, so the
+ * Request defaults below them are inert for those models. Describe the active
+ * mode set so the panel can say so instead of showing numbers that never ship.
+ */
+function describeModeSampling(
+  caps: Parameters<typeof resolveModelModes>[0],
+  modelPath: string
+): { familyLabel: string; defaultMode: string; temperature: number; topP: number; topK: number } | null {
+  const modeSet = resolveModelModes(caps, modelPath);
+  if (!modeSet) {
+    return null;
+  }
+  const params = modeSet.modes[modeSet.defaultMode] || {};
+  return {
+    familyLabel: modeSet.familyLabel,
+    defaultMode: modeSet.defaultMode,
+    temperature: params.temperature ?? 0,
+    topP: params.top_p ?? 0,
+    topK: params.top_k ?? 0,
+  };
+}
 
 export class SettingsViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = "llamaAio.settingsView";
@@ -74,6 +98,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                   running: !!(status.running || httpReady),
                   starting: !!status.starting,
                   startMessage: status.startMessage || status.message,
+                  perf: this.perf.get(),
                   perfLines: this.perf.detailLines(),
                 },
               });
@@ -99,7 +124,11 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               keepModelInMemory: d.keepModelInMemory,
               tryMmap: d.tryMmap,
               unifiedKvCache: d.unifiedKvCache,
+              flashAttention: d.flashAttention,
               contextCheckpoints: d.contextCheckpoints,
+              cacheReuse: d.cacheReuse,
+              reasoningFormat: d.reasoningFormat,
+              reasoningBudget: d.reasoningBudget,
               ropeFreqBase: d.ropeFreqBase,
               ropeFreqScale: d.ropeFreqScale,
               seed: d.seed,
@@ -388,6 +417,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         launchMode: resolveLaunchMode(this.store.getConfig().get<string>("launchMode")),
         updateCheck,
         memory,
+        modeSampling: describeModeSampling(caps, state.selectedModelPath),
         memInputs: memoryEstimateInputs(caps),
         systemRamTotalBytes: os.totalmem(),
         cpuCount: Math.max(1, os.cpus().length || 1),
@@ -576,6 +606,17 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       0%, 100% { opacity: 1; }
       50% { opacity: 0.45; }
     }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 2px 9px 2px 7px;
+      border-radius: 999px;
+      border: 1px solid color-mix(in srgb, currentColor 45%, transparent);
+      background: color-mix(in srgb, currentColor 12%, transparent);
+      font-size: 11px;
+      line-height: 1.6;
+    }
     .meta-row {
       color: var(--muted);
       font-size: 11px;
@@ -689,6 +730,86 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     .ctx-legend .seg-history { background: #22c55e; }
     .ctx-legend .seg-toolResults { background: #a855f7; }
     .ctx-legend .seg-request { background: #f59e0b; }
+    .stat-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 6px;
+      margin-top: 10px;
+    }
+    .stat {
+      border: 1px solid var(--border);
+      border-radius: 5px;
+      padding: 6px 8px;
+      background: color-mix(in srgb, var(--fg) 4%, transparent);
+      min-width: 0;
+    }
+    .stat .k {
+      font-size: 9.5px;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+    .stat .v {
+      font-size: 13px;
+      font-weight: 650;
+      margin-top: 1px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .stat .s {
+      font-size: 10px;
+      color: var(--muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .stat.empty .v { color: var(--muted); font-weight: 500; }
+    .stat.good .v { color: var(--ok); }
+    .stat.warn .v { color: var(--warn); }
+    .presets {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin: 0 0 4px;
+    }
+    .chip {
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      background: transparent;
+      color: var(--fg);
+      font-size: 11px;
+      font-weight: 500;
+      padding: 3px 10px;
+      text-align: center;
+      cursor: pointer;
+    }
+    .chip:hover { background: color-mix(in srgb, var(--fg) 8%, transparent); }
+    .chip.active {
+      border-color: color-mix(in srgb, var(--accent) 70%, var(--border));
+      background: color-mix(in srgb, var(--accent) 22%, transparent);
+    }
+    .subgroup-title {
+      font-size: 10px;
+      font-weight: 650;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin: 16px 0 8px;
+      padding-bottom: 4px;
+      border-bottom: 1px solid var(--border);
+    }
+    .auto-field { display: flex; align-items: center; gap: 10px; }
+    .auto-field .auto {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      font-size: 11px;
+      font-weight: 400;
+      color: var(--muted);
+    }
+    .auto-field input[type="number"] { width: 78px; }
+    input:disabled, select:disabled { opacity: 0.5; }
     .mem-charts { margin-top: 10px; display: flex; flex-direction: column; gap: 10px; }
     .mem-chart-title {
       display: flex;
@@ -711,7 +832,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     .mem-stack .seg-weights { background: #3b82f6; }
     .mem-stack .seg-kv { background: #a855f7; }
     .mem-stack .seg-overhead { background: #64748b; }
+    .mem-stack.warn { outline: 1px solid #d29922; }
     .mem-stack.over { outline: 1px solid #f85149; }
+    .mem-chart-title .sub.warn { color: #d29922; }
+    .mem-chart-title .sub.over { color: #f85149; }
     .mem-legend {
       display: flex;
       flex-wrap: wrap;
@@ -918,8 +1042,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       <div class="srv-title">Server</div>
     </div>
     <div class="status-line stopped" id="statusLine">
-      <span class="dot stopped" id="statusDot"></span>
-      <span id="statusText">Loading…</span>
+      <span class="pill">
+        <span class="dot stopped" id="statusDot"></span>
+        <span id="statusText">Loading…</span>
+      </span>
     </div>
     <div class="meta-row" id="statusMeta">—</div>
     <div class="dirty-hint hidden" id="dirtyHint">
@@ -953,7 +1079,8 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       <span><i class="seg-toolResults"></i>Tool results</span>
       <span><i class="seg-request"></i>Request</span>
     </div>
-    <div class="meta" id="perfLines">No generation yet</div>
+    <div class="stat-grid" id="perfStats"></div>
+    <div class="meta" id="perfFoot" style="margin-top:6px">No generation yet</div>
     <div class="toggle" style="margin-top:10px">
       <span>Prompt replacements</span>
       <input type="checkbox" id="promptReplacementsEnabled" title="Strip Copilot system-prompt boilerplate before llama.cpp" />
@@ -1040,9 +1167,23 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         <span><i class="seg-overhead"></i>Overhead</span>
       </div>
     </div>
-    <div class="meta" id="memLines" style="margin-top:8px">Select a model to estimate VRAM / RAM use.</div>
+    <div class="meta" id="memSummary" style="margin-top:8px">Select a model to estimate VRAM / RAM use.</div>
+    <details class="advanced" id="memDetails" style="margin:8px 0 0">
+      <summary>Details<span class="sub">capacity, weights, KV</span></summary>
+      <div class="meta" id="memLines" style="padding-bottom:8px"></div>
+    </details>
     <div class="mem-note hidden" id="memNotes"></div>
     <div class="mem-warn hidden" id="memWarn"></div>
+  </div>
+
+  <div class="row" style="margin-bottom:10px">
+    <div class="label"><span class="name">Presets</span></div>
+    <div class="presets" id="presetChips">
+      <button class="chip" id="presetAgent" data-preset="agent" title="Coding agent: q8_0 K + q8_0 V, one slot, 64K context — near-lossless quality with room for tools + history">Coding agent</button>
+      <button class="chip" id="presetContext" data-preset="context" title="Max context: q8_0 K + q4_0 V, largest context that still fits your VRAM. K stays at q8_0 because the key cache is far more sensitive to quantization than the value cache.">Max context</button>
+      <button class="chip" id="presetQuality" data-preset="quality" title="Max quality: f16 K + q8_0 V at 64K context — spends VRAM on key precision instead of shrinking the context (truncated prompts cost more quality than q8_0 V does).">Max quality</button>
+    </div>
+    <div class="hint" id="presetHint">Sets context length, KV cache types, and slots together. Reload to apply.</div>
   </div>
 
   <div class="row">
@@ -1064,6 +1205,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
   <details class="advanced">
     <summary>Advanced Settings<span class="sub">threads, batch, KV, RoPE, speculative…</span></summary>
 
+  <div class="subgroup-title">Compute</div>
   <div class="row">
     <div class="label"><span class="name tip" data-flag="-t, --threads" data-help="Number of CPU threads to use during generation (default: -1).">CPU Thread Pool Size</span><input type="number" id="cpuThreads" min="1" max="64" /></div>
     <input type="range" id="cpuThreadsRange" min="1" max="64" step="1" />
@@ -1079,7 +1221,18 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     <div class="label"><span class="name tip" data-flag="-np, --parallel" data-help="Number of server slots (default: -1 = auto). Context is split across slots.">Max Concurrent Predictions</span><span class="badge">Splits context</span><input type="number" id="maxConcurrentPredictions" min="1" max="64" /></div>
     <div class="hint">Use <strong>1</strong> for Copilot Chat. Values &gt; 1 split Context Length across slots (e.g. 8192/4 = 2048 per request).</div>
   </div>
+  <div class="row">
+    <div class="label"><span class="name tip" data-flag="-fa, --flash-attn" data-help="Flash Attention: 'on', 'off' or 'auto' (default: auto — enabled when the backend supports it).">Flash Attention</span>
+      <select id="flashAttention">
+        <option value="auto">Auto (default)</option>
+        <option value="on">On</option>
+        <option value="off">Off</option>
+      </select>
+    </div>
+    <div class="hint">Only sent when not Auto. Forcing <strong>On</strong> can help quantized KV cache; older llama.cpp builds may reject the flag.</div>
+  </div>
 
+  <div class="subgroup-title">Memory &amp; KV cache</div>
   <div class="toggle"><span class="tip" data-flag="-nkvo, --no-kv-offload" data-help="Whether to enable KV cache offloading to GPU (default: enabled). Uncheck to keep KV in system RAM.">Offload KV Cache to GPU Memory</span><input type="checkbox" id="offloadKvCacheToGpu" /></div>
   <div class="row">
     <div class="label"><span class="name tip" data-flag="-ctk, --cache-type-k" data-help="KV cache data type for K. Allowed: f32, f16, bf16, q8_0, q4_0, … (default: q8_0). q8_0 halves KV size with little quality loss.">KV Cache Type (K)</span>
@@ -1091,6 +1244,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       </select>
     </div>
   </div>
+  <div class="toggle"><span class="tip" data-flag="-ctk / -ctv" data-help="Keep V on the same type as K. Mixed K/V types fall off the fast attention path and can cost ~40% of prompt and generation throughput.">Use same type for V</span><input type="checkbox" id="kvTypesLinked" checked /></div>
   <div class="row">
     <div class="label"><span class="name tip" data-flag="-ctv, --cache-type-v" data-help="KV cache data type for V. Same types as K (default: q8_0). q4_0 saves more VRAM but can hurt long-context prompt speed.">KV Cache Type (V)</span>
       <select id="cacheTypeV">
@@ -1100,6 +1254,8 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         <option value="q4_0">q4_0 (~¼ size)</option>
       </select>
     </div>
+    <div class="hint hidden" id="kvMismatchHint">V is stored more precisely than K. The key cache is the quantization-sensitive one, so this spends memory where it helps least — prefer K at the higher precision (e.g. q8_0 K with q4_0 V).</div>
+    <div class="hint hidden" id="kvFlashAttnHint">A quantized V cache requires Flash Attention. With Flash Attention set to <strong>Off</strong>, llama-server will refuse to start — set V to f16 or put Flash Attention back to Auto/On.</div>
   </div>
   <div class="toggle"><span id="keepModelLabel" class="tip" data-flag="--load-mode mlock" data-help="Force the system to keep the model in RAM rather than swapping (load-mode mlock). On Windows this falls back to mmap.">Keep Model in Memory (--mlock)</span><input type="checkbox" id="keepModelInMemory" /></div>
   <div class="hint" id="keepModelHint" style="display:none">On Windows this uses mmap (--load-mode mmap); mlock is not reliable.</div>
@@ -1107,28 +1263,63 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
   <div class="toggle"><span class="tip" data-flag="-kvu, --kv-unified" data-help="Use a single unified KV buffer shared across all sequences (default: enabled if slot count is auto). Uncheck passes --no-kv-unified.">Unified KV Cache</span><input type="checkbox" id="unifiedKvCache" /></div>
 
   <div class="row">
-    <div class="label"><span class="name tip" data-flag="--cache-reuse" data-help="Min chunk size to attempt reusing from the cache via KV shifting (requires prompt caching; default: 0).">Context Checkpoints</span><input type="number" id="contextCheckpoints" min="0" /></div>
+    <div class="label"><span class="name tip" data-flag="-ctxcp, --ctx-checkpoints" data-help="Max number of context checkpoints to create per slot (default: 32). Checkpoints let a slot restore an earlier context state instead of reprocessing it.">Context Checkpoints</span><input type="number" id="contextCheckpoints" min="0" /></div>
+    <div class="hint">Only sent when different from 32 (the llama.cpp default), so older builds keep working.</div>
   </div>
   <div class="row">
-    <div class="label"><span class="name tip" data-flag="--rope-freq-base" data-help="RoPE base frequency, used by NTK-aware scaling (default: loaded from model).">RoPE Frequency Base</span>
-      <label><input type="checkbox" id="ropeBaseAuto" /> Auto</label>
+    <div class="label"><span class="name tip" data-flag="--cache-reuse" data-help="Min chunk size to attempt reusing from the cache via KV shifting (requires prompt caching; llama.cpp default: 0 = off).">Cache Reuse (KV shift)</span><input type="number" id="cacheReuse" min="0" step="32" /></div>
+    <div class="hint">Reuses cached chunks after the prompt prefix diverges — raises prompt reuse in long agent threads. 0 disables it.</div>
+  </div>
+
+  <div class="subgroup-title">Reasoning</div>
+  <div class="row">
+    <div class="label"><span class="name tip" data-flag="--reasoning-format" data-help="How thoughts are returned: deepseek-legacy keeps <think> tags in content and also fills reasoning_content; deepseek puts thoughts only in reasoning_content; none leaves the raw output untouched.">Reasoning Format</span>
+      <select id="reasoningFormat">
+        <option value="deepseek-legacy">deepseek-legacy (default)</option>
+        <option value="deepseek">deepseek</option>
+        <option value="none">none (raw)</option>
+        <option value="auto">auto</option>
+      </select>
     </div>
-    <input type="number" id="ropeFreqBase" step="1" />
+    <div class="hint">Copilot Chat only renders <code>content</code> — <strong>deepseek-legacy</strong> keeps thoughts visible there.</div>
+  </div>
+  <div class="row">
+    <div class="label"><span class="name tip" data-flag="--reasoning-budget" data-help="Token budget for thinking: -1 unrestricted, 0 ends thinking immediately, N > 0 caps thinking at N tokens.">Reasoning Budget</span>
+      <span class="auto-field">
+        <label class="auto"><input type="checkbox" id="reasoningBudgetUnlimited" /> Unlimited</label>
+        <input type="number" id="reasoningBudget" min="0" step="128" />
+      </span>
+    </div>
+    <div class="hint">Caps how many tokens a think model may spend before answering. Set <strong>0</strong> to skip thinking entirely.</div>
+  </div>
+
+  <div class="subgroup-title">Positional &amp; seed</div>
+  <div class="row">
+    <div class="label"><span class="name tip" data-flag="--rope-freq-base" data-help="RoPE base frequency, used by NTK-aware scaling (default: loaded from model).">RoPE Frequency Base</span>
+      <span class="auto-field">
+        <label class="auto"><input type="checkbox" id="ropeBaseAuto" /> Auto</label>
+        <input type="number" id="ropeFreqBase" step="1" />
+      </span>
+    </div>
   </div>
   <div class="row">
     <div class="label"><span class="name tip" data-flag="--rope-freq-scale" data-help="RoPE frequency scaling factor; expands context by a factor of 1/N.">RoPE Frequency Scale</span>
-      <label><input type="checkbox" id="ropeScaleAuto" /> Auto</label>
+      <span class="auto-field">
+        <label class="auto"><input type="checkbox" id="ropeScaleAuto" /> Auto</label>
+        <input type="number" id="ropeFreqScale" step="0.01" />
+      </span>
     </div>
-    <input type="number" id="ropeFreqScale" step="0.01" />
   </div>
   <div class="row">
     <div class="label"><span class="name tip" data-flag="-s, --seed" data-help="RNG seed (default: -1 = random).">Seed</span>
-      <label><input type="checkbox" id="seedRandom" /> Random</label>
+      <span class="auto-field">
+        <label class="auto"><input type="checkbox" id="seedRandom" /> Random</label>
+        <input type="number" id="seed" step="1" />
+      </span>
     </div>
-    <input type="number" id="seed" step="1" />
   </div>
 
-  <h2>Speculative decoding</h2>
+  <div class="subgroup-title">Speculative decoding</div>
   <div class="row" id="specModeRow">
     <div class="label"><span class="name tip" data-flag="--spec-type" data-help="Speculative decoding type (e.g. none, draft-mtp). MTP needs a GGUF with next-n / MTP layers.">Mode</span>
       <select id="speculativeMode">
@@ -1156,6 +1347,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
 
   <details class="advanced">
     <summary>Request defaults<span class="sub">temperature, top-p/k, max tokens</span></summary>
+  <div class="hint hidden" id="modeOverrideHint" style="margin-bottom:10px"></div>
   <div class="row">
     <div class="label"><span class="name tip" data-flag="Chat / API request body" data-help="Sampling temperature for completions (extension request default, not a llama-server load flag).">Temperature</span><input type="number" id="temperature" min="0" max="2" step="0.05" /></div>
   </div>
@@ -1303,14 +1495,16 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         primary.classList.remove('primary');
         primary.classList.add('warn-primary');
       } else {
-        primary.disabled = true;
-        primary.textContent = 'Running';
-        primary.dataset.action = '';
+        // Status lives in the pill above; keep this slot as a usable action.
+        primary.disabled = false;
+        primary.textContent = 'Reload';
+        primary.dataset.action = 'reload';
       }
     }
 
     function scheduleSaveLoad() {
       if (saveLoadTimer) clearTimeout(saveLoadTimer);
+      highlightPreset();
       // Optimistic dirty UI while running — confirmed via silent save + statusPatch.
       if (serverRunning) {
         configDirty = true;
@@ -1501,12 +1695,85 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       }
     }
 
+    function fmtNum(n) {
+      return typeof n === 'number' && isFinite(n) ? Number(n).toLocaleString() : '—';
+    }
+
+    function fmtRate(n) {
+      if (typeof n !== 'number' || !isFinite(n) || n <= 0) return undefined;
+      return n >= 100 ? n.toFixed(0) : n.toFixed(1);
+    }
+
+    function statTile(key, value, sub, kind) {
+      return '<div class="stat' + (kind ? ' ' + kind : '') + '">' +
+        '<div class="k">' + key + '</div>' +
+        '<div class="v">' + value + '</div>' +
+        (sub ? '<div class="s">' + sub + '</div>' : '<div class="s">&nbsp;</div>') +
+        '</div>';
+    }
+
+    function renderPerfStats(perf, perfLines) {
+      const grid = $('perfStats');
+      const foot = $('perfFoot');
+      if (!grid) return;
+      const p = perf || {};
+      const tiles = [];
+
+      const gen = fmtRate(p.genTokPerSec);
+      tiles.push(gen
+        ? statTile('Generation', gen + ' tok/s', p.estimated ? 'estimated' : 'from server timings')
+        : statTile('Generation', '—', 'no generation yet', 'empty'));
+
+      const prompt = fmtRate(p.promptTokPerSec);
+      tiles.push(prompt
+        ? statTile('Prompt', prompt + ' tok/s', 'prompt processing')
+        : statTile('Prompt', '—', 'prompt processing', 'empty'));
+
+      if (typeof p.cacheHitPct === 'number') {
+        tiles.push(statTile(
+          'Prompt reuse',
+          p.cacheHitPct + '%',
+          fmtNum(p.cachedPromptTokens) + ' cached · ' + fmtNum(p.processedPromptTokens) + ' new',
+          p.cacheHitPct >= 50 ? 'good' : undefined
+        ));
+      } else {
+        tiles.push(statTile('Prompt reuse', '—', 'KV prefix cache (cache_n)', 'empty'));
+      }
+
+      if (p.speculativeMode === 'mtp' && typeof p.draftAcceptancePct === 'number') {
+        tiles.push(statTile(
+          'MTP accepted',
+          p.draftAcceptancePct.toFixed(1) + '%',
+          fmtNum(p.draftTokensAccepted) + ' / ' + fmtNum(p.draftTokens) + ' drafted',
+          p.draftAcceptancePct >= 50 ? 'good' : undefined
+        ));
+      } else {
+        tiles.push(statTile('MTP accepted', '—', p.speculativeMode === 'mtp' ? 'no draft tokens yet' : 'speculative off', 'empty'));
+      }
+
+      grid.innerHTML = tiles.join('');
+      grid.title = Array.isArray(perfLines) ? perfLines.join('\\n') : '';
+
+      if (foot) {
+        const parts = [];
+        if (p.generating) parts.push('<span class="ok">● Generating…</span>');
+        if (typeof p.completionTokens === 'number') {
+          parts.push(fmtNum(p.completionTokens) + ' completion tokens');
+        }
+        if (!p.generating && p.finishedAt && p.startedAt) {
+          parts.push(((p.finishedAt - p.startedAt) / 1000).toFixed(1) + 's');
+        }
+        foot.innerHTML = parts.length ? parts.join(' · ') : 'No generation yet';
+      }
+    }
+
     function renderStackedBar(stackId, subId, chart) {
       const stack = $(stackId);
       const sub = $(subId);
       if (!chart) {
         stack.innerHTML = '';
-        stack.classList.remove('over');
+        stack.classList.remove('over', 'warn');
+        sub.className = 'sub';
         sub.textContent = '—';
         return;
       }
@@ -1521,11 +1788,15 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         el.title = seg.label + ': ~' + fmtBytes(seg.bytes);
         stack.appendChild(el);
       }
-      const over = chart.capacityBytes && chart.totalBytes > chart.capacityBytes;
-      stack.classList.toggle('over', !!over);
       const pct = chart.capacityBytes
         ? Math.round((chart.totalBytes / chart.capacityBytes) * 100)
         : undefined;
+      // 92% is the usable ceiling used by the spill warnings (driver headroom).
+      const over = pct !== undefined && pct > 92;
+      const warn = !over && pct !== undefined && pct > 80;
+      stack.classList.toggle('over', over);
+      stack.classList.toggle('warn', warn);
+      sub.className = 'sub' + (over ? ' over' : warn ? ' warn' : '');
       sub.textContent =
         '~' + fmtBytes(chart.totalBytes) +
         (chart.capacityBytes
@@ -1588,7 +1859,13 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       const kvBytesWarm = warmKv.bytes;
       const fullAttnLayers = fullKv.fullAttnLayers;
       const kvOnGpu = !cpuOnly && !!L.offloadKvCacheToGpu && onGpu > 0;
-      const overhead = Math.round(400 * 1024 * 1024 + Math.min(L.evalBatchSize || 512, 4096) * 64 * 1024);
+      // Mirrors computeOverheadBytes() in memoryEstimate.ts.
+      const embedForOverhead = Math.max(2048, memInputs.embeddingLength || 4096);
+      const ubatchForOverhead = Math.min(Math.max(32, L.physicalBatchSize || 512), 8192);
+      const batchForOverhead = Math.min(Math.max(32, L.evalBatchSize || 2048), 8192);
+      const overhead = Math.round(
+        400 * 1024 * 1024 + ubatchForOverhead * embedForOverhead * 24 + batchForOverhead * 8 * 1024
+      );
       const gpuOverhead = onGpu > 0 ? overhead : 0;
       const cpuOverhead = onGpu > 0 ? Math.round(overhead * 0.15) : Math.round(overhead * 0.5);
       const totalGpu = gpuWeights + (kvOnGpu ? kvBytes : 0) + gpuOverhead;
@@ -1661,12 +1938,45 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       if (cpuOnly) {
         charts.vram.capacityBytes = undefined;
       }
+      let summary;
+      if (cpuOnly) {
+        summary = 'System RAM ~' + fmtBytes(totalCpu) +
+          (systemRamTotalBytes ? ' of ' + fmtBytes(systemRamTotalBytes) : '') +
+          ' · KV ~' + fmtBytes(kvBytes) + ' at full context';
+      } else {
+        const pct = gpuInfo && gpuInfo.totalBytes
+          ? Math.round((totalGpu / gpuInfo.totalBytes) * 100)
+          : undefined;
+        summary = 'VRAM ~' + fmtBytes(totalGpu) +
+          (gpuInfo && gpuInfo.totalBytes ? ' of ' + fmtBytes(gpuInfo.totalBytes) + (pct !== undefined ? ' (' + pct + '%)' : '') : '') +
+          ' · KV ~' + fmtBytes(kvBytes) + (kvOnGpu ? ' on GPU' : ' in RAM') +
+          ' · ' + onGpu + '/' + nLayers + ' layers offloaded';
+      }
       return {
+        summary,
         lines,
         warnings,
         willSpill,
         charts,
+        totalGpu,
+        totalCpu,
       };
+    }
+
+    /** Say when a curated model mode replaces the sampling values below. */
+    function renderModeOverrideHint(mode) {
+      const hint = $('modeOverrideHint');
+      if (!hint) return;
+      if (!mode) {
+        hint.classList.add('hidden');
+        hint.textContent = '';
+        return;
+      }
+      hint.classList.remove('hidden');
+      hint.textContent =
+        mode.familyLabel + ' model detected — the Model Mode picker in Copilot Chat sets sampling per request, ' +
+        'so Temperature, Top P and Top K below are not used. "' + mode.defaultMode + '" sends temperature ' +
+        mode.temperature + ', top_p ' + mode.topP + ', top_k ' + mode.topK + '. Max tokens still applies.';
     }
 
     function applyCpuOnlyUi(cpuOnly) {
@@ -1692,7 +2002,8 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
 
     function renderMemory(est) {
       if (!est) {
-        $('memLines').textContent = 'Select a model to estimate VRAM / RAM use.';
+        $('memSummary').textContent = 'Select a model to estimate VRAM / RAM use.';
+        $('memLines').textContent = '';
         $('memNotes').classList.add('hidden');
         $('memWarn').classList.add('hidden');
         renderStackedBar('vramStack', 'vramChartSub', null);
@@ -1703,6 +2014,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         renderStackedBar('vramStack', 'vramChartSub', est.charts.vram);
         renderStackedBar('ramStack', 'ramChartSub', est.charts.ram);
       }
+      $('memSummary').textContent = est.summary || '';
       $('memLines').innerHTML = (est.lines || []).map((l) => String(l)).join('<br/>');
       const soft = (est.warnings || []).filter((_, i) => !(est.willSpill && i === 0));
       if (soft.length) {
@@ -1735,9 +2047,139 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     bindRange('cpuThreads', 'cpuThreadsRange');
     bindRange('nCpuMoe', 'nCpuMoeRange');
     $('offloadKvCacheToGpu').addEventListener('change', refreshMemoryLive);
-    $('cacheTypeK').addEventListener('change', refreshMemoryLive);
-    $('cacheTypeV').addEventListener('change', refreshMemoryLive);
     $('evalBatchSize').addEventListener('input', refreshMemoryLive);
+    $('physicalBatchSize').addEventListener('input', refreshMemoryLive);
+
+    /** Higher = more precise. Used to flag lopsided K/V pairs. */
+    const KV_PRECISION_RANK = { q4_0: 0, q8_0: 1, bf16: 2, f16: 2 };
+
+    /** llama.cpp can only run a quantized V cache on the Flash Attention path. */
+    function syncFlashAttentionWarning() {
+      const hint = $('kvFlashAttnHint');
+      if (!hint) return;
+      const vQuantized = KV_PRECISION_RANK[$('cacheTypeV').value] < 2;
+      hint.classList.toggle('hidden', !(vQuantized && $('flashAttention').value === 'off'));
+    }
+
+    /** Mirror K onto V while linked; warn when V is kept more precise than K. */
+    function syncKvLink(propagate) {
+      const link = $('kvTypesLinked');
+      const k = $('cacheTypeK');
+      const v = $('cacheTypeV');
+      const hint = $('kvMismatchHint');
+      if (!link || !k || !v) return;
+      const linked = !!link.checked;
+      if (linked && propagate !== false) {
+        v.value = k.value;
+      }
+      v.disabled = linked;
+      if (hint) {
+        const lopsided = KV_PRECISION_RANK[v.value] > KV_PRECISION_RANK[k.value];
+        hint.classList.toggle('hidden', linked || !lopsided);
+      }
+      syncFlashAttentionWarning();
+    }
+
+    $('cacheTypeK').addEventListener('change', () => {
+      syncKvLink(true);
+      refreshMemoryLive();
+      scheduleSaveLoad();
+    });
+    $('cacheTypeV').addEventListener('change', () => {
+      syncKvLink(false);
+      refreshMemoryLive();
+    });
+    $('kvTypesLinked').addEventListener('change', () => {
+      syncKvLink(true);
+      refreshMemoryLive();
+      scheduleSaveLoad();
+    });
+    $('flashAttention').addEventListener('change', syncFlashAttentionWarning);
+
+    // 'fit' = largest context that still fits the detected VRAM (see fittingContext).
+    const LOAD_PRESETS = {
+      agent: { contextLength: 65536, cacheTypeK: 'q8_0', cacheTypeV: 'q8_0', slots: 1 },
+      context: { contextLength: 'fit', cacheTypeK: 'q8_0', cacheTypeV: 'q4_0', slots: 1 },
+      quality: { contextLength: 65536, cacheTypeK: 'f16', cacheTypeV: 'q8_0', slots: 1 },
+    };
+
+    const FIT_CONTEXT_STEPS = [
+      262144, 196608, 163840, 131072, 98304, 65536, 49152, 32768, 24576, 16384, 8192,
+    ];
+
+    /**
+     * Largest context from FIT_CONTEXT_STEPS whose estimate stays inside the safe
+     * device budget, measured with the K/V types already set on the form.
+     * Falls back to the model maximum when no capacity is known.
+     */
+    function fittingContext(maxCtx) {
+      const cpuOnly = $('backendSelect').value === 'cpu';
+      const capacity = cpuOnly
+        ? (systemRamTotalBytes ? systemRamTotalBytes * 0.85 : 0)
+        : (gpuInfo && gpuInfo.totalBytes ? gpuInfo.totalBytes * 0.92 : 0);
+      if (!capacity || !memInputs) return maxCtx;
+      const previous = $('contextLength').value;
+      let best = 0;
+      for (const step of FIT_CONTEXT_STEPS) {
+        const ctx = Math.min(step, maxCtx);
+        if (ctx < 8192 || ctx > maxCtx) continue;
+        $('contextLength').value = ctx;
+        const est = liveMemoryEstimate();
+        const used = est ? (cpuOnly ? est.totalCpu : est.totalGpu) : 0;
+        if (used && used <= capacity) { best = ctx; break; }
+      }
+      $('contextLength').value = previous;
+      // Nothing fits: keep the smallest step so the user sees a usable number
+      // plus the existing over-budget warning, rather than the model maximum.
+      return best || Math.min(8192, maxCtx);
+    }
+
+    function currentPresetId() {
+      const k = $('cacheTypeK').value;
+      const v = $('cacheTypeV').value;
+      if (Number($('maxConcurrentPredictions').value) !== 1) return '';
+      const ctx = Number($('contextLength').value);
+      const maxCtx = Number($('contextLengthRange').max) || 131072;
+      for (const [id, p] of Object.entries(LOAD_PRESETS)) {
+        if (p.cacheTypeK !== k || p.cacheTypeV !== v) continue;
+        // 'fit' depends on live VRAM, so any context counts as a match once the
+        // distinctive K/V pair lines up.
+        if (p.contextLength === 'fit' || ctx === Math.min(p.contextLength, maxCtx)) return id;
+      }
+      return '';
+    }
+
+    function highlightPreset() {
+      const active = currentPresetId();
+      document.querySelectorAll('#presetChips .chip').forEach((chip) => {
+        chip.classList.toggle('active', chip.dataset.preset === active);
+      });
+    }
+
+    function applyPreset(id) {
+      const p = LOAD_PRESETS[id];
+      if (!p) return;
+      const maxCtx = Number($('contextLengthRange').max) || 131072;
+      $('maxConcurrentPredictions').value = p.slots;
+      $('cacheTypeK').value = p.cacheTypeK;
+      $('cacheTypeV').value = p.cacheTypeV;
+      $('kvTypesLinked').checked = p.cacheTypeK === p.cacheTypeV;
+      syncKvLink(false);
+      // KV types must already be on the form — fittingContext measures with them.
+      const ctx = p.contextLength === 'fit'
+        ? fittingContext(maxCtx)
+        : Math.min(p.contextLength, maxCtx);
+      $('contextLength').value = ctx;
+      $('contextLengthRange').value = ctx;
+      highlightPreset();
+      syncFlashAttentionWarning();
+      refreshMemoryLive();
+      scheduleSaveLoad();
+    }
+
+    document.querySelectorAll('#presetChips .chip').forEach((chip) => {
+      chip.addEventListener('click', () => applyPreset(chip.dataset.preset));
+    });
 
     // Persist load edits so dirty tracking / reload uses the form values.
     const loadFieldIds = [
@@ -1745,7 +2187,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       'cpuThreads', 'cpuThreadsRange', 'evalBatchSize', 'physicalBatchSize',
       'maxConcurrentPredictions', 'nCpuMoe', 'nCpuMoeRange', 'offloadKvCacheToGpu',
       'cacheTypeK', 'cacheTypeV',
-      'keepModelInMemory', 'tryMmap', 'unifiedKvCache', 'contextCheckpoints',
+      'keepModelInMemory', 'tryMmap', 'unifiedKvCache', 'flashAttention',
+      'contextCheckpoints', 'cacheReuse',
+      'reasoningFormat', 'reasoningBudgetUnlimited', 'reasoningBudget',
       'ropeBaseAuto', 'ropeFreqBase', 'ropeScaleAuto', 'ropeFreqScale',
       'seedRandom', 'seed', 'speculativeMode', 'maxDraftTokens', 'minDraftTokens',
       'draftProbability'
@@ -1776,6 +2220,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       const ropeBaseAuto = $('ropeBaseAuto').checked;
       const ropeScaleAuto = $('ropeScaleAuto').checked;
       const seedRandom = $('seedRandom').checked;
+      const reasoningUnlimited = $('reasoningBudgetUnlimited').checked;
       const modeSel = $('speculativeMode');
       const mtpOpt = $('specMtpOption');
       let speculativeMode = modeSel ? modeSel.value : 'off';
@@ -1794,11 +2239,15 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         nCpuMoe: Number($('nCpuMoe').value),
         offloadKvCacheToGpu: $('offloadKvCacheToGpu').checked,
         cacheTypeK: $('cacheTypeK').value || 'q8_0',
-        cacheTypeV: $('cacheTypeV').value || 'q8_0',
+        cacheTypeV: ($('kvTypesLinked').checked ? $('cacheTypeK').value : $('cacheTypeV').value) || 'q8_0',
         keepModelInMemory: $('keepModelInMemory').checked,
         tryMmap: $('tryMmap').checked,
         unifiedKvCache: $('unifiedKvCache').checked,
+        flashAttention: $('flashAttention').value || 'auto',
         contextCheckpoints: Number($('contextCheckpoints').value),
+        cacheReuse: Number($('cacheReuse').value),
+        reasoningFormat: $('reasoningFormat').value || 'deepseek-legacy',
+        reasoningBudget: reasoningUnlimited ? -1 : Number($('reasoningBudget').value),
         ropeFreqBase: ropeBaseAuto ? null : Number($('ropeFreqBase').value),
         ropeFreqScale: ropeScaleAuto ? null : Number($('ropeFreqScale').value),
         seed: seedRandom ? null : Number($('seed').value),
@@ -1940,12 +2389,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       updatePrimaryAction();
 
       const perfLines = Array.isArray(payload.perfLines) ? payload.perfLines : ['No generation yet'];
-      const generating = payload.perf && payload.perf.generating;
       const perf = payload.perf || {};
       renderContextStack(perf);
-      $('perfLines').innerHTML =
-        (generating ? '<span class="ok">● Generating</span><br/>' : '') +
-        perfLines.map((l) => String(l)).join('<br/>');
+      renderPerfStats(perf, perfLines);
       const viewCtx = $('viewContextBtn');
       if (viewCtx) {
         viewCtx.disabled = !payload.hasLastContext;
@@ -2136,6 +2582,8 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       $('offloadKvCacheToGpu').checked = !!L.offloadKvCacheToGpu;
       $('cacheTypeK').value = L.cacheTypeK || 'q8_0';
       $('cacheTypeV').value = L.cacheTypeV || 'q8_0';
+      $('kvTypesLinked').checked = (L.cacheTypeK || 'q8_0') === (L.cacheTypeV || 'q8_0');
+      syncKvLink(false);
       $('keepModelInMemory').checked = !!L.keepModelInMemory;
       if (payload.isWindows) {
         const label = $('keepModelLabel');
@@ -2145,7 +2593,14 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       }
       $('tryMmap').checked = !!L.tryMmap;
       $('unifiedKvCache').checked = !!L.unifiedKvCache;
+      $('flashAttention').value = L.flashAttention || 'auto';
       $('contextCheckpoints').value = L.contextCheckpoints;
+      $('cacheReuse').value = L.cacheReuse ?? 0;
+      $('reasoningFormat').value = L.reasoningFormat || 'deepseek-legacy';
+      const budget = L.reasoningBudget ?? -1;
+      $('reasoningBudgetUnlimited').checked = budget < 0;
+      $('reasoningBudget').value = budget < 0 ? 2048 : budget;
+      $('reasoningBudget').disabled = budget < 0;
       $('ropeBaseAuto').checked = L.ropeFreqBase == null;
       $('ropeFreqBase').value = L.ropeFreqBase ?? 10000;
       $('ropeFreqBase').disabled = L.ropeFreqBase == null;
@@ -2164,6 +2619,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       $('topP').value = R.topP;
       $('topK').value = R.topK;
       $('maxTokens').value = R.maxTokens;
+      renderModeOverrideHint(payload.modeSampling);
+      syncFlashAttentionWarning();
+
+      highlightPreset();
 
       memInputs = payload.memInputs || null;
       gpuInfo = payload.gpu || null;
@@ -2184,6 +2643,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     });
     $('seedRandom').addEventListener('change', () => {
       $('seed').disabled = $('seedRandom').checked;
+    });
+    $('reasoningBudgetUnlimited').addEventListener('change', () => {
+      $('reasoningBudget').disabled = $('reasoningBudgetUnlimited').checked;
     });
     const speculativeModeEl = $('speculativeMode');
     if (speculativeModeEl) {
@@ -2359,11 +2821,8 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           const text = $('statusText');
           if (text) text.textContent = 'Server ready';
         }
-        if (Array.isArray(msg.payload.perfLines)) {
-          const el = $('perfLines');
-          if (el) {
-            el.innerHTML = msg.payload.perfLines.map((l) => String(l)).join('<br/>');
-          }
+        if (msg.payload.perf || Array.isArray(msg.payload.perfLines)) {
+          renderPerfStats(msg.payload.perf || {}, msg.payload.perfLines);
         }
       }
     });
