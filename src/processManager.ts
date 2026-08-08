@@ -4,16 +4,15 @@ import * as path from "path";
 import { execFileSync, spawn } from "child_process";
 import {
   ensureDirs,
-  findLlamaServerOnPath,
   getLlamaServerBinary,
   getLockDir,
   getLockPath,
   getLogPath,
-  withBinaryDirEnv,
 } from "./paths";
 import { resolveLaunchMode, spawnInExternalTerminal } from "./externalTerminal";
 import { clampLoadSettingsToModel, readModelCapabilities } from "./ggufMetadata";
 import { LlamaInstaller } from "./llamaInstaller";
+import { isNixOS, hasUsableFhsDynamicLinker, nixOsIncompatibilityHint, resolveLaunchPlan } from "./nixCompat";
 import { isLlamaServerProcess, sameModelFile, uniquePids } from "./processIdentity";
 import { buildServerArgs, serverConfigFingerprint, SettingsStore } from "./settings";
 import { ServerStatus } from "./types";
@@ -251,14 +250,11 @@ export class ProcessManager {
   resolveBinary(): string {
     const installer = new LlamaInstaller(this.store);
     const installed = getLlamaServerBinary(installer.getActiveInstallDir());
-    if (fs.existsSync(installed)) {
+    try {
+      return resolveLaunchPlan(installed).binary;
+    } catch {
       return installed;
     }
-    const onPath = findLlamaServerOnPath();
-    if (onPath) {
-      return onPath;
-    }
-    return installed;
   }
 
   /** True when the active install / setting is a CPU-only binary (no GPU). */
@@ -333,12 +329,10 @@ export class ProcessManager {
       this.clearLock();
     }
 
-    const binary = this.resolveBinary();
-    if (!fs.existsSync(binary)) {
-      throw new Error(
-        `llama-server binary not found at ${binary}. Run "Llama AIO: Install / Upgrade llama.cpp" first.`
-      );
-    }
+    const launch = resolveLaunchPlan(
+      getLlamaServerBinary(new LlamaInstaller(this.store).getActiveInstallDir())
+    );
+    const binary = launch.binary;
 
     const host = this.store.getHost();
     const port = this.store.getPort();
@@ -383,15 +377,23 @@ export class ProcessManager {
     ensureDirs(getLockDir(), path.dirname(getLogPath()));
     // Fresh log per start so failures are easy to read.
     const logPath = getLogPath();
+    const spawnArgv = [...launch.prefixArgs, ...args];
     fs.writeFileSync(
       logPath,
-      `# llama-aio-vs start ${new Date().toISOString()}\n# mode=${launchMode}\n# ${binary} ${args.join(" ")}\n`,
+      `# llama-aio-vs start ${new Date().toISOString()}\n` +
+        `# mode=${launchMode} method=${launch.method}\n` +
+        `# ${launch.command} ${spawnArgv.join(" ")}\n` +
+        (launch.note ? `# note: ${launch.note}\n` : ""),
       "utf8"
     );
 
-    const childEnv = withBinaryDirEnv(binary, process.env);
+    const childEnv = launch.env;
 
-    report(`Starting llama-server (${path.basename(model)})…`);
+    report(
+      launch.method === "steam-run"
+        ? `Starting llama-server via steam-run (${path.basename(model)})…`
+        : `Starting llama-server (${path.basename(model)})…`
+    );
     let launcherPid: number | undefined;
     if (launchMode === "externalTerminal") {
       const child = spawnInExternalTerminal({
@@ -399,6 +401,8 @@ export class ProcessManager {
         args,
         env: childEnv,
         logPath,
+        command: launch.method === "direct" ? undefined : launch.command,
+        prefixArgs: launch.method === "direct" ? undefined : launch.prefixArgs,
       });
       launcherPid = child.pid;
       if (!launcherPid) {
@@ -406,7 +410,7 @@ export class ProcessManager {
       }
     } else {
       const logFd = fs.openSync(logPath, "a");
-      const child = spawn(binary, args, {
+      const child = spawn(launch.command, spawnArgv, {
         detached: true,
         stdio: ["ignore", logFd, logFd],
         windowsHide: true,
@@ -555,6 +559,13 @@ export class ProcessManager {
     } else if (/out of memory|insufficient memory/i.test(blob)) {
       hint =
         "\n\nOut of memory while loading. Lower Context Length / GPU Offload, or use a smaller quant.";
+    } else if (
+      (isNixOS() || (process.platform === "linux" && !hasUsableFhsDynamicLinker())) &&
+      /no such file or directory|error while loading shared libraries|cannot open shared object file/i.test(
+        blob
+      )
+    ) {
+      hint = `\n\n${nixOsIncompatibilityHint()}`;
     }
     const fatal = fatalLine ? `\n\nDetected: ${fatalLine}` : "";
     return `${prefix}${fatal}${hint}\n\nLast log lines (${logPath}):\n${snippet || "(empty)"}`;

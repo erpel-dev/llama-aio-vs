@@ -2432,7 +2432,12 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
 
       const binaryDetail = $('llamaBinaryDetail');
       if (binaryDetail) {
-        if (build.binaryVersionDetail || build.binaryVersion) {
+        if (build.binaryRunnable === false) {
+          binaryDetail.textContent =
+            'Binary present but not runnable on this OS' +
+            (build.nixOs ? ' (NixOS / missing FHS linker)' : '') +
+            (build.binaryRunError ? (': ' + String(build.binaryRunError).slice(0, 120)) : '.');
+        } else if (build.binaryVersionDetail || build.binaryVersion) {
           binaryDetail.textContent = build.binaryVersionDetail || build.binaryVersion;
         } else if (build.tag && payload.binaryExists) {
           binaryDetail.textContent = 'Installed release ' + build.tag;
