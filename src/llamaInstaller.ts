@@ -6,6 +6,11 @@ import { execFile, execFileSync } from "child_process";
 import { promisify } from "util";
 import * as vscode from "vscode";
 import { ensureDirs, getBackendInstallDir, getInstallDir, getLlamaServerBinary, InstallBackendId, withBinaryDirEnv } from "./paths";
+import {
+  findSteamRun,
+  isNixOS,
+  probeLlamaServerRunnable,
+} from "./nixCompat";
 import { SettingsStore } from "./settings";
 
 const execFileAsync = promisify(execFile);
@@ -360,6 +365,10 @@ export interface InstalledBuildInfo {
   binaryVersion?: string;
   /** Full --version stdout (trimmed) */
   binaryVersionDetail?: string;
+  /** False when the binary exists but `llama-server --version` cannot run (common on NixOS). */
+  binaryRunnable?: boolean;
+  /** Short probe error when binaryRunnable is false. */
+  binaryRunError?: string;
   asset?: string;
   /** Configured backend setting */
   configuredBackend: LlamaBackend;
@@ -367,6 +376,8 @@ export interface InstalledBuildInfo {
   activeBackend: UiBackend;
   /** Backend inferred from installed asset name */
   resolvedBackend?: UiBackend | string;
+  /** True when running on NixOS (helps the UI show FHS / nix-ld guidance). */
+  nixOs?: boolean;
 }
 
 function isArchive(name: string): boolean {
@@ -945,22 +956,30 @@ export class LlamaInstaller {
 
     let binaryVersion: string | undefined;
     let binaryVersionDetail: string | undefined;
+    let binaryRunnable: boolean | undefined;
+    let binaryRunError: string | undefined;
     const binary = getLlamaServerBinary(installDir);
     if (fs.existsSync(binary)) {
-      try {
-        const out = execFileSync(binary, ["--version"], {
-          encoding: "utf8",
-          timeout: 5000,
-          windowsHide: true,
-          cwd: path.dirname(binary),
-          env: withBinaryDirEnv(binary),
-        })
-          .toString()
-          .trim();
-        binaryVersionDetail = out;
-        binaryVersion = out.split("\n")[0]?.trim() || out;
-      } catch {
-        // binary may fail to start without GPU libs
+      const env = withBinaryDirEnv(binary);
+      let probe = probeLlamaServerRunnable(binary, { env });
+      let viaSteamRun = false;
+      if (!probe.ok) {
+        const steamRun = findSteamRun();
+        if (steamRun) {
+          const wrapped = probeLlamaServerRunnable(binary, { env, wrapper: steamRun });
+          if (wrapped.ok) {
+            probe = wrapped;
+            viaSteamRun = true;
+          }
+        }
+      }
+      if (probe.ok) {
+        binaryRunnable = true;
+        binaryVersion = probe.detail;
+        binaryVersionDetail = viaSteamRun ? `${probe.detail} (via steam-run)` : probe.detail;
+      } else {
+        binaryRunnable = false;
+        binaryRunError = probe.detail;
       }
     }
 
@@ -968,10 +987,13 @@ export class LlamaInstaller {
       tag: version.tag,
       binaryVersion,
       binaryVersionDetail,
+      binaryRunnable,
+      binaryRunError,
       asset: version.asset,
       configuredBackend,
       activeBackend,
       resolvedBackend: version.resolved || inferBackendFromAsset(version.asset) || activeBackend,
+      nixOs: isNixOS(),
     };
   }
 

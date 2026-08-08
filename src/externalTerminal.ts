@@ -59,12 +59,20 @@ function resolveLinuxTerminal(): { bin: string; argsPrefix: string[] } | undefin
  * Returns the launcher PID (terminal/shell), not necessarily llama-server.
  */
 export function spawnInExternalTerminal(options: {
+  /** Path shown in the terminal banner / used for LD_LIBRARY_PATH. */
   binary: string;
   args: string[];
   env: NodeJS.ProcessEnv;
   logPath: string;
+  /**
+   * Optional launcher (e.g. steam-run on NixOS). When set, the shell runs
+   * `command …prefixArgs …args` instead of invoking `binary` directly.
+   * Callers should put `binary` inside `prefixArgs` when using a wrapper.
+   */
+  command?: string;
+  prefixArgs?: string[];
 }): ChildProcess {
-  const { binary, args, env, logPath } = options;
+  const { binary, args, env, logPath, command, prefixArgs } = options;
   ensureDirs(path.dirname(logPath));
 
   if (process.platform === "win32") {
@@ -73,14 +81,16 @@ export function spawnInExternalTerminal(options: {
   if (process.platform === "darwin") {
     return spawnMac(binary, args, env, logPath);
   }
-  return spawnLinux(binary, args, env, logPath);
+  return spawnLinux(binary, args, env, logPath, command, prefixArgs);
 }
 
 function spawnLinux(
   binary: string,
   args: string[],
   env: NodeJS.ProcessEnv,
-  logPath: string
+  logPath: string,
+  command?: string,
+  prefixArgs?: string[]
 ): ChildProcess {
   const term = resolveLinuxTerminal();
   if (!term) {
@@ -91,13 +101,18 @@ function spawnLinux(
   }
 
   const libDir = path.dirname(binary);
+  const launchArgv = command
+    ? [command, ...(prefixArgs || []), ...args]
+    : [binary, ...args];
+  const launchLine = launchArgv.map(shQuote).join(" ");
   const cmd = [
     `echo "Llama AIO · llama-server"`,
     `echo "Binary: ${shQuote(binary)}"`,
+    command ? `echo "Launcher: ${shQuote(command)}"` : `true`,
     `echo "Log also mirrored to: ${shQuote(logPath)}"`,
     `echo`,
     `export LD_LIBRARY_PATH=${shQuote(libDir)}\${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}`,
-    `${shQuote(binary)} ${args.map(shQuote).join(" ")} 2>&1 | tee -a ${shQuote(logPath)}`,
+    `${launchLine} 2>&1 | tee -a ${shQuote(logPath)}`,
     `code=$?`,
     `echo`,
     `echo "llama-server exited with code $code"`,

@@ -129,6 +129,11 @@ Only llama-servers are ever adopted or stopped — anything else holding the por
 - **Keep Model in Memory** uses `--load-mode mlock` (mmap on Windows); it does not control process lifetime.
 - Quantized V cache requires flash attention; the settings panel warns when the combination cannot work.
 - MTP needs a GGUF with next-n / MTP layers. Copilot **Agent** prompts are large — prefer a GPU backend or Ask mode on CPU.
+- **NixOS:** official llama.cpp Linux archives are Ubuntu builds that need the FHS dynamic linker (`/lib64/ld-linux-x86-64.so.2`). Stock NixOS does not provide it, so a freshly downloaded binary often fails with a misleading “No such file or directory”. Llama AIO detects this and will:
+  1. wrap the binary with `steam-run` when that command is on `PATH`, or
+  2. fall back to a nixpkgs `llama-server` already on `PATH`, or
+  3. show how to enable `programs.nix-ld.enable = true` (and restart VS Code).
+  Vulkan may also need nixGL / correct ICD packages.
 
 ## Development
 

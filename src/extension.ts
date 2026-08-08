@@ -1,5 +1,6 @@
 import { LlamaInstaller, UiBackend } from "./llamaInstaller";
 import { openModelFileDialog, pickDownloadedModel } from "./modelPicker";
+import { nixOsIncompatibilityHint } from "./nixCompat";
 import { ensureDirs, getInstallDir, getLockDir, getModelsDir } from "./paths";
 import { PerfStats } from "./perfStats";
 import { LaunchToken, LAUNCH_IN_PROGRESS_MSG, ProcessManager } from "./processManager";
@@ -171,11 +172,21 @@ export function activate(context: vscode.ExtensionContext): void {
   const afterBackendInstall = async (wasReady: boolean) => {
     const info = installer.getInstalledInfo();
     const label = info.binaryVersion || info.tag || processManager.resolveBinary();
-    vscode.window.showInformationMessage(
-      `llama.cpp ready: ${label}` + (info.asset ? ` (${info.asset})` : "")
-    );
+    if (info.binaryRunnable === false) {
+      void vscode.window.showWarningMessage(
+        `llama.cpp installed (${label}) but the binary cannot run on this system yet. ` +
+          nixOsIncompatibilityHint().replace(/\n+/g, " ")
+      );
+    } else {
+      vscode.window.showInformationMessage(
+        `llama.cpp ready: ${label}` + (info.asset ? ` (${info.asset})` : "")
+      );
+    }
     chatProvider?.notifyChanged();
     await settingsView.pushState();
+    if (info.binaryRunnable === false) {
+      return;
+    }
     if (wasReady && store.getState().selectedModelPath) {
       const restart = await vscode.window.showInformationMessage(
         "Backend ready. Start the server again?",
