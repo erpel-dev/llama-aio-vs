@@ -1,12 +1,14 @@
 node_modules/
 out/
 out-test/
+dist/
 *.vsix
 .DS_Store
 Thumbs.db
 *.log
 *.tsbuildinfo
 .vscode-test/
+packages/vscode/prompt-replacements/
 media/icon-source.png
 media/*-preview.png
 media/*-24.png

@@ -1,0 +1,29 @@
+{
+  "name": "@llama-aio/tui",
+  "version": "0.1.5",
+  "private": true,
+  "description": "Terminal UI for Llama AIO: manage llama.cpp, models, load settings, and chat — sharing the extension's configuration.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "llama-aio": "./out/main.js"
+  },
+  "main": "./out/main.js",
+  "scripts": {
+    "compile": "tsc -p tsconfig.json",
+    "watch": "tsc -w -p tsconfig.json",
+    "lint": "tsc --noEmit -p tsconfig.json",
+    "start": "node --experimental-ffi out/main.js"
+  },
+  "dependencies": {
+    "@llama-aio/core": "*",
+    "@opentui/core": "^0.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "typescript": "^5.8.2"
+  },
+  "engines": {
+    "node": ">=26.4"
+  }
+}

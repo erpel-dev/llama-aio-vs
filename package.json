@@ -1,208 +1,28 @@
 {
-  "name": "llama-aio-vs",
-  "displayName": "Llama AIO",
-  "description": "All-in-one local llama.cpp for VS Code: install, HF models, LM Studio-style settings, shared server, Copilot Chat provider.",
+  "name": "llama-aio-workspace",
+  "private": true,
   "version": "0.1.5",
-  "publisher": "erpel-dev",
+  "description": "Llama AIO monorepo: shared core, VS Code extension, and terminal UI.",
   "license": "MIT",
-  "icon": "media/icon.png",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/erpel-dev/llama-aio-vs.git"
-  },
-  "bugs": {
-    "url": "https://github.com/erpel-dev/llama-aio-vs/issues"
-  },
-  "homepage": "https://github.com/erpel-dev/llama-aio-vs#readme",
-  "engines": {
-    "vscode": "^1.109.0"
-  },
-  "categories": [
-    "AI",
-    "Machine Learning",
-    "Chat"
+  "workspaces": [
+    "packages/core",
+    "packages/vscode",
+    "packages/tui"
   ],
-  "keywords": [
-    "llama.cpp",
-    "llama-server",
-    "local llm",
-    "huggingface",
-    "copilot"
-  ],
-  "activationEvents": [
-    "onStartupFinished"
-  ],
-  "main": "./out/extension.js",
-  "contributes": {
-    "commands": [
-      {
-        "command": "llamaAio.openSettings",
-        "title": "Llama AIO: Open Settings",
-        "icon": "$(settings-gear)"
-      },
-      {
-        "command": "llamaAio.installLlamaCpp",
-        "title": "Llama AIO: Install / Upgrade llama.cpp"
-      },
-      {
-        "command": "llamaAio.installLlamaCppByTag",
-        "title": "Llama AIO: Install llama.cpp by Release Tag…"
-      },
-      {
-        "command": "llamaAio.installLlamaCppFromArchive",
-        "title": "Llama AIO: Install llama.cpp from Archive…"
-      },
-      {
-        "command": "llamaAio.browseModels",
-        "title": "Llama AIO: Download Model from Hugging Face"
-      },
-      {
-        "command": "llamaAio.openModelFile",
-        "title": "Llama AIO: Open GGUF File…"
-      },
-      {
-        "command": "llamaAio.selectLocalModel",
-        "title": "Llama AIO: Choose from Downloaded Models"
-      },
-      {
-        "command": "llamaAio.startServer",
-        "title": "Llama AIO: Start Server"
-      },
-      {
-        "command": "llamaAio.stopServer",
-        "title": "Llama AIO: Stop Server"
-      },
-      {
-        "command": "llamaAio.reloadServer",
-        "title": "Llama AIO: Reload Server (Apply Settings)"
-      },
-      {
-        "command": "llamaAio.showStatus",
-        "title": "Llama AIO: Show Status"
-      },
-      {
-        "command": "llamaAio.viewLastCall",
-        "title": "Llama AIO: View Last Call"
-      },
-      {
-        "command": "llamaAio.viewLastResponse",
-        "title": "Llama AIO: View Last Response"
-      }
-    ],
-    "viewsContainers": {
-      "activitybar": [
-        {
-          "id": "llama-aio",
-          "title": "Llama AIO",
-          "icon": "media/llama-aio-activity.svg"
-        }
-      ]
-    },
-    "views": {
-      "llama-aio": [
-        {
-          "type": "webview",
-          "id": "llamaAio.settingsView",
-          "name": "Server Settings"
-        }
-      ]
-    },
-    "configuration": {
-      "title": "Llama AIO",
-      "properties": {
-        "llamaAio.port": {
-          "type": "number",
-          "default": 8742,
-          "description": "Fixed port for the shared llama-server instance."
-        },
-        "llamaAio.host": {
-          "type": "string",
-          "default": "127.0.0.1",
-          "description": "Host bind address for llama-server."
-        },
-        "llamaAio.installDir": {
-          "type": "string",
-          "default": "",
-          "description": "Optional override for llama.cpp install directory. Empty uses ~/.llama-aio-vs/llama.cpp."
-        },
-        "llamaAio.modelsDir": {
-          "type": "string",
-          "default": "",
-          "description": "Optional override for GGUF models directory. Empty uses ~/.llama-aio-vs/models."
-        },
-        "llamaAio.extraModelDirs": {
-          "type": "array",
-          "items": { "type": "string" },
-          "default": [],
-          "description": "Extra directories to scan in “Choose from downloaded…”, in addition to LM Studio / Unsloth / HF cache defaults."
-        },
-        "llamaAio.hfToken": {
-          "type": "string",
-          "default": "",
-          "description": "Optional Hugging Face token for gated/private models."
-        },
-        "llamaAio.autoStart": {
-          "type": "boolean",
-          "default": false,
-          "description": "Automatically start llama-server on activation if a model is configured."
-        },
-        "llamaAio.backend": {
-          "type": "string",
-          "default": "auto",
-          "enum": ["auto", "vulkan", "rocm", "cuda", "cpu", "openvino", "sycl"],
-          "enumDescriptions": [
-            "Prefer Vulkan (Linux/AMD/Intel), CUDA (Windows), else CPU. Avoids OpenVINO by default.",
-            "Vulkan GPU build (good default for AMD GPUs on Linux)",
-            "ROCm / HIP Radeon build",
-            "CUDA GPU build (shown in sidebar only when NVIDIA GPU is detected)",
-            "CPU-only x64/arm64 build (no GPU)",
-            "OpenVINO build (Intel-oriented; can crash on AMD)",
-            "SYCL build"
-          ],
-          "description": "Which llama.cpp release binary family to install. Re-run Install / Upgrade after changing."
-        },
-        "llamaAio.launchMode": {
-          "type": "string",
-          "default": "externalTerminal",
-          "enum": ["externalTerminal", "background"],
-          "enumDescriptions": [
-            "Open a system terminal window showing llama-server logs. Closing that window stops the server.",
-            "Run llama-server hidden in the background (logs only to ~/.llama-aio-vs/runtime/llama-server.log)."
-          ],
-          "description": "How to launch llama-server. External terminal is best for seeing request/tool activity."
-        },
-        "llamaAio.promptReplacementsEnabled": {
-          "type": "boolean",
-          "default": true,
-          "description": "Strip redundant Copilot system-prompt boilerplate (safety/identity blocks) before sending to llama.cpp. Saves context tokens."
-        },
-        "llamaAio.promptReplacementsFile": {
-          "type": "string",
-          "default": "",
-          "description": "Optional path to a custom prompt-replacements JSON file. Empty uses the bundled defaults."
-        }
-      }
-    },
-    "languageModelChatProviders": [
-      {
-        "vendor": "llama-aio",
-        "displayName": "Llama AIO (llama.cpp)",
-        "managementCommand": "llamaAio.openSettings"
-      }
-    ]
-  },
   "scripts": {
-    "vscode:prepublish": "npm run compile",
-    "compile": "tsc -p ./",
-    "watch": "tsc -watch -p ./",
-    "lint": "tsc --noEmit -p ./",
-    "test": "tsc -p tsconfig.test.json && node --require ./src/test/vscodeShim.js --test \"out-test/test/*.test.js\"",
-    "package": "vsce package --no-dependencies"
+    "compile": "npm run compile -w @llama-aio/core && npm run bundle -w llama-aio-vs && npm run compile -w @llama-aio/tui",
+    "lint": "npm run lint --workspaces --if-present",
+    "test": "npm run test -w @llama-aio/core",
+    "tui": "npm run compile -w @llama-aio/core && npm start -w @llama-aio/tui",
+    "package:vsix": "node scripts/package-vsix.mjs",
+    "package:tui": "node scripts/package-tui.mjs",
+    "package": "npm run compile && npm test && npm run package:vsix && npm run package:tui"
   },
   "devDependencies": {
-    "@types/node": "^22.13.10",
-    "@types/vscode": "^1.109.0",
-    "@vscode/vsce": "^3.6.0",
     "typescript": "^5.8.2"
+  },
+  "allowScripts": {
+    "esbuild@0.25.12": true,
+    "@vscode/vsce-sign@2.0.9": true
   }
 }

@@ -1,0 +1,143 @@
+{
+  "name": "llama-aio-vs",
+  "displayName": "Llama AIO",
+  "description": "All-in-one local llama.cpp for VS Code: install, HF models, LM Studio-style settings, shared server, Copilot Chat provider.",
+  "version": "0.1.5",
+  "publisher": "erpel-dev",
+  "license": "MIT",
+  "icon": "media/icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/erpel-dev/llama-aio-vs.git"
+  },
+  "bugs": {
+    "url": "https://github.com/erpel-dev/llama-aio-vs/issues"
+  },
+  "homepage": "https://github.com/erpel-dev/llama-aio-vs#readme",
+  "engines": {
+    "vscode": "^1.109.0"
+  },
+  "categories": [
+    "AI",
+    "Machine Learning",
+    "Chat"
+  ],
+  "keywords": [
+    "llama.cpp",
+    "llama-server",
+    "local llm",
+    "huggingface",
+    "copilot"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "llamaAio.openSettings",
+        "title": "Llama AIO: Open Settings",
+        "icon": "$(settings-gear)"
+      },
+      {
+        "command": "llamaAio.openConfigFile",
+        "title": "Llama AIO: Open Configuration File"
+      },
+      {
+        "command": "llamaAio.installLlamaCpp",
+        "title": "Llama AIO: Install / Upgrade llama.cpp"
+      },
+      {
+        "command": "llamaAio.installLlamaCppByTag",
+        "title": "Llama AIO: Install llama.cpp by Release Tag…"
+      },
+      {
+        "command": "llamaAio.installLlamaCppFromArchive",
+        "title": "Llama AIO: Install llama.cpp from Archive…"
+      },
+      {
+        "command": "llamaAio.browseModels",
+        "title": "Llama AIO: Download Model from Hugging Face"
+      },
+      {
+        "command": "llamaAio.openModelFile",
+        "title": "Llama AIO: Open GGUF File…"
+      },
+      {
+        "command": "llamaAio.selectLocalModel",
+        "title": "Llama AIO: Choose from Downloaded Models"
+      },
+      {
+        "command": "llamaAio.selectDraftModel",
+        "title": "Llama AIO: Choose DFlash Draft GGUF…"
+      },
+      {
+        "command": "llamaAio.startServer",
+        "title": "Llama AIO: Start Server"
+      },
+      {
+        "command": "llamaAio.stopServer",
+        "title": "Llama AIO: Stop Server"
+      },
+      {
+        "command": "llamaAio.reloadServer",
+        "title": "Llama AIO: Reload Server (Apply Settings)"
+      },
+      {
+        "command": "llamaAio.showStatus",
+        "title": "Llama AIO: Show Status"
+      },
+      {
+        "command": "llamaAio.viewLastCall",
+        "title": "Llama AIO: View Last Call"
+      },
+      {
+        "command": "llamaAio.viewLastResponse",
+        "title": "Llama AIO: View Last Response"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "llama-aio",
+          "title": "Llama AIO",
+          "icon": "media/llama-aio-activity.svg"
+        }
+      ]
+    },
+    "views": {
+      "llama-aio": [
+        {
+          "type": "webview",
+          "id": "llamaAio.settingsView",
+          "name": "Server Settings"
+        }
+      ]
+    },
+    "languageModelChatProviders": [
+      {
+        "vendor": "llama-aio",
+        "displayName": "Llama AIO (llama.cpp)",
+        "managementCommand": "llamaAio.openSettings"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run bundle",
+    "compile": "tsc -p tsconfig.json",
+    "bundle": "node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
+    "lint": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@llama-aio/core": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "@types/vscode": "^1.109.0",
+    "@vscode/vsce": "^3.6.0",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.8.2"
+  }
+}

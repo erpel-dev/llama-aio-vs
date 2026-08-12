@@ -1,0 +1,23 @@
+{
+  "name": "@llama-aio/core",
+  "version": "0.1.5",
+  "private": true,
+  "description": "Shared llama.cpp management core: config, GGUF metadata, memory estimates, server lifecycle.",
+  "license": "MIT",
+  "main": "./out/index.js",
+  "types": "./out/index.d.ts",
+  "files": [
+    "out",
+    "prompt-replacements"
+  ],
+  "scripts": {
+    "compile": "tsc -p tsconfig.json",
+    "watch": "tsc -w -p tsconfig.json",
+    "lint": "tsc --noEmit -p tsconfig.json",
+    "test": "tsc -p tsconfig.test.json && node --test \"out-test/test/*.test.js\""
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "typescript": "^5.8.2"
+  }
+}

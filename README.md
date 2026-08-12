@@ -11,11 +11,12 @@ Local **llama.cpp** for VS Code: install newest llama.cpp binaries, manage GGUF 
 
 ```bash
 cd llama-aio-vs
-make          # test + compile + build .vsix
-# or: make install
+make          # test + compile + build .vsix and TUI into dist/
+# or: make install   # install the .vsix into VS Code
+# or: make tui       # TUI only → dist/llama-aio
 ```
 
-Install `llama-aio-vs-*.vsix` via **Extensions: Install from VSIX…** (or `make install`), then reload the window.
+Artifacts land in `dist/`: `llama-aio-vs-*.vsix` and the `llama-aio` TUI executable (needs Node **26.4+** on `PATH`; OpenTUI uses `--experimental-ffi`). Install the VSIX via **Extensions: Install from VSIX…** (or `make install`), then reload the window.
 
 1. Open the **Llama AIO** activity bar panel
 2. Install / switch a backend
@@ -25,15 +26,18 @@ Install `llama-aio-vs-*.vsix` via **Extensions: Install from VSIX…** (or `make
 
 ## llama.cpp backends
 
-Download the newest llama.cpp version directly from within VS Code.
+Pick a backend in the sidebar (shared with the TUI via `~/.llama-aio-vs/config.json`):
 
 - **Vulkan** — default GPU path (Linux / Windows; good for AMD)
 - **CUDA** — when an NVIDIA GPU is detected
 - **CPU** — no GPU (`-ngl` ignored)
+- **System (PATH)** — use a `llama-server` already on your `PATH` (distro / nixpkgs / self-built)
 
-Installs live under `~/.llama-aio-vs/llama.cpp/<backend>/`. Switching reuses a cached build; **Upgrade to latest release** resolves the newest tag and downloads the matching archive. New binaries are staged and swapped in at the end, so a failed install leaves the working one in place.
+Downloaded installs live under `~/.llama-aio-vs/llama.cpp/<backend>/`. Switching reuses a cached build; **Upgrade to latest release** resolves the newest tag and downloads the matching archive. New binaries are staged and swapped in at the end, so a failed install leaves the working one in place.
 
-To pin a build or work offline: **Install release tag…** or **Install from archive…**. Browse builds at [llama.cpp releases](https://github.com/ggml-org/llama.cpp/releases). Extra families (`rocm`, `openvino`, `sycl`, `auto`) via `llamaAio.backend`.
+To pin a build or work offline: **Install release tag…** or **Install from archive…**. Browse builds at [llama.cpp releases](https://github.com/ggml-org/llama.cpp/releases).
+
+**NixOS:** official Linux archives need the FHS dynamic linker. Stock NixOS does not provide it, so a download often fails with “No such file or directory”. Llama AIO will wrap with `steam-run` when available, fall back to a PATH `llama-server`, or show how to enable `programs.nix-ld.enable = true`. Prefer **System (PATH)** with nixpkgs `llama-cpp` when you manage the binary yourself.
 
 ## Models
 
@@ -100,6 +104,7 @@ Only llama-servers are ever adopted or stopped — anything else holding the por
 | RoPE base/scale                 | `--rope-freq-base` / `--rope-freq-scale`         |
 | Seed                            | `--seed`                                           |
 | Speculative MTP                 | `--spec-type draft-mtp` (+ draft n-max/min, p-min) |
+| Speculative DFlash              | `--spec-type draft-dflash` + `-md` draft GGUF (+ n-max, draft-ngl; draft KV f16) |
 
 ## Commands
 
@@ -137,7 +142,7 @@ npm test        # unit tests (Node's built-in runner, no extra deps)
 npm run compile # type-check + build to out/
 ```
 
-Tests live in `src/test/` and build to `out-test/`, so nothing test-related ships in the VSIX. `make package` runs them before packaging.
+Tests live in `packages/core/test/` and build to `packages/core/out-test/`, so nothing test-related ships in the VSIX. `make package` runs them before packaging both the extension and the TUI.
 
 ## License
 
