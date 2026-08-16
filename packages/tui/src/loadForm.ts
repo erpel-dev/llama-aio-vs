@@ -5,6 +5,7 @@
 import os from "node:os";
 import {
   FLASH_ATTENTION_MODES,
+  GPU_SPLIT_MODES,
   KV_CACHE_TYPES,
   type FlashAttention,
   type KvCacheType,
@@ -109,6 +110,43 @@ export const LOAD_FIELD_DEFS: LoadFieldDef[] = [
     max: "gpuMax",
   },
   {
+    id: "tensorSplit",
+    kind: "number",
+    label: "Weights on main GPU",
+    help: "Percent of weights + KV on the Main GPU (--tensor-split). The rest is split evenly across the other cards. llama.cpp still receives device-index order (GPU 0, GPU 1, …).",
+    step: 1,
+    store: "load",
+    key: "tensorSplit",
+    min: 10,
+    max: 90,
+  },
+  {
+    id: "splitMode",
+    kind: "enum",
+    label: "Split Mode",
+    help: "How tensors are split (--split-mode). Layer shares the model across cards. Row needs a fast interconnect. None keeps every GPU layer on the Main GPU.",
+    store: "load",
+    key: "splitMode",
+    options: GPU_SPLIT_MODES.map((m) => ({
+      value: m,
+      name:
+        m === "layer"
+          ? "layer — default, sequential layers"
+          : m === "row"
+            ? "row — needs a fast GPU interconnect"
+            : "none — Main GPU only (other cards stay free)",
+    })),
+  },
+  {
+    id: "mainGpu",
+    kind: "enum",
+    label: "Main GPU",
+    help: "Device for the compute graph, scratch, and the weight-share above (--main-gpu). Pick the faster card by name.",
+    store: "load",
+    key: "mainGpu",
+    options: Array.from({ length: 8 }, (_, i) => ({ value: String(i), name: `GPU ${i}` })),
+  },
+  {
     id: "cpuThreads",
     kind: "number",
     label: "CPU Threads",
@@ -181,6 +219,18 @@ export const LOAD_FIELD_DEFS: LoadFieldDef[] = [
     ],
   },
   {
+    id: "mmprojOffloadToGpu",
+    kind: "enum",
+    label: "Offload vision to GPU",
+    help: "CLIP / mmproj GPU offload (default on). Off passes --no-mmproj-offload (system RAM).",
+    store: "load",
+    key: "mmprojOffloadToGpu",
+    options: [
+      { value: "true", name: "On — CLIP on GPU" },
+      { value: "false", name: "Off — CLIP in system RAM" },
+    ],
+  },
+  {
     id: "evalBatchSize",
     kind: "number",
     label: "Eval Batch Size",
@@ -206,7 +256,7 @@ export const LOAD_FIELD_DEFS: LoadFieldDef[] = [
     id: "speculativeMode",
     kind: "enum",
     label: "Speculative Mode",
-    help: "MTP uses next-n layers in the main GGUF. DFlash needs a separate draft GGUF (set draft path in VS Code).",
+    help: "MTP uses next-n layers in the main GGUF, or a sibling mtp-*.gguf (Gemma 4). DFlash needs a separate draft GGUF.",
     store: "load",
     key: "speculativeMode",
     options: [
@@ -230,7 +280,7 @@ export const LOAD_FIELD_DEFS: LoadFieldDef[] = [
     id: "draftGpuOffload",
     kind: "number",
     label: "Draft GPU Offload",
-    help: "DFlash draft layers in VRAM (--spec-draft-ngl). 99 ≈ all.",
+    help: "DFlash/sidecar-MTP draft layers in VRAM (--spec-draft-ngl). 99 ≈ all.",
     step: 1,
     store: "load",
     key: "draftGpuOffload",

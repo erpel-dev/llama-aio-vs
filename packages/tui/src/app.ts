@@ -23,12 +23,21 @@ import {
 import {
   estimateMemory,
   formatBytes,
+  formatGpuDeviceLabel,
   formatLicenseQuickPick,
   formatModelSize,
+  languageGgufFiles,
   licenseFromTags,
   listLocalModelEntries,
+  preferredMmprojFile,
+  preferredMtpDraftFile,
   STARTER_MODEL,
   streamChatCompletion,
+  parseTensorSplit,
+  tensorSplitForMainShare,
+  mainShareFromSplit,
+  isLegacyGpu0FirstSplit,
+  alignTensorSplitToMainGpu,
   type ChatMessage,
   type HfFileHit,
   type HfModelHit,
@@ -38,7 +47,7 @@ import {
   type MemoryBarChart,
   type ModelLicenseInfo,
   type UiBackend,
-  detectGpuMemory,
+  detectGpus,
 } from "@llama-aio/core";
 import type { AppServices } from "./services.js";
 import { theme } from "./theme.js";
@@ -455,6 +464,7 @@ export async function runApp(services: AppServices): Promise<void> {
   let hfPickedRepo: HfModelHit | undefined;
   let hfPickedLicense: ModelLicenseInfo | undefined;
   let hfFiles: HfFileHit[] = [];
+  let hfAllFiles: HfFileHit[] = [];
 
   const modelHint = mount(
     Text({
@@ -542,6 +552,7 @@ export async function runApp(services: AppServices): Promise<void> {
   function memBarRow(): {
     row: BoxRenderable;
     weights: TextRenderable;
+    vision: TextRenderable;
     draft: TextRenderable;
     kv: TextRenderable;
     overhead: TextRenderable;
@@ -550,6 +561,7 @@ export async function runApp(services: AppServices): Promise<void> {
     const mk = (fg: string) =>
       mount(Text({ content: "", fg, height: 1, flexShrink: 0 })) as TextRenderable;
     const weights = mk(theme.memWeights);
+    const vision = mk(theme.memVision);
     const draft = mk(theme.memDraft);
     const kv = mk(theme.memKv);
     const overhead = mk(theme.memOverhead);
@@ -563,11 +575,12 @@ export async function runApp(services: AppServices): Promise<void> {
       })
     ) as BoxRenderable;
     row.add(weights);
+    row.add(vision);
     row.add(draft);
     row.add(kv);
     row.add(overhead);
     row.add(free);
-    return { row, weights, draft, kv, overhead, free };
+    return { row, weights, vision, draft, kv, overhead, free };
   }
 
   function paintMemBar(
@@ -575,9 +588,10 @@ export async function runApp(services: AppServices): Promise<void> {
     chart: MemoryBarChart | null,
     width: number
   ): void {
-    const empty = { weights: "", draft: "", kv: "", overhead: "", free: "░".repeat(width) };
+    const empty = { weights: "", vision: "", draft: "", kv: "", overhead: "", free: "░".repeat(width) };
     if (!chart) {
       cells.weights.content = empty.weights;
+      cells.vision.content = empty.vision;
       cells.draft.content = empty.draft;
       cells.kv.content = empty.kv;
       cells.overhead.content = empty.overhead;
@@ -588,6 +602,7 @@ export async function runApp(services: AppServices): Promise<void> {
     const parts = barParts(chart, width);
     const byKey = {
       weights: "",
+      vision: "",
       draft: "",
       kv: "",
       overhead: "",
@@ -597,12 +612,13 @@ export async function runApp(services: AppServices): Promise<void> {
       byKey[p.key] = barCell(p.cols);
     }
     cells.weights.content = byKey.weights;
+    cells.vision.content = byKey.vision;
     cells.draft.content = byKey.draft;
     cells.kv.content = byKey.kv;
     cells.overhead.content = byKey.overhead;
     cells.free.content =
       byKey.free ||
-      (byKey.weights || byKey.draft || byKey.kv || byKey.overhead ? "" : "░".repeat(width));
+      (byKey.weights || byKey.vision || byKey.draft || byKey.kv || byKey.overhead ? "" : "░".repeat(width));
   }
 
   const loadMemNote = mount(
@@ -616,6 +632,8 @@ export async function runApp(services: AppServices): Promise<void> {
 
   const loadVramHead = memTitleRow("VRAM · est. at full context");
   const loadVramBar = memBarRow();
+  const loadVram2Head = memTitleRow("VRAM · GPU 1 · est. at full context");
+  const loadVram2Bar = memBarRow();
   const loadRamHead = memTitleRow("System RAM · est. at full context");
   const loadRamBar = memBarRow();
 
@@ -630,6 +648,9 @@ export async function runApp(services: AppServices): Promise<void> {
   ) as BoxRenderable;
   loadMemLegendRow.add(
     mount(Text({ content: "█ Weights", fg: theme.memWeights })) as TextRenderable
+  );
+  loadMemLegendRow.add(
+    mount(Text({ content: "█ Vision", fg: theme.memVision })) as TextRenderable
   );
   loadMemLegendRow.add(
     mount(Text({ content: "█ Spec", fg: theme.memDraft })) as TextRenderable
@@ -684,6 +705,8 @@ export async function runApp(services: AppServices): Promise<void> {
   loadMemPanel.add(loadMemNote);
   loadMemPanel.add(loadVramHead.row);
   loadMemPanel.add(loadVramBar.row);
+  loadMemPanel.add(loadVram2Head.row);
+  loadMemPanel.add(loadVram2Bar.row);
   loadMemPanel.add(loadRamHead.row);
   loadMemPanel.add(loadRamBar.row);
   loadMemPanel.add(loadMemLegendRow);
@@ -695,6 +718,63 @@ export async function runApp(services: AppServices): Promise<void> {
   let loadSaveTimer: ReturnType<typeof setTimeout> | undefined;
 
   type LoadBounds = { min: number; max: number };
+
+  function splitGpuInfos() {
+    const cpuOnly = services.installer.resolveActiveUiBackend() === "cpu";
+    return cpuOnly ? [] : detectGpus(false, services.processManager.resolveBinary());
+  }
+
+  function splitGpuCount(): number {
+    return Math.max(2, splitGpuInfos().length || 2);
+  }
+
+  function syncMainGpuOptions(): void {
+    const field = LOAD_FIELD_DEFS.find((f) => f.id === "mainGpu");
+    if (!field || field.kind !== "enum") {
+      return;
+    }
+    const gpus = splitGpuInfos();
+    field.options = gpus.length
+      ? gpus.map((g, i) => ({
+          value: String(i),
+          name: `${formatGpuDeviceLabel(g, i)} · ${formatBytes(g.totalBytes)}`,
+        }))
+      : Array.from({ length: 8 }, (_, i) => ({ value: String(i), name: `GPU ${i}` }));
+  }
+
+  function tensorSplitPercent(load: LlamaLoadSettings): number {
+    const gpus = splitGpuInfos();
+    const n = splitGpuCount();
+    const vram = gpus.length ? gpus.map((g) => g.totalBytes) : Array.from({ length: n }, () => 1);
+    const share = mainShareFromSplit(load.tensorSplit, load.mainGpu, n, vram);
+    return Math.min(90, Math.max(10, Math.round(share * 100)));
+  }
+
+  function visibleLoadFields(): typeof LOAD_FIELD_DEFS {
+    const splitMode = services.store.getState().loadSettings.splitMode || "layer";
+    return LOAD_FIELD_DEFS.filter((f) => !(f.id === "tensorSplit" && splitMode === "none"));
+  }
+
+  function maybeMigrateLegacySplit(): void {
+    const gpus = splitGpuInfos();
+    if (gpus.length < 2) {
+      return;
+    }
+    const load = services.store.getState().loadSettings;
+    if (!isLegacyGpu0FirstSplit(load.tensorSplit) || load.mainGpu <= 0) {
+      return;
+    }
+    const aligned = alignTensorSplitToMainGpu(
+      load.tensorSplit,
+      load.mainGpu,
+      gpus.length,
+      gpus.map((g) => g.totalBytes)
+    );
+    if (!aligned) {
+      return;
+    }
+    void services.store.updateLoadSettings({ tensorSplit: aligned });
+  }
 
   function loadBounds(field: (typeof LOAD_FIELD_DEFS)[number]): LoadBounds {
     if (field.kind !== "number") {
@@ -732,6 +812,9 @@ export async function runApp(services: AppServices): Promise<void> {
       if (field.key === "offloadKvCacheToGpu") {
         return load.offloadKvCacheToGpu ? "true" : "false";
       }
+      if (field.key === "mmprojOffloadToGpu") {
+        return load.mmprojOffloadToGpu !== false ? "true" : "false";
+      }
       if (field.key === "cacheTypeK") {
         return load.cacheTypeK;
       }
@@ -743,6 +826,12 @@ export async function runApp(services: AppServices): Promise<void> {
       }
       if (field.key === "speculativeMode") {
         return load.speculativeMode || "off";
+      }
+      if (field.key === "splitMode") {
+        return load.splitMode || "layer";
+      }
+      if (field.key === "mainGpu") {
+        return String(load.mainGpu);
       }
       return "";
     }
@@ -764,6 +853,8 @@ export async function runApp(services: AppServices): Promise<void> {
     if (field.key === "physicalBatchSize") return load.physicalBatchSize;
     if (field.key === "maxDraftTokens") return load.maxDraftTokens;
     if (field.key === "draftGpuOffload") return load.draftGpuOffload;
+    if (field.key === "tensorSplit") return tensorSplitPercent(load);
+    if (field.key === "mainGpu") return load.mainGpu;
     return 0;
   }
 
@@ -771,8 +862,9 @@ export async function runApp(services: AppServices): Promise<void> {
     const raw = readFieldRaw(field);
     if (field.kind === "number") {
       const shown = formatFieldValue(raw as number, field.step);
+      const suffix = field.key === "tensorSplit" ? "%" : "";
       return {
-        name: `${field.label}  ·  ${shown}`,
+        name: `${field.label}  ·  ${shown}${suffix}`,
         description: field.help,
         value: field.id,
       };
@@ -780,8 +872,9 @@ export async function runApp(services: AppServices): Promise<void> {
     if (field.kind === "enum") {
       const cur = String(raw);
       const opt = field.options.find((o) => o.value === cur);
+      const shown = opt?.name || cur;
       return {
-        name: `${field.label}  ·  ${cur}`,
+        name: `${field.label}  ·  ${shown}`,
         description: opt?.name || field.help,
         value: field.id,
       };
@@ -832,7 +925,10 @@ export async function runApp(services: AppServices): Promise<void> {
       paintLoadDetailBar(min, max, value);
     } else if (field.kind === "enum") {
       const cur = String(readFieldRaw(field));
-      const labels = field.options.map((o) => (o.value === cur ? `[${o.value}]` : o.value));
+      const labels = field.options.map((o) => {
+        const label = field.key === "mainGpu" ? o.name : o.value;
+        return o.value === cur ? `[${label}]` : label;
+      });
       loadDetailFilled.content = "";
       loadDetailEmpty.content = labels.join("  ");
     } else {
@@ -888,14 +984,28 @@ export async function runApp(services: AppServices): Promise<void> {
   async function commitLoadNumber(field: Extract<(typeof LOAD_FIELD_DEFS)[number], { kind: "number" }>, value: number): Promise<void> {
     if (field.store === "request") {
       await services.store.updateRequestSettings({ [field.key]: value });
-    } else {
-      await services.store.updateLoadSettings({ [field.key]: value });
+      return;
     }
+    if (field.key === "tensorSplit") {
+      const load = services.store.getState().loadSettings;
+      if (load.splitMode === "none") {
+        return;
+      }
+      await services.store.updateLoadSettings({
+        tensorSplit: tensorSplitForMainShare(value / 100, load.mainGpu, splitGpuCount()),
+      });
+      return;
+    }
+    await services.store.updateLoadSettings({ [field.key]: value });
   }
 
   async function commitLoadEnum(field: Extract<(typeof LOAD_FIELD_DEFS)[number], { kind: "enum" }>, value: string): Promise<void> {
     if (field.key === "offloadKvCacheToGpu") {
       await services.store.updateLoadSettings({ offloadKvCacheToGpu: value === "true" });
+      return;
+    }
+    if (field.key === "mmprojOffloadToGpu") {
+      await services.store.updateLoadSettings({ mmprojOffloadToGpu: value === "true" });
       return;
     }
     if (field.key === "cacheTypeK" || field.key === "cacheTypeV") {
@@ -914,7 +1024,23 @@ export async function runApp(services: AppServices): Promise<void> {
           ? { maxDraftTokens: 15 }
           : {}),
       });
+      return;
     }
+    if (field.key === "mainGpu") {
+      const mainGpu = Number(value);
+      const load = services.store.getState().loadSettings;
+      const patch: Partial<LlamaLoadSettings> = { mainGpu };
+      if (parseTensorSplit(load.tensorSplit).length >= 2) {
+        patch.tensorSplit = tensorSplitForMainShare(
+          tensorSplitPercent(load) / 100,
+          mainGpu,
+          splitGpuCount()
+        );
+      }
+      await services.store.updateLoadSettings(patch);
+      return;
+    }
+    await services.store.updateLoadSettings({ [field.key]: value });
   }
 
   function adjustLoadField(dir: -1 | 1): boolean {
@@ -934,7 +1060,10 @@ export async function runApp(services: AppServices): Promise<void> {
       paintLoadDetailBar(min, max, next);
       const opts = loadFieldSelect.options.map((o) =>
         o.value === field.id
-          ? { ...o, name: `${field.label}  ·  ${formatFieldValue(next, field.step)}` }
+          ? {
+              ...o,
+              name: `${field.label}  ·  ${formatFieldValue(next, field.step)}${field.key === "tensorSplit" ? "%" : ""}`,
+            }
           : o
       );
       loadFieldSelect.options = opts;
@@ -952,10 +1081,11 @@ export async function runApp(services: AppServices): Promise<void> {
     }
     scheduleLoadPatch(() => commitLoadEnum(field, next));
     // refresh via store onDidChange; optimistic option text:
-    loadFieldSelect.options = LOAD_FIELD_DEFS.map((f) =>
+    const nextName = field.options.find((o) => o.value === next)?.name || next;
+    loadFieldSelect.options = visibleLoadFields().map((f) =>
       f.id === field.id
         ? {
-            name: `${field.label}  ·  ${next}`,
+            name: `${field.label}  ·  ${nextName}`,
             description: field.options.find((o) => o.value === next)?.name || field.help,
             value: field.id,
           }
@@ -984,6 +1114,7 @@ export async function runApp(services: AppServices): Promise<void> {
     setLoadEditing(!loadEditing);
   }
 
+  syncMainGpuOptions();
   const loadFieldSelect = mount(
     Select({
       width: "100%",
@@ -996,7 +1127,7 @@ export async function runApp(services: AppServices): Promise<void> {
       selectedTextColor: theme.selectedFg,
       textColor: theme.text,
       descriptionColor: theme.muted,
-      options: LOAD_FIELD_DEFS.map((f) => formatLoadOption(f)),
+      options: visibleLoadFields().map((f) => formatLoadOption(f)),
     })
   ) as SelectRenderable;
   wireSelect(loadFieldSelect, true);
@@ -1051,10 +1182,10 @@ export async function runApp(services: AppServices): Promise<void> {
     const raw = min + (local / width) * (max - min);
     const next = roundToStep(raw, field.step, min, max);
     paintLoadDetailBar(min, max, next);
-    loadFieldSelect.options = LOAD_FIELD_DEFS.map((f) =>
+    loadFieldSelect.options = visibleLoadFields().map((f) =>
       f.id === field.id
         ? {
-            name: `${field.label}  ·  ${formatFieldValue(next, field.step)}`,
+            name: `${field.label}  ·  ${formatFieldValue(next, field.step)}${field.key === "tensorSplit" ? "%" : ""}`,
             description: field.help,
             value: field.id,
           }
@@ -1257,6 +1388,13 @@ export async function runApp(services: AppServices): Promise<void> {
       `Endpoint:  ${st.endpoint}`,
       `PID:       ${st.pid ?? "—"}`,
       `Model:     ${shortPath(st.modelPath || state.selectedModelPath || "")}`,
+      `Vision:    ${
+        state.loadSettings.mmprojPath
+          ? `${path.basename(state.loadSettings.mmprojPath)}${
+              state.loadSettings.mmprojOffloadToGpu === false ? " · CPU" : " · GPU"
+            }`
+          : "off"
+      }`,
       `Config:    ${services.config.path}`,
       `Dirty:     ${st.configDirty ? "yes — reload to apply" : "no"}`,
       `Owned:     ${st.ownedByThisExtension ? "yes" : "no / foreign"}`,
@@ -1315,6 +1453,7 @@ export async function runApp(services: AppServices): Promise<void> {
       hfPickedRepo = undefined;
       hfPickedLicense = undefined;
       hfFiles = [];
+      hfAllFiles = [];
       modelSearch.value = "";
       refreshModels();
       modelSelect.focus();
@@ -1397,7 +1536,12 @@ export async function runApp(services: AppServices): Promise<void> {
       description: formatBytes(f.size),
       value: f.path,
     }));
-    modelHint.content = `${hfPickedRepo?.id} · ${hfFiles.length} GGUF file(s) · Enter download · Esc back`;
+    const mmproj = preferredMmprojFile(hfAllFiles);
+    const mtp = preferredMtpDraftFile(hfAllFiles);
+    const extras = [mmproj?.path, mtp?.path].filter(Boolean).map((p) => path.basename(p as string));
+    modelHint.content = extras.length
+      ? `${hfPickedRepo?.id} · ${hfFiles.length} GGUF · also fetches ${extras.join(", ")} · Enter download · Esc back`
+      : `${hfPickedRepo?.id} · ${hfFiles.length} GGUF file(s) · Enter download · Esc back`;
     modelSelect.focus();
     renderer.requestRender();
   }
@@ -1437,9 +1581,11 @@ export async function runApp(services: AppServices): Promise<void> {
       return;
     }
     await withBusy("Listing GGUF files…", async () => {
-      hfFiles = await services.hf.listGgufFiles(hfPickedRepo!.id);
+      const all = await services.hf.listGgufFiles(hfPickedRepo!.id);
+      hfFiles = languageGgufFiles(all);
+      hfAllFiles = all;
       if (!hfFiles.length) {
-        setStatusMessage("No .gguf files in that repo.");
+        setStatusMessage("No language GGUF files in that repo.");
         showHfRepos();
         return;
       }
@@ -1460,9 +1606,32 @@ export async function runApp(services: AppServices): Promise<void> {
           renderer.requestRender();
         },
       });
+      try {
+        await services.hf.downloadPreferredMmproj(repoId, hfAllFiles, {
+          report: (v: { message?: string; increment?: number }) => {
+            bootMessage = v.message || bootMessage;
+            refreshStatus();
+            renderer.requestRender();
+          },
+        });
+      } catch {
+        // Language GGUF is enough to start; projector can be added later.
+      }
+      try {
+        await services.hf.downloadPreferredMtpDraft(repoId, hfAllFiles, {
+          report: (v: { message?: string; increment?: number }) => {
+            bootMessage = v.message || bootMessage;
+            refreshStatus();
+            renderer.requestRender();
+          },
+        });
+      } catch {
+        // Optional sidecar MTP drafter.
+      }
       await services.store.applySelectedModel(dest, {
         recommendDefaults: true,
         cpuOnly: services.installer.resolveActiveUiBackend() === "cpu",
+        attachMmproj: true,
       });
       setStatusMessage(`Downloaded ${path.basename(dest)}. Start/reload to load it.`);
       setModelBrowse("local");
@@ -1482,9 +1651,29 @@ export async function runApp(services: AppServices): Promise<void> {
           },
         }
       );
+      try {
+        const files = await services.hf.listGgufFiles(STARTER_MODEL.repoId);
+        await services.hf.downloadPreferredMmproj(STARTER_MODEL.repoId, files, {
+          report: (v: { message?: string; increment?: number }) => {
+            bootMessage = v.message || bootMessage;
+            refreshStatus();
+            renderer.requestRender();
+          },
+        });
+        await services.hf.downloadPreferredMtpDraft(STARTER_MODEL.repoId, files, {
+          report: (v: { message?: string; increment?: number }) => {
+            bootMessage = v.message || bootMessage;
+            refreshStatus();
+            renderer.requestRender();
+          },
+        });
+      } catch {
+        // optional
+      }
       await services.store.applySelectedModel(dest, {
         recommendDefaults: true,
         cpuOnly: services.installer.resolveActiveUiBackend() === "cpu",
+        attachMmproj: true,
       });
       setStatusMessage(`Starter ready: ${path.basename(dest)}.`);
       setModelBrowse("local");
@@ -1499,6 +1688,16 @@ export async function runApp(services: AppServices): Promise<void> {
     if (modelBrowse === "hf-repos" || modelBrowse === "hf-query") {
       setModelBrowse("local");
       return;
+    }
+  }
+
+  function setVram2Visible(show: boolean): void {
+    loadVram2Head.row.height = show ? 1 : 0;
+    loadVram2Bar.row.height = show ? 1 : 0;
+    if (!show) {
+      loadVram2Head.title.content = "";
+      loadVram2Head.sub.content = "";
+      paintMemBar(loadVram2Bar, null, 0);
     }
   }
 
@@ -1519,6 +1718,7 @@ export async function runApp(services: AppServices): Promise<void> {
       loadRamHead.sub.fg = theme.muted as never;
       paintMemBar(loadVramBar, null, barWidth);
       paintMemBar(loadRamBar, null, barWidth);
+      setVram2Visible(false);
       loadMemSummary.content = "Select a model to estimate VRAM / RAM use.";
       loadMemSummary.fg = theme.muted as never;
       loadMemWarn.content = "";
@@ -1526,13 +1726,18 @@ export async function runApp(services: AppServices): Promise<void> {
     }
 
     const cpuOnly = services.installer.resolveActiveUiBackend() === "cpu";
-    const gpu = cpuOnly ? undefined : detectGpuMemory();
-    const est = estimateMemory(caps, state.loadSettings, gpu, { cpuOnly });
+    const gpus = cpuOnly ? [] : detectGpus(false, services.processManager.resolveBinary());
+    const gpu = gpus[0];
+    const est = estimateMemory(caps, state.loadSettings, gpu, {
+      cpuOnly,
+      gpus: cpuOnly ? undefined : gpus,
+    });
     if (!est) {
       loadMemSummary.content = "Memory estimate unavailable.";
       loadMemWarn.content = "";
       paintMemBar(loadVramBar, null, barWidth);
       paintMemBar(loadRamBar, null, barWidth);
+      setVram2Visible(false);
       return;
     }
 
@@ -1541,12 +1746,23 @@ export async function runApp(services: AppServices): Promise<void> {
       loadVramHead.sub.content = "—";
       loadVramHead.sub.fg = theme.muted as never;
       paintMemBar(loadVramBar, null, barWidth);
+      setVram2Visible(false);
     } else {
       loadVramHead.title.content = est.charts.vram.title;
       const vSub = chartSubtitle(est.charts.vram);
       loadVramHead.sub.content = vSub.text;
       loadVramHead.sub.fg = memToneFg(vSub.tone) as never;
       paintMemBar(loadVramBar, est.charts.vram, barWidth);
+      if (est.charts.vram2) {
+        setVram2Visible(true);
+        loadVram2Head.title.content = est.charts.vram2.title;
+        const v2Sub = chartSubtitle(est.charts.vram2);
+        loadVram2Head.sub.content = v2Sub.text;
+        loadVram2Head.sub.fg = memToneFg(v2Sub.tone) as never;
+        paintMemBar(loadVram2Bar, est.charts.vram2, barWidth);
+      } else {
+        setVram2Visible(false);
+      }
     }
 
     loadRamHead.title.content = est.charts.ram.title;
@@ -1569,13 +1785,15 @@ export async function runApp(services: AppServices): Promise<void> {
     const req = state.requestSettings;
     const selectedId = loadFieldSelect.getSelectedOption()?.value as string | undefined;
 
+    syncMainGpuOptions();
+    maybeMigrateLegacySplit();
     refreshMemoryCharts();
     loadHint.content = [
       `ctx ${load.contextLength} · ngl ${load.gpuOffload} · KV ${load.cacheTypeK}/${load.cacheTypeV} · slots ${load.maxConcurrentPredictions}`,
       `sampling T=${req.temperature} top_p=${req.topP} top_k=${req.topK} max_tokens=${req.maxTokens}`,
     ].join("\n");
 
-    loadFieldSelect.options = LOAD_FIELD_DEFS.map((f) => formatLoadOption(f));
+    loadFieldSelect.options = visibleLoadFields().map((f) => formatLoadOption(f));
     if (selectedId) {
       const idx = loadFieldSelect.options.findIndex((o) => o.value === selectedId);
       if (idx >= 0) {
@@ -1726,23 +1944,22 @@ export async function runApp(services: AppServices): Promise<void> {
       return Math.min(65536, maxCtx);
     }
     const cpuOnly = services.installer.resolveActiveUiBackend() === "cpu";
-    const gpu = cpuOnly ? undefined : detectGpuMemory();
-    const capacity = cpuOnly
-      ? undefined
-      : gpu?.totalBytes
-        ? gpu.totalBytes * 0.92
-        : undefined;
-    if (!capacity) {
+    const gpus = cpuOnly ? [] : detectGpus(false, services.processManager.resolveBinary());
+    if (cpuOnly || !gpus.length) {
       return Math.min(65536, maxCtx);
     }
+    const gpu = gpus[0];
     let best = 0;
     for (const step of FIT_CONTEXT_STEPS) {
       const ctx = Math.min(step, maxCtx);
       if (ctx < 8192) {
         continue;
       }
-      const est = estimateMemory(caps, { ...load, contextLength: ctx }, gpu, { cpuOnly });
-      if (est && est.totalGpuBytes <= capacity) {
+      const est = estimateMemory(caps, { ...load, contextLength: ctx }, gpu, {
+        cpuOnly,
+        gpus,
+      });
+      if (est && !est.willSpill) {
         best = ctx;
         break;
       }

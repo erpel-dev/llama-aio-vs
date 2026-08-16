@@ -68,29 +68,55 @@ function isRetryableNetworkError(err: unknown): boolean {
   if (err instanceof Error && err.cause) {
     parts.push(String(err.cause));
   }
-  return /hang up|ECONNRESET|ETIMEDOUT|EAI_AGAIN|ECONNREFUSED|aborted|AbortError|fetch failed|UND_ERR|socket|NGHTTP2|ERR_HTTP2|REFUSED_STREAM/i.test(
+  return /hang up|ECONNRESET|ETIMEDOUT|EAI_AGAIN|ECONNREFUSED|aborted|AbortError|TimeoutError|fetch failed|UND_ERR|socket|NGHTTP2|ERR_HTTP2|REFUSED_STREAM/i.test(
     parts.join(" ")
   );
 }
 
 /**
+ * Timer abort that can be disarmed after `fetch()` resolves (headers in).
+ * `AbortSignal.timeout()` keeps ticking through the body and will kill a long download.
+ */
+export function createClearableTimeoutSignal(ms: number): { signal: AbortSignal; clear: () => void } {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), ms);
+  return {
+    signal: ac.signal,
+    clear: () => clearTimeout(timer),
+  };
+}
+
+/**
  * GitHub's HTML site resets Node's `https.get` (HTTP/1.1) with `socket hang up`.
  * Undici `fetch` (HTTP/2) follows redirects and actually completes.
+ *
+ * `timeoutMode: "headers"` disarms the timer once headers arrive so archive
+ * bodies can take longer than the header wait. Default `"total"` still bounds
+ * small JSON / HEAD responses.
  */
-async function githubFetch(url: string, init: RequestInit = {}, timeoutMs = 20_000): Promise<Response> {
+async function githubFetch(
+  url: string,
+  init: RequestInit = {},
+  timeoutMs = 20_000,
+  timeoutMode: "total" | "headers" = "total"
+): Promise<Response> {
   let lastErr: unknown;
   for (let attempt = 1; attempt <= 3; attempt++) {
+    const timed = timeoutMode === "headers" ? createClearableTimeoutSignal(timeoutMs) : undefined;
     try {
-      return await fetch(url, {
+      const res = await fetch(url, {
         ...init,
         headers: {
           "User-Agent": GITHUB_UA,
           ...(init.headers as Record<string, string> | undefined),
         },
         redirect: init.redirect ?? "follow",
-        signal: init.signal ?? AbortSignal.timeout(timeoutMs),
+        signal: init.signal ?? timed?.signal ?? AbortSignal.timeout(timeoutMs),
       });
+      timed?.clear();
+      return res;
     } catch (err) {
+      timed?.clear();
       lastErr = err;
       if (attempt === 3 || !isRetryableNetworkError(err)) {
         throw err;
@@ -112,11 +138,42 @@ async function httpGetJson<T>(url: string, headers: Record<string, string> = {})
   return JSON.parse(body) as T;
 }
 
+/** How long to wait for download response headers (redirects included). */
+const DOWNLOAD_HEADER_TIMEOUT_MS = 60_000;
+const DOWNLOAD_ATTEMPTS = 3;
+
 async function downloadFile(url: string, dest: string, onProgress?: (pct: number) => void): Promise<void> {
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= DOWNLOAD_ATTEMPTS; attempt++) {
+    try {
+      await downloadFileOnce(url, dest, onProgress);
+      return;
+    } catch (err) {
+      lastErr = err;
+      try {
+        fs.rmSync(dest, { force: true });
+      } catch {
+        // truncated leftover from a dropped connection
+      }
+      if (attempt === DOWNLOAD_ATTEMPTS || !isRetryableNetworkError(err)) {
+        throw err;
+      }
+      await new Promise((r) => setTimeout(r, 400 * attempt));
+    }
+  }
+  throw lastErr;
+}
+
+async function downloadFileOnce(
+  url: string,
+  dest: string,
+  onProgress?: (pct: number) => void
+): Promise<void> {
   const res = await githubFetch(
     url,
     { headers: { Accept: "application/octet-stream" } },
-    5 * 60_000
+    DOWNLOAD_HEADER_TIMEOUT_MS,
+    "headers"
   );
   if (!res.ok) {
     throw new Error(`Download failed: HTTP ${res.status} for ${url}`);

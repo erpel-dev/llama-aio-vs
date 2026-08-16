@@ -17,8 +17,13 @@ import {
   resolveModeParams,
   resolveModelModes,
 } from "@llama-aio/core";
-import { estimateContextBreakdown } from "@llama-aio/core";
+import {
+  estimateContextBreakdown,
+  formatExceedContextError,
+  messagesHaveImageParts,
+} from "@llama-aio/core";
 import { decodeSseLines, toolCallSlot } from "@llama-aio/core";
+import { positiveRate, ratesFromTimings, type LlamaTimings } from "@llama-aio/core";
 import { SettingsStore } from "@llama-aio/core";
 
 interface OpenAiModel {
@@ -36,8 +41,16 @@ interface ServerProps {
   model_alias?: string;
 }
 
+type OpenAiContentPart =
+  | { type: "text"; text: string }
+  | { type: "image_url"; image_url: { url: string } };
+
 type OpenAiChatMessage =
-  | { role: "system" | "user" | "assistant"; content: string | null; tool_calls?: OpenAiToolCall[] }
+  | {
+      role: "system" | "user" | "assistant";
+      content: string | null | OpenAiContentPart[];
+      tool_calls?: OpenAiToolCall[];
+    }
   | { role: "tool"; content: string; tool_call_id: string };
 
 type OpenAiToolCall = {
@@ -72,26 +85,62 @@ type StreamEvent =
       toolsEnabled: boolean;
     };
 
-interface LlamaTimings {
-  /** Prompt tokens served from the KV prefix cache (-1 / absent on older builds). */
-  cache_n?: number;
-  prompt_n?: number;
-  prompt_ms?: number;
-  prompt_per_second?: number;
-  predicted_n?: number;
-  predicted_ms?: number;
-  predicted_per_second?: number;
-  /** Speculative / MTP draft tokens generated. */
-  draft_n?: number;
-  /** Speculative / MTP draft tokens accepted. */
-  draft_n_accepted?: number;
-}
-
 interface LlamaUsage {
   prompt_tokens?: number;
   completion_tokens?: number;
   total_tokens?: number;
   prompt_tokens_details?: { cached_tokens?: number };
+}
+
+function promptTokensFrom(usage?: LlamaUsage, timings?: LlamaTimings): number | undefined {
+  if (typeof usage?.prompt_tokens === "number" && usage.prompt_tokens > 0) {
+    return usage.prompt_tokens;
+  }
+  if (typeof timings?.cache_n === "number" && timings.cache_n >= 0) {
+    const processed = typeof timings.prompt_n === "number" && timings.prompt_n > 0 ? timings.prompt_n : 0;
+    const total = timings.cache_n + processed;
+    return total > 0 ? total : undefined;
+  }
+  if (typeof timings?.prompt_n === "number" && timings.prompt_n > 0) {
+    return timings.prompt_n;
+  }
+  return undefined;
+}
+
+function estimateCompletionTokens(
+  chars: number,
+  usage?: LlamaUsage,
+  timings?: LlamaTimings
+): number | undefined {
+  if (typeof usage?.completion_tokens === "number" && usage.completion_tokens > 0) {
+    return usage.completion_tokens;
+  }
+  if (typeof timings?.predicted_n === "number" && timings.predicted_n > 0) {
+    return timings.predicted_n;
+  }
+  if (chars > 0) {
+    return Math.max(1, Math.ceil(chars / 4));
+  }
+  return undefined;
+}
+
+type StatsEvent = Extract<StreamEvent, { kind: "stats" }>;
+
+function statsFromTimings(timings?: LlamaTimings, usage?: LlamaUsage, chars = 0): StatsEvent {
+  const rates = ratesFromTimings(timings);
+  return {
+    kind: "stats",
+    promptTokens: promptTokensFrom(usage, timings),
+    completionTokens: estimateCompletionTokens(chars, usage, timings),
+    promptTokPerSec: rates.promptTokPerSec,
+    genTokPerSec: rates.genTokPerSec,
+    draftTokens: timings?.draft_n,
+    draftTokensAccepted: timings?.draft_n_accepted,
+    cachedPromptTokens:
+      usage?.prompt_tokens_details?.cached_tokens ??
+      (typeof timings?.cache_n === "number" && timings.cache_n >= 0 ? timings.cache_n : undefined),
+    processedPromptTokens: timings?.prompt_n,
+  };
 }
 
 function httpJson<T>(
@@ -142,7 +191,11 @@ function httpJson<T>(
   });
 }
 
-function formatHttpError(status: number, text: string): string {
+function formatHttpError(
+  status: number,
+  text: string,
+  extras?: { maxContext?: number; hasImages?: boolean }
+): string {
   try {
     const json = JSON.parse(text) as {
       error?: { message?: string; type?: string; n_prompt_tokens?: number; n_ctx?: number };
@@ -156,20 +209,41 @@ function formatHttpError(status: number, text: string): string {
       /exceed.*context|exceed_context_size/i.test(msg) ||
       (typeof nPrompt === "number" && typeof nCtx === "number" && nPrompt > nCtx)
     ) {
-      return (
-        `Context too small for this Copilot Chat request` +
-        (nPrompt && nCtx ? ` (${nPrompt} tokens > ${nCtx} slot context)` : "") +
-        `.\n\nFix in Llama AIO sidebar:\n` +
-        `1. Set Context Length ≥ 65536 (or higher)\n` +
-        `2. Set Max Concurrent Predictions = 1 (parallel slots split the context)\n` +
-        `3. Click "Reload to apply changes"\n\n` +
-        `Server said: ${msg}`
-      );
+      return formatExceedContextError({
+        nPrompt: typeof nPrompt === "number" ? nPrompt : undefined,
+        nCtx: typeof nCtx === "number" ? nCtx : undefined,
+        maxContext: extras?.maxContext,
+        hasImages: extras?.hasImages,
+        serverMessage: msg,
+      });
     }
     return `HTTP ${status}: ${msg}`;
   } catch {
     return `HTTP ${status}: ${text.slice(0, 400)}`;
   }
+}
+
+function asImagePart(part: unknown): { mimeType: string; data: Uint8Array } | undefined {
+  if (!part || typeof part !== "object") {
+    return undefined;
+  }
+  const rec = part as { mimeType?: unknown; data?: unknown; value?: unknown };
+  const mime = typeof rec.mimeType === "string" ? rec.mimeType : "";
+  if (!/^image\//i.test(mime)) {
+    return undefined;
+  }
+  const raw = rec.data ?? rec.value;
+  if (raw instanceof Uint8Array) {
+    return { mimeType: mime, data: raw };
+  }
+  if (typeof Buffer !== "undefined" && Buffer.isBuffer(raw)) {
+    return { mimeType: mime, data: raw };
+  }
+  return undefined;
+}
+
+function imageToDataUrl(img: { mimeType: string; data: Uint8Array }): string {
+  return `data:${img.mimeType};base64,${Buffer.from(img.data).toString("base64")}`;
 }
 
 function extractTextFromPart(part: unknown): string {
@@ -204,6 +278,7 @@ function toOpenAiMessages(
 
   for (const msg of messages) {
     const textParts: string[] = [];
+    const imageParts: Array<{ mimeType: string; data: Uint8Array }> = [];
     const toolCalls: OpenAiToolCall[] = [];
     const toolResults: Array<{ callId: string; content: string }> = [];
 
@@ -224,6 +299,11 @@ function toOpenAiMessages(
           callId: part.callId,
           content: stringifyToolResult(part.content),
         });
+        continue;
+      }
+      const image = asImagePart(part);
+      if (image) {
+        imageParts.push(image);
         continue;
       }
       const text = extractTextFromPart(part);
@@ -259,7 +339,16 @@ function toOpenAiMessages(
     }
 
     // user
-    if (textContent) {
+    if (imageParts.length > 0) {
+      const content: OpenAiContentPart[] = [];
+      if (textContent) {
+        content.push({ type: "text", text: textContent });
+      }
+      for (const img of imageParts) {
+        content.push({ type: "image_url", image_url: { url: imageToDataUrl(img) } });
+      }
+      out.push({ role: "user", content });
+    } else if (textContent) {
       out.push({ role: "user", content: textContent });
     }
     for (const toolResult of toolResults) {
@@ -323,7 +412,8 @@ function stripThinkTags(text: string): string {
 async function* streamChatCompletions(
   endpoint: string,
   body: Record<string, unknown>,
-  token: vscode.CancellationToken
+  token: vscode.CancellationToken,
+  extras?: { maxContext?: number; hasImages?: boolean }
 ): AsyncGenerator<StreamEvent> {
   const u = new URL(`${endpoint}/v1/chat/completions`);
   const payload = JSON.stringify({ ...body, stream: true });
@@ -348,7 +438,11 @@ async function* streamChatCompletions(
           const chunks: Buffer[] = [];
           res.on("data", (c) => chunks.push(c));
           res.on("end", () =>
-            reject(new Error(formatHttpError(res.statusCode || 0, Buffer.concat(chunks).toString("utf8"))))
+            reject(
+              new Error(
+                formatHttpError(res.statusCode || 0, Buffer.concat(chunks).toString("utf8"), extras)
+              )
+            )
           );
           return;
         }
@@ -417,36 +511,26 @@ async function* streamChatCompletions(
       }
 
       const choice = json.choices?.[0];
-      if (!choice) {
-        continue;
-      }
+      const delta = choice?.delta;
+      let progressed = false;
 
-      const delta = choice.delta;
       if (typeof delta?.reasoning_content === "string" && delta.reasoning_content.length) {
         assembledReasoning += delta.reasoning_content;
         completionChars += delta.reasoning_content.length;
-        if (!toolsEnabled) {
+        progressed = true;
+        if (!toolsEnabled && !delta.content) {
           // Live-stream reasoning when the server only emits reasoning_content
           // (deepseek format). deepseek-legacy also puts tags in content.
-          if (!delta.content) {
-            yield { kind: "text", text: delta.reasoning_content };
-            yield {
-              kind: "stats",
-              completionTokens: Math.max(1, Math.ceil(completionChars / 4)),
-            };
-          }
+          yield { kind: "text", text: delta.reasoning_content };
         }
       }
       if (typeof delta?.content === "string" && delta.content.length) {
         assembledText += delta.content;
         completionChars += delta.content.length;
+        progressed = true;
         // Live-stream only when tools are not involved (no XML tool-call risk).
         if (!toolsEnabled) {
           yield { kind: "text", text: delta.content };
-          yield {
-            kind: "stats",
-            completionTokens: Math.max(1, Math.ceil(completionChars / 4)),
-          };
         }
       }
 
@@ -464,23 +548,48 @@ async function* streamChatCompletions(
           }
           if (tc.function?.arguments) {
             toolCalls[idx].arguments += tc.function.arguments;
+            completionChars += tc.function.arguments.length;
+            progressed = true;
           }
         }
       }
 
-      if (choice.message?.reasoning_content && !assembledReasoning) {
+      if (choice?.message?.reasoning_content && !assembledReasoning) {
         assembledReasoning = choice.message.reasoning_content;
+        completionChars += choice.message.reasoning_content.length;
+        progressed = true;
       }
-      if (choice.message?.content && !assembledText) {
+      if (choice?.message?.content && !assembledText) {
         assembledText = choice.message.content;
+        completionChars += choice.message.content.length;
+        progressed = true;
       }
-      if (Array.isArray(choice.message?.tool_calls)) {
+      if (Array.isArray(choice?.message?.tool_calls)) {
         for (const [idx, tc] of choice.message.tool_calls.entries()) {
+          const hadArgs = !!toolCalls[idx]?.arguments;
           toolCalls[idx] = {
             id: tc.id || `call_${idx}`,
             name: tc.function?.name || "",
             arguments: tc.function?.arguments || "",
           };
+          if (!hadArgs && tc.function?.arguments) {
+            completionChars += tc.function.arguments.length;
+            progressed = true;
+          }
+        }
+      }
+
+      // Live tok/s ticks even when tools buffer the text (Copilot Chat/agent).
+      // Console `slot print_timing` is not on the SSE stream until timings arrive.
+      if (progressed || json.timings || json.usage) {
+        const live = statsFromTimings(json.timings, lastUsage, completionChars);
+        if (
+          live.completionTokens ||
+          live.genTokPerSec ||
+          live.promptTokPerSec ||
+          live.promptTokens
+        ) {
+          yield live;
         }
       }
     } catch (err) {
@@ -495,29 +604,11 @@ async function* streamChatCompletions(
   }
 
   if (lastTimings || lastUsage) {
+    yield statsFromTimings(lastTimings, lastUsage, completionChars);
+  } else if (assembledText || assembledReasoning || completionChars) {
     yield {
       kind: "stats",
-      promptTokens: lastUsage?.prompt_tokens ?? lastTimings?.prompt_n,
-      completionTokens: lastUsage?.completion_tokens ?? lastTimings?.predicted_n,
-      promptTokPerSec: lastTimings?.prompt_per_second,
-      genTokPerSec: lastTimings?.predicted_per_second,
-      draftTokens: lastTimings?.draft_n,
-      draftTokensAccepted: lastTimings?.draft_n_accepted,
-      cachedPromptTokens:
-        lastUsage?.prompt_tokens_details?.cached_tokens ??
-        // cache_n is -1 on builds that don't report prefix reuse.
-        (typeof lastTimings?.cache_n === "number" && lastTimings.cache_n >= 0
-          ? lastTimings.cache_n
-          : undefined),
-      processedPromptTokens: lastTimings?.prompt_n,
-    };
-  } else if (assembledText || assembledReasoning) {
-    yield {
-      kind: "stats",
-      completionTokens: Math.max(
-        1,
-        Math.ceil((assembledText.length + assembledReasoning.length) / 4)
-      ),
+      completionTokens: estimateCompletionTokens(completionChars),
     };
   }
 
@@ -696,6 +787,7 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
     const maxOutput = Math.min(state.requestSettings.maxTokens, Math.floor(serverSlotCtx / 4));
     const maxInput = Math.max(1024, serverSlotCtx - maxOutput);
     const shortName = modelId.split(/[/\\]/).pop() || modelId;
+    const vision = !!(state.loadSettings.mmprojPath || "").trim();
     const modeSet = resolveModelModes(state.modelCapabilities, modelId);
     const info: vscode.LanguageModelChatInformation & {
       configurationSchema?: { properties: Record<string, unknown> };
@@ -707,12 +799,12 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
       maxInputTokens: maxInput,
       maxOutputTokens: maxOutput,
       tooltip: modeSet
-        ? `Local llama.cpp at ${this.store.getEndpoint()} · slot context ${serverSlotCtx} · modes: ${Object.keys(modeSet.modes).join(", ")}`
-        : `Local llama.cpp at ${this.store.getEndpoint()} · slot context ${serverSlotCtx}`,
+        ? `Local llama.cpp at ${this.store.getEndpoint()} · slot context ${serverSlotCtx} · modes: ${Object.keys(modeSet.modes).join(", ")}${vision ? " · vision" : ""}`
+        : `Local llama.cpp at ${this.store.getEndpoint()} · slot context ${serverSlotCtx}${vision ? " · vision" : ""}`,
       detail: `${serverSlotCtx} ctx/slot · ${state.selectedModelPath || this.store.getEndpoint()}`,
       capabilities: {
         toolCalling: true,
-        imageInput: false,
+        imageInput: vision,
       },
     };
     if (modeSet) {
@@ -811,7 +903,7 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
       speculativeMode: state.loadSettings.speculativeMode || "off",
       contextBreakdown,
     });
-    let sawFinalServerStats = false;
+    let lastServerStats: StatsEvent | undefined;
     let lastCompletionTokens = 0;
     let lastPromptTokens: number | undefined;
     let lastTickAt = 0;
@@ -828,7 +920,10 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
         }
       | undefined;
     try {
-      for await (const event of streamChatCompletions(this.store.getEndpoint(), body, token)) {
+      for await (const event of streamChatCompletions(this.store.getEndpoint(), body, token, {
+        maxContext: state.modelCapabilities?.maxContextLength,
+        hasImages: messagesHaveImageParts(converted),
+      })) {
         if (event.kind === "text") {
           emittedTextChars += event.text.length;
           progress.report(new vscode.LanguageModelTextPart(event.text));
@@ -851,34 +946,46 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
               estimated: false,
             });
           }
-          const hasSpeed =
-            typeof event.genTokPerSec === "number" ||
-            typeof event.promptTokPerSec === "number";
-          if (hasSpeed) {
-            sawFinalServerStats = true;
-            this.perf.complete({
-              promptTokens: event.promptTokens ?? lastPromptTokens,
-              completionTokens:
-                (event.completionTokens ?? lastCompletionTokens) || undefined,
-              promptTokPerSec: event.promptTokPerSec,
-              genTokPerSec: event.genTokPerSec,
-              draftTokens: event.draftTokens,
-              draftTokensAccepted: event.draftTokensAccepted,
-              cachedPromptTokens: event.cachedPromptTokens,
-              processedPromptTokens: event.processedPromptTokens,
-              contextLimit: slotCtx,
-              source: "server",
-            });
-          } else if (typeof event.completionTokens === "number") {
+          const gen = positiveRate(event.genTokPerSec);
+          const prompt = positiveRate(event.promptTokPerSec);
+          const hasServerExtras =
+            gen !== undefined ||
+            prompt !== undefined ||
+            event.draftTokens !== undefined ||
+            event.cachedPromptTokens !== undefined ||
+            event.processedPromptTokens !== undefined;
+          if (hasServerExtras) {
+            lastServerStats = event;
+          }
+          // Tick during the stream — do not complete() until the SSE ends, or
+          // a mid-stream timings object (prompt tok/s) would hide "Generating…".
+          if (typeof event.completionTokens === "number" || gen || prompt) {
             const now = Date.now();
-            if (now - lastTickAt >= 250) {
+            if (now - lastTickAt >= 250 || gen || prompt) {
               lastTickAt = now;
-              this.perf.tick(event.completionTokens);
+              this.perf.tick(event.completionTokens ?? lastCompletionTokens, {
+                genTokPerSec: gen,
+                promptTokPerSec: prompt,
+              });
             }
           }
         }
       }
-      if (!sawFinalServerStats) {
+      if (lastServerStats) {
+        this.perf.complete({
+          promptTokens: lastServerStats.promptTokens ?? lastPromptTokens,
+          completionTokens:
+            (lastServerStats.completionTokens ?? lastCompletionTokens) || undefined,
+          promptTokPerSec: lastServerStats.promptTokPerSec,
+          genTokPerSec: lastServerStats.genTokPerSec,
+          draftTokens: lastServerStats.draftTokens,
+          draftTokensAccepted: lastServerStats.draftTokensAccepted,
+          cachedPromptTokens: lastServerStats.cachedPromptTokens,
+          processedPromptTokens: lastServerStats.processedPromptTokens,
+          contextLimit: slotCtx,
+          source: "server",
+        });
+      } else {
         this.perf.complete({
           promptTokens: lastPromptTokens ?? estimatedPromptTokens,
           completionTokens: lastCompletionTokens || undefined,

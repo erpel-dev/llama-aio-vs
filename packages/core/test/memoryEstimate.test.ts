@@ -40,6 +40,55 @@ describe("estimateKvBytes", () => {
     assert.ok(estimateKvBytes(swa, 65536, "q8_0", "q8_0") < full);
   });
 
+  it("tiles a short SWA pattern across all layers (Muse Glimmer official GGUF)", () => {
+    const glimmer = denseCaps({
+      blockCount: 52,
+      attentionHeadCount: 32,
+      attentionHeadCountKv: 2,
+      keyLength: 128,
+      valueLength: 128,
+      embeddingLength: 6656,
+      slidingWindow: 2048,
+      slidingWindowPattern: [true, true, true, false],
+    });
+    const atWindow = estimateKvBytes(glimmer, 2048, "q8_0", "q8_0");
+    const atLong = estimateKvBytes(glimmer, 131072, "q8_0", "q8_0");
+    const naive = estimateKvBytes(
+      denseCaps({
+        blockCount: 52,
+        attentionHeadCount: 32,
+        attentionHeadCountKv: 2,
+        keyLength: 128,
+        valueLength: 128,
+        embeddingLength: 6656,
+      }),
+      131072,
+      "q8_0",
+      "q8_0"
+    );
+    assert.ok(atLong > atWindow, "global layers still grow with context");
+    assert.ok(atLong < naive / 2, "39/52 layers must stay capped at 2048, not scale with n_ctx");
+    // 13 global layers * (131072-2048) extra tokens — not 52 layers.
+    assert.ok(atLong / atWindow < 20, "must not grow ~64× like a dense 128k cache");
+  });
+
+  it("does not invent smaller SWA head dims when the GGUF omits key_length_swa", () => {
+    const sameDim = denseCaps({
+      slidingWindow: 2048,
+      slidingWindowPattern: Array.from({ length: 48 }, () => true),
+      keyLength: 128,
+      valueLength: 128,
+    });
+    const atWindow = estimateKvBytes(sameDim, 2048, "q8_0", "q8_0");
+    const denseAtWindow = estimateKvBytes(
+      denseCaps({ keyLength: 128, valueLength: 128 }),
+      2048,
+      "q8_0",
+      "q8_0"
+    );
+    assert.equal(atWindow, denseAtWindow);
+  });
+
   it("skips recurrent layers in hybrid models", () => {
     const hybrid = denseCaps({
       recurrentLayers: Array.from({ length: 48 }, (_, i) => i % 4 !== 3),
@@ -185,5 +234,83 @@ describe("estimateMemory", () => {
     );
     assert.equal(est?.mtpLayers, undefined);
     assert.ok(!(est?.charts.vram.segments.some((s) => s.key === "draft" && s.bytes > 0)));
+  });
+
+  it("splits VRAM across two GPUs and exposes a second chart", () => {
+    const g0 = { totalBytes: 16 * GiB, usedBytes: 0, name: "RX 9070 XT", source: "test" };
+    const g1 = { totalBytes: 16 * GiB, usedBytes: 0, name: "RX 9060 XT", source: "test" };
+    const est = estimateMemory(
+      denseCaps(),
+      loadSettings({ tensorSplit: "3,1", mainGpu: 0 }),
+      g0,
+      { gpus: [g0, g1] }
+    );
+    assert.ok(est);
+    assert.ok(est.charts.vram2);
+    const w0 = est.charts.vram.segments.find((s) => s.key === "weights")!.bytes;
+    const w1 = est.charts.vram2!.segments.find((s) => s.key === "weights")!.bytes;
+    assert.ok(Math.abs(w0 / (w0 + w1) - 0.75) < 0.001);
+    assert.ok(Math.abs(w1 / (w0 + w1) - 0.25) < 0.001);
+    const oh0 = est.charts.vram.segments.find((s) => s.key === "overhead")!.bytes;
+    const oh1 = est.charts.vram2!.segments.find((s) => s.key === "overhead")!.bytes;
+    assert.ok(oh0 > 0);
+    assert.equal(oh1, 0);
+    assert.ok(est.charts.vram.capacityBytes === 16 * GiB);
+    assert.ok(est.charts.vram2!.capacityBytes === 16 * GiB);
+  });
+
+  it("puts the main GPU chart first when it is not device 0", () => {
+    const g0 = { totalBytes: 16 * GiB, usedBytes: 0, name: "RX 9060 XT", source: "test" };
+    const g1 = { totalBytes: 16 * GiB, usedBytes: 0, name: "RX 9070 XT", source: "test" };
+    const est = estimateMemory(
+      denseCaps(),
+      loadSettings({ tensorSplit: "25,75", mainGpu: 1 }),
+      g0,
+      { gpus: [g0, g1] }
+    );
+    assert.ok(est?.charts.vram2);
+    assert.match(est.charts.vram.title, /9070/);
+    assert.match(est.charts.vram2!.title, /9060/);
+    const wMain = est.charts.vram.segments.find((s) => s.key === "weights")!.bytes;
+    const wOther = est.charts.vram2!.segments.find((s) => s.key === "weights")!.bytes;
+    assert.ok(Math.abs(wMain / (wMain + wOther) - 0.75) < 0.001);
+    assert.ok(est.charts.vram.segments.find((s) => s.key === "overhead")!.bytes > 0);
+    assert.equal(est.charts.vram2!.segments.find((s) => s.key === "overhead")!.bytes, 0);
+  });
+
+  it("flags spill when either GPU is over capacity", () => {
+    const g0 = gpu(8);
+    const g1 = gpu(8);
+    const est = estimateMemory(
+      denseCaps({ fileSizeBytes: 18 * GiB }),
+      loadSettings({ tensorSplit: "3,1", contextLength: 65536 }),
+      g0,
+      { gpus: [g0, g1] }
+    );
+    assert.ok(est?.willSpill);
+    assert.ok(est.charts.vram2);
+  });
+
+  it("does not add a second chart for a single GPU", () => {
+    const est = estimateMemory(denseCaps(), loadSettings(), gpu(16));
+    assert.equal(est?.charts.vram2, undefined);
+  });
+
+  it("split-mode none parks all GPU weights on the main GPU", () => {
+    const g0 = { totalBytes: 16 * GiB, usedBytes: 0, name: "RX 9070 XT", source: "test" };
+    const g1 = { totalBytes: 16 * GiB, usedBytes: 0, name: "RX 9060 XT", source: "test" };
+    const est = estimateMemory(
+      denseCaps(),
+      loadSettings({ tensorSplit: "90,10", splitMode: "none", mainGpu: 0 }),
+      g0,
+      { gpus: [g0, g1] }
+    );
+    assert.ok(est);
+    const w0 = est.charts.vram.segments.find((s) => s.key === "weights")!.bytes;
+    const w1 = est.charts.vram2?.segments.find((s) => s.key === "weights")?.bytes ?? 0;
+    assert.ok(w0 > 0);
+    assert.equal(w1, 0);
+    assert.ok(est.lines.some((l) => /No GPU split/i.test(l)));
+    assert.ok(!est.warnings.some((w) => /split by VRAM/i.test(w)));
   });
 });

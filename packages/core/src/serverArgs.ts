@@ -1,3 +1,6 @@
+import { parseTensorSplit } from "./gpuSplit";
+import type { GpuMemoryInfo } from "./gpuInfo";
+import { usesSidecarMtp } from "./modelLibrary";
 import { LlamaLoadSettings, normalizeLoadSettings } from "./types";
 
 /**
@@ -11,6 +14,7 @@ export function normalizeLoadSettingsForCpuBackend(
     ...settings,
     gpuOffload: 0,
     offloadKvCacheToGpu: false,
+    mmprojOffloadToGpu: false,
     nCpuMoe: 0,
   };
 }
@@ -24,7 +28,8 @@ export function buildServerArgs(
   modelPath: string,
   host: string,
   port: number,
-  rawSettings: LlamaLoadSettings
+  rawSettings: LlamaLoadSettings,
+  options?: { gpus?: GpuMemoryInfo[] }
 ): string[] {
   const settings = normalizeLoadSettings(rawSettings);
   const args: string[] = [
@@ -116,6 +121,47 @@ export function buildServerArgs(
     args.push("--seed", String(settings.seed));
   }
 
+  // Vision projector (CLIP / mmproj). llama.cpp defaults GPU-offload on.
+  const mmproj = (settings.mmprojPath || "").trim();
+  if (mmproj) {
+    args.push("--mmproj", mmproj);
+    if (!settings.mmprojOffloadToGpu) {
+      args.push("--no-mmproj-offload");
+    }
+  }
+
+  // Multi-GPU: omit defaults so a single-GPU / older llama.cpp still starts.
+  // --tensor-split is GPU0,GPU1,… (Vulkan/CUDA device order).
+  // --split-mode none keeps the model on one card: drop the split and, when
+  // llama.cpp device ids are known, pass --device so the other GPUs stay free.
+  if (settings.gpuOffload > 0) {
+    const split = parseTensorSplit(settings.tensorSplit);
+    if (settings.splitMode === "none") {
+      const gpus = (options?.gpus || []).filter((g) => g.totalBytes > 0);
+      const main = gpus.length
+        ? Math.min(Math.max(0, settings.mainGpu || 0), gpus.length - 1)
+        : Math.max(0, settings.mainGpu || 0);
+      const deviceId = (gpus[main]?.llamaDeviceId || "").trim();
+      args.push("--split-mode", "none");
+      if (deviceId) {
+        args.push("--device", deviceId);
+      } else if (main !== 0) {
+        args.push("--main-gpu", String(main));
+      }
+    } else if (split.length >= 2) {
+      args.push("--tensor-split", settings.tensorSplit);
+      args.push("--split-mode", settings.splitMode || "layer");
+      args.push("--main-gpu", String(settings.mainGpu || 0));
+    } else if (settings.splitMode && settings.splitMode !== "layer") {
+      args.push("--split-mode", settings.splitMode);
+      if (settings.mainGpu !== 0) {
+        args.push("--main-gpu", String(settings.mainGpu));
+      }
+    } else if (settings.mainGpu !== 0) {
+      args.push("--main-gpu", String(settings.mainGpu));
+    }
+  }
+
   // Speculative decoding (llama.cpp ≥ ~b10xxx uses --spec-*).
   if (settings.speculativeMode === "mtp") {
     args.push("--spec-type", "draft-mtp");
@@ -125,6 +171,16 @@ export function buildServerArgs(
     }
     if (settings.draftProbability > 0) {
       args.push("--spec-draft-p-min", String(settings.draftProbability));
+    }
+    // Gemma 4 (and similar) load next-n heads from a sibling GGUF, not the
+    // language file. Qwen-style baked-in MTP omits --model-draft.
+    if (usesSidecarMtp(settings) && settings.draftModelPath) {
+      args.push("--model-draft", settings.draftModelPath);
+      args.push("--spec-draft-ngl", String(settings.draftGpuOffload));
+      // llama.cpp --fit defaults to on; its draft-memory probe fails with
+      // "Gemma4Assistant requires ctx_other to be set" and aborts load.
+      // We already set --ctx-size / -ngl, so skip the probe (same as DFlash).
+      args.push("--fit", "off");
     }
   } else if (settings.speculativeMode === "dflash" && settings.draftModelPath) {
     // DFlash needs a separate draft GGUF trained for the target model.
@@ -195,7 +251,12 @@ export function serverConfigFingerprint(
     maxDraftTokens: spec === "off" ? 0 : effectiveMaxDraftTokens(settings),
     minDraftTokens: spec === "mtp" ? settings.minDraftTokens : 0,
     draftProbability: spec === "mtp" ? settings.draftProbability : 0,
-    draftModelPath: spec === "dflash" ? settings.draftModelPath || "" : "",
-    draftGpuOffload: spec === "dflash" ? settings.draftGpuOffload : 0,
+    draftModelPath: spec === "dflash" || usesSidecarMtp(settings) ? settings.draftModelPath || "" : "",
+    draftGpuOffload: spec === "dflash" || usesSidecarMtp(settings) ? settings.draftGpuOffload : 0,
+    mmprojPath: settings.mmprojPath || "",
+    mmprojOffloadToGpu: !!settings.mmprojOffloadToGpu,
+    tensorSplit: settings.tensorSplit || "",
+    splitMode: settings.splitMode || "layer",
+    mainGpu: settings.mainGpu || 0,
   });
 }

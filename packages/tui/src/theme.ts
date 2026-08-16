@@ -15,6 +15,7 @@ export const theme = {
   inputBg: "#0e1014",
   /** Memory bar segments (match VS Code sidebar). */
   memWeights: "#3b82f6",
+  memVision: "#f97316",
   memDraft: "#14b8a6",
   memKv: "#a855f7",
   memOverhead: "#64748b",

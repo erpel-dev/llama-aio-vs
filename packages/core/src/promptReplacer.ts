@@ -136,6 +136,19 @@ export function messageContentChars(messages: Array<{ role?: string; content?: u
     chars += (m.role?.length || 0) + 8;
     if (typeof m.content === "string") {
       chars += m.content.length;
+    } else if (Array.isArray(m.content)) {
+      for (const part of m.content) {
+        if (!part || typeof part !== "object") {
+          continue;
+        }
+        const rec = part as { type?: string; text?: string };
+        if (rec.type === "text" && typeof rec.text === "string") {
+          chars += rec.text.length;
+        } else if (rec.type === "image_url") {
+          // CLIP tokens vary; a few hundred is enough for the sidebar estimate.
+          chars += 1024;
+        }
+      }
     }
     if (m.role === "assistant" && Array.isArray(m.tool_calls)) {
       for (const tc of m.tool_calls as Array<{ function?: { name?: string; arguments?: string } }>) {

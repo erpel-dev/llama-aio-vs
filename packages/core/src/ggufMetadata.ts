@@ -1,6 +1,7 @@
 import * as fs from "fs";
 import * as path from "path";
 import { LlamaLoadSettings } from "./types";
+import { isMtpDraftFileName } from "./modelLibrary";
 
 export interface ModelCapabilities {
   path: string;
@@ -24,7 +25,7 @@ export interface ModelCapabilities {
   valueLength?: number;
   /** Sliding-window attention length (tokens), if present */
   slidingWindow?: number;
-  /** Per-layer: true = SWA layer */
+  /** Per-layer: true = SWA layer. Expanded to `blockCount` (GGUF may store a scalar period or a short repeating array). */
   slidingWindowPattern?: boolean[];
   /** Key/value dims for SWA layers (Gemma 4) */
   keyLengthSwa?: number;
@@ -190,6 +191,45 @@ function asNumber(v: GgufValue | undefined): number | undefined {
     return Number(v);
   }
   return undefined;
+}
+
+/**
+ * llama.cpp `attention.sliding_window_pattern`: a per-layer bool/0-1 array
+ * (possibly shorter than n_layer — tile it) or a scalar period N, matching
+ * `set_swa_pattern(N)`: SWA when `il % N < N-1` (N=0 all SWA, N=1 all dense).
+ * Muse Glimmer official GGUFs use a 4-entry array; Unsloth uses UINT32 4.
+ */
+export function resolveSlidingWindowPattern(
+  raw: unknown,
+  blockCount: number
+): boolean[] | undefined {
+  const n = Math.max(1, blockCount);
+  if (raw === undefined || raw === null || raw === "") {
+    return undefined;
+  }
+  if (typeof raw === "number" && Number.isFinite(raw)) {
+    const period = Math.max(0, Math.floor(raw));
+    return Array.from({ length: n }, (_, il) => period === 0 || (il % period < period - 1));
+  }
+  if (typeof raw === "boolean") {
+    return Array.from({ length: n }, () => raw);
+  }
+  if (!Array.isArray(raw) || raw.length === 0) {
+    return undefined;
+  }
+  const flags = raw.map((v) => {
+    if (typeof v === "boolean") {
+      return v;
+    }
+    if (typeof v === "number") {
+      return !!v;
+    }
+    return false;
+  });
+  if (flags.length >= n) {
+    return flags.slice(0, n);
+  }
+  return Array.from({ length: n }, (_, i) => flags[i % flags.length]!);
 }
 
 /** Read GGUF key/value metadata (header only — does not scan tensors). */
@@ -414,7 +454,19 @@ export function readModelCapabilities(filePath: string): ModelCapabilities {
   const keyLengthSwa = pickArchNumber("attention.key_length_swa");
   const valueLengthSwa = pickArchNumber("attention.value_length_swa");
   const slidingWindow = pickArchNumber("attention.sliding_window", "sliding_window");
-  const slidingWindowPattern = pickArchBoolArray("attention.sliding_window_pattern");
+  let slidingWindowPattern = resolveSlidingWindowPattern(
+    pickArchRaw("attention.sliding_window_pattern"),
+    blockCount
+  );
+  // llama.cpp muse-glimmer defaults the period to 4 when the key is missing.
+  if (
+    !slidingWindowPattern &&
+    slidingWindow &&
+    slidingWindow > 0 &&
+    (arch || "").toLowerCase() === "muse-glimmer"
+  ) {
+    slidingWindowPattern = resolveSlidingWindowPattern(4, blockCount);
+  }
   const fullAttentionInterval = pickArchNumber("full_attention_interval");
   let recurrentLayers = pickArchBoolArray(
     "attention.recurrent_layers",
@@ -531,6 +583,15 @@ export function isDflashDraftArchitecture(architecture?: string): boolean {
   return (architecture || "").toLowerCase() === "dflash";
 }
 
+/**
+ * True for Gemma 4 (and similar) sidecar MTP drafters
+ * (`general.architecture = gemma4-assistant`).
+ */
+export function isMtpDraftArchitecture(architecture?: string): boolean {
+  const a = (architecture || "").toLowerCase().replace(/_/g, "-");
+  return a.endsWith("-assistant");
+}
+
 /** Clamp load settings to what the GGUF model actually supports. */
 export function clampLoadSettingsToModel(
   settings: LlamaLoadSettings,
@@ -548,8 +609,11 @@ export function clampLoadSettingsToModel(
     : 0;
 
   let speculativeMode = settings.speculativeMode;
-  // MTP without next-n layers crashes llama-server ("model doesn't contain MTP layers").
-  if (speculativeMode === "mtp" && !(caps.nextnPredictLayers && caps.nextnPredictLayers > 0)) {
+  const bakedMtp = !!(caps.nextnPredictLayers && caps.nextnPredictLayers > 0);
+  const sidecarMtp = isMtpDraftFileName(settings.draftModelPath);
+  // MTP without next-n layers and without a sidecar drafter crashes llama-server
+  // ("model doesn't contain MTP layers").
+  if (speculativeMode === "mtp" && !bakedMtp && !sidecarMtp) {
     speculativeMode = "off";
   }
   // DFlash without a draft GGUF path can't start speculative — leave mode but
@@ -565,5 +629,6 @@ export function clampLoadSettingsToModel(
     speculativeMode,
     draftModelPath: typeof settings.draftModelPath === "string" ? settings.draftModelPath.trim() : "",
     draftGpuOffload: Math.min(Math.max(0, settings.draftGpuOffload ?? 99), 999),
+    mmprojPath: typeof settings.mmprojPath === "string" ? settings.mmprojPath.trim() : "",
   };
 }

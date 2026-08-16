@@ -6,6 +6,7 @@ import { after, before, describe, it } from "node:test";
 import {
   clampLoadSettingsToModel,
   readModelCapabilities,
+  resolveSlidingWindowPattern,
   shardFileNames,
   totalModelBytes,
 } from "../src/ggufMetadata";
@@ -148,5 +149,25 @@ describe("clampLoadSettingsToModel", () => {
 
   it("zeroes --n-cpu-moe for dense models", () => {
     assert.equal(clampLoadSettingsToModel(loadSettings({ nCpuMoe: 12 }), denseCaps()).nCpuMoe, 0);
+  });
+});
+
+describe("resolveSlidingWindowPattern", () => {
+  it("expands llama.cpp scalar period 4 to SWA,SWA,SWA,dense", () => {
+    const p = resolveSlidingWindowPattern(4, 8);
+    assert.deepEqual(p, [true, true, true, false, true, true, true, false]);
+  });
+
+  it("tiles a 4-entry official-GGUF array across all layers", () => {
+    const p = resolveSlidingWindowPattern([1, 1, 1, 0], 52);
+    assert.equal(p?.length, 52);
+    assert.equal(p?.filter(Boolean).length, 39);
+    assert.equal(p?.[3], false);
+    assert.equal(p?.[4], true);
+  });
+
+  it("treats period 0 as all SWA and period 1 as all dense", () => {
+    assert.deepEqual(resolveSlidingWindowPattern(0, 3), [true, true, true]);
+    assert.deepEqual(resolveSlidingWindowPattern(1, 3), [false, false, false]);
   });
 });

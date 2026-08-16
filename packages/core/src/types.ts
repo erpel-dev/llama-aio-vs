@@ -1,5 +1,27 @@
 import * as os from "os";
 import type { ModelCapabilities } from "./ggufMetadata";
+import {
+  type GpuSplitMode,
+  normalizeGpuSplitMode,
+  normalizeTensorSplit,
+} from "./gpuSplit";
+
+export type { GpuSplitMode };
+export {
+  GPU_SPLIT_MODES,
+  alignTensorSplitToMainGpu,
+  gpuDisplayOrder,
+  mainShareForUi,
+  mainShareFromSplit,
+  normalizeGpuSplitMode,
+  normalizeTensorSplit,
+  parseTensorSplit,
+  tensorSplitForMainShare,
+  tensorSplitShares,
+  effectiveTensorSplitShares,
+  tensorSplitSharesEqual,
+  isLegacyGpu0FirstSplit,
+} from "./gpuSplit";
 
 export type { ModelCapabilities };
 
@@ -99,12 +121,37 @@ export interface LlamaLoadSettings {
   /** Draft probability (--spec-draft-p-min); mainly for MTP */
   draftProbability: number;
   /**
-   * Separate draft GGUF for DFlash (`-md` / `--spec-draft-model`).
-   * Required when speculativeMode is `dflash`.
+   * Separate draft GGUF for DFlash or sidecar MTP (`-md` / `--model-draft`).
+   * Required when speculativeMode is `dflash`. For MTP, set when the next-n
+   * heads live in a sibling `mtp-*.gguf` (Gemma 4) rather than the language GGUF.
    */
   draftModelPath: string;
   /** Draft model GPU layers (`--spec-draft-ngl`); 99 ≈ all */
   draftGpuOffload: number;
+  /**
+   * Vision projector GGUF (`-mm` / `--mmproj`). Empty = text-only.
+   * Auto-filled from a sibling `mmproj*.gguf` when a model is selected.
+   */
+  mmprojPath: string;
+  /**
+   * GPU-offload the vision projector (llama.cpp `--mmproj-offload`, default on).
+   * False passes `--no-mmproj-offload` so CLIP stays in system RAM.
+   */
+  mmprojOffloadToGpu: boolean;
+  /**
+   * How to split tensors across GPUs (`--tensor-split`). Empty = omit
+   * (llama.cpp splits by VRAM, often 1:1). Stored in **device-index order**
+   * (`75,25` = 75% on GPU 0). The UI slider is “% on Main GPU” and is mapped
+   * with {@link tensorSplitForMainShare}.
+   */
+  tensorSplit: string;
+  /** How layers/rows are split (`--split-mode`). Default layer. */
+  splitMode: GpuSplitMode;
+  /**
+   * Device that holds the compute graph / scratch (`--main-gpu`).
+   * The settings UI also puts this card’s share of weights + KV first.
+   */
+  mainGpu: number;
 }
 
 export interface RequestSettings {
@@ -155,6 +202,11 @@ export const DEFAULT_LOAD_SETTINGS: LlamaLoadSettings = {
   draftProbability: 0.75,
   draftModelPath: "",
   draftGpuOffload: 99,
+  mmprojPath: "",
+  mmprojOffloadToGpu: true,
+  tensorSplit: "",
+  splitMode: "layer",
+  mainGpu: 0,
 };
 
 /**
@@ -255,6 +307,11 @@ export function normalizeLoadSettings(raw: Partial<LlamaLoadSettings> | undefine
     draftProbability: float(s.draftProbability, 0, 1, d.draftProbability),
     draftModelPath: typeof s.draftModelPath === "string" ? s.draftModelPath.trim() : "",
     draftGpuOffload: int(s.draftGpuOffload, 0, 999, d.draftGpuOffload),
+    mmprojPath: typeof s.mmprojPath === "string" ? s.mmprojPath.trim() : "",
+    mmprojOffloadToGpu: toBoolean(s.mmprojOffloadToGpu, d.mmprojOffloadToGpu),
+    tensorSplit: normalizeTensorSplit(s.tensorSplit),
+    splitMode: normalizeGpuSplitMode(s.splitMode),
+    mainGpu: int(s.mainGpu, 0, 7, d.mainGpu),
   };
 }
 

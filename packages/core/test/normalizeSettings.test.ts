@@ -107,6 +107,20 @@ describe("normalizeLoadSettings", () => {
     }
   });
 
+  it("trims the vision projector path", () => {
+    assert.equal(normalizeLoadSettings({ mmprojPath: "  /m/mmproj-F16.gguf  " }).mmprojPath, "/m/mmproj-F16.gguf");
+    assert.equal(normalizeLoadSettings({ mmprojPath: undefined }).mmprojPath, "");
+  });
+
+  it("defaults vision GPU offload on and coerces the flag", () => {
+    assert.equal(normalizeLoadSettings({}).mmprojOffloadToGpu, true);
+    assert.equal(normalizeLoadSettings({ mmprojOffloadToGpu: false }).mmprojOffloadToGpu, false);
+    assert.equal(
+      normalizeLoadSettings({ mmprojOffloadToGpu: "false" as unknown as boolean }).mmprojOffloadToGpu,
+      false
+    );
+  });
+
   it("treats reasoningBudget -1 as a valid unlimited marker", () => {
     assert.equal(normalizeLoadSettings({ reasoningBudget: -1 }).reasoningBudget, -1);
     assert.equal(normalizeLoadSettings({ reasoningBudget: -99 }).reasoningBudget, -1);
@@ -123,6 +137,16 @@ describe("normalizeLoadSettings", () => {
     assert.equal(s.keepModelInMemory, true);
     assert.equal(s.tryMmap, false);
     assert.equal(s.unifiedKvCache, true);
+  });
+
+  it("normalizes tensor-split / split-mode / main-gpu", () => {
+    assert.equal(normalizeLoadSettings({ tensorSplit: "3, 1" }).tensorSplit, "3,1");
+    assert.equal(normalizeLoadSettings({ tensorSplit: "nope" }).tensorSplit, "");
+    assert.equal(normalizeLoadSettings({ splitMode: "row" }).splitMode, "row");
+    assert.equal(normalizeLoadSettings({ splitMode: "nope" as never }).splitMode, "layer");
+    assert.equal(normalizeLoadSettings({ mainGpu: 2 }).mainGpu, 2);
+    assert.equal(normalizeLoadSettings({ mainGpu: -1 }).mainGpu, 0);
+    assert.equal(normalizeLoadSettings({ mainGpu: 99 }).mainGpu, 7);
   });
 });
 
