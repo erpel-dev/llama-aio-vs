@@ -14,7 +14,7 @@ import {
   SettingsStore,
   UiBackend,
 } from "@llama-aio/core";
-import { openModelFileDialog, pickDownloadedModel, pickDraftModelFromLibrary } from "./modelPicker";
+import { openModelFileDialog, pickDownloadedModel, pickDraftModelFromLibrary, pickMmprojFromLibrary } from "./modelPicker";
 import { SettingsViewProvider } from "./settingsView";
 import * as path from "path";
 import * as vscode from "vscode";
@@ -167,17 +167,27 @@ export function activate(context: vscode.ExtensionContext): void {
       if (!selected) {
         return;
       }
-      const { readModelCapabilities, isDflashDraftArchitecture } = await import("@llama-aio/core");
+      const { readModelCapabilities, isDflashDraftArchitecture, isMtpDraftArchitecture, isMtpDraftFileName } =
+        await import("@llama-aio/core");
       let warn = "";
+      let kind: "dflash" | "mtp" | "unknown" = "unknown";
       try {
         const caps = readModelCapabilities(selected);
-        if (!isDflashDraftArchitecture(caps.architecture)) {
+        if (isDflashDraftArchitecture(caps.architecture)) {
+          kind = "dflash";
+        } else if (isMtpDraftArchitecture(caps.architecture) || isMtpDraftFileName(selected)) {
+          kind = "mtp";
+        } else {
           warn =
             `Selected draft GGUF architecture is "${caps.architecture || "unknown"}" ` +
-            `(DFlash expects general.architecture = dflash). Continue anyway?`;
+            `(DFlash expects general.architecture = dflash; Gemma 4 MTP is a sibling mtp-*.gguf). Continue anyway?`;
         }
       } catch {
-        warn = "Could not read draft GGUF metadata. Use it anyway?";
+        if (isMtpDraftFileName(selected)) {
+          kind = "mtp";
+        } else {
+          warn = "Could not read draft GGUF metadata. Use it anyway?";
+        }
       }
       if (warn) {
         const proceed = await vscode.window.showWarningMessage(warn, "Use anyway", "Cancel");
@@ -186,9 +196,21 @@ export function activate(context: vscode.ExtensionContext): void {
         }
       }
       const cur = store.getState().loadSettings;
+      if (kind === "mtp") {
+        await store.updateLoadSettings({
+          draftModelPath: selected,
+          speculativeMode: "mtp",
+          maxDraftTokens: cur.maxDraftTokens > 0 ? cur.maxDraftTokens : 4,
+        });
+        settingsView.postDraftModelSelected(selected);
+        settingsView.syncSpeculativeMode();
+        await settingsView.pushState();
+        void vscode.window.showInformationMessage(`MTP drafter set to ${path.basename(selected)}`);
+        return;
+      }
       await store.updateLoadSettings({
         draftModelPath: selected,
-        speculativeMode: cur.speculativeMode === "off" ? "dflash" : cur.speculativeMode,
+        speculativeMode: cur.speculativeMode === "off" || cur.speculativeMode === "mtp" ? "dflash" : cur.speculativeMode,
         maxDraftTokens: cur.speculativeMode === "dflash" || cur.maxDraftTokens > 2 ? cur.maxDraftTokens : 15,
       });
       // Immediate sidebar update — full pushState can lag (local library scan) so
@@ -200,6 +222,35 @@ export function activate(context: vscode.ExtensionContext): void {
     } catch (e) {
       vscode.window.showErrorMessage(
         `Select draft model failed: ${e instanceof Error ? e.message : String(e)}`
+      );
+    }
+  };
+
+  const pickMmproj = async () => {
+    try {
+      const selected = await pickMmprojFromLibrary(store);
+      if (!selected) {
+        return;
+      }
+      const { isMmprojFileName } = await import("@llama-aio/core");
+      if (!isMmprojFileName(selected)) {
+        const proceed = await vscode.window.showWarningMessage(
+          "Selected file name does not look like an mmproj projector. Use it anyway?",
+          "Use anyway",
+          "Cancel"
+        );
+        if (proceed !== "Use anyway") {
+          return;
+        }
+      }
+      await store.updateLoadSettings({ mmprojPath: selected });
+      settingsView.postMmprojSelected(selected);
+      await settingsView.pushState();
+      chatProvider?.notifyChanged();
+      void vscode.window.showInformationMessage(`Vision projector set to ${path.basename(selected)}`);
+    } catch (e) {
+      vscode.window.showErrorMessage(
+        `Select vision projector failed: ${e instanceof Error ? e.message : String(e)}`
       );
     }
   };
@@ -561,6 +612,7 @@ export function activate(context: vscode.ExtensionContext): void {
       openGgufFile,
       pickDownloaded,
       pickDraftModel,
+      pickMmproj,
       installLlamaCpp: (backend?: UiBackend) => installLlamaCpp(backend),
       reinstallLlamaCpp,
       installLlamaCppByTag,
@@ -650,14 +702,15 @@ export function activate(context: vscode.ExtensionContext): void {
         }
       }
 
-      // Throttle sidebar updates while streaming.
+      // Throttle sidebar updates while streaming. A full pushState re-probes
+      // the binary and scans the model library, so live tok/s would lag or stall.
       if (sidebarPerfTimer) {
         return;
       }
       sidebarPerfTimer = setTimeout(() => {
         sidebarPerfTimer = undefined;
-        void settingsView.pushState();
-      }, 400);
+        settingsView.postPerf();
+      }, 250);
     }),
     { dispose: () => clearTimeout(sidebarPerfTimer) }
   );
@@ -679,6 +732,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("llamaAio.openModelFile", openGgufFile),
     vscode.commands.registerCommand("llamaAio.selectLocalModel", pickDownloaded),
     vscode.commands.registerCommand("llamaAio.selectDraftModel", pickDraftModel),
+    vscode.commands.registerCommand("llamaAio.selectMmproj", pickMmproj),
 
     vscode.commands.registerCommand("llamaAio.startServer", async () => {
       const token = processManager.claimLaunch("start", "Starting llama-server…");

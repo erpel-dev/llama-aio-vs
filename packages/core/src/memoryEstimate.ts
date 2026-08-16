@@ -1,10 +1,12 @@
 import * as os from "os";
-import { GpuMemoryInfo } from "./gpuInfo";
+import { formatGpuDeviceLabel, GpuMemoryInfo } from "./gpuInfo";
+import { gpuDisplayOrder, parseTensorSplit, effectiveTensorSplitShares } from "./gpuSplit";
 import { heuristicMoeExpertShare, ModelCapabilities, readModelCapabilities } from "./ggufMetadata";
+import { mmprojFileSize, isMtpDraftFileName, usesSidecarMtp } from "./modelLibrary";
 import { KvCacheType, LlamaLoadSettings } from "./types";
 
 export interface MemoryBarSegment {
-  key: "weights" | "kv" | "overhead" | "draft";
+  key: "weights" | "vision" | "kv" | "overhead" | "draft";
   label: string;
   bytes: number;
 }
@@ -44,6 +46,8 @@ export interface MemoryEstimate {
   mtpWeightsBytes?: number;
   /** Extra MTP draft-context KV at full context. */
   mtpKvBytes?: number;
+  /** Vision projector GGUF size when `--mmproj` is set. */
+  mmprojFileSizeBytes?: number;
   overheadBytes: number;
   gpuOverheadBytes: number;
   cpuOverheadBytes: number;
@@ -60,6 +64,8 @@ export interface MemoryEstimate {
   /** Stacked bars for the sidebar. */
   charts: {
     vram: MemoryBarChart;
+    /** Second GPU when two (or more) discrete GPUs are detected. */
+    vram2?: MemoryBarChart;
     ram: MemoryBarChart;
   };
   /** Estimated VRAM exceeds detected GPU memory (with headroom). */
@@ -89,6 +95,39 @@ export function formatBytes(bytes: number): string {
     return `${(bytes / MiB).toFixed(0)} MiB`;
   }
   return `${Math.round(bytes / 1024)} KiB`;
+}
+
+function gpuLabel(gpu: GpuMemoryInfo, index: number): string {
+  return formatGpuDeviceLabel(gpu, index);
+}
+
+function buildGpuBarChart(
+  index: number,
+  gpu: GpuMemoryInfo | undefined,
+  weights: number,
+  kv: number,
+  overhead: number,
+  spec: number,
+  specLabel: string,
+  labeled = false,
+  vision = 0
+): MemoryBarChart {
+  const totalBytes = weights + kv + overhead + spec + vision;
+  const title = labeled && gpu
+    ? `VRAM · ${gpuLabel(gpu, index)} · est. at full context`
+    : "VRAM · est. at full context";
+  return {
+    title,
+    segments: [
+      { key: "weights" as const, label: "Weights", bytes: weights },
+      { key: "vision" as const, label: "Vision (CLIP)", bytes: vision },
+      { key: "draft" as const, label: specLabel, bytes: spec },
+      { key: "kv" as const, label: "KV cache (full ctx)", bytes: kv },
+      { key: "overhead" as const, label: "Overhead", bytes: overhead },
+    ],
+    totalBytes,
+    capacityBytes: gpu?.totalBytes,
+  };
 }
 
 /**
@@ -190,14 +229,12 @@ export function estimateKvBytes(
       continue;
     }
 
-    const isSwa = !!(swa && pattern && pattern[i]);
+    const isSwa = !!(swa && pattern && pattern.length && pattern[i % pattern.length]);
     const nKv = Math.max(1, perLayerKv?.[i] ?? defaultKvHeads);
-    const keyDim = isSwa
-      ? Math.max(1, caps.keyLengthSwa || Math.floor(defaultKeyDim / 2) || defaultKeyDim)
-      : defaultKeyDim;
-    const valDim = isSwa
-      ? Math.max(1, caps.valueLengthSwa || Math.floor(defaultValDim / 2) || defaultValDim)
-      : defaultValDim;
+    // Gemma 4 stores smaller SWA head dims; other SWA models (Muse Glimmer) keep
+    // the same key/value width as the global layers.
+    const keyDim = isSwa && caps.keyLengthSwa ? Math.max(1, caps.keyLengthSwa) : defaultKeyDim;
+    const valDim = isSwa && caps.valueLengthSwa ? Math.max(1, caps.valueLengthSwa) : defaultValDim;
     const tokens = isSwa && swa ? Math.min(contextLength, swa) : contextLength;
     total += (nKv * keyDim * kBytes + nKv * valDim * vBytes) * tokens;
   }
@@ -237,18 +274,21 @@ export function resolveMoeExpertShare(caps: ModelCapabilities): number {
   return heuristicMoeExpertShare(caps.expertCount);
 }
 
-/** Load DFlash draft GGUF caps when mode is dflash and a path is set. */
+/** Load DFlash or sidecar-MTP draft GGUF caps when a draft path is set. */
 export function resolveDraftCapabilities(
   settings: LlamaLoadSettings,
   draftCaps?: ModelCapabilities
 ): ModelCapabilities | undefined {
-  if (settings.speculativeMode !== "dflash") {
+  const path = (settings.draftModelPath || "").trim();
+  const wantDraft =
+    settings.speculativeMode === "dflash" ||
+    (settings.speculativeMode === "mtp" && isMtpDraftFileName(path));
+  if (!wantDraft) {
     return undefined;
   }
   if (draftCaps?.fileSizeBytes && draftCaps.blockCount) {
     return draftCaps;
   }
-  const path = (settings.draftModelPath || "").trim();
   if (!path) {
     return undefined;
   }
@@ -275,8 +315,9 @@ interface DraftFootprint {
 }
 
 /**
- * DFlash draft weights + KV. Draft KV is always f16/f16 (llama.cpp forces it).
- * KV sits with the draft weights (GPU when any draft layers are offloaded).
+ * Draft weights + KV. DFlash forces f16/f16 draft KV; sidecar MTP uses the
+ * main cache dtypes. KV sits with the draft weights (GPU when any draft layers
+ * are offloaded).
  */
 function estimateDraftFootprint(
   draftCaps: ModelCapabilities,
@@ -296,8 +337,10 @@ function estimateDraftFootprint(
         : Math.min(settings.draftGpuOffload, nLayers);
   const gpuWeights = fileSize * (onGpu / nLayers);
   const cpuWeights = Math.max(0, fileSize - gpuWeights);
-  const kvBytes = estimateKvBytes(draftCaps, contextLength, "f16", "f16");
-  const kvBytesWarm = estimateKvBytes(draftCaps, warmCtx, "f16", "f16");
+  const kvK = settings.speculativeMode === "dflash" ? "f16" : settings.cacheTypeK;
+  const kvV = settings.speculativeMode === "dflash" ? "f16" : settings.cacheTypeV;
+  const kvBytes = estimateKvBytes(draftCaps, contextLength, kvK, kvV);
+  const kvBytesWarm = estimateKvBytes(draftCaps, warmCtx, kvK, kvV);
   const kvOnGpu = onGpu > 0;
   return {
     fileSizeBytes: fileSize,
@@ -404,12 +447,13 @@ function estimateMtpFootprint(
  * Intentionally approximate — good enough for spill warnings and UI hints.
  * @param options.cpuOnly When true (CPU llama.cpp build), everything is attributed to system RAM.
  * @param options.draftCaps Optional pre-read DFlash draft caps (otherwise loaded from draftModelPath).
+ * @param options.gpus All detected GPUs (PCI / Vulkan order). When two or more, VRAM is split across bars.
  */
 export function estimateMemory(
   caps: ModelCapabilities | undefined,
   settings: LlamaLoadSettings,
   gpu?: GpuMemoryInfo,
-  options?: { cpuOnly?: boolean; draftCaps?: ModelCapabilities }
+  options?: { cpuOnly?: boolean; draftCaps?: ModelCapabilities; gpus?: GpuMemoryInfo[] }
 ): MemoryEstimate | undefined {
   if (!caps?.fileSizeBytes || !caps.blockCount) {
     return undefined;
@@ -428,7 +472,16 @@ export function estimateMemory(
     const moeCpuLayers = Math.min(settings.nCpuMoe, onGpu);
     gpuWeights = Math.max(0, gpuWeights - fileSize * (moeCpuLayers / nLayers) * moeExpertShare);
   }
-  const cpuWeights = Math.max(0, fileSize - gpuWeights);
+  let cpuWeights = Math.max(0, fileSize - gpuWeights);
+  const mmprojBytes = mmprojFileSize(settings.mmprojPath);
+  const mmprojMissing = !!(settings.mmprojPath || "").trim() && mmprojBytes <= 0;
+  // CLIP is a separate model: GPU-offloaded by default, not tensor-split with the LLM.
+  // --no-mmproj-offload keeps the projector in system RAM.
+  const gpuVisionBytes =
+    !cpuOnly && onGpu > 0 && mmprojBytes > 0 && settings.mmprojOffloadToGpu !== false
+      ? mmprojBytes
+      : 0;
+  const cpuVisionBytes = gpuVisionBytes > 0 ? 0 : Math.max(0, mmprojBytes);
 
   const kvBytes = estimateKvBytes(
     caps,
@@ -456,15 +509,18 @@ export function estimateMemory(
   const draft = draftCaps
     ? estimateDraftFootprint(draftCaps, settings, settings.contextLength, warmCtx, cpuOnly)
     : undefined;
-  const mtp = estimateMtpFootprint(
-    caps,
-    settings,
-    settings.contextLength,
-    warmCtx,
-    cpuOnly,
-    onGpu > 0,
-    kvOnGpu
-  );
+  const sidecarMtp = usesSidecarMtp(settings);
+  const mtp = sidecarMtp
+    ? undefined
+    : estimateMtpFootprint(
+        caps,
+        settings,
+        settings.contextLength,
+        warmCtx,
+        cpuOnly,
+        onGpu > 0,
+        kvOnGpu
+      );
 
   // Speculative extra (DFlash XOR MTP) — teal bar segment.
   const specGpuBundle =
@@ -480,15 +536,17 @@ export function estimateMemory(
     (draft ? draft.cpuWeightsBytes + draft.cpuKvWarmBytes : 0) +
     (mtp ? mtp.cpuWeightsBytes + mtp.cpuKvWarmBytes : 0);
   const specLabel = draft
-    ? "DFlash draft (weights + KV)"
+    ? sidecarMtp
+      ? "MTP draft (weights + KV)"
+      : "DFlash draft (weights + KV)"
     : mtp
       ? `MTP head + KV (${mtp.layers} next-n)`
       : "Speculative";
 
-  const totalGpuBytes = gpuWeights + gpuKvBytes + gpuOverheadBytes + specGpuBundle;
-  const totalCpuBytes = cpuWeights + cpuKvBytes + cpuOverheadBytes + specCpuBundle;
-  const totalGpuBytesWarm = gpuWeights + gpuKvWarm + gpuOverheadBytes + specGpuWarmBundle;
-  const totalCpuBytesWarm = cpuWeights + cpuKvWarm + cpuOverheadBytes + specCpuWarmBundle;
+  const totalGpuBytes = gpuWeights + gpuKvBytes + gpuOverheadBytes + specGpuBundle + gpuVisionBytes;
+  const totalCpuBytes = cpuWeights + cpuKvBytes + cpuOverheadBytes + specCpuBundle + cpuVisionBytes;
+  const totalGpuBytesWarm = gpuWeights + gpuKvWarm + gpuOverheadBytes + specGpuWarmBundle + gpuVisionBytes;
+  const totalCpuBytesWarm = cpuWeights + cpuKvWarm + cpuOverheadBytes + specCpuWarmBundle + cpuVisionBytes;
   const systemRamTotalBytes = os.totalmem();
 
   const warnings: string[] = [];
@@ -536,16 +594,19 @@ export function estimateMemory(
       "DFlash is on but no draft GGUF is selected — memory bars omit the draft; pick a draft model before starting."
     );
   }
-  if (settings.speculativeMode === "mtp" && !mtp) {
+  if (settings.speculativeMode === "mtp" && !mtp && !draft) {
     warnings.push(
-      "MTP is on but this GGUF reports no nextn_predict_layers — speculative overhead omitted from the bars."
+      "MTP is on but this GGUF reports no nextn_predict_layers and no sidecar mtp-*.gguf — speculative overhead omitted from the bars."
     );
   }
   if (draft) {
     warnings.push(
-      `DFlash draft included: ~${formatBytes(draft.fileSizeBytes)} weights` +
+      (sidecarMtp ? "MTP sidecar included: " : "DFlash draft included: ") +
+        `~${formatBytes(draft.fileSizeBytes)} weights` +
         ` (${draft.layersOnGpu}/${draft.layersTotal} GPU layers)` +
-        ` + ~${formatBytes(draft.kvBytes)} draft KV (f16) at full context.`
+        ` + ~${formatBytes(draft.kvBytes)} draft KV` +
+        (sidecarMtp ? "" : " (f16)") +
+        " at full context."
     );
   }
   if (mtp) {
@@ -554,26 +615,83 @@ export function estimateMemory(
         ` (${mtp.layers} layers) + ~${formatBytes(mtp.kvBytes)} MTP KV at full context.`
     );
   }
+  if (mmprojMissing) {
+    warnings.push(
+      "Vision projector path is set but the file is missing — llama-server --mmproj will fail until you pick a valid mmproj or Clear."
+    );
+  }
 
   // Keep ~8% free for the compositor / driver; going above this often spills even if
   // the raw estimate is still slightly under the advertised GPU total.
   const usableFraction = 0.92;
-  if (!cpuOnly && gpu?.totalBytes) {
-    const usableBytes = gpu.totalBytes * usableFraction;
-    const pct = Math.round((totalGpuBytes / gpu.totalBytes) * 100);
-    if (totalGpuBytes > gpu.totalBytes) {
-      willSpill = true;
-      warnings.unshift(
-        `Estimated VRAM at full context ~${formatBytes(totalGpuBytes)} is over the full ${formatBytes(gpu.totalBytes)} GPU (${pct}%). Expect spill to system RAM (much slower). Lower Context Length, GPU Offload, or use a smaller quant.`
-      );
-    } else if (totalGpuBytes > usableBytes) {
-      willSpill = true;
-      warnings.unshift(
-        `Tight on VRAM at full context: ~${formatBytes(totalGpuBytes)} of ${formatBytes(gpu.totalBytes)} (${pct}%). Only ~${formatBytes(gpu.totalBytes - usableBytes)} is left as safe headroom for the driver — llama.cpp often spills to system RAM at this point. Lower Context Length or GPU Offload.`
-      );
-    } else if (totalGpuBytes > gpu.totalBytes * 0.8) {
+  const gpus: GpuMemoryInfo[] =
+    !cpuOnly && options?.gpus?.length
+      ? options.gpus.filter((g) => g.totalBytes > 0)
+      : !cpuOnly && gpu?.totalBytes
+        ? [gpu]
+        : [];
+  const shares = effectiveTensorSplitShares(
+    settings.tensorSplit,
+    settings.splitMode,
+    settings.mainGpu || 0,
+    gpus.length,
+    gpus.map((g) => g.totalBytes)
+  );
+  const mainGpuIndex = gpus.length
+    ? Math.min(Math.max(0, settings.mainGpu || 0), gpus.length - 1)
+    : 0;
+  const perGpuParts = gpus.map((_, i) => {
+    const share = shares[i] || 0;
+    const isMain = i === mainGpuIndex;
+    const weights = gpuWeights * share;
+    const kv = gpuKvBytes * share;
+    const overhead = isMain ? gpuOverheadBytes : 0;
+    const spec = isMain ? specGpuBundle : 0;
+    const vision = isMain ? gpuVisionBytes : 0;
+    return { weights, kv, overhead, spec, vision, used: weights + kv + overhead + spec + vision };
+  });
+
+  if (mmprojBytes > 0) {
+    const where =
+      gpuVisionBytes > 0
+        ? gpus.length
+          ? ` on ${gpuLabel(gpus[mainGpuIndex]!, mainGpuIndex)} (CLIP / --mmproj, not tensor-split)`
+          : " in VRAM (--mmproj, GPU offload on)"
+        : settings.mmprojOffloadToGpu === false
+          ? " in system RAM (--no-mmproj-offload)"
+          : " in system RAM";
+    warnings.push(`Vision projector included: ~${formatBytes(mmprojBytes)}${where}.`);
+  }
+
+  if (!cpuOnly && gpus.length) {
+    for (let i = 0; i < gpus.length; i++) {
+      const used = perGpuParts[i]!.used;
+      const cap = gpus[i]!.totalBytes;
+      const pct = Math.round((used / cap) * 100);
+      const label = gpuLabel(gpus[i]!, i);
+      if (used > cap) {
+        willSpill = true;
+        warnings.unshift(
+          `Estimated ${label} at full context ~${formatBytes(used)} is over the full ${formatBytes(cap)} (${pct}%). Expect spill to system RAM (much slower). Lower Context Length, GPU Offload, or use a smaller quant.`
+        );
+      } else if (used > cap * usableFraction) {
+        willSpill = true;
+        warnings.unshift(
+          `Tight on ${label} at full context: ~${formatBytes(used)} of ${formatBytes(cap)} (${pct}%). Only ~${formatBytes(cap - cap * usableFraction)} is left as safe headroom for the driver — llama.cpp often spills to system RAM at this point. Lower Context Length or GPU Offload.`
+        );
+      } else if (used > cap * 0.8) {
+        warnings.push(
+          `Getting full on ${label} at full context: ~${formatBytes(used)} of ${formatBytes(cap)} VRAM (${pct}%). Leave some free for the display driver.`
+        );
+      }
+    }
+    if (
+      gpus.length >= 2 &&
+      settings.splitMode !== "none" &&
+      parseTensorSplit(settings.tensorSplit).length < 2
+    ) {
       warnings.push(
-        `Getting full at full context: ~${formatBytes(totalGpuBytes)} of ${formatBytes(gpu.totalBytes)} VRAM (${pct}%). Leave some free for the display driver.`
+        "Tensor split is empty — llama.cpp will split by VRAM size (often 1:1). Pick the faster card as Main GPU and raise Weights on main GPU so that card gets more of the model."
       );
     }
   }
@@ -588,17 +706,31 @@ export function estimateMemory(
   const lines: string[] = [];
   if (cpuOnly) {
     lines.push("Backend: CPU (x64) — GPU Offload / VRAM not used");
-  } else if (gpu?.totalBytes) {
-    const free =
-      gpu.usedBytes !== undefined ? Math.max(0, gpu.totalBytes - gpu.usedBytes) : undefined;
-    lines.push(
-      `GPU capacity: ${formatBytes(gpu.totalBytes)}` +
-        (gpu.name ? ` (${gpu.name})` : "")
-    );
-    if (free !== undefined) {
-      lines.push(
-        `Live GPU free now: ~${formatBytes(free)} (current occupancy — not part of the estimate bars)`
-      );
+  } else if (gpus.length) {
+    for (let i = 0; i < gpus.length; i++) {
+      const g = gpus[i]!;
+      const free =
+        g.usedBytes !== undefined ? Math.max(0, g.totalBytes - g.usedBytes) : undefined;
+      lines.push(`${gpuLabel(g, i)} capacity: ${formatBytes(g.totalBytes)}`);
+      if (free !== undefined) {
+        lines.push(
+          `Live ${gpuLabel(g, i)} free now: ~${formatBytes(free)} (current occupancy — not part of the estimate bars)`
+        );
+      }
+    }
+    if (gpus.length >= 2) {
+      const mainLabel = gpus[mainGpuIndex]
+        ? gpuLabel(gpus[mainGpuIndex]!, mainGpuIndex)
+        : `GPU ${mainGpuIndex}`;
+      if (settings.splitMode === "none") {
+        lines.push(`No GPU split — all GPU layers on ${mainLabel} (--split-mode none)`);
+      } else {
+        const split = parseTensorSplit(settings.tensorSplit);
+        const splitLabel = split.length >= 2 ? settings.tensorSplit : "auto (by VRAM)";
+        lines.push(
+          `Tensor split: ${splitLabel} · split-mode ${settings.splitMode || "layer"} · main ${mainLabel}`
+        );
+      }
     }
   } else {
     lines.push("GPU VRAM: unknown (could not detect)");
@@ -621,6 +753,9 @@ export function estimateMemory(
         `MTP in RAM: ~${formatBytes(mtp.weightsBytes)} next-n head` +
           ` + ~${formatBytes(mtp.kvBytes)} MTP KV`
       );
+    }
+    if (mmprojBytes > 0) {
+      lines.push(`Vision projector in RAM: ~${formatBytes(mmprojBytes)}`);
     }
     if (kvBytesWarm < kvBytes) {
       lines.push(
@@ -657,6 +792,18 @@ export function estimateMemory(
           (mtp.gpuKvBytes > 0 ? " (GPU)" : " (CPU RAM)")
       );
     }
+    if (mmprojBytes > 0) {
+      lines.push(
+        `Vision projector: ~${formatBytes(mmprojBytes)}` +
+          (gpuVisionBytes > 0
+            ? gpus.length
+              ? ` (${gpuLabel(gpus[mainGpuIndex]!, mainGpuIndex)}, CLIP / --mmproj)`
+              : " (GPU, --mmproj)"
+            : settings.mmprojOffloadToGpu === false
+              ? " (CPU RAM, --no-mmproj-offload)"
+              : " (CPU RAM)")
+      );
+    }
     if (kvBytesWarm < kvBytes) {
       lines.push(
         `KV @ ~${warmCtx.toLocaleString()} ctx (mid-chat): ~${formatBytes(kvBytesWarm)}` +
@@ -671,47 +818,82 @@ export function estimateMemory(
   }
   lines.push("Bars show estimate at full context. Actual use varies by quant, MoE, and backend.");
 
-  const summary = cpuOnly
-    ? `System RAM ~${formatBytes(totalCpuBytes)}` +
-      (systemRamTotalBytes ? ` of ${formatBytes(systemRamTotalBytes)}` : "") +
-      ` · KV ~${formatBytes(kvBytes)} at full context` +
-      (draft ? ` · DFlash +${formatBytes(draft.fileSizeBytes + draft.kvBytes)}` : "") +
-      (mtp ? ` · MTP +${formatBytes(mtp.weightsBytes + mtp.kvBytes)}` : "")
-    : `VRAM ~${formatBytes(totalGpuBytes)}` +
-      (gpu?.totalBytes
-        ? ` of ${formatBytes(gpu.totalBytes)} (${Math.round((totalGpuBytes / gpu.totalBytes) * 100)}%)`
-        : "") +
-      ` · KV ~${formatBytes(kvBytes)}${kvOnGpu ? " on GPU" : " in RAM"}` +
-      ` · ${onGpu}/${nLayers} layers` +
-      (specGpuBundle > 0
+  const vramSummary = (() => {
+    if (cpuOnly) {
+      return (
+        `System RAM ~${formatBytes(totalCpuBytes)}` +
+        (systemRamTotalBytes ? ` of ${formatBytes(systemRamTotalBytes)}` : "") +
+        ` · KV ~${formatBytes(kvBytes)} at full context` +
+        (draft ? ` · DFlash +${formatBytes(draft.fileSizeBytes + draft.kvBytes)}` : "") +
+        (mtp ? ` · MTP +${formatBytes(mtp.weightsBytes + mtp.kvBytes)}` : "") +
+        (mmprojBytes > 0 ? ` · vision +${formatBytes(mmprojBytes)}` : "")
+      );
+    }
+    const specBit =
+      specGpuBundle > 0
         ? ` · ${draft ? "DFlash" : "MTP"} +${formatBytes(specGpuBundle)}` +
           (specCpuBundle > MiB ? ` (+${formatBytes(specCpuBundle)} RAM)` : "")
-        : "");
+        : "";
+    const visionBit = mmprojBytes > 0 ? ` · vision +${formatBytes(mmprojBytes)}` : "";
+    const kvBit = ` · KV ~${formatBytes(kvBytes)}${kvOnGpu ? " on GPU" : " in RAM"} · ${onGpu}/${nLayers} layers`;
+    if (gpus.length >= 2 && perGpuParts.length >= 2) {
+      const order = gpuDisplayOrder(gpus.length, mainGpuIndex).slice(0, 2);
+      const parts = order.map((i) => {
+        const p = perGpuParts[i]!;
+        const cap = gpus[i]!.totalBytes;
+        const pct = Math.round((p.used / cap) * 100);
+        return `${gpuLabel(gpus[i]!, i)} ~${formatBytes(p.used)} of ${formatBytes(cap)} (${pct}%)`;
+      });
+      return `VRAM ${parts.join(" · ")}${kvBit}${specBit}${visionBit}`;
+    }
+    const cap = gpus[0]?.totalBytes ?? gpu?.totalBytes;
+    return (
+      `VRAM ~${formatBytes(totalGpuBytes)}` +
+      (cap ? ` of ${formatBytes(cap)} (${Math.round((totalGpuBytes / cap) * 100)}%)` : "") +
+      kvBit +
+      specBit +
+      visionBit
+    );
+  })();
 
+  const chartOrder = gpuDisplayOrder(gpus.length, mainGpuIndex);
+  const gpuCharts = chartOrder.map((i) => {
+    const g = gpus[i]!;
+    const p = perGpuParts[i]!;
+    return buildGpuBarChart(
+      i,
+      g,
+      p.weights,
+      p.kv,
+      p.overhead,
+      p.spec,
+      specLabel,
+      gpus.length >= 2,
+      p.vision
+    );
+  });
   const charts = {
-    vram: {
-      title: "VRAM · est. at full context",
-      segments: [
-        { key: "weights" as const, label: "Weights", bytes: gpuWeights },
-        {
-          key: "draft" as const,
-          label: specLabel,
-          bytes: specGpuBundle,
-        },
-        { key: "kv" as const, label: "KV cache (full ctx)", bytes: gpuKvBytes },
-        { key: "overhead" as const, label: "Overhead", bytes: gpuOverheadBytes },
-      ],
-      totalBytes: totalGpuBytes,
-      capacityBytes: cpuOnly ? undefined : gpu?.totalBytes,
-    },
+    vram:
+      gpuCharts[0] ||
+      buildGpuBarChart(
+        0,
+        cpuOnly ? undefined : gpu,
+        gpuWeights,
+        gpuKvBytes,
+        gpuOverheadBytes,
+        specGpuBundle,
+        specLabel,
+        false,
+        gpuVisionBytes
+      ),
+    vram2: gpuCharts[1],
     ram: {
       title: "System RAM · est. at full context",
       segments: [
         { key: "weights" as const, label: "Weights", bytes: cpuWeights },
+        { key: "vision" as const, label: "Vision (CLIP)", bytes: cpuVisionBytes },
         {
-          key: "draft" as const,
-          label: specLabel,
-          bytes: specCpuBundle,
+          key: "draft" as const, label: specLabel, bytes: specCpuBundle,
         },
         { key: "kv" as const, label: "KV cache (full ctx)", bytes: cpuKvBytes },
         { key: "overhead" as const, label: "Overhead", bytes: cpuOverheadBytes },
@@ -720,6 +902,8 @@ export function estimateMemory(
       capacityBytes: systemRamTotalBytes,
     },
   };
+
+  const primaryGpu = gpus[mainGpuIndex] || gpus[0] || gpu;
 
   return {
     fileSizeBytes: fileSize,
@@ -738,6 +922,7 @@ export function estimateMemory(
     mtpLayers: mtp?.layers,
     mtpWeightsBytes: mtp?.weightsBytes,
     mtpKvBytes: mtp?.kvBytes,
+    mmprojFileSizeBytes: mmprojBytes > 0 ? mmprojBytes : undefined,
     overheadBytes,
     gpuOverheadBytes,
     cpuOverheadBytes,
@@ -745,22 +930,23 @@ export function estimateMemory(
     totalCpuBytes,
     totalGpuBytesWarm,
     totalCpuBytesWarm,
-    gpuTotalBytes: gpu?.totalBytes,
-    gpuUsedBytes: gpu?.usedBytes,
-    gpuName: gpu?.name,
+    gpuTotalBytes: primaryGpu?.totalBytes,
+    gpuUsedBytes: primaryGpu?.usedBytes,
+    gpuName: primaryGpu?.name,
     systemRamTotalBytes,
     charts,
     willSpill,
     warnings,
     lines,
-    summary,
+    summary: vramSummary,
   };
 }
 
 /** Compact JSON-safe payload for the webview live calculator (main + optional DFlash draft). */
 export function memoryEstimateInputs(
   caps: ModelCapabilities | undefined,
-  draftCaps?: ModelCapabilities
+  draftCaps?: ModelCapabilities,
+  mmprojFileSizeBytes?: number
 ): Record<string, unknown> | null {
   if (!caps?.fileSizeBytes) {
     return null;
@@ -788,5 +974,6 @@ export function memoryEstimateInputs(
   return {
     ...pack(caps),
     draft: draftCaps?.fileSizeBytes && draftCaps.blockCount ? pack(draftCaps) : null,
+    mmprojFileSizeBytes: mmprojFileSizeBytes && mmprojFileSizeBytes > 0 ? mmprojFileSizeBytes : 0,
   };
 }

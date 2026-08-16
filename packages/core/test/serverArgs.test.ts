@@ -129,6 +129,82 @@ describe("buildServerArgs", () => {
     assert.ok(!args.includes("--model-draft"));
     assert.ok(!args.includes("--fit"));
   });
+
+  describe("multi-GPU split flags", () => {
+    it("omits split flags on defaults (single GPU)", () => {
+      const args = build();
+      assert.ok(!args.includes("--tensor-split"));
+      assert.ok(!args.includes("--split-mode"));
+      assert.ok(!args.includes("--main-gpu"));
+    });
+
+    it("emits tensor-split, split-mode, and main-gpu together", () => {
+      const args = build({ tensorSplit: "3,1", splitMode: "layer", mainGpu: 0 });
+      assert.equal(argValue(args, "--tensor-split"), "3,1");
+      assert.equal(argValue(args, "--split-mode"), "layer");
+      assert.equal(argValue(args, "--main-gpu"), "0");
+    });
+
+    it("emits split-mode row without a tensor-split", () => {
+      const args = build({ splitMode: "row" });
+      assert.equal(argValue(args, "--split-mode"), "row");
+      assert.ok(!args.includes("--tensor-split"));
+    });
+
+    it("emits main-gpu when it is not device 0", () => {
+      const args = build({ mainGpu: 1 });
+      assert.equal(argValue(args, "--main-gpu"), "1");
+    });
+
+    it("does not emit split flags when GPU offload is 0", () => {
+      const args = build({ gpuOffload: 0, tensorSplit: "3,1", mainGpu: 1, splitMode: "row" });
+      assert.ok(!args.includes("--tensor-split"));
+      assert.ok(!args.includes("--split-mode"));
+      assert.ok(!args.includes("--main-gpu"));
+    });
+
+    it("split-mode none drops tensor-split and pins --device to the main GPU", () => {
+      const gpus = [
+        { totalBytes: 16 * 1024 ** 3, source: "test", llamaDeviceId: "Vulkan0", name: "9070" },
+        { totalBytes: 16 * 1024 ** 3, source: "test", llamaDeviceId: "Vulkan1", name: "9060" },
+      ];
+      const args = buildServerArgs(
+        MODEL,
+        "127.0.0.1",
+        8742,
+        loadSettings({ splitMode: "none", tensorSplit: "90,10", mainGpu: 0 }),
+        { gpus }
+      );
+      assert.ok(!args.includes("--tensor-split"));
+      assert.equal(argValue(args, "--split-mode"), "none");
+      assert.equal(argValue(args, "--device"), "Vulkan0");
+      assert.ok(!args.includes("--main-gpu"));
+    });
+
+    it("split-mode none on GPU 1 uses that card's llama.cpp id", () => {
+      const gpus = [
+        { totalBytes: 16 * 1024 ** 3, source: "test", llamaDeviceId: "Vulkan0" },
+        { totalBytes: 16 * 1024 ** 3, source: "test", llamaDeviceId: "Vulkan1" },
+      ];
+      const args = buildServerArgs(
+        MODEL,
+        "127.0.0.1",
+        8742,
+        loadSettings({ splitMode: "none", tensorSplit: "50,50", mainGpu: 1 }),
+        { gpus }
+      );
+      assert.equal(argValue(args, "--device"), "Vulkan1");
+      assert.ok(!args.includes("--tensor-split"));
+    });
+
+    it("split-mode none without device ids still omits tensor-split", () => {
+      const args = build({ splitMode: "none", tensorSplit: "75,25", mainGpu: 1 });
+      assert.ok(!args.includes("--tensor-split"));
+      assert.equal(argValue(args, "--split-mode"), "none");
+      assert.equal(argValue(args, "--main-gpu"), "1");
+      assert.ok(!args.includes("--device"));
+    });
+  });
 });
 
 describe("serverConfigFingerprint", () => {
@@ -142,6 +218,11 @@ describe("serverConfigFingerprint", () => {
       ["reasoningBudget", { reasoningBudget: 512 }],
       ["cacheReuse", { cacheReuse: 0 }],
       ["contextCheckpoints", { contextCheckpoints: 8 }],
+      ["mmprojPath", { mmprojPath: "/models/mmproj-F16.gguf" }],
+      ["mmprojOffloadToGpu", { mmprojOffloadToGpu: false }],
+      ["tensorSplit", { tensorSplit: "3,1" }],
+      ["splitMode", { splitMode: "row" }],
+      ["mainGpu", { mainGpu: 1 }],
     ];
     for (const [label, patch] of changed) {
       assert.notEqual(
@@ -201,12 +282,13 @@ describe("serverConfigFingerprint", () => {
 });
 
 describe("normalizeLoadSettingsForCpuBackend", () => {
-  it("zeros GPU offload, KV GPU offload, and n-cpu-moe", () => {
+  it("zeros GPU offload, KV GPU offload, vision GPU offload, and n-cpu-moe", () => {
     const normalized = normalizeLoadSettingsForCpuBackend(
-      loadSettings({ gpuOffload: 40, offloadKvCacheToGpu: true, nCpuMoe: 12 })
+      loadSettings({ gpuOffload: 40, offloadKvCacheToGpu: true, mmprojOffloadToGpu: true, nCpuMoe: 12 })
     );
     assert.equal(normalized.gpuOffload, 0);
     assert.equal(normalized.offloadKvCacheToGpu, false);
+    assert.equal(normalized.mmprojOffloadToGpu, false);
     assert.equal(normalized.nCpuMoe, 0);
   });
 

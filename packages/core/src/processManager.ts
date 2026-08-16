@@ -12,6 +12,7 @@ import {
 } from "./paths";
 import { resolveLaunchMode, spawnInExternalTerminal } from "./externalTerminal";
 import { clampLoadSettingsToModel, readModelCapabilities } from "./ggufMetadata";
+import { detectGpus } from "./gpuInfo";
 import { LlamaInstaller } from "./llamaInstaller";
 import {
   hasUsableFhsDynamicLinker,
@@ -415,7 +416,8 @@ export class ProcessManager {
       // CPU builds ignore -ngl / --n-cpu-moe; keep args honest so logs/estimate match reality.
       loadSettings = normalizeLoadSettingsForCpuBackend(loadSettings);
     }
-    const args = buildServerArgs(model, host, port, loadSettings);
+    const gpus = this.isCpuBackend() ? [] : detectGpus(false, binary);
+    const args = buildServerArgs(model, host, port, loadSettings, { gpus });
     const launchMode = resolveLaunchMode(this.store.getConfig().get<string>("launchMode"));
     const configFingerprint = serverConfigFingerprint(model, loadSettings, launchMode);
 

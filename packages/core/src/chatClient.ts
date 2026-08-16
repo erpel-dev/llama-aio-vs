@@ -3,6 +3,7 @@
  * Used by the TUI (and any non-VS Code frontend). Abort with AbortSignal.
  */
 import * as http from "http";
+import { ratesFromTimings, type LlamaTimings } from "./llamaTimings";
 import { decodeSseLines } from "./sseStream";
 
 export type ChatRole = "system" | "user" | "assistant";
@@ -34,16 +35,6 @@ export interface ChatCompletionOptions {
   topK?: number;
   maxTokens?: number;
   signal?: AbortSignal;
-}
-
-interface LlamaTimings {
-  cache_n?: number;
-  prompt_n?: number;
-  prompt_ms?: number;
-  prompt_per_second?: number;
-  predicted_n?: number;
-  predicted_ms?: number;
-  predicted_per_second?: number;
 }
 
 interface LlamaUsage {
@@ -184,14 +175,16 @@ export async function* streamChatCompletion(
     stream.destroy();
   }
 
+  const rates = ratesFromTimings(lastTimings);
   yield {
     kind: "stats",
     promptTokens: lastUsage?.prompt_tokens,
     completionTokens:
       lastUsage?.completion_tokens ??
+      lastTimings?.predicted_n ??
       (completionChars ? Math.max(1, Math.ceil(completionChars / 4)) : undefined),
-    promptTokPerSec: lastTimings?.prompt_per_second,
-    genTokPerSec: lastTimings?.predicted_per_second,
+    promptTokPerSec: rates.promptTokPerSec,
+    genTokPerSec: rates.genTokPerSec,
     cachedPromptTokens:
       lastUsage?.prompt_tokens_details?.cached_tokens ??
       (typeof lastTimings?.cache_n === "number" && lastTimings.cache_n >= 0

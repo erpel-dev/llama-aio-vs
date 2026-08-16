@@ -1,6 +1,7 @@
 import { Emitter } from "./events";
 import type { ContextBreakdown } from "./contextBreakdown";
 import { scaleBreakdownToServerPrompt } from "./contextBreakdown";
+import { positiveRate } from "./llamaTimings";
 import type { PromptReplacementStats } from "./promptReplacer";
 
 export type ContextLevel = "ok" | "warn" | "critical";
@@ -139,6 +140,8 @@ export class PerfStats {
   readonly onDidChange = this._onDidChange.event;
 
   private current: GenerationPerf = { generating: false };
+  /** Wall-clock of the first completion token (excludes prompt eval from live tok/s). */
+  private genStartedAt: number | undefined;
   /** Highest alert band we've already toasted for this conversation fill. */
   private alertBand: 0 | 80 | 90 = 0;
   /** Last Copilot → llama.cpp chat request (for debug "View context"). */
@@ -458,6 +461,7 @@ export class PerfStats {
       opts?.contextLimit ?? prev.contextLimit,
       opts?.estimatedPromptTokens !== undefined ? true : prev.contextEstimated
     );
+    this.genStartedAt = undefined;
     this.current = {
       generating: true,
       startedAt: Date.now(),
@@ -479,18 +483,56 @@ export class PerfStats {
     this._onDidChange.fire(this.get());
   }
 
-  /** Live update while tokens stream (estimate from elapsed time). */
-  tick(completionTokens: number): void {
+  /**
+   * Live update while tokens stream. Uses server tok/s when provided;
+   * otherwise estimates from elapsed time since the first completion token
+   * (so prompt eval does not drag the generation rate down).
+   */
+  tick(
+    completionTokens: number,
+    opts?: { genTokPerSec?: number; promptTokPerSec?: number }
+  ): void {
     if (!this.current.generating || !this.current.startedAt) {
       return;
     }
-    const elapsedSec = Math.max(0.05, (Date.now() - this.current.startedAt) / 1000);
+    const promptTokPerSec = positiveRate(opts?.promptTokPerSec) ?? this.current.promptTokPerSec;
+    const serverGen = positiveRate(opts?.genTokPerSec);
+    let genTokPerSec = this.current.genTokPerSec;
+    let estimated = this.current.estimated;
+    let source = this.current.source;
+    let nextCompletion = this.current.completionTokens;
+
+    if (typeof completionTokens === "number" && completionTokens > 0) {
+      nextCompletion = completionTokens;
+      if (!this.genStartedAt) {
+        this.genStartedAt = Date.now();
+      }
+      if (serverGen) {
+        genTokPerSec = serverGen;
+        estimated = false;
+        source = "server";
+      } else if (source === "server" && positiveRate(this.current.genTokPerSec)) {
+        genTokPerSec = this.current.genTokPerSec;
+        estimated = false;
+      } else {
+        const elapsedSec = Math.max(0.05, (Date.now() - this.genStartedAt) / 1000);
+        genTokPerSec = completionTokens / elapsedSec;
+        estimated = true;
+        source = "estimate";
+      }
+    } else if (serverGen) {
+      genTokPerSec = serverGen;
+      estimated = false;
+      source = "server";
+    }
+
     this.current = {
       ...this.current,
-      completionTokens,
-      genTokPerSec: completionTokens / elapsedSec,
-      estimated: true,
-      source: "estimate",
+      completionTokens: nextCompletion,
+      genTokPerSec,
+      estimated,
+      source,
+      promptTokPerSec,
     };
     this._onDidChange.fire(this.get());
   }
@@ -528,16 +570,18 @@ export class PerfStats {
   complete(partial: Partial<GenerationPerf>): void {
     const finishedAt = Date.now();
     const startedAt = this.current.startedAt;
-    let genTokPerSec = partial.genTokPerSec ?? this.current.genTokPerSec;
+    const serverGen = positiveRate(partial.genTokPerSec);
+    const serverPrompt = positiveRate(partial.promptTokPerSec);
+    let genTokPerSec = serverGen ?? this.current.genTokPerSec;
     const completionTokens = partial.completionTokens ?? this.current.completionTokens;
-    const source = partial.source || (typeof partial.genTokPerSec === "number" ? "server" : "estimate");
+    const source = partial.source || (serverGen ? "server" : "estimate");
     if (
-      (genTokPerSec === undefined || source === "estimate") &&
+      !positiveRate(genTokPerSec) &&
       typeof completionTokens === "number" &&
-      startedAt &&
-      typeof partial.genTokPerSec !== "number"
+      (this.genStartedAt || startedAt)
     ) {
-      const elapsedSec = Math.max(0.05, (finishedAt - startedAt) / 1000);
+      const origin = this.genStartedAt ?? startedAt!;
+      const elapsedSec = Math.max(0.05, (finishedAt - origin) / 1000);
       genTokPerSec = completionTokens / elapsedSec;
     }
 
@@ -610,6 +654,7 @@ export class PerfStats {
       ...partial,
       completionTokens,
       genTokPerSec,
+      promptTokPerSec: serverPrompt ?? this.current.promptTokPerSec,
       draftTokens,
       draftTokensAccepted,
       draftAcceptancePct,
@@ -620,7 +665,7 @@ export class PerfStats {
       contextBreakdown,
       generating: false,
       finishedAt,
-      estimated: source === "estimate",
+      estimated: !serverGen,
       source,
       ...ctx,
     };

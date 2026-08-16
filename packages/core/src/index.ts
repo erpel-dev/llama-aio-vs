@@ -13,6 +13,7 @@ export * from "./gpuInfo";
 export * from "./hfLicense";
 export * from "./huggingFace";
 export * from "./llamaInstaller";
+export * from "./llamaTimings";
 export * from "./memoryEstimate";
 export * from "./modelLibrary";
 export * from "./modelModes";

@@ -3,6 +3,7 @@ import { describe, it } from "node:test";
 import {
   candidateAssetNames,
   compareReleaseTags,
+  createClearableTimeoutSignal,
   describeMissingAsset,
   pickAsset,
   resolveLatestReleaseTag,
@@ -12,6 +13,21 @@ const asset = (name: string) => ({
   name,
   browser_download_url: `https://example/${name}`,
   size: 1,
+});
+
+describe("createClearableTimeoutSignal", () => {
+  it("aborts after the timeout when not cleared", async () => {
+    const { signal } = createClearableTimeoutSignal(20);
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(signal.aborted, true);
+  });
+
+  it("does not abort after clear — so a long body is not killed", async () => {
+    const { signal, clear } = createClearableTimeoutSignal(20);
+    clear();
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(signal.aborted, false);
+  });
 });
 
 describe("candidateAssetNames", () => {

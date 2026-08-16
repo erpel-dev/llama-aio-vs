@@ -1,7 +1,7 @@
 {
   "name": "llama-aio-workspace",
   "private": true,
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "Llama AIO monorepo: shared core, VS Code extension, and terminal UI.",
   "license": "MIT",
   "workspaces": [

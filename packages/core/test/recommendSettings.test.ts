@@ -114,4 +114,44 @@ describe("recommendLoadSettings", () => {
     assert.equal(r.gpuOffload, 33);
     assert.equal(r.nCpuMoe, 7);
   });
+
+  describe("dual GPU", () => {
+    const two16 = [gpu(16), gpu(16)];
+
+    it("splits a dense model across both cards instead of spilling to RAM", () => {
+      const one = recommendLoadSettings(loadSettings(), denseCaps(), { gpu: gpu(16) });
+      assert.ok(one.gpuOffload < 99, `expected partial offload on one 16 GiB GPU, got ${one.gpuOffload}`);
+
+      const two = recommendLoadSettings(loadSettings(), denseCaps(), { gpus: two16 });
+      assert.equal(two.gpuOffload, 99);
+      assert.equal(two.nCpuMoe, 0);
+      assert.ok(two.tensorSplit, "expected an explicit tensor split");
+      assert.equal(two.splitMode, "layer");
+      const est = estimateMemory(denseCaps(), two, two16[0], { gpus: two16 });
+      assert.ok(est && !est.willSpill);
+    });
+
+    it("clears a leftover tensor split when recommending for a single GPU", () => {
+      const r = recommendLoadSettings(loadSettings({ tensorSplit: "50,50" }), denseCaps(), {
+        gpu: gpu(80),
+      });
+      assert.equal(r.tensorSplit, "");
+    });
+
+    it("still drops layers when even both cards cannot hold the model", () => {
+      const huge = denseCaps({ fileSizeBytes: 80 * GiB, blockCount: 80 });
+      const r = recommendLoadSettings(loadSettings(), huge, { gpus: two16 });
+      assert.ok(r.gpuOffload < 80, `expected partial offload, got ${r.gpuOffload}`);
+      assert.ok(r.tensorSplit, "keep a split for the layers that do fit");
+    });
+
+    it("avoids --n-cpu-moe on two GPUs when one small card needed it", () => {
+      const one = recommendLoadSettings(loadSettings(), moeCaps(), { gpu: gpu(12) });
+      assert.ok(one.nCpuMoe > 0);
+      const two = recommendLoadSettings(loadSettings(), moeCaps(), { gpus: two16 });
+      assert.equal(two.gpuOffload, 99);
+      assert.equal(two.nCpuMoe, 0);
+      assert.ok(two.tensorSplit);
+    });
+  });
 });

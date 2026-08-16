@@ -45,9 +45,13 @@ Download models directly from Hugging Face or pick a model that was downloaded b
 
 The picker shows each model's licence next to its name and warns before downloading anything that is not clearly permissive — for example Llama and Gemma models, which allow commercial use only under extra conditions. Split GGUFs (`…-00001-of-0000N.gguf`) are sized as one model.
 
+Multimodal GGUFs (Qwen3.8 and similar) ship a separate **mmproj** projector. Llama AIO downloads that file with the language GGUF, attaches it via llama-server `--mmproj`, and enables image input in Copilot Chat. Uncheck **Offload vision projector to GPU** to pass `--no-mmproj-offload` (CLIP in system RAM). Clear the projector in the Model card if you do not want vision at all.
+
+Gemma 4 GGUFs (Unsloth and similar) ship a sidecar **MTP** drafter (`mtp-*.gguf`). Llama AIO downloads that file with the language GGUF, enables speculative MTP, and starts llama-server with `--spec-type draft-mtp --model-draft <mtp> --fit off`. Needs llama.cpp from 2026-06-07 or later (`gemma4-assistant`). Qwen-style models that bake next-n heads into the language GGUF still use MTP without a draft file.
+
 ## Load settings & memory estimates
 
-The estimate shows VRAM / RAM usage at **full context**, so you can tell whether a configuration fits before starting the server. Selecting a model auto-recommends settings that leave ~2 GiB of VRAM free.
+The estimate shows VRAM / RAM usage at **full context**, so you can tell whether a configuration fits before starting the server. Selecting a model auto-recommends settings: on one GPU that leaves ~2 GiB of VRAM free; on two or more GPUs it splits the model across cards first and only spills weights to system RAM if that still does not fit.
 
 Three presets cover the common cases:
 
@@ -89,6 +93,9 @@ Only llama-servers are ever adopted or stopped — anything else holding the por
 | ------------------------------- | ---------------------------------------------------- |
 | Context Length                  | `--ctx-size`                                       |
 | GPU Offload                     | `-ngl`                                             |
+| Tensor split                    | `--tensor-split`                                   |
+| Split mode                      | `--split-mode`                                     |
+| Main GPU                        | `--main-gpu`                                       |
 | CPU Threads                     | `-t`                                               |
 | Eval / Physical batch           | `-b` / `-ub`                                     |
 | Max concurrent predictions      | `-np`                                              |
@@ -103,7 +110,7 @@ Only llama-servers are ever adopted or stopped — anything else holding the por
 | Keep model in memory / Try mmap | `--load-mode mlock` / `mmap` / `none`          |
 | RoPE base/scale                 | `--rope-freq-base` / `--rope-freq-scale`         |
 | Seed                            | `--seed`                                           |
-| Speculative MTP                 | `--spec-type draft-mtp` (+ draft n-max/min, p-min) |
+| Speculative MTP                 | `--spec-type draft-mtp` (+ draft n-max/min, p-min; sidecar Gemma 4 also `-md` and `--fit off`) |
 | Speculative DFlash              | `--spec-type draft-dflash` + `-md` draft GGUF (+ n-max, draft-ngl; draft KV f16) |
 
 ## Commands
@@ -133,7 +140,7 @@ Only llama-servers are ever adopted or stopped — anything else holding the por
 
 - **Keep Model in Memory** uses `--load-mode mlock` (mmap on Windows); it does not control process lifetime.
 - Quantized V cache requires flash attention; the settings panel warns when the combination cannot work.
-- MTP needs a GGUF with next-n / MTP layers. Copilot **Agent** prompts are large — prefer a GPU backend or Ask mode on CPU.
+- MTP needs next-n / MTP layers in the GGUF, or a sibling `mtp-*.gguf` (Gemma 4). Copilot **Agent** prompts are large — prefer a GPU backend or Ask mode on CPU.
 
 ## Development
 

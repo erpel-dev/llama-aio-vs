@@ -1,10 +1,15 @@
 import { AppConfig, ConfigAccessor, ConfigFile, toExtensionState } from "./config";
 import { Event } from "./events";
 import { clampLoadSettingsToModel, readModelCapabilities } from "./ggufMetadata";
-import { detectGpuMemory } from "./gpuInfo";
+import { detectGpuMemory, detectGpus } from "./gpuInfo";
 import { LlamaInstaller } from "./llamaInstaller";
+import { resolveMmprojPath, resolveMtpDraftPath, findSiblingMtpDraft, isMtpDraftFileName } from "./modelLibrary";
 import { recommendLoadSettings } from "./recommendSettings";
-import { getDefaultPromptReplacementsPath } from "./paths";
+import {
+  findLlamaServerOnPath,
+  getDefaultPromptReplacementsPath,
+  getLlamaServerBinary,
+} from "./paths";
 import {
   ExtensionState,
   LlamaLoadSettings,
@@ -90,6 +95,16 @@ export class SettingsStore {
   async updateLoadSettings(patch: Partial<LlamaLoadSettings>): Promise<ExtensionState> {
     const state = this.getState();
     let loadSettings = normalizeLoadSettings({ ...state.loadSettings, ...patch });
+    if (
+      patch.speculativeMode === "mtp" &&
+      !isMtpDraftFileName(loadSettings.draftModelPath) &&
+      !(state.modelCapabilities?.nextnPredictLayers && state.modelCapabilities.nextnPredictLayers > 0)
+    ) {
+      const sibling = findSiblingMtpDraft(state.selectedModelPath);
+      if (sibling) {
+        loadSettings = { ...loadSettings, draftModelPath: sibling };
+      }
+    }
     if (state.modelCapabilities) {
       loadSettings = clampLoadSettingsToModel(loadSettings, state.modelCapabilities);
     }
@@ -106,11 +121,11 @@ export class SettingsStore {
    * Read GGUF metadata for a model, clamp settings, and persist capabilities.
    * When the selected path changes (or `recommendDefaults` is true), also apply
    * MoE/dense/CPU recommended context + offload defaults, and enable MTP when
-   * the GGUF reports nextn_predict_layers > 0.
+   * the GGUF reports nextn_predict_layers > 0 or a sibling `mtp-*.gguf` is attached.
    */
   async applySelectedModel(
     modelPath: string,
-    options?: { recommendDefaults?: boolean; cpuOnly?: boolean }
+    options?: { recommendDefaults?: boolean; cpuOnly?: boolean; attachMmproj?: boolean }
   ): Promise<ExtensionState> {
     const prev = this.getState();
     const caps = readModelCapabilities(modelPath);
@@ -118,12 +133,29 @@ export class SettingsStore {
     const recommend = options?.recommendDefaults ?? pathChanged;
 
     let loadSettings = prev.loadSettings;
+    const attachCompanions = options?.attachMmproj || pathChanged;
+    loadSettings = {
+      ...loadSettings,
+      mmprojPath: resolveMmprojPath(modelPath, loadSettings.mmprojPath, attachCompanions),
+      draftModelPath: resolveMtpDraftPath(
+        modelPath,
+        loadSettings.draftModelPath,
+        attachCompanions,
+        loadSettings.speculativeMode
+      ),
+    };
     if (recommend) {
-      const cpuOnly =
-        options?.cpuOnly ?? new LlamaInstaller(this).resolveActiveUiBackend() === "cpu";
+      const installer = new LlamaInstaller(this);
+      const cpuOnly = options?.cpuOnly ?? installer.resolveActiveUiBackend() === "cpu";
+      const llamaBinary = cpuOnly
+        ? undefined
+        : installer.resolveActiveUiBackend() === "path"
+          ? findLlamaServerOnPath()
+          : getLlamaServerBinary(installer.getActiveInstallDir());
       loadSettings = recommendLoadSettings(loadSettings, caps, {
         cpuOnly,
         gpu: cpuOnly ? undefined : detectGpuMemory(),
+        gpus: cpuOnly ? undefined : detectGpus(false, llamaBinary),
       });
     }
     loadSettings = clampLoadSettingsToModel(loadSettings, caps);

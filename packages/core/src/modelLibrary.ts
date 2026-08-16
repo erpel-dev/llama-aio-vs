@@ -19,7 +19,241 @@ interface ScanRoot {
 }
 
 const MIN_MODEL_BYTES = 32 * 1024 * 1024; // skip vocab / tiny stubs
-const SKIP_NAME_RE = /^(mmproj|ggml-vocab)/i;
+const MIN_MMPROJ_BYTES = 1024 * 1024; // CLIP projectors are ~20–900 MB
+const MIN_MTP_BYTES = 1024 * 1024; // sidecar MTP drafters are typically hundreds of MB
+const SKIP_NAME_RE = /^(ggml-vocab)/i;
+
+/** True for llama.cpp vision projector GGUFs (`mmproj-F16.gguf`, …). */
+export function isMmprojFileName(name: string): boolean {
+  return /mmproj/i.test(path.basename(name));
+}
+
+/**
+ * Pick the best projector from a list of paths. Prefers F16, then BF16, then
+ * higher-bit quants — matching what llama.cpp docs usually recommend.
+ */
+export function preferMmprojPath(paths: string[]): string | undefined {
+  if (!paths.length) {
+    return undefined;
+  }
+  const score = (p: string): number => {
+    const n = path.basename(p).toLowerCase();
+    if (/\bf16\b/.test(n) && !n.includes("bf16")) {
+      return 0;
+    }
+    if (n.includes("bf16")) {
+      return 1;
+    }
+    if (n.includes("f32")) {
+      return 2;
+    }
+    if (n.includes("q8")) {
+      return 3;
+    }
+    if (n.includes("q6") || n.includes("q5")) {
+      return 4;
+    }
+    if (n.includes("q4")) {
+      return 5;
+    }
+    return 6;
+  };
+  return [...paths].sort((a, b) => score(a) - score(b) || a.localeCompare(b))[0];
+}
+
+/** First usable `mmproj*.gguf` sitting next to a language GGUF. */
+export function findSiblingMmproj(modelPath: string): string | undefined {
+  const trimmed = (modelPath || "").trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  const dir = path.dirname(trimmed);
+  let names: string[];
+  try {
+    names = fs.readdirSync(dir);
+  } catch {
+    return undefined;
+  }
+  const found: string[] = [];
+  for (const name of names) {
+    if (!name.toLowerCase().endsWith(".gguf") || !isMmprojFileName(name)) {
+      continue;
+    }
+    const full = path.join(dir, name);
+    try {
+      const st = fs.statSync(full);
+      if (st.isFile() && st.size >= MIN_MMPROJ_BYTES) {
+        found.push(full);
+      }
+    } catch {
+      // skip unreadable
+    }
+  }
+  return preferMmprojPath(found);
+}
+
+/**
+ * Projector to load with this language GGUF.
+ * Switching models drops a projector from another folder and attaches a sibling
+ * `mmproj*.gguf` when one exists. Reloading the same model keeps a manual pick.
+ */
+export function resolveMmprojPath(
+  modelPath: string,
+  current: string | undefined,
+  pathChanged: boolean
+): string {
+  if (!pathChanged) {
+    const existing = (current || "").trim();
+    if (existing && fs.existsSync(existing)) {
+      return existing;
+    }
+    if (existing) {
+      return findSiblingMmproj(modelPath) || "";
+    }
+    return "";
+  }
+  return findSiblingMmproj(modelPath) || "";
+}
+
+/** Size of a projector file, or 0 when missing / unreadable. */
+export function mmprojFileSize(mmprojPath: string | undefined): number {
+  const p = (mmprojPath || "").trim();
+  if (!p) {
+    return 0;
+  }
+  try {
+    const st = fs.statSync(p);
+    return st.isFile() ? st.size : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * True for llama.cpp sidecar MTP drafters (`mtp-gemma-4-12B-it.gguf`,
+ * `gemma-4-12B-it-Q4_0-MTP.gguf`). Not DFlash (`architecture = dflash`).
+ */
+export function isMtpDraftFileName(name: string): boolean {
+  const base = path.basename(name);
+  if (!base.toLowerCase().endsWith(".gguf") || isMmprojFileName(base)) {
+    return false;
+  }
+  return /^mtp[-_]/i.test(base) || /-mtp\.gguf$/i.test(base);
+}
+
+/** MTP mode that loads a separate GGUF via `--model-draft` (Gemma 4), not baked-in next-n heads. */
+export function usesSidecarMtp(settings: {
+  speculativeMode?: string;
+  draftModelPath?: string;
+}): boolean {
+  return settings.speculativeMode === "mtp" && isMtpDraftFileName(settings.draftModelPath || "");
+}
+
+/**
+ * Pick the best sidecar MTP GGUF. Prefers the repo-root `mtp-*.gguf` llama.cpp
+ * `-hf` auto-discovers (Unsloth's recommended smart Q4_0), then Q4, Q8, F16.
+ */
+export function preferMtpDraftPath(paths: string[]): string | undefined {
+  if (!paths.length) {
+    return undefined;
+  }
+  const score = (p: string): number => {
+    const base = path.basename(p).toLowerCase();
+    const inMtpDir = path.basename(path.dirname(p)).toLowerCase() === "mtp";
+    const rootPrefixed = /^mtp[-_]/.test(base);
+    let quant = 0;
+    if (base.includes("q4")) {
+      quant = 1;
+    } else if (base.includes("q8")) {
+      quant = 2;
+    } else if (base.includes("q6") || base.includes("q5")) {
+      quant = 3;
+    } else if (base.includes("bf16") || (/\bf16\b/.test(base) && !base.includes("bf16"))) {
+      quant = 4;
+    } else if (base.includes("f32")) {
+      quant = 5;
+    }
+    const location = rootPrefixed && !inMtpDir ? 0 : inMtpDir ? 2 : 1;
+    return location * 10 + quant;
+  };
+  return [...paths].sort((a, b) => score(a) - score(b) || a.localeCompare(b))[0];
+}
+
+function collectMtpDraftsInDir(dir: string, found: string[]): void {
+  let names: string[];
+  try {
+    names = fs.readdirSync(dir);
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    if (!name.toLowerCase().endsWith(".gguf") || !isMtpDraftFileName(name)) {
+      continue;
+    }
+    const full = path.join(dir, name);
+    try {
+      const st = fs.statSync(full);
+      if (st.isFile() && st.size >= MIN_MTP_BYTES) {
+        found.push(full);
+      }
+    } catch {
+      // skip unreadable
+    }
+  }
+}
+
+/**
+ * First usable sidecar MTP GGUF next to a language model, including an `MTP/`
+ * subdirectory (Unsloth's extra Q4_0 / Q8_0 / BF16 drafters).
+ */
+export function findSiblingMtpDraft(modelPath: string): string | undefined {
+  const trimmed = (modelPath || "").trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  const dir = path.dirname(trimmed);
+  const found: string[] = [];
+  collectMtpDraftsInDir(dir, found);
+  collectMtpDraftsInDir(path.join(dir, "MTP"), found);
+  return preferMtpDraftPath(found);
+}
+
+/**
+ * Sidecar MTP drafter to load with this language GGUF.
+ * Switching models attaches a sibling `mtp-*.gguf` when one exists. Reloading
+ * the same model keeps a manual pick (including a DFlash draft).
+ */
+export function resolveMtpDraftPath(
+  modelPath: string,
+  current: string | undefined,
+  pathChanged: boolean,
+  speculativeMode?: string
+): string {
+  const existing = (current || "").trim();
+  if (!pathChanged) {
+    if (existing && fs.existsSync(existing)) {
+      return existing;
+    }
+    if (existing && isMtpDraftFileName(existing)) {
+      return findSiblingMtpDraft(modelPath) || "";
+    }
+    return existing || "";
+  }
+  const sibling = findSiblingMtpDraft(modelPath);
+  if (sibling) {
+    return sibling;
+  }
+  if (
+    speculativeMode === "dflash" &&
+    existing &&
+    !isMtpDraftFileName(existing) &&
+    fs.existsSync(existing)
+  ) {
+    return existing;
+  }
+  return "";
+}
+
 const SKIP_DIR_NAMES = new Set([
   ".git",
   "node_modules",
@@ -163,14 +397,11 @@ export function discoverModelRoots(config: ConfigAccessor): ScanRoot[] {
   return unique;
 }
 
-function shouldSkipFile(name: string, size: number): boolean {
+function shouldSkipLanguageFile(name: string, size: number): boolean {
   if (!name.toLowerCase().endsWith(".gguf")) {
     return true;
   }
-  if (SKIP_NAME_RE.test(name)) {
-    return true;
-  }
-  if (name.toLowerCase().includes("mmproj")) {
+  if (SKIP_NAME_RE.test(name) || isMmprojFileName(name) || isMtpDraftFileName(name)) {
     return true;
   }
   if (size < MIN_MODEL_BYTES) {
@@ -182,7 +413,37 @@ function shouldSkipFile(name: string, size: number): boolean {
   return false;
 }
 
-function walkGgufs(root: ScanRoot, out: Map<string, LocalModelEntry>): void {
+function shouldSkipMmprojFile(name: string, size: number): boolean {
+  if (!name.toLowerCase().endsWith(".gguf") || !isMmprojFileName(name)) {
+    return true;
+  }
+  if (size < MIN_MMPROJ_BYTES) {
+    return true;
+  }
+  if (name.endsWith(".partial") || name.endsWith(".incomplete") || name.endsWith(".tmp")) {
+    return true;
+  }
+  return false;
+}
+
+function shouldSkipMtpDraftFile(name: string, size: number): boolean {
+  if (!name.toLowerCase().endsWith(".gguf") || !isMtpDraftFileName(name)) {
+    return true;
+  }
+  if (size < MIN_MTP_BYTES) {
+    return true;
+  }
+  if (name.endsWith(".partial") || name.endsWith(".incomplete") || name.endsWith(".tmp")) {
+    return true;
+  }
+  return false;
+}
+
+function walkGgufs(
+  root: ScanRoot,
+  out: Map<string, LocalModelEntry>,
+  skip: (name: string, size: number) => boolean
+): void {
   if (!fs.existsSync(root.dir)) {
     return;
   }
@@ -219,7 +480,7 @@ function walkGgufs(root: ScanRoot, out: Map<string, LocalModelEntry>): void {
       }
       try {
         const st = fs.statSync(full);
-        if (!st.isFile() || shouldSkipFile(ent.name, st.size)) {
+        if (!st.isFile() || skip(ent.name, st.size)) {
           continue;
         }
         // Dedupe by real path (HF snapshots often symlink into blobs/) but keep the
@@ -249,7 +510,7 @@ function walkGgufs(root: ScanRoot, out: Map<string, LocalModelEntry>): void {
 export function listLocalModelEntries(config: ConfigAccessor): LocalModelEntry[] {
   const map = new Map<string, LocalModelEntry>();
   for (const root of discoverModelRoots(config)) {
-    walkGgufs(root, map);
+    walkGgufs(root, map, shouldSkipLanguageFile);
   }
   return [...map.values()].sort((a, b) => {
     if (a.source !== b.source) {
@@ -264,6 +525,24 @@ export function listLocalModelEntries(config: ConfigAccessor): LocalModelEntry[]
     }
     return path.basename(a.path).localeCompare(path.basename(b.path));
   });
+}
+
+/** Same roots as listLocalModelEntries, but only vision projector GGUFs. */
+export function listMmprojEntries(config: ConfigAccessor): LocalModelEntry[] {
+  const map = new Map<string, LocalModelEntry>();
+  for (const root of discoverModelRoots(config)) {
+    walkGgufs(root, map, shouldSkipMmprojFile);
+  }
+  return [...map.values()].sort((a, b) => path.basename(a.path).localeCompare(path.basename(b.path)));
+}
+
+/** Same roots as listLocalModelEntries, but only sidecar MTP draft GGUFs. */
+export function listMtpDraftEntries(config: ConfigAccessor): LocalModelEntry[] {
+  const map = new Map<string, LocalModelEntry>();
+  for (const root of discoverModelRoots(config)) {
+    walkGgufs(root, map, shouldSkipMtpDraftFile);
+  }
+  return [...map.values()].sort((a, b) => path.basename(a.path).localeCompare(path.basename(b.path)));
 }
 
 /**

@@ -2,7 +2,7 @@
   "name": "llama-aio-vs",
   "displayName": "Llama AIO",
   "description": "All-in-one local llama.cpp for VS Code: install, HF models, LM Studio-style settings, shared server, Copilot Chat provider.",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "publisher": "erpel-dev",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -71,6 +71,10 @@
       {
         "command": "llamaAio.selectDraftModel",
         "title": "Llama AIO: Choose DFlash Draft GGUF…"
+      },
+      {
+        "command": "llamaAio.selectMmproj",
+        "title": "Llama AIO: Choose Vision Projector (mmproj)…"
       },
       {
         "command": "llamaAio.startServer",

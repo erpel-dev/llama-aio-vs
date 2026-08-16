@@ -12,10 +12,35 @@ import {
 } from "./hfLicense";
 import type { ProgressReporter } from "./llamaInstaller";
 import { formatBytes } from "./memoryEstimate";
-import { listLocalModelEntries } from "./modelLibrary";
+import {
+  isMmprojFileName,
+  isMtpDraftFileName,
+  listLocalModelEntries,
+  preferMmprojPath,
+  preferMtpDraftPath,
+} from "./modelLibrary";
 import { ensureDirs, getModelsDir } from "./paths";
 import type { SettingsStore } from "./settings";
 import type { HfFileHit, HfModelHit } from "./types";
+
+/** Language GGUFs only — hide CLIP projectors and sidecar MTP drafters from the picker. */
+export function languageGgufFiles(files: HfFileHit[]): HfFileHit[] {
+  return files.filter((f) => !isMmprojFileName(f.path) && !isMtpDraftFileName(f.path));
+}
+
+/** Best mmproj in a Hugging Face file listing, if any. */
+export function preferredMmprojFile(files: HfFileHit[]): HfFileHit | undefined {
+  const mm = files.filter((f) => isMmprojFileName(f.path));
+  const best = preferMmprojPath(mm.map((f) => f.path));
+  return best ? mm.find((f) => f.path === best) : undefined;
+}
+
+/** Best sidecar MTP drafter in a Hugging Face file listing, if any. */
+export function preferredMtpDraftFile(files: HfFileHit[]): HfFileHit | undefined {
+  const mtp = files.filter((f) => isMtpDraftFileName(f.path));
+  const best = preferMtpDraftPath(mtp.map((f) => f.path));
+  return best ? mtp.find((f) => f.path === best) : undefined;
+}
 
 function requestJson<T>(url: string, token?: string): Promise<T> {
   return new Promise((resolve, reject) => {
@@ -155,14 +180,38 @@ export class HuggingFaceClient {
     return out;
   }
 
+  private async listRepoTree(
+    modelId: string,
+    subpath = ""
+  ): Promise<Array<{ path: string; type: string; size?: number }>> {
+    const suffix = subpath ? `/${subpath}` : "";
+    const url = `https://huggingface.co/api/models/${modelId}/tree/main${suffix}`;
+    return requestJson(url, this.token());
+  }
+
   async listGgufFiles(modelId: string): Promise<HfFileHit[]> {
-    const url = `https://huggingface.co/api/models/${modelId}/tree/main`;
-    const tree = await requestJson<Array<{ path: string; type: string; size?: number }>>(
-      url,
-      this.token()
+    const tree = await this.listRepoTree(modelId);
+    const files = tree.filter((f) => f.type === "file" && f.path.toLowerCase().endsWith(".gguf"));
+    const mtpDir = tree.find(
+      (f) => f.type === "directory" && (f.path === "MTP" || f.path.endsWith("/MTP"))
     );
-    return tree
-      .filter((f) => f.type === "file" && f.path.toLowerCase().endsWith(".gguf"))
+    if (mtpDir) {
+      try {
+        const extra = await this.listRepoTree(modelId, mtpDir.path);
+        const prefix = mtpDir.path.replace(/\/$/, "");
+        files.push(
+          ...extra
+            .filter((f) => f.type === "file" && f.path.toLowerCase().endsWith(".gguf"))
+            .map((f) => ({
+              ...f,
+              path: f.path === prefix || f.path.startsWith(`${prefix}/`) ? f.path : `${prefix}/${f.path}`,
+            }))
+        );
+      } catch {
+        // Root listing is enough when the MTP/ folder is missing or gated.
+      }
+    }
+    return files
       .map((f) => ({
         path: f.path,
         size: f.size || 0,
@@ -194,6 +243,38 @@ export class HuggingFaceClient {
     });
     fs.renameSync(dest + ".partial", dest);
     return dest;
+  }
+
+  /**
+   * Download the preferred sibling vision projector from a repo file listing.
+   * No-op when the repo has no mmproj GGUF.
+   */
+  async downloadPreferredMmproj(
+    modelId: string,
+    files: HfFileHit[],
+    progress?: ProgressReporter
+  ): Promise<string | undefined> {
+    const file = preferredMmprojFile(files);
+    if (!file) {
+      return undefined;
+    }
+    return this.downloadModelFile(modelId, file.path, progress);
+  }
+
+  /**
+   * Download the preferred sibling MTP drafter from a repo file listing.
+   * No-op when the repo has no `mtp-*.gguf` / `*-MTP.gguf`.
+   */
+  async downloadPreferredMtpDraft(
+    modelId: string,
+    files: HfFileHit[],
+    progress?: ProgressReporter
+  ): Promise<string | undefined> {
+    const file = preferredMtpDraftFile(files);
+    if (!file) {
+      return undefined;
+    }
+    return this.downloadModelFile(modelId, file.path, progress);
   }
 
   /** Paths only — prefer listLocalModelEntries() for source labels. */
