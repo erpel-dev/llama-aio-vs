@@ -13,7 +13,7 @@ import { PerfStats } from "@llama-aio/core";
 import { LaunchToken, LAUNCH_IN_PROGRESS_MSG, ProcessManager } from "@llama-aio/core";
 import { SettingsStore } from "@llama-aio/core";
 import { resolveLaunchMode } from "@llama-aio/core";
-import { DEFAULT_LOAD_SETTINGS, DEFAULT_REQUEST_SETTINGS, LlamaLoadSettings, RequestSettings } from "@llama-aio/core";
+import { DEFAULT_LOAD_SETTINGS, DEFAULT_REQUEST_SETTINGS, effectiveServerUiState, LlamaLoadSettings, RequestSettings } from "@llama-aio/core";
 import { STARTER_MODEL } from "./huggingFace";
 
 export type ModelActions = {
@@ -91,19 +91,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             await this.store.updateLoadSettings(msg.payload as Partial<LlamaLoadSettings>);
             this.syncSpeculativeMode();
             if (msg.silent) {
-              const status = this.processManager.getStatus();
-              const httpReady = await this.processManager.isHttpReady();
-              this.view?.webview.postMessage({
-                type: "statusPatch",
-                payload: {
-                  configDirty: !!status.configDirty,
-                  running: !!(status.running || httpReady),
-                  starting: !!status.starting,
-                  startMessage: status.startMessage || status.message,
-                  perf: this.perf.get(),
-                  perfLines: this.perf.detailLines(),
-                },
-              });
+              await this.postStatusNow();
             } else {
               await this.pushState();
             }
@@ -156,6 +144,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               break;
             }
             this.postBootProgress("Reloading llama-server…");
+            let readyMessage: string | undefined;
             try {
               await this.store.updateLoadSettings(msg.payload as Partial<LlamaLoadSettings>);
               this.syncSpeculativeMode();
@@ -163,9 +152,14 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                 break;
               }
               await this.onReload(token);
+              readyMessage = this.processManager.getStatus().message;
             } finally {
               this.processManager.releaseLaunch(token);
+              await this.postStatusNow();
               await this.pushState();
+            }
+            if (readyMessage) {
+              void promptUseInCopilotChat(this.store, readyMessage);
             }
             break;
           }
@@ -176,6 +170,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               break;
             }
             this.postBootProgress("Starting llama-server…");
+            let readyMessage: string | undefined;
             try {
               if (!(await this.confirmIfMemorySpill())) {
                 break;
@@ -197,10 +192,14 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                   )
               );
               this.notifyChatModels();
-              await promptUseInCopilotChat(this.store, status.message);
+              readyMessage = status.message;
             } finally {
               this.processManager.releaseLaunch(token);
+              await this.postStatusNow();
               await this.pushState();
+            }
+            if (readyMessage) {
+              void promptUseInCopilotChat(this.store, readyMessage);
             }
             break;
           }
@@ -383,6 +382,8 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     if (!this.view) {
       return;
     }
+    // Paint Server ready/stopped before GPU probes and library scans.
+    await this.postStatusNow();
     this.syncSpeculativeMode();
     let state = this.store.getState();
     // Refresh GGUF caps when older state lacks size / arch dims needed for estimates.
@@ -537,6 +538,35 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         message,
         running: false,
         configDirty: false,
+      },
+    });
+  }
+
+  /** Patch the Server card from live process state (does not wait on Copilot dialogs). */
+  async postStatusNow(): Promise<void> {
+    if (!this.view) {
+      return;
+    }
+    const status = this.processManager.getStatus();
+    const httpReady = await this.processManager.isHttpReady();
+    const ui = effectiveServerUiState({
+      starting: status.starting,
+      running: status.running,
+      httpReady,
+    });
+    this.view.webview.postMessage({
+      type: "statusPatch",
+      payload: {
+        configDirty: ui.starting ? false : !!status.configDirty,
+        running: ui.ready,
+        starting: ui.starting,
+        httpReady,
+        endpoint: status.endpoint,
+        pid: status.pid,
+        startMessage: status.startMessage || status.message,
+        message: status.message,
+        perf: this.perf.get(),
+        perfLines: this.perf.detailLines(),
       },
     });
   }
@@ -1538,6 +1568,8 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     let serverRunning = false;
     let configDirty = false;
     let serverStarting = false;
+    let lastEndpoint = '';
+    let lastPid;
     let saveLoadTimer = null;
     let updateCheck = { latestTag: undefined, installedTag: undefined, updateAvailable: false, checkFailed: false, pending: true };
 
@@ -3111,10 +3143,14 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       }
 
       const build = payload.build || {};
-      const starting = !!(status.starting || payload.starting);
-      const ready = !starting && !!(status.httpReady || status.running);
-      const endpoint = payload.endpoint || status.endpoint || '';
+      const generating = !!(payload.perf && payload.perf.generating);
+      const httpUp = !!(status.httpReady || status.running || generating);
+      const starting = !httpUp && !!(status.starting || payload.starting);
+      const ready = httpUp;
+      const endpoint = payload.endpoint || status.endpoint || lastEndpoint;
       const startMessage = status.startMessage || status.message || '';
+      lastEndpoint = endpoint;
+      if (status.pid) lastPid = status.pid;
 
       serverStarting = starting;
       serverRunning = ready;
@@ -3611,6 +3647,19 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         if (viewResp) {
           viewResp.disabled = !msg.payload.hasLastResponse;
         }
+        if (perf.generating && serverStarting) {
+          serverStarting = false;
+          serverRunning = true;
+          updatePrimaryAction();
+          renderStatusUi({
+            ready: true,
+            dirty: configDirty,
+            starting: false,
+            endpoint: lastEndpoint,
+            pid: lastPid,
+            message: '',
+          });
+        }
       }
       if (msg.type === 'draftModelSelected') {
         setDraftModelHint(msg.path || '');
@@ -3638,37 +3687,25 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         });
       }
       if (msg.type === 'statusPatch' && msg.payload) {
-        if (msg.payload.starting) {
-          serverStarting = true;
-          serverRunning = false;
-          configDirty = false;
-          updatePrimaryAction();
-          renderStatusUi({
-            ready: false,
-            dirty: false,
-            starting: true,
-            endpoint: '',
-            message: msg.payload.startMessage || msg.payload.message || 'Starting…',
-          });
-          return;
-        }
-        serverRunning = !!msg.payload.running;
-        configDirty = !!msg.payload.configDirty;
-        serverStarting = false;
+        const p = msg.payload;
+        const httpUp = !!(p.running || p.httpReady);
+        const starting = !!p.starting && !httpUp;
+        if (p.endpoint) lastEndpoint = p.endpoint;
+        if (p.pid) lastPid = p.pid;
+        serverStarting = starting;
+        serverRunning = httpUp;
+        configDirty = starting ? false : !!p.configDirty;
         updatePrimaryAction();
-        if (serverRunning) {
-          const hint = $('dirtyHint');
-          if (hint) hint.classList.toggle('hidden', !configDirty);
-          setServerCardKind(configDirty ? 'dirty' : 'ok');
-          const line = $('statusLine');
-          const dot = $('statusDot');
-          if (line) line.className = 'status-line ' + (configDirty ? 'dirty' : 'ok');
-          if (dot) dot.className = 'dot ' + (configDirty ? 'dirty' : 'ok');
-          const text = $('statusText');
-          if (text) text.textContent = 'Server ready';
-        }
-        if (msg.payload.perf || Array.isArray(msg.payload.perfLines)) {
-          renderPerfStats(msg.payload.perf || {}, msg.payload.perfLines);
+        renderStatusUi({
+          ready: httpUp,
+          dirty: configDirty,
+          starting,
+          endpoint: lastEndpoint,
+          pid: lastPid,
+          message: starting ? (p.startMessage || p.message || 'Starting…') : (p.message || ''),
+        });
+        if (p.perf || Array.isArray(p.perfLines)) {
+          renderPerfStats(p.perf || {}, p.perfLines || []);
         }
       }
     });

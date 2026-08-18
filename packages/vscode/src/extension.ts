@@ -589,7 +589,7 @@ export function activate(context: vscode.ExtensionContext): void {
     perf,
     async (token?: LaunchToken) => {
       // Sidebar may already hold `token`; commands claim inside reload when omitted.
-      const status = await vscode.window.withProgress(
+      await vscode.window.withProgress(
         {
           location: vscode.ProgressLocation.Notification,
           title: "Llama AIO: Reloading llama-server…",
@@ -601,10 +601,8 @@ export function activate(context: vscode.ExtensionContext): void {
             settingsView.postBootProgress(msg);
           }, token)
       );
-      // Keep the Copilot prompt outside withProgress — awaiting the info dialog
-      // inside would leave the "Reloading…" toast up while the server is already ready.
       chatProvider?.notifyChanged();
-      await promptUseInCopilotChat(store, status.message);
+      await settingsView.pushState();
     },
     {
       downloadFromHuggingFace,

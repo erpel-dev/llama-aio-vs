@@ -1,6 +1,6 @@
 {
   "name": "@llama-aio/tui",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "private": true,
   "description": "Terminal UI for Llama AIO: manage llama.cpp, models, load settings, and chat — sharing the extension's configuration.",
   "license": "MIT",
