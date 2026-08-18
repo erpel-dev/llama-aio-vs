@@ -206,7 +206,7 @@ function shortPath(p: string, max = 56): string {
 }
 
 function statusLabel(running: boolean, starting: boolean, dirty: boolean): string {
-  if (starting) {
+  if (starting && !running) {
     return "starting…";
   }
   if (running && dirty) {
@@ -222,7 +222,7 @@ function statusLabel(running: boolean, starting: boolean, dirty: boolean): strin
 }
 
 function statusColor(running: boolean, starting: boolean, dirty: boolean): string {
-  if (starting) {
+  if (starting && !running) {
     return theme.accent;
   }
   if (dirty) {

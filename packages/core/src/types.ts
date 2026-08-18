@@ -350,6 +350,19 @@ export interface ServerStatus {
   startMessage?: string;
 }
 
+/**
+ * Sidebar/TUI status: a live HTTP server wins over a stuck "starting" flag.
+ * Copilot can already be generating while boot UI is still waiting on a toast.
+ */
+export function effectiveServerUiState(opts: {
+  starting?: boolean;
+  running?: boolean;
+  httpReady?: boolean;
+}): { starting: boolean; ready: boolean } {
+  const ready = !!(opts.httpReady || opts.running);
+  return { ready, starting: !!opts.starting && !ready };
+}
+
 export interface HfModelHit {
   id: string;
   downloads: number;

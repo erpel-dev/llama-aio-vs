@@ -265,9 +265,13 @@ export class ProcessManager {
   async isHttpReady(endpoint?: string): Promise<boolean> {
     const base = endpoint || this.store.getEndpoint();
     return new Promise((resolve) => {
-      const req = http.get(`${base}/v1/models`, { timeout: 1500 }, (res) => {
+      const req = http.get(`${base}/health`, { timeout: 1500 }, (res) => {
         res.resume();
         resolve((res.statusCode || 500) < 500);
+      });
+      req.setTimeout(1500, () => {
+        req.destroy();
+        resolve(false);
       });
       req.on("error", () => resolve(false));
       req.on("timeout", () => {

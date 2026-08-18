@@ -3,51 +3,31 @@
 Local **llama.cpp** for VS Code: install newest llama.cpp binaries, manage GGUF models, tune load settings with memory estimates, run one shared `llama-server`, and use it in **GitHub Copilot Chat**.
 
 <p align="center">
-  <img src="media/screenshot-panel.png" alt="Llama AIO panel — server status, live performance, backend install, and model selection" width="38%">
-  <img src="media/screenshot-load-settings.png" alt="Load settings — VRAM / RAM estimate, presets, context length, GPU offload, and CPU MoE layers" width="59%">
+  <img src="media/context-performance.jpeg" alt="Llama AIO panel — server status, live performance, backend install, and model selection" width="49%">
+  <img src="media/resource-estimate.jpeg" alt="Load settings — VRAM / RAM estimate, presets, context length, GPU offload, and CPU MoE layers" width="49%">
 </p>
-
-## Quick start
-
-```bash
-cd llama-aio-vs
-make          # test + compile + build .vsix and TUI into dist/
-# or: make install   # install the .vsix into VS Code
-# or: make tui       # TUI only → dist/llama-aio
-```
-
-Artifacts land in `dist/`: `llama-aio-vs-*.vsix` and the `llama-aio` TUI executable (needs Node **26.4+** on `PATH`; OpenTUI uses `--experimental-ffi`). Install the VSIX via **Extensions: Install from VSIX…** (or `make install`), then reload the window.
-
-1. Open the **Llama AIO** activity bar panel
-2. Install / switch a backend
-3. Download, open, or pick a GGUF
-4. Start or reload the server
-5. In Copilot Chat, select **Llama AIO: …** in the model picker
 
 ## llama.cpp backends
 
-Pick a backend in the sidebar (shared with the TUI via `~/.llama-aio-vs/config.json`):
+Pick a llama.cpp version in the sidebar
 
 - **Vulkan** — default GPU path (Linux / Windows; good for AMD)
 - **CUDA** — when an NVIDIA GPU is detected
 - **CPU** — no GPU (`-ngl` ignored)
 - **System (PATH)** — use a `llama-server` already on your `PATH` (distro / nixpkgs / self-built)
 
-Downloaded installs live under `~/.llama-aio-vs/llama.cpp/<backend>/`. Switching reuses a cached build; **Upgrade to latest release** resolves the newest tag and downloads the matching archive. New binaries are staged and swapped in at the end, so a failed install leaves the working one in place.
+Downloaded installs live under `~/.llama-aio-vs/llama.cpp/<backend>/`.
+ **Upgrade to latest release** resolves the newest tag and downloads the matching archive. New binaries are staged and swapped in at the end, so a failed install leaves the working one in place.
 
 To pin a build or work offline: **Install release tag…** or **Install from archive…**. Browse builds at [llama.cpp releases](https://github.com/ggml-org/llama.cpp/releases).
-
-**NixOS:** official Linux archives need the FHS dynamic linker. Stock NixOS does not provide it, so a download often fails with “No such file or directory”. Llama AIO will wrap with `steam-run` when available, fall back to a PATH `llama-server`, or show how to enable `programs.nix-ld.enable = true`. Prefer **System (PATH)** with nixpkgs `llama-cpp` when you manage the binary yourself.
 
 ## Models
 
 Download models directly from Hugging Face or pick a model that was downloaded by other tools.
 
-The picker shows each model's licence next to its name and warns before downloading anything that is not clearly permissive — for example Llama and Gemma models, which allow commercial use only under extra conditions. Split GGUFs (`…-00001-of-0000N.gguf`) are sized as one model.
+The picker shows each model's licence next to its name and warns before downloading anything that is not clearly permissive.
 
-Multimodal GGUFs (Qwen3.8 and similar) ship a separate **mmproj** projector. Llama AIO downloads that file with the language GGUF, attaches it via llama-server `--mmproj`, and enables image input in Copilot Chat. Uncheck **Offload vision projector to GPU** to pass `--no-mmproj-offload` (CLIP in system RAM). Clear the projector in the Model card if you do not want vision at all.
-
-Gemma 4 GGUFs (Unsloth and similar) ship a sidecar **MTP** drafter (`mtp-*.gguf`). Llama AIO downloads that file with the language GGUF, enables speculative MTP, and starts llama-server with `--spec-type draft-mtp --model-draft <mtp> --fit off`. Needs llama.cpp from 2026-06-07 or later (`gemma4-assistant`). Qwen-style models that bake next-n heads into the language GGUF still use MTP without a draft file.
+To enable vision a **mmproj** projector can be selected.
 
 ## Load settings & memory estimates
 
@@ -67,10 +47,6 @@ Use local LLMs directly in GitHub Copilot Chat — the running model appears as 
 
 Sampling defaults (temperature, top-p, top-k, max tokens) are set under **Request defaults**. Well-known models such as Qwen3 ship with curated modes that override those values; the panel says so when a mode is active.
 
-### Prompt replacements
-
-Copilot's system prompt is long. Optional find/replace rules shrink it before the request is sent, and the panel reports how many tokens were saved. Toggle and custom rule file: `llamaAio.promptReplacementsEnabled` / `llamaAio.promptReplacementsFile`.
-
 ## Performance
 
 Automated context monitoring and performance measurement of the current Chat session.
@@ -89,29 +65,29 @@ Only llama-servers are ever adopted or stopped — anything else holding the por
 
 ## Key load settings → llama.cpp flags
 
-| UI                              | Flag                                                 |
-| ------------------------------- | ---------------------------------------------------- |
-| Context Length                  | `--ctx-size`                                       |
-| GPU Offload                     | `-ngl`                                             |
-| Tensor split                    | `--tensor-split`                                   |
-| Split mode                      | `--split-mode`                                     |
-| Main GPU                        | `--main-gpu`                                       |
-| CPU Threads                     | `-t`                                               |
-| Eval / Physical batch           | `-b` / `-ub`                                     |
-| Max concurrent predictions      | `-np`                                              |
-| CPU MoE layers                  | `--n-cpu-moe`                                      |
-| KV cache type K / V             | `--cache-type-k` / `--cache-type-v`              |
-| Flash attention                 | `--flash-attn`                                     |
-| Unified KV cache                | `--kv-unified` / `--no-kv-unified`               |
-| Offload KV to GPU               | default /`--no-kv-offload`                         |
-| Cache reuse (KV shift)          | `--cache-reuse`                                    |
-| Context checkpoints             | `--ctx-checkpoints`                                |
-| Reasoning format / budget       | `--reasoning-format` / `--reasoning-budget`      |
-| Keep model in memory / Try mmap | `--load-mode mlock` / `mmap` / `none`          |
-| RoPE base/scale                 | `--rope-freq-base` / `--rope-freq-scale`         |
-| Seed                            | `--seed`                                           |
+| UI                              | Flag                                                                                                 |
+| ------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| Context Length                  | `--ctx-size`                                                                                       |
+| GPU Offload                     | `-ngl`                                                                                             |
+| Tensor split                    | `--tensor-split`                                                                                   |
+| Split mode                      | `--split-mode`                                                                                     |
+| Main GPU                        | `--main-gpu`                                                                                       |
+| CPU Threads                     | `-t`                                                                                               |
+| Eval / Physical batch           | `-b` / `-ub`                                                                                     |
+| Max concurrent predictions      | `-np`                                                                                              |
+| CPU MoE layers                  | `--n-cpu-moe`                                                                                      |
+| KV cache type K / V             | `--cache-type-k` / `--cache-type-v`                                                              |
+| Flash attention                 | `--flash-attn`                                                                                     |
+| Unified KV cache                | `--kv-unified` / `--no-kv-unified`                                                               |
+| Offload KV to GPU               | default /`--no-kv-offload`                                                                         |
+| Cache reuse (KV shift)          | `--cache-reuse`                                                                                    |
+| Context checkpoints             | `--ctx-checkpoints`                                                                                |
+| Reasoning format / budget       | `--reasoning-format` / `--reasoning-budget`                                                      |
+| Keep model in memory / Try mmap | `--load-mode mlock` / `mmap` / `none`                                                          |
+| RoPE base/scale                 | `--rope-freq-base` / `--rope-freq-scale`                                                         |
+| Seed                            | `--seed`                                                                                           |
 | Speculative MTP                 | `--spec-type draft-mtp` (+ draft n-max/min, p-min; sidecar Gemma 4 also `-md` and `--fit off`) |
-| Speculative DFlash              | `--spec-type draft-dflash` + `-md` draft GGUF (+ n-max, draft-ngl; draft KV f16) |
+| Speculative DFlash              | `--spec-type draft-dflash` + `-md` draft GGUF (+ n-max, draft-ngl; draft KV f16)                 |
 
 ## Commands
 
@@ -134,24 +110,7 @@ Only llama-servers are ever adopted or stopped — anything else holding the por
 - `llamaAio.autoStart`
 - `llamaAio.backend` — `auto` / `vulkan` / `cuda` / `cpu` / `rocm` / `openvino` / `sycl`
 - `llamaAio.launchMode` — `externalTerminal` (default) or `background`
-- `llamaAio.promptReplacementsEnabled` / `llamaAio.promptReplacementsFile`
-
-## Notes
-
-- **Keep Model in Memory** uses `--load-mode mlock` (mmap on Windows); it does not control process lifetime.
-- Quantized V cache requires flash attention; the settings panel warns when the combination cannot work.
-- MTP needs next-n / MTP layers in the GGUF, or a sibling `mtp-*.gguf` (Gemma 4). Copilot **Agent** prompts are large — prefer a GPU backend or Ask mode on CPU.
-
-## Development
-
-```bash
-npm test        # unit tests (Node's built-in runner, no extra deps)
-npm run compile # type-check + build to out/
-```
-
-Tests live in `packages/core/test/` and build to `packages/core/out-test/`, so nothing test-related ships in the VSIX. `make package` runs them before packaging both the extension and the TUI.
-
-## License
+- `llamaAio.promptReplacementsEnabled` / `llamaAio.promptReplacementsFile`License
 
 This project is licensed under the [MIT License](LICENSE).
 
