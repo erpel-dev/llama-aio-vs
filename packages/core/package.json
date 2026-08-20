@@ -1,6 +1,6 @@
 {
   "name": "@llama-aio/core",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "private": true,
   "description": "Shared llama.cpp management core: config, GGUF metadata, memory estimates, server lifecycle.",
   "license": "MIT",

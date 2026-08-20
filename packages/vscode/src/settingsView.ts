@@ -896,7 +896,96 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       text-overflow: ellipsis;
     }
     .stat.empty .v { color: var(--muted); font-weight: 500; }
+    .stat.stale .v { color: var(--muted); font-weight: 600; }
     .stat.good .v { color: var(--ok); }
+    .perf-session { margin-top: 8px; }
+    .perf-session .spark-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 8px;
+      font-size: 10px;
+      color: var(--muted);
+      margin-bottom: 2px;
+    }
+    .perf-session .spark-head .avg {
+      color: var(--fg);
+      font-weight: 650;
+      font-size: 11px;
+    }
+    .perf-spark {
+      display: block;
+      width: 100%;
+      height: 28px;
+    }
+    .perf-spark polyline {
+      fill: none;
+      stroke: var(--starting);
+      stroke-width: 1.5;
+    }
+    .perf-spark circle { fill: var(--starting); }
+    .perf-pills {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+      margin-top: 6px;
+    }
+    .perf-pills span {
+      font-size: 10px;
+      color: var(--muted);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      padding: 1px 7px;
+    }
+    .perf-history {
+      margin-top: 8px;
+      border: 1px solid var(--border);
+      border-radius: 5px;
+      overflow: hidden;
+    }
+    .perf-history summary {
+      list-style: none;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+      padding: 5px 8px;
+      font-size: 11px;
+      cursor: pointer;
+      user-select: none;
+    }
+    .perf-history summary::-webkit-details-marker { display: none; }
+    .perf-history summary::before {
+      content: '▸';
+      color: var(--muted);
+      font-size: 10px;
+      flex-shrink: 0;
+    }
+    .perf-history[open] summary::before { content: '▾'; }
+    .perf-history table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 10.5px;
+      border-top: 1px solid var(--border);
+    }
+    .perf-history th, .perf-history td {
+      padding: 3px 6px;
+      text-align: right;
+      white-space: nowrap;
+    }
+    .perf-history th:first-child, .perf-history td:first-child { text-align: left; }
+    .perf-history th {
+      font-size: 9px;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--muted);
+      font-weight: 600;
+      background: color-mix(in srgb, var(--fg) 5%, transparent);
+    }
+    .perf-history tr:nth-child(even) td {
+      background: color-mix(in srgb, var(--fg) 3%, transparent);
+    }
+    .perf-history .muted { color: var(--muted); }
     .stat.warn .v { color: var(--warn); }
     .presets {
       display: flex;
@@ -1222,6 +1311,8 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     </div>
     <div class="stat-grid" id="perfStats"></div>
     <div class="meta" id="perfFoot" style="margin-top:6px">No generation yet</div>
+    <div class="perf-session hidden" id="perfSession"></div>
+    <details class="perf-history hidden" id="perfHistory"></details>
     <div class="toggle" style="margin-top:10px">
       <span>Prompt replacements</span>
       <input type="checkbox" id="promptReplacementsEnabled" title="Strip Copilot system-prompt boilerplate before llama.cpp" />
@@ -2122,6 +2213,43 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       return n >= 100 ? n.toFixed(0) : n.toFixed(1);
     }
 
+    function meanField(rows, key, allowZero) {
+      const xs = [];
+      for (let i = 0; i < rows.length; i++) {
+        const n = rows[i][key];
+        if (typeof n !== 'number' || !isFinite(n)) continue;
+        if (!allowZero && n <= 0) continue;
+        xs.push(n);
+      }
+      if (!xs.length) return undefined;
+      let sum = 0;
+      for (let i = 0; i < xs.length; i++) sum += xs[i];
+      return sum / xs.length;
+    }
+
+    function sparklineSvg(values) {
+      if (!values.length) return '';
+      const w = 240, h = 28, pad = 2.5;
+      let min = values[0], max = values[0];
+      for (let i = 1; i < values.length; i++) {
+        if (values[i] < min) min = values[i];
+        if (values[i] > max) max = values[i];
+      }
+      const span = max - min || 1;
+      const pts = values.map(function (v, i) {
+        const x = values.length === 1 ? w / 2 : (i / (values.length - 1)) * w;
+        const y = h - pad - ((v - min) / span) * (h - pad * 2);
+        return x.toFixed(1) + ',' + y.toFixed(1);
+      }).join(' ');
+      const last = values[values.length - 1];
+      const lastX = values.length === 1 ? w / 2 : w;
+      const lastY = h - pad - ((last - min) / span) * (h - pad * 2);
+      return '<svg class="perf-spark" viewBox="0 0 ' + w + ' ' + h + '" preserveAspectRatio="none" role="img" aria-label="Generation tok/s over recent calls">' +
+        '<polyline points="' + pts + '"/>' +
+        '<circle cx="' + lastX.toFixed(1) + '" cy="' + lastY.toFixed(1) + '" r="2.2"/>' +
+        '</svg>';
+    }
+
     function statTile(key, value, sub, kind) {
       return '<div class="stat' + (kind ? ' ' + kind : '') + '">' +
         '<div class="k">' + key + '</div>' +
@@ -2133,26 +2261,34 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     function renderPerfStats(perf, perfLines) {
       const grid = $('perfStats');
       const foot = $('perfFoot');
+      const sessEl = $('perfSession');
+      const histEl = $('perfHistory');
       if (!grid) return;
       const p = perf || {};
+      const stale = !!(p.generating && p.showingPreviousCall);
       const tiles = [];
 
       const gen = fmtRate(p.genTokPerSec);
       tiles.push(gen
-        ? statTile('Generation', gen + ' tok/s', p.estimated ? 'estimated' : 'from server timings')
+        ? statTile(
+          'Generation',
+          gen + ' tok/s',
+          stale ? 'last call' : (p.estimated ? 'live estimate' : 'from server timings'),
+          stale ? 'stale' : undefined
+        )
         : statTile('Generation', '—', p.generating ? 'measuring…' : 'no generation yet', 'empty'));
 
       const prompt = fmtRate(p.promptTokPerSec);
       tiles.push(prompt
-        ? statTile('Prompt', prompt + ' tok/s', 'prompt processing')
+        ? statTile('Prompt', prompt + ' tok/s', stale ? 'last call' : 'prompt processing', stale ? 'stale' : undefined)
         : statTile('Prompt', '—', 'prompt processing', 'empty'));
 
       if (typeof p.cacheHitPct === 'number') {
         tiles.push(statTile(
           'Prompt reuse',
           p.cacheHitPct + '%',
-          fmtNum(p.cachedPromptTokens) + ' cached · ' + fmtNum(p.processedPromptTokens) + ' new',
-          p.cacheHitPct >= 50 ? 'good' : undefined
+          (stale ? 'last call · ' : '') + fmtNum(p.cachedPromptTokens) + ' cached · ' + fmtNum(p.processedPromptTokens) + ' new',
+          stale ? 'stale' : (p.cacheHitPct >= 50 ? 'good' : undefined)
         ));
       } else {
         tiles.push(statTile('Prompt reuse', '—', 'KV prefix cache (cache_n)', 'empty'));
@@ -2164,11 +2300,11 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           tiles.push(statTile(
             label,
             p.draftAcceptancePct.toFixed(1) + '%',
-            fmtNum(p.draftTokensAccepted) + ' / ' + fmtNum(p.draftTokens) + ' drafted',
-            p.draftAcceptancePct >= 50 ? 'good' : undefined
+            (stale ? 'last call · ' : '') + fmtNum(p.draftTokensAccepted) + ' / ' + fmtNum(p.draftTokens) + ' drafted',
+            stale ? 'stale' : (p.draftAcceptancePct >= 50 ? 'good' : undefined)
           ));
         } else {
-          tiles.push(statTile(label, '—', 'no draft tokens yet', 'empty'));
+          tiles.push(statTile(label, '—', p.generating ? 'drafts arrive at end of call' : 'no draft tokens yet', 'empty'));
         }
       } else {
         tiles.push(statTile('Spec accepted', '—', 'speculative off', 'empty'));
@@ -2187,6 +2323,70 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           parts.push(((p.finishedAt - p.startedAt) / 1000).toFixed(1) + 's');
         }
         foot.innerHTML = parts.length ? parts.join(' · ') : 'No generation yet';
+      }
+
+      if (sessEl || histEl) {
+        const rows = Array.isArray(p.history) ? p.history : [];
+        if (!rows.length) {
+          if (sessEl) {
+            sessEl.classList.add('hidden');
+            sessEl.innerHTML = '';
+          }
+          if (histEl) {
+            histEl.classList.add('hidden');
+            histEl.innerHTML = '';
+          }
+        } else {
+          const genAvg = meanField(rows, 'genTokPerSec', false);
+          const promptAvg = meanField(rows, 'promptTokPerSec', false);
+          const reuseAvg = meanField(rows, 'cacheHitPct', true);
+          const mtpAvg = meanField(rows, 'draftAcceptancePct', true);
+          const genSeries = [];
+          for (let i = rows.length - 1; i >= 0; i--) {
+            const n = rows[i].genTokPerSec;
+            if (typeof n === 'number' && isFinite(n) && n > 0) genSeries.push(n);
+          }
+
+          if (sessEl) {
+            sessEl.classList.remove('hidden');
+            const pills = [];
+            const promptLabel = fmtRate(promptAvg);
+            if (promptLabel) pills.push('<span>Prompt ' + promptLabel + ' avg</span>');
+            if (typeof reuseAvg === 'number') pills.push('<span>Reuse ' + reuseAvg.toFixed(0) + '%</span>');
+            if (typeof mtpAvg === 'number') pills.push('<span>MTP ' + mtpAvg.toFixed(0) + '%</span>');
+            const avgLabel = fmtRate(genAvg);
+            sessEl.innerHTML =
+              '<div class="spark-head"><span>Gen tok/s · last ' + rows.length +
+              ' call' + (rows.length === 1 ? '' : 's') + '</span>' +
+              (avgLabel ? '<span class="avg">' + avgLabel + ' avg</span>' : '') +
+              '</div>' +
+              sparklineSvg(genSeries) +
+              (pills.length ? '<div class="perf-pills">' + pills.join('') + '</div>' : '');
+          }
+
+          if (histEl) {
+            const wasOpen = !!histEl.open;
+            histEl.classList.remove('hidden');
+            const body = rows.map((h, i) => {
+              const when = h.finishedAt ? new Date(h.finishedAt).toLocaleTimeString() : '';
+              const genH = fmtRate(h.genTokPerSec);
+              const reuse = typeof h.cacheHitPct === 'number' ? h.cacheHitPct.toFixed(0) + '%' : '—';
+              const tok = typeof h.completionTokens === 'number' ? fmtNum(h.completionTokens) : '—';
+              const dur = typeof h.durationMs === 'number' ? (h.durationMs / 1000).toFixed(1) + 's' : '—';
+              return '<tr><td>' + (i === 0 ? when + ' <span class="muted">latest</span>' : when) +
+                '</td><td>' + (genH || '—') +
+                '</td><td>' + reuse +
+                '</td><td>' + tok +
+                '</td><td>' + dur + '</td></tr>';
+            }).join('');
+            const avgBit = fmtRate(genAvg) ? '<span class="muted">avg ' + fmtRate(genAvg) + ' gen</span>' : '';
+            histEl.innerHTML = '<summary><span>Recent calls · ' + rows.length + '</span>' + avgBit + '</summary>' +
+              '<table><thead><tr>' +
+              '<th>Call</th><th>Gen</th><th>Reuse</th><th>Out</th><th>Time</th>' +
+              '</tr></thead><tbody>' + body + '</tbody></table>';
+            histEl.open = wasOpen;
+          }
+        }
       }
     }
 
@@ -3195,18 +3395,25 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       const prStats = $('replacementStats');
       if (prStats) {
         const pr = perf.promptReplacements;
+        const hist = Array.isArray(perf.history) ? perf.history : [];
+        const sessionSaved = hist.reduce(function (sum, h) {
+          return sum + (typeof h.tokensSaved === 'number' ? h.tokensSaved : 0);
+        }, 0);
+        const sessionBit = sessionSaved > 0
+          ? 'Session: ≈' + Number(sessionSaved).toLocaleString() + ' tok across ' + hist.length + ' call' + (hist.length === 1 ? '' : 's') + '. '
+          : '';
         if (!payload.promptReplacementsEnabled) {
-          prStats.textContent = 'Last call: replacements off';
+          prStats.textContent = sessionBit + 'Last call: replacements off';
         } else if (!pr) {
-          prStats.textContent = 'Last call: — (send a chat to measure)';
+          prStats.textContent = sessionBit + 'Last call: — (send a chat to measure)';
         } else if (!pr.enabled) {
-          prStats.textContent = 'Last call: replacements were off';
+          prStats.textContent = sessionBit + 'Last call: replacements were off';
         } else if (pr.tokensSaved > 0) {
-          prStats.textContent =
+          prStats.textContent = sessionBit +
             'Last call: saved ≈' + Number(pr.tokensSaved).toLocaleString() +
             ' tokens (' + pr.pctSaved + '% of request)';
         } else {
-          prStats.textContent = 'Last call: no matching boilerplate (' +
+          prStats.textContent = sessionBit + 'Last call: no matching boilerplate (' +
             Number(pr.tokensBefore || 0).toLocaleString() + ' tok request)';
         }
       }
