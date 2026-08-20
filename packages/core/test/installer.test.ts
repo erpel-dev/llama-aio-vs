@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
+  buildArchiveExtractCommand,
   candidateAssetNames,
   compareReleaseTags,
   createClearableTimeoutSignal,
@@ -110,6 +111,34 @@ describe("compareReleaseTags", () => {
     assert.ok(compareReleaseTags("b10375", "b10344") > 0);
     assert.ok(compareReleaseTags("b10344", "b10375") < 0);
     assert.equal(compareReleaseTags("b10344", "b10344"), 0);
+  });
+});
+
+describe("buildArchiveExtractCommand", () => {
+  it("never invokes PowerShell", () => {
+    const zip = buildArchiveExtractCommand("llama.zip", "out");
+    const tgz = buildArchiveExtractCommand("llama.tar.gz", "out");
+    for (const plan of [zip, tgz]) {
+      assert.notEqual(plan.command.toLowerCase(), "powershell.exe");
+      assert.equal(plan.argv.join(" ").toLowerCase().includes("expand-archive"), false);
+    }
+  });
+
+  it("unpacks zip with tar.exe on Windows and unzip elsewhere", () => {
+    const plan = buildArchiveExtractCommand("llama.zip", "dest");
+    if (process.platform === "win32") {
+      assert.equal(plan.command, "tar.exe");
+      assert.deepEqual(plan.argv, ["-xf", "llama.zip", "-C", "dest"]);
+    } else {
+      assert.equal(plan.command, "unzip");
+      assert.deepEqual(plan.argv, ["-o", "llama.zip", "-d", "dest"]);
+    }
+  });
+
+  it("unpacks tar.gz with tar on every platform", () => {
+    const plan = buildArchiveExtractCommand("llama.tar.gz", "dest");
+    assert.match(plan.command, /^tar(\.exe)?$/);
+    assert.deepEqual(plan.argv, ["-xzf", "llama.tar.gz", "-C", "dest"]);
   });
 });
 
