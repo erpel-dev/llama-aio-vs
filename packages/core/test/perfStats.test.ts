@@ -3,18 +3,69 @@ import { describe, it } from "node:test";
 import { PerfStats } from "../src/perfStats";
 
 describe("PerfStats live generation rate", () => {
-  it("estimates tok/s from completion tokens after generation starts", () => {
+  it("does not publish a tok/s spike in the first few hundred milliseconds", () => {
     const perf = new PerfStats();
     perf.begin({ contextLimit: 4096, estimatedPromptTokens: 100 });
     assert.equal(perf.get().generating, true);
+    perf.tick(40, { now: Date.now() });
     assert.equal(perf.get().genTokPerSec, undefined);
+    assert.equal(perf.get().completionTokens, 40);
+  });
 
-    perf.tick(40);
+  it("estimates tok/s after enough tokens and elapsed time", () => {
+    const perf = new PerfStats();
+    const t0 = 1_000_000;
+    perf.begin({ contextLimit: 4096, estimatedPromptTokens: 100 });
+    perf.tick(8, { now: t0 });
+    assert.equal(perf.get().genTokPerSec, undefined);
+    perf.tick(40, { now: t0 + 800 });
     const live = perf.get();
     assert.equal(live.generating, true);
     assert.equal(live.completionTokens, 40);
     assert.ok(typeof live.genTokPerSec === "number" && live.genTokPerSec > 0);
+    assert.ok(live.genTokPerSec < 200, `expected a settled estimate, got ${live.genTokPerSec}`);
     assert.equal(live.estimated, true);
+  });
+
+  it("keeps the previous call's prompt / MTP tiles until this request completes", () => {
+    const perf = new PerfStats();
+    perf.begin({ contextLimit: 4096 });
+    perf.complete({
+      genTokPerSec: 42,
+      promptTokPerSec: 900,
+      completionTokens: 100,
+      promptTokens: 2000,
+      draftTokens: 80,
+      draftTokensAccepted: 72,
+      cachedPromptTokens: 1800,
+      processedPromptTokens: 200,
+      speculativeMode: "mtp",
+      source: "server",
+    });
+    perf.begin({ contextLimit: 4096, speculativeMode: "mtp" });
+    const live = perf.get();
+    assert.equal(live.generating, true);
+    assert.equal(live.showingPreviousCall, true);
+    assert.equal(live.promptTokPerSec, 900);
+    assert.equal(live.draftAcceptancePct, 90);
+    assert.equal(live.cacheHitPct, 90);
+    assert.equal(live.history?.length, 1);
+  });
+
+  it("records a short history of completed calls", () => {
+    const perf = new PerfStats();
+    for (let i = 0; i < 3; i++) {
+      perf.begin({ contextLimit: 4096 });
+      perf.complete({
+        genTokPerSec: 30 + i,
+        completionTokens: 10 + i,
+        source: "server",
+      });
+    }
+    const hist = perf.get().history || [];
+    assert.equal(hist.length, 3);
+    assert.equal(hist[0]?.genTokPerSec, 32);
+    assert.equal(hist[2]?.genTokPerSec, 30);
   });
 
   it("keeps a server tok/s across later ticks that have no new rate", () => {
@@ -43,8 +94,10 @@ describe("PerfStats live generation rate", () => {
 
   it("ignores a zero server gen rate and keeps the live estimate", () => {
     const perf = new PerfStats();
+    const t0 = 1_000_000;
     perf.begin({ contextLimit: 4096 });
-    perf.tick(80);
+    perf.tick(80, { now: t0 });
+    perf.tick(80, { now: t0 + 800 });
     const estimated = perf.get().genTokPerSec;
     assert.ok(typeof estimated === "number" && estimated > 0);
 

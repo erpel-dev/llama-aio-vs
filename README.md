@@ -3,7 +3,7 @@
 Local **llama.cpp** for VS Code: install newest llama.cpp binaries, manage GGUF models, tune load settings with memory estimates, run one shared `llama-server`, and use it in **GitHub Copilot Chat**.
 
 <p align="center">
-  <img src="media/context-performance.jpeg" alt="Llama AIO panel — server status, live performance, backend install, and model selection" width="49%">
+  <img src="media/performance.png" alt="Llama AIO panel — server status, live performance, backend install, and model selection" width="49%">
   <img src="media/resource-estimate.jpeg" alt="Load settings — VRAM / RAM estimate, presets, context length, GPU offload, and CPU MoE layers" width="49%">
 </p>
 

@@ -127,7 +127,24 @@ describe("buildServerArgs", () => {
     const args = build({ speculativeMode: "dflash", draftModelPath: "" });
     assert.ok(!args.includes("--spec-type"));
     assert.ok(!args.includes("--model-draft"));
-    assert.ok(!args.includes("--fit"));
+  });
+
+  it("always disables llama.cpp auto-fit because -ngl is user-set", () => {
+    assert.equal(argValue(build(), "--fit"), "off");
+    assert.equal(
+      argValue(build({ nCpuMoe: 6, tensorSplit: "45,55", gpuOffload: 41 }), "--fit"),
+      "off"
+    );
+  });
+
+  it("loads without mmap when CPU MoE overrides are in use", () => {
+    const args = build({ nCpuMoe: 6, tryMmap: true });
+    assert.equal(argValue(args, "--n-cpu-moe"), "6");
+    assert.equal(argValue(args, "--load-mode"), "none");
+  });
+
+  it("keeps mmap when CPU MoE is off and tryMmap is on", () => {
+    assert.equal(argValue(build({ nCpuMoe: 0, tryMmap: true }), "--load-mode"), "mmap");
   });
 
   describe("multi-GPU split flags", () => {

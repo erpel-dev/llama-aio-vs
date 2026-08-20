@@ -6,6 +6,25 @@ import type { PromptReplacementStats } from "./promptReplacer";
 
 export type ContextLevel = "ok" | "warn" | "critical";
 
+/** One finished Copilot → llama.cpp call, for the sidebar history list. */
+export interface PerfCallSummary {
+  finishedAt: number;
+  durationMs?: number;
+  completionTokens?: number;
+  promptTokens?: number;
+  genTokPerSec?: number;
+  promptTokPerSec?: number;
+  cacheHitPct?: number;
+  draftAcceptancePct?: number;
+  tokensSaved?: number;
+}
+
+const PERF_HISTORY_MAX = 8;
+/** Ignore the first ~400 ms of wall-clock tok/s — that window is almost always a spike. */
+const LIVE_GEN_MIN_MS = 400;
+const LIVE_GEN_MIN_TOKENS = 16;
+const GEN_EMA = 0.35;
+
 /** Last (or in-flight) generation performance from llama-server. */
 export interface GenerationPerf {
   /** True while a Copilot chat response is streaming. */
@@ -48,6 +67,13 @@ export interface GenerationPerf {
   promptReplacements?: PromptReplacementStats;
   /** Segmented context-bar breakdown (Tools / System / History / …). */
   contextBreakdown?: ContextBreakdown;
+  /**
+   * True while generating and prompt/reuse/MTP numbers are still from the
+   * previous completed call (llama.cpp only sends those timings at the end).
+   */
+  showingPreviousCall?: boolean;
+  /** Newest-first summaries of recent completed calls. */
+  history?: PerfCallSummary[];
 }
 
 /** Snapshot of the last Copilot → llama.cpp chat request (for debug "View context"). */
@@ -140,8 +166,11 @@ export class PerfStats {
   readonly onDidChange = this._onDidChange.event;
 
   private current: GenerationPerf = { generating: false };
+  private history: PerfCallSummary[] = [];
   /** Wall-clock of the first completion token (excludes prompt eval from live tok/s). */
   private genStartedAt: number | undefined;
+  /** EMA of live generation tok/s (avoids the first-sample spike). */
+  private smoothedGen: number | undefined;
   /** Highest alert band we've already toasted for this conversation fill. */
   private alertBand: 0 | 80 | 90 = 0;
   /** Last Copilot → llama.cpp chat request (for debug "View context"). */
@@ -150,7 +179,7 @@ export class PerfStats {
   private lastResponse: LastChatResponseTrace | undefined;
 
   get(): GenerationPerf {
-    return { ...this.current };
+    return { ...this.current, history: this.history.slice() };
   }
 
   hasLastRequestContext(): boolean {
@@ -462,18 +491,29 @@ export class PerfStats {
       opts?.estimatedPromptTokens !== undefined ? true : prev.contextEstimated
     );
     this.genStartedAt = undefined;
+    this.smoothedGen = undefined;
     this.current = {
       generating: true,
       startedAt: Date.now(),
       estimated: true,
       source: "estimate",
       completionTokens: undefined,
-      promptTokPerSec: undefined,
-      genTokPerSec: undefined,
-      // Clear draft stats so a disabled / no-draft run never shows a prior %.
-      draftTokens: undefined,
-      draftTokensAccepted: undefined,
-      draftAcceptancePct: undefined,
+      // Keep last-call prompt / reuse / MTP / gen until this request's
+      // timings arrive — llama.cpp does not send draft_n / cache_n mid-stream.
+      promptTokPerSec: prev.promptTokPerSec,
+      genTokPerSec: prev.genTokPerSec,
+      draftTokens: prev.draftTokens,
+      draftTokensAccepted: prev.draftTokensAccepted,
+      draftAcceptancePct: prev.draftAcceptancePct,
+      cachedPromptTokens: prev.cachedPromptTokens,
+      processedPromptTokens: prev.processedPromptTokens,
+      cacheHitPct: prev.cacheHitPct,
+      showingPreviousCall: !!(
+        prev.promptTokPerSec ||
+        prev.cacheHitPct !== undefined ||
+        prev.draftAcceptancePct !== undefined ||
+        prev.genTokPerSec
+      ),
       speculativeMode: opts?.speculativeMode ?? prev.speculativeMode,
       promptReplacements: opts?.promptReplacements ?? prev.promptReplacements,
       contextBreakdown: opts?.contextBreakdown ?? prev.contextBreakdown,
@@ -490,40 +530,63 @@ export class PerfStats {
    */
   tick(
     completionTokens: number,
-    opts?: { genTokPerSec?: number; promptTokPerSec?: number }
+    opts?: { genTokPerSec?: number; promptTokPerSec?: number; now?: number }
   ): void {
     if (!this.current.generating || !this.current.startedAt) {
       return;
     }
+    const now = opts?.now ?? Date.now();
     const promptTokPerSec = positiveRate(opts?.promptTokPerSec) ?? this.current.promptTokPerSec;
     const serverGen = positiveRate(opts?.genTokPerSec);
     let genTokPerSec = this.current.genTokPerSec;
     let estimated = this.current.estimated;
     let source = this.current.source;
     let nextCompletion = this.current.completionTokens;
+    let showingPreviousCall = this.current.showingPreviousCall;
+    if (positiveRate(opts?.promptTokPerSec)) {
+      showingPreviousCall = false;
+    }
 
     if (typeof completionTokens === "number" && completionTokens > 0) {
       nextCompletion = completionTokens;
       if (!this.genStartedAt) {
-        this.genStartedAt = Date.now();
+        this.genStartedAt = now;
       }
       if (serverGen) {
-        genTokPerSec = serverGen;
+        this.smoothedGen =
+          this.smoothedGen == null
+            ? serverGen
+            : this.smoothedGen * (1 - GEN_EMA) + serverGen * GEN_EMA;
+        genTokPerSec = this.smoothedGen;
         estimated = false;
         source = "server";
-      } else if (source === "server" && positiveRate(this.current.genTokPerSec)) {
+        showingPreviousCall = false;
+      } else if (source === "server" && positiveRate(this.current.genTokPerSec) && !this.current.showingPreviousCall) {
         genTokPerSec = this.current.genTokPerSec;
         estimated = false;
       } else {
-        const elapsedSec = Math.max(0.05, (Date.now() - this.genStartedAt) / 1000);
-        genTokPerSec = completionTokens / elapsedSec;
-        estimated = true;
-        source = "estimate";
+        const elapsedMs = Math.max(0, now - this.genStartedAt);
+        if (elapsedMs >= LIVE_GEN_MIN_MS && completionTokens >= LIVE_GEN_MIN_TOKENS) {
+          const instant = completionTokens / (elapsedMs / 1000);
+          this.smoothedGen =
+            this.smoothedGen == null
+              ? instant
+              : this.smoothedGen * (1 - GEN_EMA) + instant * GEN_EMA;
+          genTokPerSec = this.smoothedGen;
+          estimated = true;
+          source = "estimate";
+          showingPreviousCall = false;
+        }
       }
     } else if (serverGen) {
-      genTokPerSec = serverGen;
+      this.smoothedGen =
+        this.smoothedGen == null
+          ? serverGen
+          : this.smoothedGen * (1 - GEN_EMA) + serverGen * GEN_EMA;
+      genTokPerSec = this.smoothedGen;
       estimated = false;
       source = "server";
+      showingPreviousCall = false;
     }
 
     this.current = {
@@ -533,6 +596,7 @@ export class PerfStats {
       estimated,
       source,
       promptTokPerSec,
+      showingPreviousCall,
     };
     this._onDidChange.fire(this.get());
   }
@@ -572,7 +636,9 @@ export class PerfStats {
     const startedAt = this.current.startedAt;
     const serverGen = positiveRate(partial.genTokPerSec);
     const serverPrompt = positiveRate(partial.promptTokPerSec);
-    let genTokPerSec = serverGen ?? this.current.genTokPerSec;
+    let genTokPerSec =
+      serverGen ??
+      (this.current.showingPreviousCall ? undefined : positiveRate(this.current.genTokPerSec));
     const completionTokens = partial.completionTokens ?? this.current.completionTokens;
     const source = partial.source || (serverGen ? "server" : "estimate");
     if (
@@ -581,7 +647,7 @@ export class PerfStats {
       (this.genStartedAt || startedAt)
     ) {
       const origin = this.genStartedAt ?? startedAt!;
-      const elapsedSec = Math.max(0.05, (finishedAt - origin) / 1000);
+      const elapsedSec = Math.max(LIVE_GEN_MIN_MS / 1000, (finishedAt - origin) / 1000);
       genTokPerSec = completionTokens / elapsedSec;
     }
 
@@ -664,11 +730,14 @@ export class PerfStats {
       speculativeMode,
       contextBreakdown,
       generating: false,
+      showingPreviousCall: false,
       finishedAt,
       estimated: !serverGen,
       source,
       ...ctx,
     };
+    this.smoothedGen = undefined;
+    this.pushHistory(this.current, startedAt, finishedAt);
     this.maybeResetAlertBand(ctx.contextPct);
     this._onDidChange.fire(this.get());
   }
@@ -677,8 +746,35 @@ export class PerfStats {
     if (!this.current.generating) {
       return;
     }
-    this.current = { ...this.current, generating: false, finishedAt: Date.now() };
+    this.current = { ...this.current, generating: false, showingPreviousCall: false, finishedAt: Date.now() };
     this._onDidChange.fire(this.get());
+  }
+
+  private pushHistory(p: GenerationPerf, startedAt: number | undefined, finishedAt: number): void {
+    const durationMs =
+      typeof startedAt === "number" && finishedAt >= startedAt ? finishedAt - startedAt : undefined;
+    const hasRate = positiveRate(p.genTokPerSec) || positiveRate(p.promptTokPerSec);
+    const hasTokens =
+      (typeof p.completionTokens === "number" && p.completionTokens > 0) ||
+      (typeof p.promptTokens === "number" && p.promptTokens > 0);
+    if (!hasRate && !hasTokens) {
+      return;
+    }
+    const saved = p.promptReplacements?.enabled ? p.promptReplacements.tokensSaved : undefined;
+    this.history = [
+      {
+        finishedAt,
+        durationMs,
+        completionTokens: p.completionTokens,
+        promptTokens: p.promptTokens,
+        genTokPerSec: positiveRate(p.genTokPerSec),
+        promptTokPerSec: positiveRate(p.promptTokPerSec),
+        cacheHitPct: p.cacheHitPct,
+        draftAcceptancePct: p.draftAcceptancePct,
+        tokensSaved: typeof saved === "number" && saved > 0 ? saved : undefined,
+      },
+      ...this.history,
+    ].slice(0, PERF_HISTORY_MAX);
   }
 
   /**
@@ -778,7 +874,7 @@ export class PerfStats {
     }
     const lines: string[] = [];
     if (p.generating) {
-      lines.push("Generating…");
+      lines.push(p.showingPreviousCall ? "Generating… (rates from last call until timings arrive)" : "Generating…");
     }
     if (
       typeof p.promptTokens === "number" &&

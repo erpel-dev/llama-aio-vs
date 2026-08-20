@@ -101,9 +101,14 @@ export function buildServerArgs(
 
   // Prefer current --load-mode over deprecated --mmap / --mlock / --no-mmap.
   // mlock is poorly supported on Windows — fall back to mmap when pinning is requested.
+  // --n-cpu-moe uses CPU tensor overrides; llama.cpp warns that mmap then
+  // leaves expert weights mapped and is slower than --load-mode none.
   if (settings.keepModelInMemory && process.platform !== "win32") {
     args.push("--load-mode", "mlock");
-  } else if (!settings.tryMmap && !settings.keepModelInMemory) {
+  } else if (
+    (!settings.tryMmap && !settings.keepModelInMemory) ||
+    settings.nCpuMoe > 0
+  ) {
     args.push("--load-mode", "none");
   } else {
     args.push("--load-mode", "mmap");
@@ -177,10 +182,6 @@ export function buildServerArgs(
     if (usesSidecarMtp(settings) && settings.draftModelPath) {
       args.push("--model-draft", settings.draftModelPath);
       args.push("--spec-draft-ngl", String(settings.draftGpuOffload));
-      // llama.cpp --fit defaults to on; its draft-memory probe fails with
-      // "Gemma4Assistant requires ctx_other to be set" and aborts load.
-      // We already set --ctx-size / -ngl, so skip the probe (same as DFlash).
-      args.push("--fit", "off");
     }
   } else if (settings.speculativeMode === "dflash" && settings.draftModelPath) {
     // DFlash needs a separate draft GGUF trained for the target model.
@@ -191,11 +192,14 @@ export function buildServerArgs(
     // Quantized draft KV collapses acceptance (llama.cpp#25725); keep f16.
     args.push("--cache-type-k-draft", "f16");
     args.push("--cache-type-v-draft", "f16");
-    // llama.cpp --fit defaults to on; its draft-memory probe fails with
-    // "dflash requires ctx_other to be set" and aborts load. We already set
-    // --ctx-size / -ngl ourselves, so turn fit off for DFlash.
-    args.push("--fit", "off");
   }
+
+  // llama.cpp --fit defaults to on, but it cannot change user-set -ngl,
+  // --tensor-split, or --n-cpu-moe (CPU tensor overrides). The probe then
+  // logs "failed to fit params … n_gpu_layers already set … abort" and
+  // mis-accounts multi-GPU + CPU MoE. We always set --ctx-size / -ngl, so
+  // skip it (also required for sidecar MTP / DFlash draft probes).
+  args.push("--fit", "off");
 
   return args;
 }
