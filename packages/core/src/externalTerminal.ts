@@ -1,17 +1,54 @@
-import * as fs from "fs";
-import * as os from "os";
 import * as path from "path";
 import { spawn, ChildProcess } from "child_process";
 import { ensureDirs, whichOnPath } from "./paths";
 
 export type LaunchMode = "externalTerminal" | "background";
 
+export type ExternalLaunchPlan = {
+  command: string;
+  argv: string[];
+  cwd: string;
+};
+
 function shQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
-function powershellSingleQuote(value: string): string {
-  return `'${value.replace(/'/g, "''")}'`;
+/** Ensure llama-server also writes the extension log (no shell tee on Windows). */
+export function withLogFileArg(args: string[], logPath: string): string[] {
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--log-file" || args[i] === "-lf") {
+      return args;
+    }
+  }
+  return ["--log-file", logPath, ...args];
+}
+
+/**
+ * argv for a visible Windows console running llama-server.exe directly.
+ * Never PowerShell: a temp `.ps1` + `-ExecutionPolicy Bypass` looks like a dropper.
+ */
+export function buildWindowsExternalLaunch(options: {
+  binary: string;
+  args: string[];
+  logPath: string;
+  windowsTerminal?: string;
+}): ExternalLaunchPlan {
+  const { binary, args, logPath, windowsTerminal } = options;
+  const cwd = path.dirname(binary);
+  const launchArgs = withLogFileArg(args, logPath);
+  if (windowsTerminal) {
+    return {
+      command: windowsTerminal,
+      argv: ["-d", cwd, "--title", "Llama AIO - llama-server", binary, ...launchArgs],
+      cwd,
+    };
+  }
+  return {
+    command: "cmd.exe",
+    argv: ["/c", "start", "Llama AIO - llama-server", binary, ...launchArgs],
+    cwd,
+  };
 }
 
 function resolveLinuxTerminal(): { bin: string; argsPrefix: string[] } | undefined {
@@ -167,68 +204,21 @@ function spawnWindows(
   env: NodeJS.ProcessEnv,
   logPath: string
 ): ChildProcess {
-  const binDir = path.dirname(binary);
-  // PowerShell script: live console + Tee-Object into the extension log (needed for
-  // fatal-line detection), PATH for sibling DLLs, self-delete when done.
-  const ps1Path = path.join(os.tmpdir(), `llama-aio-vs-${Date.now()}.ps1`);
-  const q = powershellSingleQuote;
-  const script = [
-    "$ErrorActionPreference = 'Continue'",
-    `$env:PATH = ${q(binDir + ";")} + $env:PATH`,
-    "Write-Host 'Llama AIO · llama-server'",
-    `Write-Host ('Binary: ' + ${q(binary)})`,
-    `Write-Host ('Log also mirrored to: ' + ${q(logPath)})`,
-    "Write-Host ''",
-    `Set-Location -LiteralPath ${q(binDir)}`,
-    `& ${q(binary)} ${args.map(q).join(" ")} 2>&1 | Tee-Object -FilePath ${q(logPath)} -Append`,
-    "$code = $LASTEXITCODE",
-    "Write-Host ''",
-    "Write-Host (\"llama-server exited with code $code\")",
-    "Write-Host 'Press Enter to close this window…'",
-    "try { Read-Host | Out-Null } catch {}",
-    "try { Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue } catch {}",
-    "exit $code",
-    "",
-  ].join("\r\n");
-  fs.writeFileSync(ps1Path, script, "utf8");
-
-  const psArgs = [
-    "-NoProfile",
-    "-ExecutionPolicy",
-    "Bypass",
-    "-File",
-    ps1Path,
-  ];
-
-  // Prefer Windows Terminal if available; start in the binary dir for DLL lookup.
   const wt = whichOnPath("wt.exe") || whichOnPath("wt");
-  if (wt) {
-    const child = spawn(wt, ["-d", binDir, "powershell.exe", ...psArgs], {
-      detached: true,
-      stdio: "ignore",
-      windowsHide: false,
-      cwd: binDir,
-      env: { ...process.env, ...env },
-    });
-    child.unref();
-    return child;
-  }
-
-  // No `/D binDir`: the spawn cwd below already puts cmd (and therefore the
-  // started process) in the binary directory, and dropping the flag avoids
-  // `start` mis-parsing an install path that contains spaces.
-  const child = spawn(
-    "cmd.exe",
-    ["/c", "start", "Llama AIO - llama-server", "powershell.exe", ...psArgs],
-    {
-      detached: true,
-      stdio: "ignore",
-      windowsHide: false,
-      cwd: binDir,
-      env: { ...process.env, ...env },
-      shell: false,
-    }
-  );
+  const plan = buildWindowsExternalLaunch({
+    binary,
+    args,
+    logPath,
+    windowsTerminal: wt,
+  });
+  const child = spawn(plan.command, plan.argv, {
+    detached: true,
+    stdio: "ignore",
+    windowsHide: false,
+    cwd: plan.cwd,
+    env: { ...process.env, ...env, PATH: `${plan.cwd};${env.PATH || process.env.PATH || ""}` },
+    shell: false,
+  });
   child.unref();
   return child;
 }

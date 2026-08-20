@@ -797,19 +797,26 @@ function copyFilesIntoBin(srcRoot: string, binDir: string, extensions?: string[]
 
 async function extractArchive(archivePath: string, destDir: string): Promise<void> {
   ensureDirs(destDir);
-  if (archivePath.endsWith(".zip")) {
-    if (process.platform === "win32") {
-      await execFileAsync("powershell.exe", [
-        "-NoProfile",
-        "-Command",
-        `Expand-Archive -Path '${archivePath.replace(/'/g, "''")}' -DestinationPath '${destDir.replace(/'/g, "''")}' -Force`,
-      ]);
-    } else {
-      await execFileAsync("unzip", ["-o", archivePath, "-d", destDir]);
-    }
-  } else {
-    await execFileAsync("tar", ["-xzf", archivePath, "-C", destDir]);
+  const { command, argv } = buildArchiveExtractCommand(archivePath, destDir);
+  await execFileAsync(command, argv);
+}
+
+/**
+ * Unpack llama.cpp zips/tarballs without PowerShell (`Expand-Archive` is a
+ * common Defender false-positive). Windows 10+ ships `tar.exe` (libarchive).
+ */
+export function buildArchiveExtractCommand(
+  archivePath: string,
+  destDir: string
+): { command: string; argv: string[] } {
+  if (archivePath.endsWith(".zip") && process.platform !== "win32") {
+    return { command: "unzip", argv: ["-o", archivePath, "-d", destDir] };
   }
+  const tar = process.platform === "win32" ? "tar.exe" : "tar";
+  if (archivePath.endsWith(".zip")) {
+    return { command: tar, argv: ["-xf", archivePath, "-C", destDir] };
+  }
+  return { command: tar, argv: ["-xzf", archivePath, "-C", destDir] };
 }
 
 function findBinaryAfterExtract(root: string): string | undefined {
