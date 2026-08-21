@@ -21,10 +21,17 @@ import {
   nixOsIncompatibilityHint,
   resolveLaunchPlan,
 } from "./nixCompat";
-import { isLlamaServerProcess, sameModelFile, uniquePids } from "./processIdentity";
+import {
+  isLlamaServerProcess,
+  isPidAlive,
+  sameModelFile,
+  stopProcessTree,
+  uniquePids,
+} from "./processIdentity";
 import { buildServerArgs, serverConfigFingerprint, SettingsStore } from "./settings";
 import { normalizeLoadSettingsForCpuBackend } from "./serverArgs";
 import { ServerStatus } from "./types";
+import { activeInstallLock } from "./installSwap";
 
 interface LockFile {
   pid: number;
@@ -37,15 +44,6 @@ interface LockFile {
   launchMode?: string;
   /** Fingerprint of model + load settings (+ launch mode) applied at start. */
   configFingerprint?: string;
-}
-
-function isPidAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 function sleep(ms: number): Promise<void> {
@@ -326,6 +324,17 @@ export class ProcessManager {
   }
 
   private async startInner(modelPath: string | undefined, report: StartProgress): Promise<ServerStatus> {
+    const installing = activeInstallLock();
+    if (installing) {
+      throw new Error(
+        "llama.cpp is being updated" +
+          (installing.pid && installing.pid !== process.pid
+            ? ` in another Llama AIO window (pid ${installing.pid})`
+            : "") +
+          ". Wait for that install to finish, then start the server."
+      );
+    }
+
     const state = this.store.getState();
     const model = (modelPath || state.selectedModelPath || "").trim();
     if (!model) {
@@ -668,36 +677,7 @@ export class ProcessManager {
       );
     }
     for (const pid of pids) {
-      if (!isPidAlive(pid)) {
-        continue;
-      }
-      try {
-        if (process.platform === "win32") {
-          try {
-            execFileSync("taskkill", ["/PID", String(pid), "/T", "/F"], {
-              stdio: "ignore",
-              windowsHide: true,
-              timeout: 15_000,
-            });
-          } catch {
-            // Process may already be gone.
-          }
-          for (let i = 0; i < 25; i++) {
-            if (!isPidAlive(pid)) {
-              break;
-            }
-            await sleep(100);
-          }
-        } else {
-          process.kill(pid, force ? "SIGKILL" : "SIGTERM");
-          await sleep(500);
-          if (isPidAlive(pid)) {
-            process.kill(pid, "SIGKILL");
-          }
-        }
-      } catch {
-        // ignore
-      }
+      await stopProcessTree(pid, force);
     }
     // Wait briefly for the port to free (Windows especially).
     for (let i = 0; i < 20; i++) {

@@ -324,9 +324,8 @@ export function activate(context: vscode.ExtensionContext): void {
         return;
       }
       const wasReady = await processManager.isHttpReady();
-      if (wasReady) {
-        await processManager.stop(true);
-      }
+      // Keep the server up during the download. The installer takes a cross-window
+      // lock, then stops llama-server immediately before replacing vulkan\bin.
       await vscode.window.withProgress(
         {
           location: vscode.ProgressLocation.Notification,
@@ -360,9 +359,6 @@ export function activate(context: vscode.ExtensionContext): void {
         return;
       }
       const wasReady = await processManager.isHttpReady();
-      if (wasReady) {
-        await processManager.stop(true);
-      }
       await vscode.window.withProgress(
         {
           location: vscode.ProgressLocation.Notification,
@@ -407,9 +403,6 @@ export function activate(context: vscode.ExtensionContext): void {
       }
 
       const wasReady = await processManager.isHttpReady();
-      if (wasReady) {
-        await processManager.stop(true);
-      }
       await vscode.window.withProgress(
         {
           location: vscode.ProgressLocation.Notification,
@@ -471,9 +464,6 @@ export function activate(context: vscode.ExtensionContext): void {
       }
 
       const wasReady = await processManager.isHttpReady();
-      if (wasReady) {
-        await processManager.stop(true);
-      }
       await vscode.window.withProgress(
         {
           location: vscode.ProgressLocation.Notification,

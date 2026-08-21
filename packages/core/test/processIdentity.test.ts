@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import * as path from "node:path";
 import { describe, it } from "node:test";
 import {
+  executableIsUnderDir,
   isLlamaServerProcess,
+  isPidAlive,
   looksLikeLlamaServer,
   sameModelFile,
   uniquePids,
@@ -72,5 +74,36 @@ describe("uniquePids", () => {
 
   it("drops junk, zero and negative values", () => {
     assert.deepEqual(uniquePids(["", undefined, "abc", "0", "-1", "7"]), [7]);
+  });
+});
+
+describe("isPidAlive", () => {
+  it("sees the current process", () => {
+    assert.equal(isPidAlive(process.pid), true);
+  });
+
+  it("rejects impossible pids", () => {
+    assert.equal(isPidAlive(0), false);
+    assert.equal(isPidAlive(-1), false);
+    assert.equal(isPidAlive(2 ** 30), false);
+  });
+});
+
+describe("executableIsUnderDir", () => {
+  it("matches a binary inside the directory", () => {
+    const dir = path.join("/home", "u", ".llama-aio-vs", "llama.cpp", "vulkan", "bin");
+    const exe = path.join(dir, "llama-server");
+    assert.equal(executableIsUnderDir(exe, dir), true);
+  });
+
+  it("does not match a sibling directory with a shared prefix", () => {
+    const dir = path.join("/home", "u", ".llama-aio-vs", "llama.cpp", "vulkan", "bin");
+    const other = path.join("/home", "u", ".llama-aio-vs", "llama.cpp", "vulkan", "bin.old-1", "llama-server");
+    assert.equal(executableIsUnderDir(other, dir), false);
+  });
+
+  it("is false when the path is missing", () => {
+    assert.equal(executableIsUnderDir(undefined, "/tmp"), false);
+    assert.equal(executableIsUnderDir("/tmp/llama-server", ""), false);
   });
 });

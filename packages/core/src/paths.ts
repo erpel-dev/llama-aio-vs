@@ -61,6 +61,11 @@ export function getLockPath(): string {
   return path.join(getLockDir(), "server.lock.json");
 }
 
+/** Cross-window lock while llama.cpp binaries are being replaced. */
+export function getInstallLockPath(): string {
+  return path.join(getLockDir(), "install.lock.json");
+}
+
 export function getLogPath(): string {
   return path.join(getLockDir(), "llama-server.log");
 }

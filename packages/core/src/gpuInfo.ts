@@ -1,6 +1,7 @@
 import * as fs from "fs";
 import { execFileSync, spawnSync } from "child_process";
 import * as path from "path";
+import { activeInstallLock } from "./installSwap";
 
 export interface GpuMemoryInfo {
   /** Total VRAM in bytes for this GPU. */
@@ -414,7 +415,8 @@ export function detectGpus(force = false, llamaServerBinary?: string): GpuMemory
   const wmi = nvidia || sysfs ? undefined : readWindowsWmiGpus();
   const rocm = nvidia || sysfs || wmi ? undefined : readRocmSmi();
   let gpus = nvidia || sysfs || wmi || (rocm ? [rocm] : []);
-  if (binKey && gpus.length >= 2) {
+  // `--list-devices` maps the vulkan\bin exe; skip while an install holds it.
+  if (binKey && gpus.length >= 2 && !activeInstallLock()) {
     const listed = readLlamaListDevices(binKey);
     if (listed?.length) {
       gpus = orderGpusLikeLlama(gpus, listed);

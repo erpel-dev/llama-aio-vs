@@ -5,8 +5,10 @@ import { Readable } from "stream";
 import { pipeline } from "stream/promises";
 import { execFile, execFileSync } from "child_process";
 import { promisify } from "util";
+import { swapInstallDir, withInstallLock, activeInstallLock } from "./installSwap";
 import {
   findSteamRun,
+  invalidateLlamaServerProbeCache,
   isNixOS,
   probeLlamaServerRunnable,
 } from "./nixCompat";
@@ -16,9 +18,11 @@ import {
   getBackendInstallDir,
   getInstallDir,
   getLlamaServerBinary,
+  getLockPath,
   InstallBackendId,
   withBinaryDirEnv,
 } from "./paths";
+import { stopLlamaServersUsingDir, isPidAlive, executableIsUnderDir } from "./processIdentity";
 import { SettingsStore } from "./settings";
 
 const execFileAsync = promisify(execFile);
@@ -682,28 +686,25 @@ function describeProbe(probe: { status?: number; error?: string }): string {
   return `HTTP ${probe.status ?? "?"}`;
 }
 
-/**
- * Move a fully staged `bin.new-*` tree into place.
- * The old tree is kept until the new one is in position, and restored if the
- * final rename fails (Windows can refuse while a DLL is still mapped).
- */
-function swapInstallDir(stageDir: string, binDir: string): void {
-  const backupDir = `${binDir}.old-${Date.now()}`;
-  const hadPrevious = fs.existsSync(binDir);
-  if (hadPrevious) {
-    fs.renameSync(binDir, backupDir);
-  }
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Drop a stale server.lock.json after we killed the process that owned those binaries. */
+function clearServerLockIfUsingDir(binDir: string): void {
+  const lockFile = getLockPath();
   try {
-    fs.renameSync(stageDir, binDir);
-  } catch (err) {
-    if (hadPrevious) {
-      fs.renameSync(backupDir, binDir);
+    if (!fs.existsSync(lockFile)) {
+      return;
     }
-    fs.rmSync(stageDir, { recursive: true, force: true });
-    throw err;
-  }
-  if (hadPrevious) {
-    fs.rmSync(backupDir, { recursive: true, force: true });
+    const lock = JSON.parse(fs.readFileSync(lockFile, "utf8")) as { pid?: number; binary?: string };
+    const dead = !lock.pid || !isPidAlive(lock.pid);
+    const ours = executableIsUnderDir(lock.binary, binDir);
+    if (dead || ours) {
+      fs.unlinkSync(lockFile);
+    }
+  } catch {
+    // ignore
   }
 }
 
@@ -1096,7 +1097,9 @@ export class LlamaInstaller {
     let binaryRunnable: boolean | undefined;
     let binaryRunError: string | undefined;
     const binary = getLlamaServerBinary(installDir);
-    if (fs.existsSync(binary)) {
+    // Other windows exec llama-server --version every few seconds; skip that
+    // while an install holds the lock so Windows can rename vulkan\bin.
+    if (fs.existsSync(binary) && !activeInstallLock()) {
       const env = withBinaryDirEnv(binary);
       let probe = probeLlamaServerRunnable(binary, { env });
       let viaSteamRun = false;
@@ -1265,6 +1268,16 @@ export class LlamaInstaller {
     progress?: ProgressReporter,
     backendOverride?: LlamaBackend
   ): Promise<string> {
+    return withInstallLock(() => this.installByTagUnlocked(tagInput, progress, backendOverride), {
+      progress,
+    });
+  }
+
+  private async installByTagUnlocked(
+    tagInput: string,
+    progress?: ProgressReporter,
+    backendOverride?: LlamaBackend
+  ): Promise<string> {
     this.migrateLegacyInstallIfNeeded();
     const tag = normalizeReleaseTag(tagInput);
     const backendSetting = backendOverride || this.getBackend();
@@ -1338,7 +1351,7 @@ export class LlamaInstaller {
       }
     }
 
-    return this.installFromArchive(archivePath, {
+    return this.installFromArchiveUnlocked(archivePath, {
       uiBackend,
       tag,
       assetName,
@@ -1352,6 +1365,21 @@ export class LlamaInstaller {
    * Does not contact the GitHub API.
    */
   async installFromArchive(
+    archivePath: string,
+    options: {
+      uiBackend?: UiBackend;
+      tag?: string;
+      assetName?: string;
+      cudartArchivePath?: string;
+      progress?: ProgressReporter;
+    } = {}
+  ): Promise<string> {
+    return withInstallLock(() => this.installFromArchiveUnlocked(archivePath, options), {
+      progress: options.progress,
+    });
+  }
+
+  private async installFromArchiveUnlocked(
     archivePath: string,
     options: {
       uiBackend?: UiBackend;
@@ -1454,7 +1482,25 @@ export class LlamaInstaller {
           `the previous install is untouched.\n${copyFailures.slice(0, 5).join("\n")}`
       );
     }
-    swapInstallDir(stageDir, binDir);
+
+    progress?.report({ message: "Stopping llama-server so binaries can be replaced…" });
+    await stopLlamaServersUsingDir(binDir);
+    clearServerLockIfUsingDir(binDir);
+    if (process.platform === "win32") {
+      // Mapped DLLs can linger after taskkill returns.
+      await sleep(400);
+    }
+    try {
+      await swapInstallDir(stageDir, binDir, { progress });
+    } catch (err) {
+      try {
+        fs.rmSync(stageDir, { recursive: true, force: true });
+      } catch {
+        // ignore
+      }
+      throw err;
+    }
+    invalidateLlamaServerProbeCache();
 
     if (options.cudartArchivePath && fs.existsSync(options.cudartArchivePath)) {
       progress?.report({ message: "Extracting CUDA runtime…" });
