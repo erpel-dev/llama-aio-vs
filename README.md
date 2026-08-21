@@ -17,7 +17,7 @@ Pick a llama.cpp version in the sidebar
 - **System (PATH)** — use a `llama-server` already on your `PATH` (distro / nixpkgs / self-built)
 
 Downloaded installs live under `~/.llama-aio-vs/llama.cpp/<backend>/`.
- **Upgrade to latest release** resolves the newest tag and downloads the matching archive. New binaries are staged and swapped in at the end, so a failed install leaves the working one in place.
+ **Upgrade to latest release** resolves the newest tag and downloads the matching archive. New binaries are staged next to the live `bin` folder and swapped in at the end, so a failed install leaves the working one in place. On Windows the swap retries if `vulkan\bin` is locked (another VS Code window probing `--version`, or a still-running llama-server) and falls back to replacing individual files, which Windows allows even for a mapped `.exe`.
 
 To pin a build or work offline: **Install release tag…** or **Install from archive…**. Browse builds at [llama.cpp releases](https://github.com/ggml-org/llama.cpp/releases).
 
