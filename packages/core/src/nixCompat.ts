@@ -64,6 +64,23 @@ export interface BinaryProbeResult {
   missingLinkerLikely: boolean;
 }
 
+interface ProbeCacheEntry {
+  mtimeMs: number;
+  size: number;
+  result: BinaryProbeResult;
+}
+
+const probeCache = new Map<string, ProbeCacheEntry>();
+
+/** Drop cached `--version` results (call after replacing the binary). */
+export function invalidateLlamaServerProbeCache(binary?: string): void {
+  if (!binary) {
+    probeCache.clear();
+    return;
+  }
+  probeCache.delete(path.resolve(binary));
+}
+
 /**
  * Try `llama-server --version` the same way we launch (cwd + LD_LIBRARY_PATH).
  * Optional wrapper: e.g. steam-run → `steam-run <binary> --version`.
@@ -76,6 +93,19 @@ export function probeLlamaServerRunnable(
     timeoutMs?: number;
   }
 ): BinaryProbeResult {
+  const key = path.resolve(binary);
+  if (!options?.wrapper) {
+    try {
+      const st = fs.statSync(binary);
+      const cached = probeCache.get(key);
+      if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size) {
+        return cached.result;
+      }
+    } catch {
+      // probe below
+    }
+  }
+
   const env = options?.env || withBinaryDirEnv(binary);
   const timeout = options?.timeoutMs ?? 8000;
   const wrapper = options?.wrapper;
@@ -93,57 +123,68 @@ export function probeLlamaServerRunnable(
   const stderr = (result.stderr || "").toString().trim();
   const combined = [stdout, stderr].filter(Boolean).join("\n").trim();
 
+  let probe: BinaryProbeResult;
   if (result.error) {
     const err = result.error as NodeJS.ErrnoException;
     const detail = [`code=${err.code || "error"}`, err.message, combined]
       .filter(Boolean)
       .join(" | ")
       .slice(0, 500);
-    return {
+    probe = {
       ok: false,
       detail,
       missingLinkerLikely: looksLikeMissingDynamicLinker(binary, err, detail),
     };
-  }
-
-  // llama-server often prints the version banner to stderr; treat a version
-  // line as success even when the process exits non-zero.
-  if (combined && /version\s*:/i.test(combined)) {
-    return {
+  } else if (combined && /version\s*:/i.test(combined)) {
+    // llama-server often prints the version banner to stderr; treat a version
+    // line as success even when the process exits non-zero.
+    probe = {
       ok: true,
       detail: combined.split("\n")[0]?.trim() || combined,
       missingLinkerLikely: false,
     };
-  }
-
-  if (result.status === 0) {
-    return {
+  } else if (result.status === 0) {
+    probe = {
       ok: true,
       detail: (combined.split("\n")[0]?.trim() || combined || "ok").slice(0, 200),
       missingLinkerLikely: false,
     };
+  } else {
+    const detail =
+      [
+        typeof result.status === "number" ? `status=${result.status}` : "",
+        result.signal ? `signal=${result.signal}` : "",
+        combined,
+      ]
+        .filter(Boolean)
+        .join(" | ")
+        .slice(0, 500) || "unknown error";
+    const fakeErr = Object.assign(new Error(detail), {
+      code: result.status === null ? "SPAWN_FAILED" : undefined,
+      status: result.status ?? undefined,
+      stdout,
+      stderr,
+    });
+    probe = {
+      ok: false,
+      detail,
+      missingLinkerLikely: looksLikeMissingDynamicLinker(binary, fakeErr, detail),
+    };
   }
 
-  const detail =
-    [
-      typeof result.status === "number" ? `status=${result.status}` : "",
-      result.signal ? `signal=${result.signal}` : "",
-      combined,
-    ]
-      .filter(Boolean)
-      .join(" | ")
-      .slice(0, 500) || "unknown error";
-  const fakeErr = Object.assign(new Error(detail), {
-    code: result.status === null ? "SPAWN_FAILED" : undefined,
-    status: result.status ?? undefined,
-    stdout,
-    stderr,
-  });
-  return {
-    ok: false,
-    detail,
-    missingLinkerLikely: looksLikeMissingDynamicLinker(binary, fakeErr, detail),
-  };
+  // Only cache successes — a failed probe during an in-progress replace
+  // must not stick after the new binary is in place.
+  if (!options?.wrapper && probe.ok) {
+    try {
+      const st = fs.statSync(binary);
+      probeCache.set(key, { mtimeMs: st.mtimeMs, size: st.size, result: probe });
+    } catch {
+      // ignore
+    }
+  } else if (!probe.ok) {
+    probeCache.delete(key);
+  }
+  return probe;
 }
 
 export function looksLikeMissingDynamicLinker(

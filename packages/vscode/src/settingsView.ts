@@ -3,7 +3,7 @@ import * as os from "os";
 import * as path from "path";
 import * as vscode from "vscode";
 import { promptUseInCopilotChat } from "./copilotChatPrompt";
-import { detectGpus } from "@llama-aio/core";
+import { detectGpus, activeInstallLock } from "@llama-aio/core";
 import { LlamaInstaller, UiBackend } from "@llama-aio/core";
 import { estimateMemory, memoryEstimateInputs, mmprojFileSize, resolveDraftCapabilities } from "@llama-aio/core";
 import { resolveModelModes } from "@llama-aio/core";
@@ -347,7 +347,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     const state = this.store.getState();
     const cpuOnly =
       this.installer.resolveActiveUiBackend() === "cpu" || this.processManager.isCpuBackend();
-    const gpus = cpuOnly ? [] : detectGpus(false, this.processManager.resolveBinary());
+    const gpus = cpuOnly || activeInstallLock() ? [] : detectGpus(false, this.processManager.resolveBinary());
     return estimateMemory(
       state.modelCapabilities,
       state.loadSettings,
@@ -428,7 +428,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       build.resolvedBackend ||
       (build.configuredBackend === "auto" ? "vulkan" : build.configuredBackend)) as string;
     const cpuOnly = selectedUiBackend === "cpu";
-    const gpus = cpuOnly ? [] : detectGpus(false, this.processManager.resolveBinary());
+    const gpus = cpuOnly || activeInstallLock() ? [] : detectGpus(false, this.processManager.resolveBinary());
     const gpu = gpus[0];
     const draftCaps = resolveDraftCapabilities(state.loadSettings);
     const memory = estimateMemory(caps, state.loadSettings, gpu, {
