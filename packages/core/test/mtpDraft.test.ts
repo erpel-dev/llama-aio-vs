@@ -157,6 +157,22 @@ describe("sidecar MTP load path", () => {
     assert.equal(s.speculativeMode, "off");
   });
 
+  it("keeps ngram-mtp when a sidecar draft is set even without next-n layers", () => {
+    const s = clampLoadSettingsToModel(
+      loadSettings({ speculativeMode: "ngram-mtp", draftModelPath: draft }),
+      denseCaps()
+    );
+    assert.equal(s.speculativeMode, "ngram-mtp");
+  });
+
+  it("falls back to n-gram from ngram-mtp without next-n layers or a sidecar", () => {
+    const s = clampLoadSettingsToModel(
+      loadSettings({ speculativeMode: "ngram-mtp", draftModelPath: "/models/other.gguf" }),
+      denseCaps()
+    );
+    assert.equal(s.speculativeMode, "ngram");
+  });
+
   it("enables MTP when recommending with a sidecar draft attached", () => {
     const r = recommendLoadSettings(
       loadSettings({ draftModelPath: draft }),
@@ -165,7 +181,7 @@ describe("sidecar MTP load path", () => {
     );
     assert.equal(r.speculativeMode, "mtp");
     assert.equal(r.draftModelPath, draft);
-    assert.equal(r.maxDraftTokens, 2);
+    assert.equal(r.maxDraftTokens, 4);
     const fromZero = recommendLoadSettings(
       loadSettings({ draftModelPath: draft, maxDraftTokens: 0 }),
       denseCaps(),

@@ -38,12 +38,20 @@ import {
   mainShareFromSplit,
   isLegacyGpu0FirstSplit,
   alignTensorSplitToMainGpu,
+  isMtpDraftFileName,
+  recommendedMaxDraftTokens,
+  recommendedNgramSizes,
+  speculativeUsesDflash,
+  speculativeUsesMtp,
+  speculativeUsesNgram,
+  normalizeSpeculativeMode,
   type ChatMessage,
   type HfFileHit,
   type HfModelHit,
   type FlashAttention,
   type KvCacheType,
   type LlamaLoadSettings,
+  type NgramSpecVariant,
   type MemoryBarChart,
   type ModelLicenseInfo,
   type UiBackend,
@@ -751,8 +759,34 @@ export async function runApp(services: AppServices): Promise<void> {
   }
 
   function visibleLoadFields(): typeof LOAD_FIELD_DEFS {
-    const splitMode = services.store.getState().loadSettings.splitMode || "layer";
-    return LOAD_FIELD_DEFS.filter((f) => !(f.id === "tensorSplit" && splitMode === "none"));
+    const load = services.store.getState().loadSettings;
+    const splitMode = load.splitMode || "layer";
+    const spec = load.speculativeMode || "off";
+    return LOAD_FIELD_DEFS.filter((f) => {
+      if (f.id === "tensorSplit" && splitMode === "none") {
+        return false;
+      }
+      if (
+        (f.id === "ngramVariant" ||
+          f.id === "ngramSizeN" ||
+          f.id === "ngramSizeM" ||
+          f.id === "ngramMinHits") &&
+        !speculativeUsesNgram(spec)
+      ) {
+        return false;
+      }
+      // llama.cpp's ngram-mod flags have no min-hits equivalent.
+      if (f.id === "ngramMinHits" && load.ngramVariant === "mod") {
+        return false;
+      }
+      if (f.id === "maxDraftTokens" && !speculativeUsesMtp(spec) && !speculativeUsesDflash(spec)) {
+        return false;
+      }
+      if (f.id === "draftGpuOffload" && !speculativeUsesMtp(spec) && !speculativeUsesDflash(spec)) {
+        return false;
+      }
+      return true;
+    });
   }
 
   function maybeMigrateLegacySplit(): void {
@@ -827,6 +861,9 @@ export async function runApp(services: AppServices): Promise<void> {
       if (field.key === "speculativeMode") {
         return load.speculativeMode || "off";
       }
+      if (field.key === "ngramVariant") {
+        return load.ngramVariant || "simple";
+      }
       if (field.key === "splitMode") {
         return load.splitMode || "layer";
       }
@@ -841,6 +878,10 @@ export async function runApp(services: AppServices): Promise<void> {
       if (field.key === "topP") return req.topP;
       if (field.key === "topK") return req.topK;
       if (field.key === "maxTokens") return req.maxTokens;
+      if (field.key === "minP") return req.minP;
+      if (field.key === "repeatPenalty") return req.repeatPenalty;
+      if (field.key === "presencePenalty") return req.presencePenalty;
+      if (field.key === "frequencyPenalty") return req.frequencyPenalty;
       return 0;
     }
     const load = state.loadSettings;
@@ -853,18 +894,35 @@ export async function runApp(services: AppServices): Promise<void> {
     if (field.key === "physicalBatchSize") return load.physicalBatchSize;
     if (field.key === "maxDraftTokens") return load.maxDraftTokens;
     if (field.key === "draftGpuOffload") return load.draftGpuOffload;
+    if (field.key === "ngramSizeN") return load.ngramSizeN;
+    if (field.key === "ngramSizeM") return load.ngramSizeM;
+    if (field.key === "ngramMinHits") return load.ngramMinHits;
     if (field.key === "tensorSplit") return tensorSplitPercent(load);
     if (field.key === "mainGpu") return load.mainGpu;
     return 0;
   }
 
+  function loadFieldLabel(field: (typeof LOAD_FIELD_DEFS)[number]): string {
+    const spec = services.store.getState().loadSettings.speculativeMode || "off";
+    if (field.id === "maxDraftTokens") {
+      if (speculativeUsesDflash(spec)) return "DFlash Max Draft Tokens";
+      if (speculativeUsesMtp(spec)) return "MTP Max Draft Tokens";
+    }
+    if (field.id === "draftGpuOffload") {
+      if (speculativeUsesDflash(spec)) return "DFlash GPU Offload";
+      if (speculativeUsesMtp(spec)) return "MTP GPU Offload";
+    }
+    return field.label;
+  }
+
   function formatLoadOption(field: (typeof LOAD_FIELD_DEFS)[number]): { name: string; description: string; value: string } {
     const raw = readFieldRaw(field);
+    const label = loadFieldLabel(field);
     if (field.kind === "number") {
       const shown = formatFieldValue(raw as number, field.step);
       const suffix = field.key === "tensorSplit" ? "%" : "";
       return {
-        name: `${field.label}  ·  ${shown}${suffix}`,
+        name: `${label}  ·  ${shown}${suffix}`,
         description: field.help,
         value: field.id,
       };
@@ -874,7 +932,7 @@ export async function runApp(services: AppServices): Promise<void> {
       const opt = field.options.find((o) => o.value === cur);
       const shown = opt?.name || cur;
       return {
-        name: `${field.label}  ·  ${shown}`,
+        name: `${label}  ·  ${shown}`,
         description: opt?.name || field.help,
         value: field.id,
       };
@@ -1017,12 +1075,20 @@ export async function runApp(services: AppServices): Promise<void> {
       return;
     }
     if (field.key === "speculativeMode") {
-      const mode = value === "mtp" || value === "dflash" ? value : "off";
+      const mode = normalizeSpeculativeMode(value);
+      const load = services.store.getState().loadSettings;
       await services.store.updateLoadSettings({
         speculativeMode: mode,
-        ...(mode === "dflash" && services.store.getState().loadSettings.maxDraftTokens <= 2
-          ? { maxDraftTokens: 15 }
-          : {}),
+        maxDraftTokens: recommendedMaxDraftTokens(mode, load.maxDraftTokens, isMtpDraftFileName(load.draftModelPath)),
+      });
+      return;
+    }
+    if (field.key === "ngramVariant") {
+      const load = services.store.getState().loadSettings;
+      const sizes = recommendedNgramSizes(value as NgramSpecVariant, load.ngramSizeN, load.ngramSizeM);
+      await services.store.updateLoadSettings({
+        ngramVariant: value as NgramSpecVariant,
+        ...sizes,
       });
       return;
     }
@@ -2018,6 +2084,10 @@ export async function runApp(services: AppServices): Promise<void> {
         topP: req.topP,
         topK: req.topK,
         maxTokens: req.maxTokens,
+        minP: req.minP,
+        presencePenalty: req.presencePenalty,
+        frequencyPenalty: req.frequencyPenalty,
+        repeatPenalty: req.repeatPenalty,
         signal: chatAbort.signal,
       })) {
         if (ev.kind === "text") {

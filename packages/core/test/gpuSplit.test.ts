@@ -42,10 +42,11 @@ describe("normalizeTensorSplit", () => {
 });
 
 describe("normalizeGpuSplitMode", () => {
-  it("keeps layer/row/none and falls back otherwise", () => {
+  it("keeps layer/row/tensor/none and falls back otherwise", () => {
     assert.equal(normalizeGpuSplitMode("row"), "row");
     assert.equal(normalizeGpuSplitMode("none"), "none");
     assert.equal(normalizeGpuSplitMode("layer"), "layer");
+    assert.equal(normalizeGpuSplitMode("tensor"), "tensor");
     assert.equal(normalizeGpuSplitMode("nope"), "layer");
   });
 });

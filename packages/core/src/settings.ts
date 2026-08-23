@@ -16,6 +16,7 @@ import {
   normalizeLoadSettings,
   normalizeRequestSettings,
   RequestSettings,
+  speculativeUsesMtp,
 } from "./types";
 
 /**
@@ -96,7 +97,7 @@ export class SettingsStore {
     const state = this.getState();
     let loadSettings = normalizeLoadSettings({ ...state.loadSettings, ...patch });
     if (
-      patch.speculativeMode === "mtp" &&
+      speculativeUsesMtp(patch.speculativeMode) &&
       !isMtpDraftFileName(loadSettings.draftModelPath) &&
       !(state.modelCapabilities?.nextnPredictLayers && state.modelCapabilities.nextnPredictLayers > 0)
     ) {

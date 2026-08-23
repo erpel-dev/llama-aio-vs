@@ -173,6 +173,13 @@ describe("applyModeToRequestBody", () => {
     assert.deepEqual(body.chat_template_kwargs, { reasoning_strength: "low" });
   });
 
+  it("maps repetition_penalty onto repeat_penalty so modes override request defaults", () => {
+    const body: Record<string, unknown> = { repeat_penalty: 1 };
+    applyModeToRequestBody(body, { repetition_penalty: 1.1 });
+    assert.equal(body.repeat_penalty, 1.1);
+    assert.equal(body.repetition_penalty, undefined);
+  });
+
   it("puts Gemma 4 enable_thinking on chat_template_kwargs", () => {
     const set = resolveModelModes(undefined, "gemma-4-12B-it");
     assert.ok(set);

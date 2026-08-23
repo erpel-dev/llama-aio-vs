@@ -42,3 +42,14 @@ export function argValue(args: string[], flag: string): string | undefined {
   const i = args.indexOf(flag);
   return i >= 0 ? args[i + 1] : undefined;
 }
+
+/** Values that follow every occurrence of `flag` in an argv array. */
+export function argValues(args: string[], flag: string): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < args.length - 1; i++) {
+    if (args[i] === flag) {
+      out.push(args[i + 1]!);
+    }
+  }
+  return out;
+}

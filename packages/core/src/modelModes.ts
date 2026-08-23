@@ -285,7 +285,9 @@ export function applyModeToRequestBody(
     body.presence_penalty = params.presence_penalty;
   }
   if (typeof params.repetition_penalty === "number") {
-    body.repetition_penalty = params.repetition_penalty;
+    // llama.cpp's OpenAI-compat endpoint reads `repeat_penalty`. Modes still
+    // use the HuggingFace name internally; map it so they override request defaults.
+    body.repeat_penalty = params.repetition_penalty;
   }
   if (params.chat_template_kwargs && typeof params.chat_template_kwargs === "object") {
     body.chat_template_kwargs = { ...params.chat_template_kwargs };

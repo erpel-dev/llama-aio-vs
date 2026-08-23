@@ -1,7 +1,7 @@
 /** llama.cpp --split-mode */
-export type GpuSplitMode = "layer" | "row" | "none";
+export type GpuSplitMode = "layer" | "row" | "tensor" | "none";
 
-export const GPU_SPLIT_MODES: readonly GpuSplitMode[] = ["layer", "row", "none"];
+export const GPU_SPLIT_MODES: readonly GpuSplitMode[] = ["layer", "row", "tensor", "none"];
 
 export function normalizeGpuSplitMode(
   value: unknown,

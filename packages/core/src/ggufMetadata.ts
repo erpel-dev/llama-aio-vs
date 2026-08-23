@@ -1,7 +1,7 @@
 import * as fs from "fs";
 import * as path from "path";
-import { LlamaLoadSettings } from "./types";
 import { isMtpDraftFileName } from "./modelLibrary";
+import { LlamaLoadSettings, speculativeUsesMtp, speculativeUsesNgram } from "./types";
 
 export interface ModelCapabilities {
   path: string;
@@ -613,8 +613,8 @@ export function clampLoadSettingsToModel(
   const sidecarMtp = isMtpDraftFileName(settings.draftModelPath);
   // MTP without next-n layers and without a sidecar drafter crashes llama-server
   // ("model doesn't contain MTP layers").
-  if (speculativeMode === "mtp" && !bakedMtp && !sidecarMtp) {
-    speculativeMode = "off";
+  if (speculativeUsesMtp(speculativeMode) && !bakedMtp && !sidecarMtp) {
+    speculativeMode = speculativeUsesNgram(speculativeMode) ? "ngram" : "off";
   }
   // DFlash without a draft GGUF path can't start speculative — leave mode but
   // serverArgs will omit flags until draftModelPath is set.

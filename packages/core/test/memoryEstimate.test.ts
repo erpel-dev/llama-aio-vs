@@ -193,6 +193,21 @@ describe("estimateMemory", () => {
       withDraft.charts.vram.segments.some((s) => s.key === "draft" && s.bytes > 0),
       "VRAM chart should include a draft segment"
     );
+
+    const stacked = estimateMemory(
+      denseCaps(),
+      loadSettings({
+        speculativeMode: "ngram-dflash",
+        draftModelPath: "/models/draft.gguf",
+        draftGpuOffload: 99,
+        maxDraftTokens: 15,
+      }),
+      gpu(48),
+      { draftCaps: draft }
+    );
+    assert.ok(stacked);
+    assert.equal(stacked.draftFileSizeBytes, withDraft.draftFileSizeBytes);
+    assert.equal(stacked.totalGpuBytes, withDraft.totalGpuBytes);
   });
 
   it("ignores draft caps unless speculativeMode is dflash", () => {

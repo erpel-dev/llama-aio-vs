@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { buildServerArgs, normalizeLoadSettingsForCpuBackend, serverConfigFingerprint } from "../src/serverArgs";
 import { DEFAULT_LOAD_SETTINGS } from "../src/types";
-import { argValue, loadSettings } from "./helpers";
+import { argValue, argValues, loadSettings } from "./helpers";
 
 const MODEL = "/models/test.gguf";
 const build = (over = {}) => buildServerArgs(MODEL, "127.0.0.1", 8742, loadSettings(over));
@@ -109,6 +109,7 @@ describe("buildServerArgs", () => {
     assert.equal(argValue(args, "--model-draft"), draft);
     assert.equal(argValue(args, "--spec-draft-n-max"), "15");
     assert.equal(argValue(args, "--spec-draft-ngl"), "99");
+    assert.equal(argValue(args, "--spec-draft-p-min"), "0.75");
     assert.equal(argValue(args, "--cache-type-k-draft"), "f16");
     assert.equal(argValue(args, "--cache-type-v-draft"), "f16");
     assert.equal(argValue(args, "--fit"), "off");
@@ -127,6 +128,138 @@ describe("buildServerArgs", () => {
     const args = build({ speculativeMode: "dflash", draftModelPath: "" });
     assert.ok(!args.includes("--spec-type"));
     assert.ok(!args.includes("--model-draft"));
+  });
+
+  describe("n-gram speculative decoding", () => {
+    it("emits ngram-simple with lookup/draft sizes and min-hits", () => {
+      const args = build({
+        speculativeMode: "ngram",
+        ngramVariant: "simple",
+        ngramSizeN: 12,
+        ngramSizeM: 48,
+        ngramMinHits: 2,
+      });
+      assert.equal(argValue(args, "--spec-type"), "ngram-simple");
+      assert.equal(argValue(args, "--spec-ngram-simple-size-n"), "12");
+      assert.equal(argValue(args, "--spec-ngram-simple-size-m"), "48");
+      assert.equal(argValue(args, "--spec-ngram-simple-min-hits"), "2");
+    });
+
+    it("never emits draft-model flags (no draft GGUF needed)", () => {
+      const args = build({
+        speculativeMode: "ngram",
+        draftModelPath: "/models/leftover-draft.gguf",
+      });
+      assert.ok(!args.includes("--model-draft"));
+      assert.ok(!args.includes("--spec-draft-ngl"));
+      assert.ok(!args.includes("--cache-type-k-draft"));
+    });
+
+    it("maps each variant to its llama.cpp flags", () => {
+      for (const variant of ["map-k", "map-k4v"] as const) {
+        const args = build({ speculativeMode: "ngram", ngramVariant: variant });
+        assert.equal(argValue(args, "--spec-type"), `ngram-${variant}`);
+        assert.equal(argValue(args, `--spec-ngram-${variant}-size-n`), "12");
+      }
+      const mod = build({ speculativeMode: "ngram", ngramVariant: "mod" });
+      assert.equal(argValue(mod, "--spec-type"), "ngram-mod");
+      assert.equal(argValue(mod, "--spec-ngram-mod-n-match"), "12");
+      assert.equal(argValue(mod, "--spec-ngram-mod-n-max"), "48");
+      assert.ok(!mod.includes("--spec-ngram-mod-size-n"));
+    });
+
+    it("keeps the draft m-gram >= the lookup n-gram", () => {
+      const args = build({
+        speculativeMode: "ngram",
+        ngramSizeN: 64,
+        ngramSizeM: 16,
+      });
+      assert.equal(argValue(args, "--spec-ngram-simple-size-m"), "64");
+    });
+
+    it("is omitted in every other mode", () => {
+      for (const mode of ["off", "mtp", "dflash"] as const) {
+        const args = build({
+          speculativeMode: mode,
+          draftModelPath: "/models/draft.gguf",
+        });
+        assert.ok(!args.join(" ").includes("ngram"), `mode ${mode} leaked an ngram flag`);
+      }
+    });
+
+    it("stacks with MTP: n-gram lookup first, then draft-mtp", () => {
+      const args = build({
+        speculativeMode: "ngram-mtp",
+        ngramVariant: "simple",
+        ngramSizeN: 12,
+        maxDraftTokens: 2,
+      });
+      assert.deepEqual(argValues(args, "--spec-type"), ["ngram-simple", "draft-mtp"]);
+      assert.equal(argValue(args, "--spec-ngram-simple-size-n"), "12");
+      assert.equal(argValue(args, "--spec-draft-n-max"), "2");
+      assert.ok(!args.includes("--model-draft"));
+    });
+
+    it("stacks with DFlash: n-gram lookup first, then draft-dflash", () => {
+      const draft = "/models/Qwen3-4B-DFlash.gguf";
+      const args = build({
+        speculativeMode: "ngram-dflash",
+        ngramVariant: "map-k",
+        draftModelPath: draft,
+        maxDraftTokens: 15,
+        draftGpuOffload: 99,
+      });
+      assert.deepEqual(argValues(args, "--spec-type"), ["ngram-map-k", "draft-dflash"]);
+      assert.equal(argValue(args, "--model-draft"), draft);
+      assert.equal(argValue(args, "--cache-type-k-draft"), "f16");
+    });
+
+    it("still emits n-gram flags when stacked DFlash has no draft path yet", () => {
+      const args = build({ speculativeMode: "ngram-dflash", draftModelPath: "" });
+      assert.deepEqual(argValues(args, "--spec-type"), ["ngram-simple"]);
+      assert.ok(!args.includes("--model-draft"));
+    });
+  });
+
+  describe("server-side sampling defaults", () => {
+    it("are omitted when no request sampling is provided", () => {
+      const args = build();
+      for (const flag of [
+        "--temp",
+        "--top-p",
+        "--top-k",
+        "--min-p",
+        "--presence-penalty",
+        "--frequency-penalty",
+        "--repeat-penalty",
+      ]) {
+        assert.ok(!args.includes(flag), `${flag} should not ship without requestSampling`);
+      }
+    });
+
+    it("ship the request defaults as CLI flags when provided", () => {
+      const args = buildServerArgs(MODEL, "127.0.0.1", 8742, loadSettings(), {
+        requestSampling: {
+          temperature: 0.5,
+          topP: 0.95,
+          topK: 20,
+          maxTokens: 8192,
+          minP: 0,
+          presencePenalty: 0,
+          frequencyPenalty: 0,
+          repeatPenalty: 1,
+        },
+      });
+      assert.equal(argValue(args, "--temp"), "0.5");
+      assert.equal(argValue(args, "--top-p"), "0.95");
+      assert.equal(argValue(args, "--top-k"), "20");
+      // Disabled values are shipped explicitly so raw API clients never
+      // inherit llama-server's built-in min_p 0.05 / top_k 40.
+      assert.equal(argValue(args, "--min-p"), "0");
+      assert.equal(argValue(args, "--presence-penalty"), "0");
+      assert.equal(argValue(args, "--frequency-penalty"), "0");
+      assert.equal(argValue(args, "--repeat-penalty"), "1");
+    });
   });
 
   it("always disables llama.cpp auto-fit because -ngl is user-set", () => {
@@ -165,6 +298,19 @@ describe("buildServerArgs", () => {
     it("emits split-mode row without a tensor-split", () => {
       const args = build({ splitMode: "row" });
       assert.equal(argValue(args, "--split-mode"), "row");
+      assert.ok(!args.includes("--tensor-split"));
+    });
+
+    it("emits split-mode tensor with tensor-split and main-gpu", () => {
+      const args = build({ tensorSplit: "3,1", splitMode: "tensor", mainGpu: 0 });
+      assert.equal(argValue(args, "--tensor-split"), "3,1");
+      assert.equal(argValue(args, "--split-mode"), "tensor");
+      assert.equal(argValue(args, "--main-gpu"), "0");
+    });
+
+    it("emits bare split-mode tensor without a configured split", () => {
+      const args = build({ splitMode: "tensor" });
+      assert.equal(argValue(args, "--split-mode"), "tensor");
       assert.ok(!args.includes("--tensor-split"));
     });
 
@@ -294,6 +440,40 @@ describe("serverConfigFingerprint", () => {
         })
       ),
       mtp
+    );
+  });
+
+  it("tracks n-gram knobs only while n-gram mode is on", () => {
+    const off = serverConfigFingerprint(MODEL, loadSettings());
+    // Knob changes are irrelevant while off (no flags ship).
+    assert.equal(
+      serverConfigFingerprint(
+        MODEL,
+        loadSettings({ ngramVariant: "map-k", ngramSizeN: 24, ngramSizeM: 96, ngramMinHits: 3 })
+      ),
+      off
+    );
+    const ngram = serverConfigFingerprint(MODEL, loadSettings({ speculativeMode: "ngram" }));
+    // Turning the mode on invalidates.
+    assert.notEqual(ngram, off);
+    // Every knob is restart-relevant while on.
+    for (const patch of [
+      { ngramVariant: "mod" as const },
+      { ngramSizeN: 16 },
+      { ngramSizeM: 64 },
+      { ngramMinHits: 2 },
+    ]) {
+      assert.notEqual(
+        serverConfigFingerprint(MODEL, loadSettings({ speculativeMode: "ngram", ...patch })),
+        ngram,
+        `ngram knob ${JSON.stringify(patch)} should invalidate the fingerprint`
+      );
+    }
+    const stacked = serverConfigFingerprint(MODEL, loadSettings({ speculativeMode: "ngram-mtp" }));
+    assert.notEqual(stacked, ngram);
+    assert.notEqual(
+      serverConfigFingerprint(MODEL, loadSettings({ speculativeMode: "ngram-mtp", ngramSizeN: 16 })),
+      stacked
     );
   });
 });

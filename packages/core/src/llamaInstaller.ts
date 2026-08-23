@@ -64,8 +64,11 @@ interface BackendVersionInfo {
 
 const GITHUB_UA = "llama-aio-vs";
 const GITHUB_API_LATEST = "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest";
+/** Includes prereleases (llama.cpp nightlies are `b####` and marked prerelease). */
+const GITHUB_API_RELEASES = "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=30";
 const githubApiTagUrl = (tag: string) =>
   `https://api.github.com/repos/ggml-org/llama.cpp/releases/tags/${encodeURIComponent(tag)}`;
+const BUILD_TAG_RE = /^b\d+$/i;
 
 function isRetryableNetworkError(err: unknown): boolean {
   const parts = [err instanceof Error ? `${err.name} ${err.message}` : String(err)];
@@ -248,12 +251,70 @@ export function normalizeReleaseTag(input: string): string {
   if (/^\d+$/.test(s)) {
     s = `b${s}`;
   }
-  if (!/^b\d+$/i.test(s)) {
+  if (!BUILD_TAG_RE.test(s)) {
     throw new Error(
-      `Invalid release tag "${input}". Use e.g. b10154, or a URL like ${LLAMA_CPP_RELEASES_URL}/tag/b10154`
+      `Invalid release tag "${input}". Use a nightly (b10154), a stable tag (v0.2.0), or a URL like ${LLAMA_CPP_RELEASES_URL}/tag/b10154`
     );
   }
   return `b${s.slice(1)}`;
+}
+
+/** Stable llama.cpp tag (`v0.2.0`) from typed input or a releases URL. */
+export function parseStableReleaseTag(input: string): string | undefined {
+  const s = (input || "").trim();
+  if (!s) {
+    return undefined;
+  }
+  const fromUrl = /\/releases\/tag\/(v?\d+\.\d+\.\d+)/i.exec(s);
+  const raw = fromUrl?.[1] ?? (/^(v?\d+\.\d+\.\d+)$/i.exec(s)?.[1]);
+  if (!raw) {
+    return undefined;
+  }
+  const digits = raw.replace(/^v/i, "");
+  return `v${digits}`;
+}
+
+export function parseNightlyTagFile(text: string): string | undefined {
+  const m = /\b(b\d+)\b/i.exec((text || "").trim());
+  return m ? `b${m[1].slice(1)}` : undefined;
+}
+
+/** Newest `b####` nightly that actually has binary archives. Skips `vX.Y.Z` stables. */
+export function pickNewestBuildTag(
+  releases: Array<{ tag_name?: string; assets?: Array<{ name: string }> }>
+): string | undefined {
+  let bestN = -1;
+  let best: string | undefined;
+  for (const release of releases) {
+    const raw = (release.tag_name || "").trim();
+    if (!BUILD_TAG_RE.test(raw)) {
+      continue;
+    }
+    if (release.assets) {
+      const hasBinary = release.assets.some((a) => /^llama-b\d+-bin-/i.test(a.name));
+      if (!hasBinary) {
+        continue;
+      }
+    }
+    const n = Number.parseInt(raw.slice(1), 10);
+    if (Number.isFinite(n) && n > bestN) {
+      bestN = n;
+      best = `b${n}`;
+    }
+  }
+  return best;
+}
+
+async function tryReadNightlyPointerTag(stableTag: string): Promise<string | undefined> {
+  try {
+    const res = await githubFetch(`${LLAMA_CPP_DOWNLOAD_BASE}/${stableTag}/nightly-tag.txt`);
+    if (!res.ok) {
+      return undefined;
+    }
+    return parseNightlyTagFile(await res.text());
+  } catch {
+    return undefined;
+  }
 }
 
 /** Direct-download asset name candidates for a tag + backend (no GitHub API). */
@@ -308,23 +369,51 @@ export function directAssetUrl(tag: string, assetName: string): string {
 }
 
 /**
- * Newest llama.cpp release tag. Prefers the GitHub API; falls back to following
- * `/releases/latest` (fetch/HTTP2 — Node `https.get` to github.com hangs up).
+ * Newest llama.cpp nightly (`b####`). GitHub's `/releases/latest` is now the
+ * stable `vX.Y.Z` tag, which has no binary archives — only `nightly-tag.txt`.
  */
 export async function resolveLatestReleaseTag(): Promise<string> {
   try {
-    const release = await httpGetJson<GithubRelease>(GITHUB_API_LATEST);
-    if (release?.tag_name) {
-      return normalizeReleaseTag(release.tag_name);
+    const releases = await httpGetJson<GithubRelease[]>(GITHUB_API_RELEASES);
+    const tag = pickNewestBuildTag(releases);
+    if (tag) {
+      return tag;
     }
   } catch {
-    // Rate limit or API outage — HTML latest URL still works via fetch.
+    // Rate limit or API outage — try the stable pointer, then the HTML list.
   }
-  const res = await githubFetch(`${LLAMA_CPP_RELEASES_URL}/latest`);
+
+  try {
+    const latest = await httpGetJson<GithubRelease>(GITHUB_API_LATEST);
+    const name = latest?.tag_name?.trim() || "";
+    if (BUILD_TAG_RE.test(name)) {
+      return normalizeReleaseTag(name);
+    }
+    if (name) {
+      const pointed = await tryReadNightlyPointerTag(name);
+      if (pointed) {
+        return pointed;
+      }
+    }
+  } catch {
+    // keep falling through
+  }
+
+  const res = await githubFetch(LLAMA_CPP_RELEASES_URL);
   if (!res.ok) {
-    throw new Error(`HTTP ${res.status} resolving latest llama.cpp release from ${res.url}`);
+    throw new Error(`HTTP ${res.status} resolving latest llama.cpp nightly from ${res.url}`);
   }
-  return normalizeReleaseTag(res.url);
+  const html = await res.text();
+  const scraped = [...html.matchAll(/\/releases\/tag\/(b\d+)/gi)].map((m) => ({
+    tag_name: m[1],
+  }));
+  const fromHtml = pickNewestBuildTag(scraped);
+  if (fromHtml) {
+    return fromHtml;
+  }
+  throw new Error(
+    `Could not find a llama.cpp nightly tag (b####) on ${LLAMA_CPP_RELEASES_URL}`
+  );
 }
 
 const LATEST_TAG_CACHE_MS = 45 * 60 * 1000;
@@ -1230,7 +1319,7 @@ export class LlamaInstaller {
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       throw new Error(
-        `${msg}\n\nCould not resolve the latest tag from ${LLAMA_CPP_RELEASES_URL}/latest.\n` +
+        `${msg}\n\nCould not resolve the latest llama.cpp nightly (b-tag) from GitHub.\n` +
           `Use “Install release tag…” or “Install from archive…” instead.`
       );
     }
@@ -1279,7 +1368,21 @@ export class LlamaInstaller {
     backendOverride?: LlamaBackend
   ): Promise<string> {
     this.migrateLegacyInstallIfNeeded();
-    const tag = normalizeReleaseTag(tagInput);
+    const stable = parseStableReleaseTag(tagInput);
+    let tag: string;
+    if (stable) {
+      progress?.report({ message: `Stable ${stable} — resolving matching nightly…` });
+      const pointed = await tryReadNightlyPointerTag(stable);
+      if (!pointed) {
+        throw new Error(
+          `Stable tag ${stable} has no binary archives (llama.cpp ships those on nightlies). ` +
+            `Could not read nightly-tag.txt. Paste a b-tag such as b10587, or use Install / Upgrade.`
+        );
+      }
+      tag = pointed;
+    } else {
+      tag = normalizeReleaseTag(tagInput);
+    }
     const backendSetting = backendOverride || this.getBackend();
     const uiBackend =
       backendSetting === "vulkan" || backendSetting === "cuda" || backendSetting === "cpu"

@@ -34,6 +34,14 @@ export interface ChatCompletionOptions {
   topP?: number;
   topK?: number;
   maxTokens?: number;
+  /** Min-p sampling (0 = disabled). */
+  minP?: number;
+  /** Presence penalty (OpenAI-style, 0 = disabled). */
+  presencePenalty?: number;
+  /** Frequency penalty (OpenAI-style, 0 = disabled). */
+  frequencyPenalty?: number;
+  /** Repetition penalty (llama.cpp style, 1.0 = disabled). */
+  repeatPenalty?: number;
   signal?: AbortSignal;
 }
 
@@ -64,6 +72,12 @@ export async function* streamChatCompletion(
     top_p: options.topP,
     top_k: options.topK,
     max_tokens: options.maxTokens,
+    // Sent explicitly (even at disabled values) so a request never silently
+    // inherits llama-server's built-in defaults (min_p 0.05, repeat-last-n 64).
+    min_p: options.minP ?? 0,
+    presence_penalty: options.presencePenalty ?? 0,
+    frequency_penalty: options.frequencyPenalty ?? 0,
+    repeat_penalty: options.repeatPenalty ?? 1,
     stream: true,
     stream_options: { include_usage: true },
   };

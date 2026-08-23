@@ -1,7 +1,14 @@
 import { parseTensorSplit } from "./gpuSplit";
 import type { GpuMemoryInfo } from "./gpuInfo";
 import { usesSidecarMtp } from "./modelLibrary";
-import { LlamaLoadSettings, normalizeLoadSettings } from "./types";
+import {
+  LlamaLoadSettings,
+  normalizeLoadSettings,
+  RequestSettings,
+  speculativeUsesDflash,
+  speculativeUsesMtp,
+  speculativeUsesNgram,
+} from "./types";
 
 /**
  * CPU builds ignore -ngl / GPU KV offload / --n-cpu-moe. Apply the same zeros
@@ -23,13 +30,18 @@ export function normalizeLoadSettingsForCpuBackend(
  * Build llama-server CLI args from load settings + model path.
  * Settings are normalized here as well as in the store, so no caller can put a
  * NaN/undefined/out-of-range value on the command line.
+ *
+ * `options.requestSampling` ships the current request defaults as server-side
+ * sampling flags, so raw clients that omit sampling fields inherit them instead
+ * of llama.cpp's generic built-ins (top_k 40, min_p 0.05, …). Per-request
+ * values still win for our own frontends.
  */
 export function buildServerArgs(
   modelPath: string,
   host: string,
   port: number,
   rawSettings: LlamaLoadSettings,
-  options?: { gpus?: GpuMemoryInfo[] }
+  options?: { gpus?: GpuMemoryInfo[]; requestSampling?: RequestSettings }
 ): string[] {
   const settings = normalizeLoadSettings(rawSettings);
   const args: string[] = [
@@ -97,6 +109,19 @@ export function buildServerArgs(
   const reasoningBudget = settings.reasoningBudget ?? -1;
   if (reasoningBudget >= 0) {
     args.push("--reasoning-budget", String(reasoningBudget));
+  }
+
+  // Server-side sampling defaults (see doc comment above). Only shipped when a
+  // caller provides request sampling, so older call sites keep working.
+  const rs = options?.requestSampling;
+  if (rs) {
+    args.push("--temp", String(rs.temperature));
+    args.push("--top-p", String(rs.topP));
+    args.push("--top-k", String(rs.topK));
+    args.push("--min-p", String(rs.minP));
+    args.push("--presence-penalty", String(rs.presencePenalty));
+    args.push("--frequency-penalty", String(rs.frequencyPenalty));
+    args.push("--repeat-penalty", String(rs.repeatPenalty));
   }
 
   // Prefer current --load-mode over deprecated --mmap / --mlock / --no-mmap.
@@ -167,8 +192,13 @@ export function buildServerArgs(
     }
   }
 
-  // Speculative decoding (llama.cpp ≥ ~b10xxx uses --spec-*).
-  if (settings.speculativeMode === "mtp") {
+  // Speculative decoding (llama.cpp ≥ ~b10xxx uses --spec-*). `--spec-type` is a
+  // list: n-gram can stack with MTP or DFlash (cheap lookup first, neural draft
+  // fills misses). llama.cpp then runs impls in a hardcoded priority order.
+  if (speculativeUsesNgram(settings.speculativeMode)) {
+    appendNgramSpecArgs(args, settings);
+  }
+  if (speculativeUsesMtp(settings.speculativeMode)) {
     args.push("--spec-type", "draft-mtp");
     args.push("--spec-draft-n-max", String(effectiveMaxDraftTokens(settings)));
     if (settings.minDraftTokens > 0) {
@@ -183,12 +213,15 @@ export function buildServerArgs(
       args.push("--model-draft", settings.draftModelPath);
       args.push("--spec-draft-ngl", String(settings.draftGpuOffload));
     }
-  } else if (settings.speculativeMode === "dflash" && settings.draftModelPath) {
+  } else if (speculativeUsesDflash(settings.speculativeMode) && settings.draftModelPath) {
     // DFlash needs a separate draft GGUF trained for the target model.
     args.push("--spec-type", "draft-dflash");
     args.push("--model-draft", settings.draftModelPath);
     args.push("--spec-draft-n-max", String(effectiveMaxDraftTokens(settings)));
     args.push("--spec-draft-ngl", String(settings.draftGpuOffload));
+    if (settings.draftProbability > 0) {
+      args.push("--spec-draft-p-min", String(settings.draftProbability));
+    }
     // Quantized draft KV collapses acceptance (llama.cpp#25725); keep f16.
     args.push("--cache-type-k-draft", "f16");
     args.push("--cache-type-v-draft", "f16");
@@ -204,12 +237,27 @@ export function buildServerArgs(
   return args;
 }
 
+/** N-gram `--spec-type` + per-variant size flags. Safe to call in stacked modes. */
+function appendNgramSpecArgs(args: string[], settings: LlamaLoadSettings): void {
+  const variant = settings.ngramVariant || "simple";
+  if (variant === "mod") {
+    args.push("--spec-type", "ngram-mod");
+    args.push("--spec-ngram-mod-n-match", String(settings.ngramSizeN));
+    args.push("--spec-ngram-mod-n-max", String(Math.max(settings.ngramSizeM, settings.ngramSizeN)));
+  } else {
+    args.push("--spec-type", `ngram-${variant}`);
+    args.push(`--spec-ngram-${variant}-size-n`, String(settings.ngramSizeN));
+    args.push(`--spec-ngram-${variant}-size-m`, String(Math.max(settings.ngramSizeM, settings.ngramSizeN)));
+    args.push(`--spec-ngram-${variant}-min-hits`, String(settings.ngramMinHits));
+  }
+}
+
 /** Draft length actually passed as `--spec-draft-n-max` (DFlash defaults to 15). */
 export function effectiveMaxDraftTokens(settings: LlamaLoadSettings): number {
-  if (settings.speculativeMode === "dflash") {
+  if (speculativeUsesDflash(settings.speculativeMode)) {
     return Math.max(1, settings.maxDraftTokens || 15);
   }
-  if (settings.speculativeMode === "mtp") {
+  if (speculativeUsesMtp(settings.speculativeMode)) {
     return Math.max(1, settings.maxDraftTokens);
   }
   return settings.maxDraftTokens;
@@ -253,10 +301,23 @@ export function serverConfigFingerprint(
     seed: settings.seed,
     speculativeMode: spec,
     maxDraftTokens: spec === "off" ? 0 : effectiveMaxDraftTokens(settings),
-    minDraftTokens: spec === "mtp" ? settings.minDraftTokens : 0,
-    draftProbability: spec === "mtp" ? settings.draftProbability : 0,
-    draftModelPath: spec === "dflash" || usesSidecarMtp(settings) ? settings.draftModelPath || "" : "",
-    draftGpuOffload: spec === "dflash" || usesSidecarMtp(settings) ? settings.draftGpuOffload : 0,
+    minDraftTokens: speculativeUsesMtp(spec) ? settings.minDraftTokens : 0,
+    draftProbability:
+      speculativeUsesMtp(spec) || speculativeUsesDflash(spec) ? settings.draftProbability : 0,
+    draftModelPath:
+      speculativeUsesDflash(spec) || usesSidecarMtp(settings) ? settings.draftModelPath || "" : "",
+    draftGpuOffload:
+      speculativeUsesDflash(spec) || usesSidecarMtp(settings) ? settings.draftGpuOffload : 0,
+    // N-gram knobs are CLI flags → restart-relevant. Omitted entirely when
+    // n-gram speculation is off so old fingerprints stay stable.
+    ...(speculativeUsesNgram(spec)
+      ? {
+          ngramVariant: settings.ngramVariant || "simple",
+          ngramSizeN: settings.ngramSizeN,
+          ngramSizeM: settings.ngramSizeM,
+          ngramMinHits: settings.ngramMinHits,
+        }
+      : {}),
     mmprojPath: settings.mmprojPath || "",
     mmprojOffloadToGpu: !!settings.mmprojOffloadToGpu,
     tensorSplit: settings.tensorSplit || "",

@@ -3,7 +3,7 @@ import { tensorSplitForMainShare } from "./gpuSplit";
 import { ModelCapabilities } from "./ggufMetadata";
 import { estimateMemory, MemoryEstimate } from "./memoryEstimate";
 import { isMtpDraftFileName } from "./modelLibrary";
-import { LlamaLoadSettings } from "./types";
+import { LlamaLoadSettings, recommendedMaxDraftTokens, speculativeUsesDflash, speculativeUsesNgram } from "./types";
 
 const GiB = 1024 ** 3;
 /** Prefer this context when the model allows it. */
@@ -141,21 +141,32 @@ function recommendSpeculative(current: LlamaLoadSettings, caps: ModelCapabilitie
   };
   // Keep an explicit DFlash setup even when the new GGUF also has MTP heads,
   // unless the attached draft is actually a sidecar MTP GGUF (model switch).
-  if (current.speculativeMode === "dflash" && !sidecarMtp) {
+  if (speculativeUsesDflash(current.speculativeMode) && !sidecarMtp) {
+    const mode = speculativeUsesNgram(current.speculativeMode) ? "ngram-dflash" : "dflash";
     return {
-      speculativeMode: "dflash",
-      maxDraftTokens: current.maxDraftTokens > 0 ? current.maxDraftTokens : 15,
+      speculativeMode: mode,
+      maxDraftTokens: recommendedMaxDraftTokens(mode, current.maxDraftTokens),
       minDraftTokens: current.minDraftTokens,
-      draftProbability: current.draftProbability,
+      draftProbability: current.draftProbability > 0 ? current.draftProbability : 0.75,
       ...keepDraft,
     };
   }
   if (mtpCapable) {
+    const mode = speculativeUsesNgram(current.speculativeMode) ? "ngram-mtp" : "mtp";
     return {
-      speculativeMode: "mtp",
-      maxDraftTokens: current.maxDraftTokens > 0 ? current.maxDraftTokens : sidecarMtp ? 4 : 2,
+      speculativeMode: mode,
+      maxDraftTokens: recommendedMaxDraftTokens(mode, current.maxDraftTokens, sidecarMtp),
       minDraftTokens: current.minDraftTokens,
       draftProbability: current.draftProbability > 0 ? current.draftProbability : 0.75,
+      ...keepDraft,
+    };
+  }
+  if (speculativeUsesNgram(current.speculativeMode)) {
+    return {
+      speculativeMode: "ngram",
+      maxDraftTokens: current.maxDraftTokens,
+      minDraftTokens: current.minDraftTokens,
+      draftProbability: current.draftProbability,
       ...keepDraft,
     };
   }

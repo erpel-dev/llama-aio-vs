@@ -862,6 +862,12 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
       top_p: state.requestSettings.topP,
       top_k: state.requestSettings.topK,
       max_tokens: Math.min(state.requestSettings.maxTokens, Math.floor(slotCtx / 4)),
+      // Explicit so requests never inherit llama-server's built-in sampler
+      // defaults (min_p 0.05 …). Curated model modes still override below.
+      min_p: state.requestSettings.minP,
+      presence_penalty: state.requestSettings.presencePenalty,
+      frequency_penalty: state.requestSettings.frequencyPenalty,
+      repeat_penalty: state.requestSettings.repeatPenalty,
       stream: true,
       stream_options: { include_usage: true },
     };

@@ -1,6 +1,6 @@
 # Llama AIO (VS Code)
 
-Local **llama.cpp** for VS Code: install newest llama.cpp binaries, manage GGUF models, tune load settings with memory estimates, run one shared `llama-server`, and use it in **GitHub Copilot Chat**.
+All-in-one local **llama.cpp** for VS Code: install newest llama.cpp binaries, manage GGUF models, tune load settings with memory estimates, run one shared `llama-server`, and use it in **GitHub Copilot Chat**.
 
 <p align="center">
   <img src="media/performance.png" alt="Llama AIO panel — server status, live performance, backend install, and model selection" width="49%">

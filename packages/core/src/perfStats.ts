@@ -3,6 +3,7 @@ import type { ContextBreakdown } from "./contextBreakdown";
 import { scaleBreakdownToServerPrompt } from "./contextBreakdown";
 import { positiveRate } from "./llamaTimings";
 import type { PromptReplacementStats } from "./promptReplacer";
+import type { SpeculativeMode } from "./types";
 
 export type ContextLevel = "ok" | "warn" | "critical";
 
@@ -61,8 +62,8 @@ export interface GenerationPerf {
   processedPromptTokens?: number;
   /** 100 * cached / (cached + processed) — prompt cache hit rate. */
   cacheHitPct?: number;
-  /** Current load-settings speculative mode (`off` | `mtp` | `dflash`). */
-  speculativeMode?: "off" | "mtp" | "dflash";
+  /** Current load-settings speculative mode. */
+  speculativeMode?: SpeculativeMode;
   /** System-prompt find/replace savings for the last request. */
   promptReplacements?: PromptReplacementStats;
   /** Segmented context-bar breakdown (Tools / System / History / …). */
@@ -453,7 +454,7 @@ export class PerfStats {
   }
 
   /** Keep speculative label in sync with Load settings (clears stale drafts when off). */
-  setSpeculativeMode(mode: "off" | "mtp" | "dflash"): void {
+  setSpeculativeMode(mode: SpeculativeMode): void {
     const clearDrafts = mode === "off";
     const hadDrafts =
       this.current.draftTokens !== undefined ||
@@ -480,7 +481,7 @@ export class PerfStats {
     contextLimit?: number;
     estimatedPromptTokens?: number;
     promptReplacements?: PromptReplacementStats;
-    speculativeMode?: "off" | "mtp" | "dflash";
+    speculativeMode?: SpeculativeMode;
     contextBreakdown?: ContextBreakdown;
   }): void {
     const prev = this.current;
@@ -850,7 +851,16 @@ export class PerfStats {
     if (p.speculativeMode === undefined) {
       return undefined;
     }
-    const label = p.speculativeMode === "dflash" ? "DFlash" : "MTP";
+    const label =
+      p.speculativeMode === "dflash" || p.speculativeMode === "ngram-dflash"
+        ? p.speculativeMode === "ngram-dflash"
+          ? "N-gram+DFlash"
+          : "DFlash"
+        : p.speculativeMode === "ngram"
+          ? "N-gram"
+          : p.speculativeMode === "ngram-mtp"
+            ? "N-gram+MTP"
+            : "MTP";
     if (p.speculativeMode === "off") {
       return "Speculative: off";
     }

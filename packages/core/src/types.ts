@@ -38,7 +38,6 @@ export function normalizeKvCacheType(value: unknown, fallback: KvCacheType = "q8
 
 /** llama.cpp --reasoning-format */
 export type ReasoningFormat = "deepseek-legacy" | "deepseek" | "none" | "auto";
-
 export const REASONING_FORMATS: readonly ReasoningFormat[] = [
   "deepseek-legacy",
   "deepseek",
@@ -67,6 +66,102 @@ export function normalizeFlashAttention(
   return typeof value === "string" && (FLASH_ATTENTION_MODES as readonly string[]).includes(value)
     ? (value as FlashAttention)
     : fallback;
+}
+
+/**
+ * llama.cpp n-gram speculative decoding variants (--spec-type ngram-*).
+ * Draft-model-free: drafts from n-grams seen in the prompt itself.
+ */
+export type NgramSpecVariant = "simple" | "map-k" | "map-k4v" | "mod";
+
+export const NGRAM_SPEC_VARIANTS: readonly NgramSpecVariant[] = [
+  "simple",
+  "map-k",
+  "map-k4v",
+  "mod",
+];
+
+export function normalizeNgramSpecVariant(
+  value: unknown,
+  fallback: NgramSpecVariant = "simple"
+): NgramSpecVariant {
+  return typeof value === "string" && (NGRAM_SPEC_VARIANTS as readonly string[]).includes(value)
+    ? (value as NgramSpecVariant)
+    : fallback;
+}
+
+/**
+ * llama.cpp `--spec-type` is a list: n-gram can stack with MTP or DFlash.
+ * `ngram-mtp` / `ngram-dflash` emit both implementations.
+ */
+export type SpeculativeMode = "off" | "mtp" | "dflash" | "ngram" | "ngram-mtp" | "ngram-dflash";
+
+export const SPECULATIVE_MODES: readonly SpeculativeMode[] = [
+  "off",
+  "mtp",
+  "dflash",
+  "ngram",
+  "ngram-mtp",
+  "ngram-dflash",
+];
+
+export function normalizeSpeculativeMode(
+  value: unknown,
+  fallback: SpeculativeMode = "off"
+): SpeculativeMode {
+  return typeof value === "string" && (SPECULATIVE_MODES as readonly string[]).includes(value)
+    ? (value as SpeculativeMode)
+    : fallback;
+}
+
+export function speculativeUsesNgram(mode: string | undefined): boolean {
+  return mode === "ngram" || mode === "ngram-mtp" || mode === "ngram-dflash";
+}
+
+export function speculativeUsesMtp(mode: string | undefined): boolean {
+  return mode === "mtp" || mode === "ngram-mtp";
+}
+
+export function speculativeUsesDflash(mode: string | undefined): boolean {
+  return mode === "dflash" || mode === "ngram-dflash";
+}
+
+/**
+ * MTP drafts a few extra tokens (baked heads ≈ 2, Gemma sidecar ≈ 4).
+ * DFlash drafts a diffusion block (llama.cpp examples use 15).
+ * Switching modes should not keep the other family's leftover.
+ */
+export function recommendedMaxDraftTokens(
+  mode: SpeculativeMode,
+  current: number,
+  sidecarMtp = false
+): number {
+  const mtpDefault = sidecarMtp ? 4 : 2;
+  const n = Number.isFinite(current) ? current : 0;
+  if (speculativeUsesDflash(mode)) {
+    if (n <= 4) return 15;
+    return n;
+  }
+  if (speculativeUsesMtp(mode)) {
+    if (n <= 0 || n >= 8) return mtpDefault;
+    if (sidecarMtp && n === 2) return 4;
+    return n;
+  }
+  return n;
+}
+
+/** llama.cpp ngram-simple/map-* defaults vs ngram-mod (24 / 64). */
+export function recommendedNgramSizes(
+  variant: NgramSpecVariant,
+  n: number,
+  m: number
+): { ngramSizeN: number; ngramSizeM: number } {
+  const simpleDefault = n === 12 && m === 48;
+  const modDefault = n === 24 && m === 64;
+  if (variant === "mod") {
+    return simpleDefault ? { ngramSizeN: 24, ngramSizeM: 64 } : { ngramSizeN: n, ngramSizeM: m };
+  }
+  return modDefault ? { ngramSizeN: 12, ngramSizeM: 48 } : { ngramSizeN: n, ngramSizeM: m };
 }
 
 export interface LlamaLoadSettings {
@@ -113,17 +208,34 @@ export interface LlamaLoadSettings {
   /** Seed; null = random */
   seed: number | null;
   /** Speculative decoding mode */
-  speculativeMode: "off" | "mtp" | "dflash";
-  /** Max draft tokens for speculative decoding (--spec-draft-n-max) */
+  speculativeMode: SpeculativeMode;
+  /**
+   * N-gram speculative decoding variant (--spec-type ngram-simple|map-k|map-k4v|mod).
+   * Used when n-gram is on, including stacked `ngram-mtp` / `ngram-dflash`.
+   */
+  ngramVariant: NgramSpecVariant;
+  /**
+   * Lookup n-gram length (--spec-ngram-*-size-n; mod variant: --spec-ngram-mod-n-match).
+   * llama.cpp defaults: 12 (simple/map-k/map-k4v), 24 (mod match).
+   */
+  ngramSizeN: number;
+  /**
+   * Draft m-gram length (--spec-ngram-*-size-m; mod variant: --spec-ngram-mod-n-max).
+   * llama.cpp default: 48 (mod max: 64).
+   */
+  ngramSizeM: number;
+  /** Minimum hits before drafting (--spec-ngram-*-min-hits; llama.cpp default 1) */
+  ngramMinHits: number;
+  /** Max draft tokens (--spec-draft-n-max). MTP ≈ 2 (sidecar ≈ 4); DFlash ≈ 15. */
   maxDraftTokens: number;
-  /** Min draft tokens for speculative decoding */
+  /** Min draft tokens (--spec-draft-n-min). llama.cpp default 0; MTP only. */
   minDraftTokens: number;
-  /** Draft probability (--spec-draft-p-min); mainly for MTP */
+  /** Draft probability (--spec-draft-p-min). llama.cpp CLI default is 0; we use 0.75. */
   draftProbability: number;
   /**
    * Separate draft GGUF for DFlash or sidecar MTP (`-md` / `--model-draft`).
-   * Required when speculativeMode is `dflash`. For MTP, set when the next-n
-   * heads live in a sibling `mtp-*.gguf` (Gemma 4) rather than the language GGUF.
+   * Required when speculativeMode is `dflash` or `ngram-dflash`. For MTP, set when
+   * the next-n heads live in a sibling `mtp-*.gguf` (Gemma 4) rather than the language GGUF.
    */
   draftModelPath: string;
   /** Draft model GPU layers (`--spec-draft-ngl`); 99 ≈ all */
@@ -159,6 +271,15 @@ export interface RequestSettings {
   topP: number;
   topK: number;
   maxTokens: number;
+  /** Min-p sampling (0 = disabled). llama.cpp's built-in default 0.05 is wrong
+   *  for most current instruct/coder families, so we default it off. */
+  minP: number;
+  /** Presence penalty (OpenAI-style; 0 = disabled) */
+  presencePenalty: number;
+  /** Frequency penalty (OpenAI-style; 0 = disabled) */
+  frequencyPenalty: number;
+  /** Repetition penalty (llama.cpp style; 1.0 = disabled) */
+  repeatPenalty: number;
 }
 
 export interface ExtensionState {
@@ -197,8 +318,15 @@ export const DEFAULT_LOAD_SETTINGS: LlamaLoadSettings = {
   ropeFreqScale: null,
   seed: null,
   speculativeMode: "off",
+  ngramVariant: "simple",
+  ngramSizeN: 12,
+  ngramSizeM: 48,
+  ngramMinHits: 1,
+  // MTP default. DFlash is bumped to 15 on mode switch / recommend.
   maxDraftTokens: 2,
   minDraftTokens: 0,
+  // llama.cpp's CLI default is 0.00, which never stops on low-confidence drafts
+  // and collapses acceptance. 0.75 is the practical gate (also for DFlash).
   draftProbability: 0.75,
   draftModelPath: "",
   draftGpuOffload: 99,
@@ -300,8 +428,11 @@ export function normalizeLoadSettings(raw: Partial<LlamaLoadSettings> | undefine
     ropeFreqBase: nullableFloat(s.ropeFreqBase, 1, 1e9),
     ropeFreqScale: nullableFloat(s.ropeFreqScale, 0.001, 1000),
     seed: s.seed === null || s.seed === undefined ? null : int(s.seed, -1, 2 ** 31 - 1, -1),
-    speculativeMode:
-      s.speculativeMode === "mtp" || s.speculativeMode === "dflash" ? s.speculativeMode : "off",
+    speculativeMode: normalizeSpeculativeMode(s.speculativeMode),
+    ngramVariant: normalizeNgramSpecVariant(s.ngramVariant),
+    ngramSizeN: int(s.ngramSizeN, 2, 512, d.ngramSizeN),
+    ngramSizeM: int(s.ngramSizeM, 2, 2048, d.ngramSizeM),
+    ngramMinHits: int(s.ngramMinHits, 1, 64, d.ngramMinHits),
     maxDraftTokens: int(s.maxDraftTokens, 0, 64, d.maxDraftTokens),
     minDraftTokens: int(s.minDraftTokens, 0, 64, d.minDraftTokens),
     draftProbability: float(s.draftProbability, 0, 1, d.draftProbability),
@@ -323,6 +454,10 @@ export function normalizeRequestSettings(raw: Partial<RequestSettings> | undefin
     topP: float(s.topP, 0, 1, d.topP),
     topK: int(s.topK, 0, 1000, d.topK),
     maxTokens: int(s.maxTokens, 16, MAX_TOKENS_HARD_CAP, d.maxTokens),
+    minP: float(s.minP, 0, 1, d.minP),
+    presencePenalty: float(s.presencePenalty, -2, 2, d.presencePenalty),
+    frequencyPenalty: float(s.frequencyPenalty, -2, 2, d.frequencyPenalty),
+    repeatPenalty: float(s.repeatPenalty, 0.5, 2, d.repeatPenalty),
   };
 }
 
@@ -331,6 +466,13 @@ export const DEFAULT_REQUEST_SETTINGS: RequestSettings = {
   topP: 0.95,
   topK: 20,
   maxTokens: 8192,
+  // Off by default: llama.cpp's built-in server defaults (min_p 0.05,
+  // repeat-last-n 64) are tuned for generic prose, not current instruct/coder
+  // families — official guidance for those is min_p 0 and no penalties.
+  minP: 0,
+  presencePenalty: 0,
+  frequencyPenalty: 0,
+  repeatPenalty: 1,
 };
 
 export interface ServerStatus {

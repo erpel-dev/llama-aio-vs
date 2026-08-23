@@ -12,6 +12,10 @@ import {
   PerfStats,
   ProcessManager,
   SettingsStore,
+  isMtpDraftFileName,
+  recommendedMaxDraftTokens,
+  speculativeUsesMtp,
+  speculativeUsesNgram,
   UiBackend,
 } from "@llama-aio/core";
 import { openModelFileDialog, pickDownloadedModel, pickDraftModelFromLibrary, pickMmprojFromLibrary } from "./modelPicker";
@@ -98,7 +102,7 @@ export function activate(context: vscode.ExtensionContext): void {
   perf.setSpeculativeMode(
     (() => {
       const mode = store.getState().loadSettings.speculativeMode;
-      return mode === "mtp" || mode === "dflash" ? mode : "off";
+      return mode === "off" ? "off" : mode;
     })()
   );
   context.subscriptions.push(perf);
@@ -197,10 +201,11 @@ export function activate(context: vscode.ExtensionContext): void {
       }
       const cur = store.getState().loadSettings;
       if (kind === "mtp") {
+        const mode = speculativeUsesNgram(cur.speculativeMode) ? "ngram-mtp" : "mtp";
         await store.updateLoadSettings({
           draftModelPath: selected,
-          speculativeMode: "mtp",
-          maxDraftTokens: cur.maxDraftTokens > 0 ? cur.maxDraftTokens : 4,
+          speculativeMode: mode,
+          maxDraftTokens: recommendedMaxDraftTokens(mode, cur.maxDraftTokens, true),
         });
         settingsView.postDraftModelSelected(selected);
         settingsView.syncSpeculativeMode();
@@ -208,10 +213,15 @@ export function activate(context: vscode.ExtensionContext): void {
         void vscode.window.showInformationMessage(`MTP drafter set to ${path.basename(selected)}`);
         return;
       }
+      const mode = speculativeUsesNgram(cur.speculativeMode)
+        ? "ngram-dflash"
+        : cur.speculativeMode === "off" || speculativeUsesMtp(cur.speculativeMode)
+          ? "dflash"
+          : cur.speculativeMode;
       await store.updateLoadSettings({
         draftModelPath: selected,
-        speculativeMode: cur.speculativeMode === "off" || cur.speculativeMode === "mtp" ? "dflash" : cur.speculativeMode,
-        maxDraftTokens: cur.speculativeMode === "dflash" || cur.maxDraftTokens > 2 ? cur.maxDraftTokens : 15,
+        speculativeMode: mode,
+        maxDraftTokens: recommendedMaxDraftTokens(mode, cur.maxDraftTokens),
       });
       // Immediate sidebar update — full pushState can lag (local library scan) so
       // the hint used to stay on "No draft model selected" after a successful pick.
@@ -387,8 +397,8 @@ export function activate(context: vscode.ExtensionContext): void {
       }
       const tagInput = await vscode.window.showInputBox({
         title: "Install llama.cpp by release tag",
-        prompt: `Direct download (no GitHub API). Uses backend “${backend}”. Paste a tag (b10154) or releases URL.`,
-        placeHolder: "b10154",
+        prompt: `Uses backend “${backend}”. Paste a nightly (b10587), a stable tag (v0.2.0), or a releases URL.`,
+        placeHolder: "b10587",
         ignoreFocusOut: true,
         validateInput: (v) => {
           const t = (v || "").trim();

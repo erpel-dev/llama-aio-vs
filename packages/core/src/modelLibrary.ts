@@ -3,6 +3,7 @@ import * as os from "os";
 import * as path from "path";
 import type { ConfigAccessor } from "./config";
 import { getModelsDir } from "./paths";
+import { speculativeUsesDflash, speculativeUsesMtp } from "./types";
 
 export interface LocalModelEntry {
   path: string;
@@ -146,7 +147,7 @@ export function usesSidecarMtp(settings: {
   speculativeMode?: string;
   draftModelPath?: string;
 }): boolean {
-  return settings.speculativeMode === "mtp" && isMtpDraftFileName(settings.draftModelPath || "");
+  return speculativeUsesMtp(settings.speculativeMode) && isMtpDraftFileName(settings.draftModelPath || "");
 }
 
 /**
@@ -244,7 +245,7 @@ export function resolveMtpDraftPath(
     return sibling;
   }
   if (
-    speculativeMode === "dflash" &&
+    speculativeUsesDflash(speculativeMode) &&
     existing &&
     !isMtpDraftFileName(existing) &&
     fs.existsSync(existing)

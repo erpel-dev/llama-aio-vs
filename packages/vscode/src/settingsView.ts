@@ -13,7 +13,7 @@ import { PerfStats } from "@llama-aio/core";
 import { LaunchToken, LAUNCH_IN_PROGRESS_MSG, ProcessManager } from "@llama-aio/core";
 import { SettingsStore } from "@llama-aio/core";
 import { resolveLaunchMode } from "@llama-aio/core";
-import { DEFAULT_LOAD_SETTINGS, DEFAULT_REQUEST_SETTINGS, effectiveServerUiState, LlamaLoadSettings, RequestSettings } from "@llama-aio/core";
+import { DEFAULT_LOAD_SETTINGS, DEFAULT_REQUEST_SETTINGS, effectiveServerUiState, LlamaLoadSettings, normalizeSpeculativeMode, RequestSettings } from "@llama-aio/core";
 import { STARTER_MODEL } from "./huggingFace";
 
 export type ModelActions = {
@@ -126,6 +126,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               maxDraftTokens: d.maxDraftTokens,
               minDraftTokens: d.minDraftTokens,
               draftProbability: d.draftProbability,
+              ngramVariant: d.ngramVariant,
+              ngramSizeN: d.ngramSizeN,
+              ngramSizeM: d.ngramSizeM,
+              ngramMinHits: d.ngramMinHits,
               draftModelPath: d.draftModelPath,
               draftGpuOffload: d.draftGpuOffload,
             });
@@ -359,7 +363,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
   /** Keep sidebar speculative line in sync with Load settings (clears stale % when off). */
   syncSpeculativeMode(): void {
     const mode = this.store.getState().loadSettings.speculativeMode || "off";
-    this.perf.setSpeculativeMode(mode === "mtp" || mode === "dflash" ? mode : "off");
+    this.perf.setSpeculativeMode(normalizeSpeculativeMode(mode));
   }
 
   /** Ask before start/reload when estimated memory is likely to spill (VRAM or RAM). */
@@ -1019,6 +1023,20 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       padding-bottom: 4px;
       border-bottom: 1px solid var(--border);
     }
+    .spec-group {
+      margin: 8px 0 4px;
+      padding: 2px 0 2px 12px;
+      border-left: 2px solid color-mix(in srgb, var(--accent) 40%, var(--border));
+    }
+    .spec-group-title {
+      font-size: 10px;
+      font-weight: 650;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin: 4px 0 2px;
+    }
+    .spec-group .row { margin: 8px 0 10px; }
     .auto-field { display: flex; align-items: center; gap: 10px; }
     .auto-field .auto {
       display: inline-flex;
@@ -1448,10 +1466,11 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       <select id="mainGpu" class="wide"></select>
     <div class="label" style="margin-top:6px"><span class="name tip" data-flag="-ts, --tensor-split" data-help="Percent of model weights and KV cache on the Main GPU. The rest is split evenly across the other cards. llama.cpp receives this as --tensor-split in --list-devices order. Disabled when Split mode is None (the whole model stays on the Main GPU).">Weights on main GPU</span><span id="tensorSplitPct">75%</span></div>
     <input type="range" id="tensorSplitRange" min="10" max="90" step="1" />
-    <div class="label" style="margin-top:6px"><span class="name tip" data-flag="-sm, --split-mode" data-help="How tensors are split. Layer (default) shares the model across cards. Row needs a fast x16 link. None keeps every GPU layer on the Main GPU and leaves the other cards free (--device).">Split mode</span></div>
+    <div class="label" style="margin-top:6px"><span class="name tip" data-flag="-sm, --split-mode" data-help="How tensors are split. Layer (default) shares the model across cards. Row needs a fast x16 link. Tensor splits every weight matrix across cards (experimental, fastest for multi-GPU inference). None keeps every GPU layer on the Main GPU and leaves the other cards free (--device).">Split mode</span></div>
       <select id="splitMode" class="wide">
         <option value="layer">Layer (default)</option>
         <option value="row">Row</option>
+        <option value="tensor">Tensor (experimental)</option>
         <option value="none">None — Main GPU only</option>
       </select>
     <div class="hint" id="dualGpuHint">Two GPUs detected. Pick the faster card as Main, then raise the slider to give it more weights.</div>
@@ -1581,36 +1600,65 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
 
   <div class="subgroup-title">Speculative decoding</div>
   <div class="row" id="specModeRow">
-    <div class="label"><span class="name tip" data-flag="--spec-type" data-help="Speculative decoding type. MTP uses next-n layers in the main GGUF, or a sibling mtp-*.gguf (Gemma 4) via --model-draft. DFlash uses a separate draft GGUF with --spec-type draft-dflash.">Mode</span>
+    <div class="label"><span class="name tip" data-flag="--spec-type" data-help="Speculative decoding type. MTP uses next-n layers in the main GGUF, or a sibling mtp-*.gguf (Gemma 4) via --model-draft. DFlash uses a separate draft GGUF with --spec-type draft-dflash. N-gram drafts from n-grams seen in the prompt itself and can stack with MTP or DFlash.">Mode</span>
       <select id="speculativeMode">
         <option value="off">Off</option>
         <option value="mtp" id="specMtpOption">MTP (draft-mtp)</option>
         <option value="dflash" id="specDflashOption">DFlash (draft-dflash)</option>
+        <option value="ngram">N-gram (no draft model)</option>
+        <option value="ngram-mtp" id="specNgramMtpOption">N-gram + MTP</option>
+        <option value="ngram-dflash">N-gram + DFlash</option>
       </select>
     </div>
-    <div class="hint" id="specHint">MTP needs next-n layers in the main GGUF or a sibling mtp-*.gguf. DFlash needs a matching DFlash draft GGUF.</div>
+    <div class="hint" id="specHint">MTP needs next-n layers in the main GGUF or a sibling mtp-*.gguf. DFlash needs a matching DFlash draft GGUF. N-gram works on any model and can stack with MTP or DFlash.</div>
   </div>
-  <div class="row hidden" id="specDraftModelRow">
-    <div class="label"><span class="name tip" data-flag="-md, --model-draft" data-help="Path to the DFlash draft GGUF (architecture = dflash) or Gemma 4 sidecar MTP GGUF (mtp-*.gguf / architecture = gemma4-assistant).">Draft model</span></div>
-    <div class="hint" id="draftModelPathHint" style="margin:4px 0 8px">No draft model selected.</div>
-    <div class="hint" id="draftModelKindHint" style="margin:0 0 8px">DFlash needs a <em>separate</em> draft GGUF (<code>architecture = dflash</code>) for your target — not the main model. Gemma 4 MTP uses a sibling <code>mtp-*.gguf</code>.</div>
-    <div class="btn-row" style="margin:0 0 8px;gap:8px;flex-wrap:wrap">
-      <button class="secondary" id="pickDraftModelBtn" type="button">Choose draft GGUF…</button>
-      <button class="secondary" id="clearDraftModelBtn" type="button">Clear</button>
+  <div class="spec-group hidden" id="specNgramGroup">
+    <div class="spec-group-title">N-gram</div>
+    <div class="row" id="specNgramVariantRow">
+      <div class="label"><span class="name tip" data-flag="--spec-type ngram-*" data-help="N-gram lookup strategy. Simple keeps a rolling window of the prompt. Map-k indexes the prompt for faster lookup on long contexts. K4v additionally caches key/value states per n-gram. Mod is the classic prompt-lookup variant tuned for long drafts.">Variant</span>
+        <select id="ngramVariant">
+          <option value="simple">simple — rolling prompt window</option>
+          <option value="map-k">map-k — indexed lookup (long prompts)</option>
+          <option value="map-k4v">map-k4v — indexed + KV cache</option>
+          <option value="mod">mod — classic prompt-lookup</option>
+        </select>
+      </div>
+    </div>
+    <div class="row" id="specNgramSizeRow">
+      <div class="label"><span class="name tip" data-flag="--spec-ngram-*-size-n" data-help="Length of the lookup n-gram in tokens (default: 12; mod variant match length: 24). Longer = fewer false matches, shorter = more draft attempts.">Lookup size</span><input type="number" id="ngramSizeN" min="2" max="512" /></div>
+      <input type="range" id="ngramSizeNRange" min="2" max="64" step="1" />
+    </div>
+    <div class="row" id="specNgramDraftRow">
+      <div class="label"><span class="name tip" data-flag="--spec-ngram-*-size-m / --spec-ngram-mod-n-max" data-help="How many tokens n-gram may draft from a prompt match (default: 48; mod variant max: 64). This is not MTP/DFlash --spec-draft-n-max.">Draft length</span><input type="number" id="ngramSizeM" min="2" max="2048" /></div>
+    </div>
+    <div class="row" id="specNgramHitsRow">
+      <div class="label"><span class="name tip" data-flag="--spec-ngram-*-min-hits" data-help="Minimum number of times an n-gram must appear before it is used to draft (default: 1). Raise to 2–3 to avoid drafting from coincidental matches. Not used by the mod variant.">Min hits</span><input type="number" id="ngramMinHits" min="1" max="64" /></div>
     </div>
   </div>
-  <div class="row hidden" id="specDraftNglRow">
-    <div class="label"><span class="name tip" data-flag="--spec-draft-ngl" data-help="Max draft-model layers in VRAM (exact number, auto, or all).">Draft GPU Offload</span><input type="number" id="draftGpuOffload" min="0" max="999" /></div>
-    <div class="hint" id="draftNglHint">99 usually means all draft layers. DFlash draft KV cache is forced to f16 (quantized draft KV collapses acceptance).</div>
-  </div>
-  <div class="row" id="specDraftMaxRow">
-    <div class="label"><span class="name tip" data-flag="--spec-draft-n-max" data-help="Number of tokens to draft for speculative decoding (default: 3). For DFlash this is clamped to the draft block size (try 8–15).">Max draft tokens</span><input type="number" id="maxDraftTokens" min="0" /></div>
-  </div>
-  <div class="row" id="specDraftMinRow">
-    <div class="label"><span class="name tip" data-flag="--spec-draft-n-min" data-help="Minimum number of draft tokens to use for speculative decoding (default: 0).">Min draft tokens</span><input type="number" id="minDraftTokens" min="0" /></div>
-  </div>
-  <div class="row" id="specDraftPRow">
-    <div class="label"><span class="name tip" data-flag="--spec-draft-p-min" data-help="Minimum speculative decoding probability / greedy threshold (default: 0.00). Mainly for MTP.">Draft probability</span><input type="number" id="draftProbability" min="0" max="1" step="0.01" /></div>
+  <div class="spec-group hidden" id="specNeuralGroup">
+    <div class="spec-group-title" id="specNeuralHeading">MTP</div>
+    <div class="row hidden" id="specDraftModelRow">
+      <div class="label"><span class="name tip" id="specDraftModelName" data-flag="-md, --model-draft" data-help="Path to the DFlash draft GGUF (architecture = dflash) or Gemma 4 sidecar MTP GGUF (mtp-*.gguf / architecture = gemma4-assistant).">Draft model</span></div>
+      <div class="hint" id="draftModelPathHint" style="margin:4px 0 8px">No draft model selected.</div>
+      <div class="hint" id="draftModelKindHint" style="margin:0 0 8px">DFlash needs a <em>separate</em> draft GGUF (<code>architecture = dflash</code>) for your target — not the main model. Gemma 4 MTP uses a sibling <code>mtp-*.gguf</code>.</div>
+      <div class="btn-row" style="margin:0 0 8px;gap:8px;flex-wrap:wrap">
+        <button class="secondary" id="pickDraftModelBtn" type="button">Choose draft GGUF…</button>
+        <button class="secondary" id="clearDraftModelBtn" type="button">Clear</button>
+      </div>
+    </div>
+    <div class="row hidden" id="specDraftNglRow">
+      <div class="label"><span class="name tip" id="specDraftNglName" data-flag="--spec-draft-ngl" data-help="Max draft-model layers in VRAM (exact number, auto, or all).">GPU offload</span><input type="number" id="draftGpuOffload" min="0" max="999" /></div>
+      <div class="hint" id="draftNglHint">99 usually means all draft layers. DFlash draft KV cache is forced to f16 (quantized draft KV collapses acceptance).</div>
+    </div>
+    <div class="row hidden" id="specDraftMaxRow">
+      <div class="label"><span class="name tip" id="specDraftMaxName" data-flag="--spec-draft-n-max" data-help="Number of tokens the MTP or DFlash drafter proposes per step (--spec-draft-n-max). Separate from n-gram draft length. For DFlash try 8–15.">Max draft tokens</span><input type="number" id="maxDraftTokens" min="0" /></div>
+    </div>
+    <div class="row hidden" id="specDraftMinRow">
+      <div class="label"><span class="name tip" id="specDraftMinName" data-flag="--spec-draft-n-min" data-help="Minimum number of draft tokens to use for speculative decoding (default: 0). MTP only.">Min draft tokens</span><input type="number" id="minDraftTokens" min="0" /></div>
+    </div>
+    <div class="row hidden" id="specDraftPRow">
+      <div class="label"><span class="name tip" id="specDraftPName" data-flag="--spec-draft-p-min" data-help="Stop drafting when the next-token probability drops below this (default here: 0.75). llama.cpp's own default of 0.00 never stops and collapses acceptance. Used by MTP and DFlash.">Draft probability</span><input type="number" id="draftProbability" min="0" max="1" step="0.01" /></div>
+    </div>
   </div>
 
   <div class="btn-col" style="margin:12px 0 8px">
@@ -1620,7 +1668,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
   </details>
 
   <details class="advanced">
-    <summary>Request defaults<span class="sub">temperature, top-p/k, max tokens</span></summary>
+    <summary>Request defaults<span class="sub">temperature, top-p/k, min-p, penalties, max tokens</span></summary>
   <div class="hint hidden" id="modeOverrideHint" style="margin-bottom:10px"></div>
   <div class="row">
     <div class="label"><span class="name tip" data-flag="Chat / API request body" data-help="Sampling temperature for completions (extension request default, not a llama-server load flag).">Temperature</span><input type="number" id="temperature" min="0" max="2" step="0.05" /></div>
@@ -1629,14 +1677,27 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     <div class="label"><span class="name tip" data-flag="Chat / API request body" data-help="Nucleus sampling top-p (extension request default).">Top P</span><input type="number" id="topP" min="0" max="1" step="0.01" /></div>
   </div>
   <div class="row">
-    <div class="label"><span class="name tip" data-flag="Chat / API request body" data-help="Top-k sampling (extension request default).">Top K</span><input type="number" id="topK" min="0" step="1" /></div>
+    <div class="label"><span class="name tip" data-flag="--top-k / request body" data-help="Top-k sampling (extension request default).">Top K</span><input type="number" id="topK" min="0" step="1" /></div>
+  </div>
+  <div class="row">
+    <div class="label"><span class="name tip" data-flag="--min-p / request body" data-help="Min-p sampling (0 = disabled). llama-server's built-in default of 0.05 is wrong for most current instruct/coder families — keep 0 unless a model card recommends otherwise.">Min P</span><input type="number" id="minP" min="0" max="1" step="0.01" /></div>
+    <div class="hint">Also shipped as a server CLI default at start, so raw API clients inherit it.</div>
+  </div>
+  <div class="row">
+    <div class="label"><span class="name tip" data-flag="--repeat-penalty / request body" data-help="Repetition penalty (llama.cpp style; 1.0 = disabled). Values above 1 discourage repeating earlier tokens — useful for prose, harmful for code (breaks exact repetition like closing tags).">Repeat penalty</span><input type="number" id="repeatPenalty" min="0.5" max="2" step="0.01" /></div>
+  </div>
+  <div class="row">
+    <div class="label"><span class="name tip" data-flag="--presence-penalty / request body" data-help="Presence penalty (OpenAI-style; 0 = disabled). Positive values push the model toward new topics. Qwen3 No-Think mode recommends 1.5.">Presence penalty</span><input type="number" id="presencePenalty" min="-2" max="2" step="0.05" /></div>
+  </div>
+  <div class="row">
+    <div class="label"><span class="name tip" data-flag="--frequency-penalty / request body" data-help="Frequency penalty (OpenAI-style; 0 = disabled). Scaled by how often a token already appeared.">Frequency penalty</span><input type="number" id="frequencyPenalty" min="-2" max="2" step="0.05" /></div>
   </div>
   <div class="row">
     <div class="label"><span class="name tip" data-flag="Chat / API request body" data-help="Max tokens to generate per reply (extension request default / n_predict-style cap).">Max tokens</span><input type="number" id="maxTokens" min="16" step="16" /></div>
   </div>
 
   <div class="btn-col" style="margin:12px 0 8px">
-    <button class="secondary" id="resetRequestBtn" title="Restore temperature, top-p/k, and max tokens to Llama AIO defaults">Reset request defaults</button>
+    <button class="secondary" id="resetRequestBtn" title="Restore temperature, top-p/k, min-p, penalties, and max tokens to Llama AIO defaults">Reset request defaults</button>
   </div>
   </details>
 
@@ -2294,8 +2355,16 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         tiles.push(statTile('Prompt reuse', '—', 'KV prefix cache (cache_n)', 'empty'));
       }
 
-      if (p.speculativeMode === 'mtp' || p.speculativeMode === 'dflash') {
-        const label = p.speculativeMode === 'dflash' ? 'DFlash accepted' : 'MTP accepted';
+      if (p.speculativeMode && p.speculativeMode !== 'off') {
+        const label = p.speculativeMode === 'dflash'
+          ? 'DFlash accepted'
+          : p.speculativeMode === 'ngram-dflash'
+            ? 'N-gram+DFlash accepted'
+            : p.speculativeMode === 'ngram'
+              ? 'N-gram accepted'
+              : p.speculativeMode === 'ngram-mtp'
+                ? 'N-gram+MTP accepted'
+                : 'MTP accepted';
         if (typeof p.draftAcceptancePct === 'number') {
           tiles.push(statTile(
             label,
@@ -2504,8 +2573,8 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       let draftGpuWarmBundle = 0;
       let draftCpuWarmBundle = 0;
       let draftLine = '';
-      const sidecarMtp = L.speculativeMode === 'mtp' && memInputs.draft && memInputs.draft.fileSizeBytes && !(Number(memInputs.nextnPredictLayers) > 0);
-      const draftIn = ((L.speculativeMode === 'dflash' || sidecarMtp) && memInputs.draft && memInputs.draft.fileSizeBytes)
+      const sidecarMtp = (L.speculativeMode === 'mtp' || L.speculativeMode === 'ngram-mtp') && memInputs.draft && memInputs.draft.fileSizeBytes && !(Number(memInputs.nextnPredictLayers) > 0);
+      const draftIn = ((L.speculativeMode === 'dflash' || L.speculativeMode === 'ngram-dflash' || sidecarMtp) && memInputs.draft && memInputs.draft.fileSizeBytes)
         ? memInputs.draft
         : null;
       if (draftIn) {
@@ -2555,9 +2624,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           (sidecarMtp ? 'MTP sidecar included: ~' : 'DFlash draft included: ~') + fmtBytes(draftIn.fileSizeBytes) + ' weights (' +
           dOnGpu + '/' + dLayers + ' GPU layers) + ~' + fmtBytes(dKv) + ' draft KV' + (sidecarMtp ? '' : ' (f16)') + ' at full context.'
         );
-      } else if (L.speculativeMode === 'dflash') {
+      } else if (L.speculativeMode === 'dflash' || L.speculativeMode === 'ngram-dflash') {
         warnings.push('DFlash is on but no draft GGUF is selected — memory bars omit the draft; pick a draft model before starting.');
-      } else if (L.speculativeMode === 'mtp' && !sidecarMtp) {
+      } else if ((L.speculativeMode === 'mtp' || L.speculativeMode === 'ngram-mtp') && !sidecarMtp) {
         const mtpLayers = Math.max(0, Math.floor(Number(memInputs.nextnPredictLayers) || 0));
         if (mtpLayers > 0) {
           const mtpWeights = memInputs.fileSizeBytes * (mtpLayers / nLayers);
@@ -2715,7 +2784,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       lines.push('Bars show estimate at full context. Actual use varies by quant, MoE, and backend.');
       const specLabel = draftIn
         ? (sidecarMtp ? 'MTP draft (weights + KV)' : 'DFlash draft (weights + KV)')
-        : (L.speculativeMode === 'mtp' && draftGpuBundle + draftCpuBundle > 0
+        : ((L.speculativeMode === 'mtp' || L.speculativeMode === 'ngram-mtp') && draftGpuBundle + draftCpuBundle > 0
           ? 'MTP head + KV'
           : 'Speculative');
       const charts = buildCharts(gpuWeights, cpuWeights, kvBytes, kvOnGpu, gpuOverhead, cpuOverhead, totalGpu, totalCpu, draftGpuBundle, draftCpuBundle, specLabel, { tensorSplit: L.tensorSplit, mainGpu: L.mainGpu, splitMode: L.splitMode }, gpuVisionBytes, cpuVisionBytes);
@@ -2725,11 +2794,11 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       let summary;
       const specBytes = draftGpuBundle + draftCpuBundle;
       const specSuffix = specBytes > 0
-        ? (L.speculativeMode === 'dflash'
+        ? (L.speculativeMode === 'dflash' || L.speculativeMode === 'ngram-dflash'
           ? (cpuOnly
             ? ' · DFlash +' + fmtBytes(specBytes)
             : ' · DFlash +' + fmtBytes(draftGpuBundle) + (draftCpuBundle > 1024 * 1024 ? ' (+' + fmtBytes(draftCpuBundle) + ' RAM)' : ''))
-          : L.speculativeMode === 'mtp'
+          : (L.speculativeMode === 'mtp' || L.speculativeMode === 'ngram-mtp')
             ? (cpuOnly
               ? ' · MTP +' + fmtBytes(specBytes)
               : ' · MTP +' + fmtBytes(draftGpuBundle) + (draftCpuBundle > 1024 * 1024 ? ' (+' + fmtBytes(draftCpuBundle) + ' RAM)' : ''))
@@ -2930,6 +2999,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     bindRange('gpuOffload', 'gpuOffloadRange');
     bindRange('cpuThreads', 'cpuThreadsRange');
     bindRange('nCpuMoe', 'nCpuMoeRange');
+    bindRange('ngramSizeN', 'ngramSizeNRange');
     const tsRange = $('tensorSplitRange');
     if (tsRange) tsRange.addEventListener('input', syncTensorSplitPctLabel);
     $('offloadKvCacheToGpu').addEventListener('change', refreshMemoryLive);
@@ -3074,6 +3144,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       'ropeBaseAuto', 'ropeFreqBase', 'ropeScaleAuto', 'ropeFreqScale',
       'seedRandom', 'seed', 'speculativeMode', 'maxDraftTokens', 'minDraftTokens',
       'draftProbability', 'draftGpuOffload',
+      'ngramVariant', 'ngramSizeN', 'ngramSizeNRange', 'ngramSizeM', 'ngramMinHits',
       'tensorSplitRange', 'splitMode', 'mainGpu'
     ];
     for (const id of loadFieldIds) {
@@ -3091,7 +3162,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         vscode.postMessage({ type: 'saveRequest', payload: readRequest() });
       }, 250);
     }
-    for (const id of ['temperature', 'topP', 'topK', 'maxTokens']) {
+    for (const id of ['temperature', 'topP', 'topK', 'minP', 'repeatPenalty', 'presencePenalty', 'frequencyPenalty', 'maxTokens']) {
       const el = $(id);
       if (!el) continue;
       el.addEventListener('change', scheduleSaveRequest);
@@ -3107,9 +3178,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       const mtpOpt = $('specMtpOption');
       let speculativeMode = modeSel ? modeSel.value : 'off';
       // Never persist MTP when the option is unavailable for this GGUF.
-      if (speculativeMode === 'mtp' && mtpOpt && (mtpOpt.disabled || mtpOpt.hidden)) {
-        speculativeMode = 'off';
-        if (modeSel) modeSel.value = 'off';
+      if ((speculativeMode === 'mtp' || speculativeMode === 'ngram-mtp') && mtpOpt && (mtpOpt.disabled || mtpOpt.hidden)) {
+        speculativeMode = speculativeMode === 'ngram-mtp' ? 'ngram' : 'off';
+        if (modeSel) modeSel.value = speculativeMode;
       }
       return {
         contextLength: Number($('contextLength').value),
@@ -3138,6 +3209,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         maxDraftTokens: Number($('maxDraftTokens').value),
         minDraftTokens: Number($('minDraftTokens').value),
         draftProbability: Number($('draftProbability').value),
+        ngramVariant: ($('ngramVariant') && $('ngramVariant').value) || 'simple',
+        ngramSizeN: Number(($('ngramSizeN') && $('ngramSizeN').value) || 12),
+        ngramSizeM: Number(($('ngramSizeM') && $('ngramSizeM').value) || 48),
+        ngramMinHits: Number(($('ngramMinHits') && $('ngramMinHits').value) || 1),
         draftGpuOffload: Number(($('draftGpuOffload') && $('draftGpuOffload').value) || 99),
         tensorSplit: readTensorSplitFromUi(),
         splitMode: ($('splitMode') && $('splitMode').value) || 'layer',
@@ -3181,6 +3256,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         topP: Number($('topP').value),
         topK: Number($('topK').value),
         maxTokens: Number($('maxTokens').value),
+        minP: $('minP') ? Number($('minP').value) : 0,
+        repeatPenalty: $('repeatPenalty') ? Number($('repeatPenalty').value) : 1,
+        presencePenalty: $('presencePenalty') ? Number($('presencePenalty').value) : 0,
+        frequencyPenalty: $('frequencyPenalty') ? Number($('frequencyPenalty').value) : 0,
       };
     }
 
@@ -3249,38 +3328,66 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       const modeSel = $('speculativeMode');
       const mtpOpt = $('specMtpOption');
       const hint = $('specHint');
+      const ngramMtpOpt = $('specNgramMtpOption');
       if (mtpOpt) {
         mtpOpt.disabled = !mtpCapable;
         mtpOpt.hidden = !mtpCapable;
       }
+      if (ngramMtpOpt) {
+        ngramMtpOpt.disabled = !mtpCapable;
+        ngramMtpOpt.hidden = !mtpCapable;
+      }
       if (modeSel) {
         if (!mtpCapable && modeSel.value === 'mtp') {
           modeSel.value = 'off';
+        } else if (!mtpCapable && modeSel.value === 'ngram-mtp') {
+          modeSel.value = 'ngram';
         }
       }
       const mode = modeSel ? modeSel.value : 'off';
-      const isMtp = mode === 'mtp';
-      const isDflash = mode === 'dflash';
+      const isMtp = mode === 'mtp' || mode === 'ngram-mtp';
+      const isDflash = mode === 'dflash' || mode === 'ngram-dflash';
+      const isNgram = mode === 'ngram' || mode === 'ngram-mtp' || mode === 'ngram-dflash';
       const showMtpKnobs = isMtp && mtpCapable;
       const showDraftKnobs = isMtp || isDflash;
       const showDraftPicker = isDflash || (isMtp && sidecarMtp && !bakedMtp);
+      const ngramGroup = $('specNgramGroup');
+      if (ngramGroup) ngramGroup.classList.toggle('hidden', !isNgram);
+      const neuralGroup = $('specNeuralGroup');
+      if (neuralGroup) neuralGroup.classList.toggle('hidden', !showDraftKnobs);
+      const neuralHead = $('specNeuralHeading');
+      if (neuralHead) neuralHead.textContent = isMtp ? 'MTP' : 'DFlash';
+      const maxName = $('specDraftMaxName');
+      if (maxName) maxName.textContent = isMtp ? 'MTP max draft tokens' : 'DFlash max draft tokens';
+      const minName = $('specDraftMinName');
+      if (minName) minName.textContent = 'MTP min draft tokens';
+      const pName = $('specDraftPName');
+      if (pName) pName.textContent = isMtp ? 'MTP draft probability' : 'DFlash draft probability';
+      const modelName = $('specDraftModelName');
+      if (modelName) modelName.textContent = isMtp ? 'MTP draft model' : 'DFlash draft model';
+      const nglName = $('specDraftNglName');
+      if (nglName) nglName.textContent = isMtp ? 'MTP GPU offload' : 'DFlash GPU offload';
 
       for (const id of ['maxDraftTokens']) {
         const el = $(id);
         if (el) el.disabled = !showDraftKnobs;
       }
-      for (const id of ['minDraftTokens', 'draftProbability']) {
+      for (const id of ['minDraftTokens']) {
         const el = $(id);
         if (el) el.disabled = !showMtpKnobs;
       }
-      for (const id of ['specDraftMaxRow']) {
+      for (const id of ['draftProbability']) {
+        const el = $(id);
+        if (el) el.disabled = !showDraftKnobs;
+      }
+      for (const id of ['specDraftMaxRow', 'specDraftPRow']) {
         const row = $(id);
         if (row) {
           row.style.opacity = showDraftKnobs ? '1' : '0.55';
           row.classList.toggle('hidden', !showDraftKnobs);
         }
       }
-      for (const id of ['specDraftMinRow', 'specDraftPRow']) {
+      for (const id of ['specDraftMinRow']) {
         const row = $(id);
         if (row) {
           row.style.opacity = showMtpKnobs ? '1' : '0.55';
@@ -3291,6 +3398,14 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         const row = $(id);
         if (row) row.classList.toggle('hidden', !showDraftPicker);
       }
+      // N-gram knobs stay visible in stacked modes (ngram-mtp / ngram-dflash) too.
+      const ngramVariant = $('ngramVariant') ? $('ngramVariant').value : 'simple';
+      for (const id of ['specNgramVariantRow', 'specNgramSizeRow', 'specNgramDraftRow']) {
+        const row = $(id);
+        if (row) row.classList.toggle('hidden', !isNgram);
+      }
+      const hitsRow = $('specNgramHitsRow');
+      if (hitsRow) hitsRow.classList.toggle('hidden', !isNgram || ngramVariant === 'mod');
 
       const kindHint = $('draftModelKindHint');
       if (kindHint) {
@@ -3306,7 +3421,16 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       }
 
       if (hint) {
-        if (isDflash) {
+        if (mode === 'ngram-mtp') {
+          hint.textContent =
+            'Stacks --spec-type ngram-<variant> with draft-mtp. N-gram drafts from prompt repeats; MTP fills the rest. Needs an MTP-capable GGUF (or sidecar mtp-*.gguf).';
+        } else if (mode === 'ngram-dflash') {
+          hint.textContent =
+            'Stacks --spec-type ngram-<variant> with draft-dflash. N-gram is a cheap lookup; DFlash drafts when there is no n-gram hit. Needs a DFlash draft GGUF.';
+        } else if (isNgram) {
+          hint.textContent =
+            'N-gram passes --spec-type ngram-<variant> with lookup/draft sizes. Drafts come from n-grams in the prompt itself — great for code (edits repeat the prompt) and the only speculative mode that needs no draft model.';
+        } else if (isDflash) {
           hint.textContent =
             'DFlash passes --spec-type draft-dflash -md <draft> --spec-draft-ngl … with draft KV forced to f16 and --fit off (llama.cpp auto-fit breaks DFlash). Flash Attention On is recommended.';
         } else if (sidecarMtp && !bakedMtp) {
@@ -3317,7 +3441,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             'This model reports MTP next-n layers. Mode MTP passes --spec-type draft-mtp.';
         } else {
           hint.textContent =
-            'This GGUF has no MTP / nextn_predict_layers and no sibling mtp-*.gguf — MTP is unavailable. Use DFlash with a separate draft GGUF, or an MTP-tagged main model.';
+            'This GGUF has no MTP / nextn_predict_layers and no sibling mtp-*.gguf — MTP is unavailable. Use DFlash with a separate draft GGUF, N-gram (no draft model), or an MTP-tagged main model.';
         }
       }
     }
@@ -3625,6 +3749,11 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       $('maxDraftTokens').value = L.maxDraftTokens;
       $('minDraftTokens').value = L.minDraftTokens;
       $('draftProbability').value = L.draftProbability;
+      if ($('ngramVariant')) $('ngramVariant').value = L.ngramVariant || 'simple';
+      if ($('ngramSizeN')) $('ngramSizeN').value = L.ngramSizeN ?? 12;
+      if ($('ngramSizeNRange')) $('ngramSizeNRange').value = Math.min(64, L.ngramSizeN ?? 12);
+      if ($('ngramSizeM')) $('ngramSizeM').value = L.ngramSizeM ?? 48;
+      if ($('ngramMinHits')) $('ngramMinHits').value = L.ngramMinHits ?? 1;
       if ($('draftGpuOffload')) $('draftGpuOffload').value = L.draftGpuOffload ?? 99;
       if ($('splitMode')) $('splitMode').value = L.splitMode || 'layer';
       setDraftModelHint(L.draftModelPath || '');
@@ -3634,6 +3763,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       $('topP').value = R.topP;
       $('topK').value = R.topK;
       $('maxTokens').value = R.maxTokens;
+      if ($('minP')) $('minP').value = R.minP ?? 0;
+      if ($('repeatPenalty')) $('repeatPenalty').value = R.repeatPenalty ?? 1;
+      if ($('presencePenalty')) $('presencePenalty').value = R.presencePenalty ?? 0;
+      if ($('frequencyPenalty')) $('frequencyPenalty').value = R.frequencyPenalty ?? 0;
       renderModeOverrideHint(payload.modeSampling);
       syncFlashAttentionWarning();
 
@@ -3667,19 +3800,50 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     $('reasoningBudgetUnlimited').addEventListener('change', () => {
       $('reasoningBudget').disabled = $('reasoningBudgetUnlimited').checked;
     });
+    function recommendedMaxDraftTokens(mode, current, sidecarMtp) {
+      const mtpDefault = sidecarMtp ? 4 : 2;
+      const n = Number(current) || 0;
+      const dflash = mode === 'dflash' || mode === 'ngram-dflash';
+      const mtp = mode === 'mtp' || mode === 'ngram-mtp';
+      if (dflash) return n <= 4 ? 15 : n;
+      if (mtp) {
+        if (n <= 0 || n >= 8) return mtpDefault;
+        if (sidecarMtp && n === 2) return 4;
+        return n;
+      }
+      return n;
+    }
+    function recommendedNgramSizes(variant, n, m) {
+      const simpleDefault = n === 12 && m === 48;
+      const modDefault = n === 24 && m === 64;
+      if (variant === 'mod') return simpleDefault ? { n: 24, m: 64 } : { n: n, m: m };
+      return modDefault ? { n: 12, m: 48 } : { n: n, m: m };
+    }
     const speculativeModeEl = $('speculativeMode');
     if (speculativeModeEl) {
       speculativeModeEl.addEventListener('change', () => {
-        if (speculativeModeEl.value === 'dflash') {
-          const maxEl = $('maxDraftTokens');
-          if (maxEl && Number(maxEl.value) <= 2) {
-            maxEl.value = '15';
-          }
-        } else if (speculativeModeEl.value === 'mtp') {
-          const maxEl = $('maxDraftTokens');
-          if (maxEl && sidecarMtpAvailable() && Number(maxEl.value) <= 0) {
-            maxEl.value = '4';
-          }
+        const maxEl = $('maxDraftTokens');
+        if (maxEl) {
+          maxEl.value = String(recommendedMaxDraftTokens(
+            speculativeModeEl.value,
+            Number(maxEl.value),
+            sidecarMtpAvailable()
+          ));
+        }
+        applySpecUi(!!(memInputs && memInputs.nextnPredictLayers > 0), sidecarMtpAvailable());
+      });
+    }
+    const ngramVariantEl = $('ngramVariant');
+    if (ngramVariantEl) {
+      ngramVariantEl.addEventListener('change', () => {
+        const nEl = $('ngramSizeN');
+        const mEl = $('ngramSizeM');
+        const rangeEl = $('ngramSizeNRange');
+        if (nEl && mEl) {
+          const next = recommendedNgramSizes(ngramVariantEl.value, Number(nEl.value), Number(mEl.value));
+          nEl.value = String(next.n);
+          mEl.value = String(next.m);
+          if (rangeEl) rangeEl.value = String(Math.min(64, next.n));
         }
         applySpecUi(!!(memInputs && memInputs.nextnPredictLayers > 0), sidecarMtpAvailable());
       });

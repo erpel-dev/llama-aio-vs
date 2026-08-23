@@ -71,6 +71,30 @@ describe("recommendLoadSettings", () => {
     assert.equal(withDflash.maxDraftTokens, 15);
   });
 
+  it("replaces a leftover DFlash n-max when recommending MTP", () => {
+    const r = recommendLoadSettings(
+      loadSettings({ speculativeMode: "mtp", maxDraftTokens: 15 }),
+      denseCaps({ nextnPredictLayers: 1 }),
+      { gpu: gpu(48) }
+    );
+    assert.equal(r.speculativeMode, "mtp");
+    assert.equal(r.maxDraftTokens, 2);
+  });
+
+  it("replaces a leftover MTP n-max when recommending DFlash", () => {
+    const r = recommendLoadSettings(
+      loadSettings({
+        speculativeMode: "dflash",
+        draftModelPath: "/models/draft.gguf",
+        maxDraftTokens: 2,
+      }),
+      denseCaps(),
+      { gpu: gpu(48) }
+    );
+    assert.equal(r.speculativeMode, "dflash");
+    assert.equal(r.maxDraftTokens, 15);
+  });
+
   it("enables MTP only for models that report next-n layers", () => {
     const withMtp = recommendLoadSettings(loadSettings(), denseCaps({ nextnPredictLayers: 1 }), {
       gpu: gpu(48),
@@ -82,6 +106,36 @@ describe("recommendLoadSettings", () => {
       { gpu: gpu(48) }
     );
     assert.equal(without.speculativeMode, "off");
+  });
+
+  it("stacks n-gram onto MTP when the GGUF is MTP-capable", () => {
+    const r = recommendLoadSettings(
+      loadSettings({ speculativeMode: "ngram" }),
+      denseCaps({ nextnPredictLayers: 1 }),
+      { gpu: gpu(48) }
+    );
+    assert.equal(r.speculativeMode, "ngram-mtp");
+  });
+
+  it("keeps n-gram when recommending for a non-MTP target", () => {
+    const r = recommendLoadSettings(loadSettings({ speculativeMode: "ngram" }), denseCaps(), {
+      gpu: gpu(48),
+    });
+    assert.equal(r.speculativeMode, "ngram");
+  });
+
+  it("preserves N-gram + DFlash when recommending", () => {
+    const r = recommendLoadSettings(
+      loadSettings({
+        speculativeMode: "ngram-dflash",
+        draftModelPath: "/models/draft.gguf",
+        maxDraftTokens: 15,
+      }),
+      denseCaps({ nextnPredictLayers: 1 }),
+      { gpu: gpu(48) }
+    );
+    assert.equal(r.speculativeMode, "ngram-dflash");
+    assert.equal(r.draftModelPath, "/models/draft.gguf");
   });
 
   describe("physical batch tuning", () => {

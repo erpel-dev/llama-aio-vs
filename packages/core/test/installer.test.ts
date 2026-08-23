@@ -6,7 +6,10 @@ import {
   compareReleaseTags,
   createClearableTimeoutSignal,
   describeMissingAsset,
+  parseNightlyTagFile,
+  parseStableReleaseTag,
   pickAsset,
+  pickNewestBuildTag,
   resolveLatestReleaseTag,
 } from "../src/llamaInstaller";
 
@@ -111,6 +114,59 @@ describe("compareReleaseTags", () => {
     assert.ok(compareReleaseTags("b10375", "b10344") > 0);
     assert.ok(compareReleaseTags("b10344", "b10375") < 0);
     assert.equal(compareReleaseTags("b10344", "b10344"), 0);
+  });
+});
+
+describe("pickNewestBuildTag", () => {
+  it("skips stable vX.Y.Z releases that only ship nightly-tag.txt", () => {
+    const tag = pickNewestBuildTag([
+      {
+        tag_name: "v0.2.0",
+        assets: [{ name: "nightly-tag.txt" }],
+      },
+      {
+        tag_name: "b10566",
+        assets: [{ name: "llama-b10566-bin-ubuntu-vulkan-x64.tar.gz" }],
+      },
+      {
+        tag_name: "b10587",
+        assets: [{ name: "llama-b10587-bin-win-vulkan-x64.zip" }],
+      },
+    ]);
+    assert.equal(tag, "b10587");
+  });
+
+  it("ignores a newer b-tag that has not uploaded binaries yet", () => {
+    const tag = pickNewestBuildTag([
+      { tag_name: "b10588", assets: [] },
+      { tag_name: "b10587", assets: [{ name: "llama-b10587-bin-macos-arm64.tar.gz" }] },
+    ]);
+    assert.equal(tag, "b10587");
+  });
+});
+
+describe("parseStableReleaseTag", () => {
+  it("accepts v-prefixed tags and release URLs", () => {
+    assert.equal(parseStableReleaseTag("v0.2.0"), "v0.2.0");
+    assert.equal(parseStableReleaseTag("0.2.0"), "v0.2.0");
+    assert.equal(
+      parseStableReleaseTag("https://github.com/ggml-org/llama.cpp/releases/tag/v0.2.0"),
+      "v0.2.0"
+    );
+  });
+
+  it("does not treat nightly tags as stable", () => {
+    assert.equal(parseStableReleaseTag("b10587"), undefined);
+    assert.equal(
+      parseStableReleaseTag("https://github.com/ggml-org/llama.cpp/releases/tag/b10587"),
+      undefined
+    );
+  });
+});
+
+describe("parseNightlyTagFile", () => {
+  it("reads the b-tag from nightly-tag.txt", () => {
+    assert.equal(parseNightlyTagFile("b10566\n"), "b10566");
   });
 });
 

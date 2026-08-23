@@ -3,7 +3,7 @@ import { formatGpuDeviceLabel, GpuMemoryInfo } from "./gpuInfo";
 import { gpuDisplayOrder, parseTensorSplit, effectiveTensorSplitShares } from "./gpuSplit";
 import { heuristicMoeExpertShare, ModelCapabilities, readModelCapabilities } from "./ggufMetadata";
 import { mmprojFileSize, isMtpDraftFileName, usesSidecarMtp } from "./modelLibrary";
-import { KvCacheType, LlamaLoadSettings } from "./types";
+import { KvCacheType, LlamaLoadSettings, speculativeUsesDflash, speculativeUsesMtp } from "./types";
 
 export interface MemoryBarSegment {
   key: "weights" | "vision" | "kv" | "overhead" | "draft";
@@ -281,8 +281,8 @@ export function resolveDraftCapabilities(
 ): ModelCapabilities | undefined {
   const path = (settings.draftModelPath || "").trim();
   const wantDraft =
-    settings.speculativeMode === "dflash" ||
-    (settings.speculativeMode === "mtp" && isMtpDraftFileName(path));
+    speculativeUsesDflash(settings.speculativeMode) ||
+    (speculativeUsesMtp(settings.speculativeMode) && isMtpDraftFileName(path));
   if (!wantDraft) {
     return undefined;
   }
@@ -337,8 +337,8 @@ function estimateDraftFootprint(
         : Math.min(settings.draftGpuOffload, nLayers);
   const gpuWeights = fileSize * (onGpu / nLayers);
   const cpuWeights = Math.max(0, fileSize - gpuWeights);
-  const kvK = settings.speculativeMode === "dflash" ? "f16" : settings.cacheTypeK;
-  const kvV = settings.speculativeMode === "dflash" ? "f16" : settings.cacheTypeV;
+  const kvK = speculativeUsesDflash(settings.speculativeMode) ? "f16" : settings.cacheTypeK;
+  const kvV = speculativeUsesDflash(settings.speculativeMode) ? "f16" : settings.cacheTypeV;
   const kvBytes = estimateKvBytes(draftCaps, contextLength, kvK, kvV);
   const kvBytesWarm = estimateKvBytes(draftCaps, warmCtx, kvK, kvV);
   const kvOnGpu = onGpu > 0;
@@ -385,7 +385,7 @@ function estimateMtpFootprint(
   mainOnGpu: boolean,
   mainKvOnGpu: boolean
 ): MtpFootprint | undefined {
-  if (settings.speculativeMode !== "mtp") {
+  if (!speculativeUsesMtp(settings.speculativeMode)) {
     return undefined;
   }
   const layers = Math.max(0, Math.floor(caps.nextnPredictLayers || 0));
@@ -589,12 +589,12 @@ export function estimateMemory(
       `CPU MoE layers = ${settings.nCpuMoe}: ~${Math.round(moeExpertShare * 100)}% of weights are experts; those layers’ experts stay in system RAM.`
     );
   }
-  if (settings.speculativeMode === "dflash" && !draft) {
+  if (speculativeUsesDflash(settings.speculativeMode) && !draft) {
     warnings.push(
       "DFlash is on but no draft GGUF is selected — memory bars omit the draft; pick a draft model before starting."
     );
   }
-  if (settings.speculativeMode === "mtp" && !mtp && !draft) {
+  if (speculativeUsesMtp(settings.speculativeMode) && !mtp && !draft) {
     warnings.push(
       "MTP is on but this GGUF reports no nextn_predict_layers and no sidecar mtp-*.gguf — speculative overhead omitted from the bars."
     );

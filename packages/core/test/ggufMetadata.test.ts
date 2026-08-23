@@ -147,6 +147,19 @@ describe("clampLoadSettingsToModel", () => {
     assert.equal(s.speculativeMode, "mtp");
   });
 
+  it("drops MTP from ngram-mtp when the model has no next-n layers", () => {
+    const s = clampLoadSettingsToModel(loadSettings({ speculativeMode: "ngram-mtp" }), denseCaps());
+    assert.equal(s.speculativeMode, "ngram");
+  });
+
+  it("keeps ngram-mtp for models that support MTP", () => {
+    const s = clampLoadSettingsToModel(
+      loadSettings({ speculativeMode: "ngram-mtp" }),
+      denseCaps({ nextnPredictLayers: 1 })
+    );
+    assert.equal(s.speculativeMode, "ngram-mtp");
+  });
+
   it("zeroes --n-cpu-moe for dense models", () => {
     assert.equal(clampLoadSettingsToModel(loadSettings({ nCpuMoe: 12 }), denseCaps()).nCpuMoe, 0);
   });

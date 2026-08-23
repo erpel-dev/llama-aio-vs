@@ -430,7 +430,12 @@ export class ProcessManager {
       loadSettings = normalizeLoadSettingsForCpuBackend(loadSettings);
     }
     const gpus = this.isCpuBackend() ? [] : detectGpus(false, binary);
-    const args = buildServerArgs(model, host, port, loadSettings, { gpus });
+    const args = buildServerArgs(model, host, port, loadSettings, {
+      gpus,
+      // Ship request sampling defaults as CLI flags so raw clients pointing at
+      // the endpoint inherit them too (our frontends send per-request values).
+      requestSampling: state.requestSettings,
+    });
     const launchMode = resolveLaunchMode(this.store.getConfig().get<string>("launchMode"));
     const configFingerprint = serverConfigFingerprint(model, loadSettings, launchMode);
 
