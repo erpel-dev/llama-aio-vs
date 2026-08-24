@@ -1,6 +1,3 @@
-/** Max Copilot tool calls we will emit in one assistant turn. */
-export const MAX_TOOL_CALLS_PER_TURN = 8;
-
 const FILE_SEARCH_TOOLS = new Set([
   "file_search",
   "glob_file_search",

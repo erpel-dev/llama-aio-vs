@@ -315,6 +315,12 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             await this.pushState();
             break;
           }
+          case "setDuplicateToolCallGuardEnabled": {
+            const enabled = !!(msg.payload && (msg.payload as { enabled?: boolean }).enabled);
+            await this.store.getConfig().update("duplicateToolCallGuardEnabled", enabled);
+            await this.pushState();
+            break;
+          }
           case "installLlamaCppByTag":
             await this.modelActions.installLlamaCppByTag();
             await this.pushState();
@@ -487,6 +493,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         hasLastResponse: this.perf.hasLastResponseTrace(),
         promptReplacementsEnabled: this.store.isPromptReplacementsEnabled(),
         wikipediaLookupEnabled: this.store.isWikipediaLookupEnabled(),
+        duplicateToolCallGuardEnabled: this.store.isDuplicateToolCallGuardEnabled(),
         endpoint: this.store.getEndpoint(),
         binary,
         binaryExists: fs.existsSync(binary),
@@ -1376,6 +1383,11 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       <input type="checkbox" id="wikipediaLookupEnabled" title="Let the model call wikipedia_lookup for encyclopedic facts. Off by default." />
     </div>
     <div class="meta" style="margin-top:4px">Off by default. When on, the model can fetch a Wikipedia lead section before answering facts it may not know.</div>
+    <div class="toggle" style="margin-top:8px">
+      <span>Skip repeating tool calls</span>
+      <input type="checkbox" id="duplicateToolCallGuardEnabled" title="Skip a tool that already ran with the same arguments in this turn. Off by default — can block a legitimate retry." />
+    </div>
+    <div class="meta" style="margin-top:4px">Off by default. When on, skip a tool that already ran with the same arguments this turn.</div>
     <div class="btn-col" style="margin-top:8px">
       <button class="secondary" id="viewContextBtn" disabled title="Open the last Copilot → llama.cpp request (messages + tools) in an editor">View last call</button>
       <button class="secondary" id="viewResponseBtn" disabled title="Open the last llama.cpp assistant stream (helps debug empty Chat replies)">View last response</button>
@@ -3595,6 +3607,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       if (wikiToggle) {
         wikiToggle.checked = !!payload.wikipediaLookupEnabled;
       }
+      const dupToggle = $('duplicateToolCallGuardEnabled');
+      if (dupToggle) {
+        dupToggle.checked = !!payload.duplicateToolCallGuardEnabled;
+      }
       const prStats = $('replacementStats');
       if (prStats) {
         const pr = perf.promptReplacements;
@@ -3990,6 +4006,15 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         vscode.postMessage({
           type: 'setWikipediaLookupEnabled',
           payload: { enabled: !!wikiToggle.checked },
+        });
+      });
+    }
+    const dupToggle = $('duplicateToolCallGuardEnabled');
+    if (dupToggle) {
+      dupToggle.addEventListener('change', () => {
+        vscode.postMessage({
+          type: 'setDuplicateToolCallGuardEnabled',
+          payload: { enabled: !!dupToggle.checked },
         });
       });
     }

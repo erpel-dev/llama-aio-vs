@@ -35,6 +35,11 @@ export interface AppPreferences {
   promptReplacementsFile: string;
   /** Off by default: Copilot may call wikipedia_lookup for encyclopedic facts. */
   wikipediaLookupEnabled: boolean;
+  /**
+   * Off by default. When true, skip a Copilot tool that already ran with the
+   * same arguments in this turn. Can block a legitimate retry (e.g. Wikipedia).
+   */
+  duplicateToolCallGuardEnabled: boolean;
 }
 
 /** Model selection plus the tuning that gets turned into llama-server flags. */
@@ -65,6 +70,7 @@ export const DEFAULT_APP_PREFERENCES: AppPreferences = {
   promptReplacementsEnabled: true,
   promptReplacementsFile: "",
   wikipediaLookupEnabled: false,
+  duplicateToolCallGuardEnabled: false,
 };
 
 /**
@@ -99,6 +105,7 @@ function normalizePreferences(raw: Partial<AppPreferences> | undefined): AppPref
     promptReplacementsEnabled: src.promptReplacementsEnabled !== false,
     promptReplacementsFile: str(src.promptReplacementsFile, ""),
     wikipediaLookupEnabled: src.wikipediaLookupEnabled === true,
+    duplicateToolCallGuardEnabled: src.duplicateToolCallGuardEnabled === true,
   };
 }
 

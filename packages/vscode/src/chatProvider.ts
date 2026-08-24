@@ -26,7 +26,6 @@ import { decodeSseLines, parseXmlToolCalls, stripXmlToolCalls, toolCallSlot } fr
 import {
   duplicateToolCallHint,
   fingerprintsSinceLastUserMessage,
-  MAX_TOOL_CALLS_PER_TURN,
   rewriteToolInput,
   toolCallFingerprint,
   WIKIPEDIA_LOOKUP_SYSTEM_HINT,
@@ -844,7 +843,8 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
 
     const { messages: converted, stats: replacementStats } =
       await this.prepareMessagesWithReplacements(convertedRaw, tools);
-    if (tools?.length) {
+    const guardDuplicates = this.store.isDuplicateToolCallGuardEnabled();
+    if (guardDuplicates && tools?.length) {
       converted.push({
         role: "system",
         content:
@@ -921,7 +921,9 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
     let lastTickAt = 0;
     let emittedTextChars = 0;
     let emittedToolCallCount = 0;
-    const priorToolCalls = fingerprintsSinceLastUserMessage(convertedRaw);
+    const priorToolCalls = guardDuplicates
+      ? fingerprintsSinceLastUserMessage(convertedRaw)
+      : new Set<string>();
     const seenThisTurn = new Set<string>();
     let skippedDuplicateHint = false;
     let lastTrace:
@@ -945,19 +947,10 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
         } else if (event.kind === "tool_call") {
           const input = rewriteToolInput(event.name, event.input);
           const fp = toolCallFingerprint(event.name, input);
-          if (priorToolCalls.has(fp) || seenThisTurn.has(fp)) {
+          if (guardDuplicates && (priorToolCalls.has(fp) || seenThisTurn.has(fp))) {
             if (!skippedDuplicateHint) {
               skippedDuplicateHint = true;
               const hint = duplicateToolCallHint(event.name, input);
-              emittedTextChars += hint.length;
-              progress.report(new vscode.LanguageModelTextPart(hint));
-            }
-            continue;
-          }
-          if (emittedToolCallCount >= MAX_TOOL_CALLS_PER_TURN) {
-            if (!skippedDuplicateHint) {
-              skippedDuplicateHint = true;
-              const hint = `Stopped after ${MAX_TOOL_CALLS_PER_TURN} tool calls this turn. Answer from what you already have, or use a different search.`;
               emittedTextChars += hint.length;
               progress.report(new vscode.LanguageModelTextPart(hint));
             }

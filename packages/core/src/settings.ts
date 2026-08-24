@@ -193,6 +193,10 @@ export class SettingsStore {
     return this.getConfig().get<boolean>("wikipediaLookupEnabled", false);
   }
 
+  isDuplicateToolCallGuardEnabled(): boolean {
+    return this.getConfig().get<boolean>("duplicateToolCallGuardEnabled", false);
+  }
+
   /** Configured replacements file, falling back to the bundled defaults. */
   getPromptReplacementsFile(): string {
     const override = (this.getConfig().get<string>("promptReplacementsFile", "") || "").trim();
