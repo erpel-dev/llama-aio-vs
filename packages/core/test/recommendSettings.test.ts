@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import { mainShareFromSplit } from "../src/gpuSplit";
 import { estimateMemory } from "../src/memoryEstimate";
-import { PREFERRED_CONTEXT, recommendLoadSettings } from "../src/recommendSettings";
+import { PREFERRED_CONTEXT, fittingContextLength, recommendLoadSettings } from "../src/recommendSettings";
 import { denseCaps, GiB, loadSettings, moeCaps } from "./helpers";
 
 const gpu = (totalGiB: number) => ({
@@ -185,6 +186,44 @@ describe("recommendLoadSettings", () => {
       assert.ok(est && !est.willSpill);
     });
 
+    it("parks a small model entirely on Main instead of equalizing occupancy", () => {
+      const two80 = [gpu(80), gpu(80)];
+      const r = recommendLoadSettings(loadSettings({ mainGpu: 0 }), denseCaps(), { gpus: two80 });
+      assert.equal(r.gpuOffload, 99);
+      assert.equal(r.splitMode, "none");
+      const flipped = recommendLoadSettings(loadSettings({ mainGpu: 1 }), denseCaps(), {
+        gpus: two80,
+      });
+      assert.equal(flipped.splitMode, "none");
+      assert.equal(flipped.mainGpu, 1);
+    });
+
+    it("fills the larger card first on mixed VRAM", () => {
+      const mixed = [gpu(32), gpu(12)];
+      const caps = denseCaps({ fileSizeBytes: 26 * GiB, blockCount: 48 });
+      const r = recommendLoadSettings(loadSettings({ mainGpu: 0 }), caps, { gpus: mixed });
+      assert.equal(r.gpuOffload, 99);
+      assert.equal(r.splitMode, "layer");
+      const vram = [32 * GiB, 12 * GiB];
+      const share = mainShareFromSplit(r.tensorSplit, 0, 2, vram);
+      assert.ok(share >= 0.7, `expected most weights on the 32 GiB Main, got ${share} (${r.tensorSplit})`);
+      const other = mainShareFromSplit(r.tensorSplit, 1, 2, vram);
+      assert.ok(other > 0, "the 12 GiB card should still take the overflow");
+    });
+
+    it("leaves the middle card idle on 3 GPUs when two cards are enough (back-to-front)", () => {
+      const three = [gpu(16), gpu(16), gpu(16)];
+      const r = recommendLoadSettings(loadSettings({ mainGpu: 0 }), denseCaps(), { gpus: three });
+      assert.equal(r.gpuOffload, 99);
+      const parts = (r.tensorSplit || "").split(",").map(Number);
+      if (r.splitMode === "none") {
+        return;
+      }
+      assert.equal(parts.length, 3);
+      assert.equal(parts[1], 0, `expected GPU 1 idle, got ${r.tensorSplit}`);
+      assert.ok(parts[2] > 0, `expected overflow on GPU 2, got ${r.tensorSplit}`);
+    });
+
     it("clears a leftover tensor split when recommending for a single GPU", () => {
       const r = recommendLoadSettings(loadSettings({ tensorSplit: "50,50" }), denseCaps(), {
         gpu: gpu(80),
@@ -206,6 +245,35 @@ describe("recommendLoadSettings", () => {
       assert.equal(two.gpuOffload, 99);
       assert.equal(two.nCpuMoe, 0);
       assert.ok(two.tensorSplit);
+    });
+  });
+
+  describe("fittingContextLength", () => {
+    it("returns the model max when VRAM is plentiful", () => {
+      const r = fittingContextLength(denseCaps(), loadSettings(), { gpu: gpu(80) });
+      assert.equal(r, 262144);
+    });
+
+    it("finds an aligned context between 8k and the model max on a tight GPU", () => {
+      const settings = loadSettings({ cacheTypeK: "q8_0", cacheTypeV: "q4_0" });
+      const r = fittingContextLength(denseCaps(), settings, { gpu: gpu(24) });
+      assert.ok(r >= 8192, `expected at least 8k, got ${r}`);
+      assert.equal(r % 256, 0);
+      const est = estimateMemory(denseCaps(), { ...settings, contextLength: r }, gpu(24));
+      assert.equal(est?.willSpill, false);
+      const next = Math.min(262144, r + 256);
+      if (next > r) {
+        const over = estimateMemory(denseCaps(), { ...settings, contextLength: next }, gpu(24));
+        // Either next still fits (then we would have picked it) or it spills.
+        if (over && !over.willSpill) {
+          assert.equal(r, 262144, "search should have kept going if next still fits");
+        }
+      }
+    });
+
+    it("falls back to 8k when even that spills", () => {
+      const r = fittingContextLength(denseCaps(), loadSettings(), { gpu: gpu(8) });
+      assert.equal(r, 8192);
     });
   });
 });

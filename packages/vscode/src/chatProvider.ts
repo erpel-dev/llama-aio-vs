@@ -22,7 +22,17 @@ import {
   formatExceedContextError,
   messagesHaveImageParts,
 } from "@llama-aio/core";
-import { decodeSseLines, toolCallSlot } from "@llama-aio/core";
+import { decodeSseLines, parseXmlToolCalls, stripXmlToolCalls, toolCallSlot } from "@llama-aio/core";
+import {
+  duplicateToolCallHint,
+  fingerprintsSinceLastUserMessage,
+  MAX_TOOL_CALLS_PER_TURN,
+  rewriteToolInput,
+  toolCallFingerprint,
+  WIKIPEDIA_LOOKUP_SYSTEM_HINT,
+  WIKIPEDIA_LOOKUP_TOOL_NAME,
+  wikipediaLookupToolDefinition,
+} from "@llama-aio/core";
 import { positiveRate, ratesFromTimings, type LlamaTimings } from "@llama-aio/core";
 import { SettingsStore } from "@llama-aio/core";
 
@@ -361,37 +371,6 @@ function toOpenAiMessages(
   }
 
   return out;
-}
-
-/** Parse Qwen/Hermes-style tool calls embedded in assistant text. */
-function parseXmlToolCalls(text: string): Array<{ name: string; input: object; raw: string }> {
-  const results: Array<{ name: string; input: object; raw: string }> = [];
-  const re = /<tool_call>\s*<function=([^>\n]+)>\s*([\s\S]*?)\s*<\/function>\s*<\/tool_call>/gi;
-  let match: RegExpExecArray | null;
-  while ((match = re.exec(text)) !== null) {
-    const name = match[1].trim();
-    const body = match[2];
-    const input: Record<string, unknown> = {};
-    const paramRe = /<parameter=([^>\n]+)>\s*([\s\S]*?)\s*<\/parameter>/gi;
-    let p: RegExpExecArray | null;
-    while ((p = paramRe.exec(body)) !== null) {
-      const key = p[1].trim();
-      let value: unknown = p[2];
-      const trimmed = p[2].trim();
-      try {
-        value = JSON.parse(trimmed);
-      } catch {
-        value = trimmed;
-      }
-      input[key] = value;
-    }
-    results.push({ name, input, raw: match[0] });
-  }
-  return results;
-}
-
-function stripXmlToolCalls(text: string): string {
-  return text.replace(/<tool_call>[\s\S]*?<\/tool_call>/gi, "").trim();
 }
 
 /** Remove model "thinking" blocks from assistant text (Qwen / DeepSeek-style). */
@@ -760,23 +739,23 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
     _token: vscode.CancellationToken
   ): Promise<vscode.LanguageModelChatInformation[]> {
     const ready = await this.processManager.isHttpReady();
-    if (!ready) {
-      if (!options.silent) {
-        // Soft prompt — don't block model picker forever.
-      }
-      return [];
-    }
-
     let modelId = "local-model";
-    try {
-      const models = await httpJson<OpenAiModelsResponse>(`${this.store.getEndpoint()}/v1/models`, {
-        timeoutMs: 3000,
-      });
-      modelId = models.data?.[0]?.id || modelId;
-    } catch {
-      const state = this.store.getState();
-      if (state.selectedModelPath) {
-        modelId = state.selectedModelPath.split(/[/\\]/).pop() || modelId;
+    if (ready) {
+      try {
+        const models = await httpJson<OpenAiModelsResponse>(`${this.store.getEndpoint()}/v1/models`, {
+          timeoutMs: 3000,
+        });
+        modelId = models.data?.[0]?.id || modelId;
+      } catch {
+        const selected = this.store.getState().selectedModelPath;
+        if (selected) {
+          modelId = selected.split(/[/\\]/).pop() || modelId;
+        }
+      }
+    } else {
+      const selected = this.store.getState().selectedModelPath;
+      if (selected) {
+        modelId = selected.split(/[/\\]/).pop() || modelId;
       }
     }
 
@@ -791,6 +770,7 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
     const modeSet = resolveModelModes(state.modelCapabilities, modelId);
     const info: vscode.LanguageModelChatInformation & {
       configurationSchema?: { properties: Record<string, unknown> };
+      statusIcon?: vscode.ThemeIcon;
     } = {
       id: modelId,
       name: `Llama AIO: ${shortName}`,
@@ -798,6 +778,7 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
       version: "1.0.0",
       maxInputTokens: maxInput,
       maxOutputTokens: maxOutput,
+      statusIcon: new vscode.ThemeIcon("llama-aio-model"),
       tooltip: modeSet
         ? `Local llama.cpp at ${this.store.getEndpoint()} · slot context ${serverSlotCtx} · modes: ${Object.keys(modeSet.modes).join(", ")}${vision ? " · vision" : ""}`
         : `Local llama.cpp at ${this.store.getEndpoint()} · slot context ${serverSlotCtx}${vision ? " · vision" : ""}`,
@@ -842,7 +823,7 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
     }
 
     const convertedRaw = toOpenAiMessages(messages);
-    const tools =
+    let tools =
       options.tools?.map((t) => ({
         type: "function",
         function: {
@@ -852,8 +833,33 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
         },
       })) ?? undefined;
 
+    if (this.store.isWikipediaLookupEnabled()) {
+      const wiki = wikipediaLookupToolDefinition();
+      const already = tools?.some((t) => t.function.name === WIKIPEDIA_LOOKUP_TOOL_NAME);
+      // Ask mode has no tools; don't emit a call Copilot cannot run.
+      if (!already && tools?.length) {
+        tools = [...tools, wiki];
+      }
+    }
+
     const { messages: converted, stats: replacementStats } =
       await this.prepareMessagesWithReplacements(convertedRaw, tools);
+    if (tools?.length) {
+      converted.push({
+        role: "system",
+        content:
+          "Do not repeat a tool call with the same arguments in this turn. If file search returned no matches, broaden the glob (**/*llama* not **/llama) or grep for a symbol. Re-reading a file later is fine.",
+      });
+    }
+    if (
+      this.store.isWikipediaLookupEnabled() &&
+      tools?.some((t) => t.function.name === WIKIPEDIA_LOOKUP_TOOL_NAME)
+    ) {
+      converted.push({
+        role: "system",
+        content: WIKIPEDIA_LOOKUP_SYSTEM_HINT,
+      });
+    }
 
     const body: Record<string, unknown> = {
       model: model.id,
@@ -915,6 +921,9 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
     let lastTickAt = 0;
     let emittedTextChars = 0;
     let emittedToolCallCount = 0;
+    const priorToolCalls = fingerprintsSinceLastUserMessage(convertedRaw);
+    const seenThisTurn = new Set<string>();
+    let skippedDuplicateHint = false;
     let lastTrace:
       | {
           assembledText: string;
@@ -934,9 +943,34 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
           emittedTextChars += event.text.length;
           progress.report(new vscode.LanguageModelTextPart(event.text));
         } else if (event.kind === "tool_call") {
+          const input = rewriteToolInput(event.name, event.input);
+          const fp = toolCallFingerprint(event.name, input);
+          if (priorToolCalls.has(fp) || seenThisTurn.has(fp)) {
+            if (!skippedDuplicateHint) {
+              skippedDuplicateHint = true;
+              const hint = duplicateToolCallHint(event.name, input);
+              emittedTextChars += hint.length;
+              progress.report(new vscode.LanguageModelTextPart(hint));
+            }
+            continue;
+          }
+          if (emittedToolCallCount >= MAX_TOOL_CALLS_PER_TURN) {
+            if (!skippedDuplicateHint) {
+              skippedDuplicateHint = true;
+              const hint = `Stopped after ${MAX_TOOL_CALLS_PER_TURN} tool calls this turn. Answer from what you already have, or use a different search.`;
+              emittedTextChars += hint.length;
+              progress.report(new vscode.LanguageModelTextPart(hint));
+            }
+            continue;
+          }
+          seenThisTurn.add(fp);
           emittedToolCallCount += 1;
           progress.report(
-            new vscode.LanguageModelToolCallPart(event.callId, event.name, event.input)
+            new vscode.LanguageModelToolCallPart(
+              event.callId,
+              event.name,
+              input && typeof input === "object" ? (input as object) : {}
+            )
           );
         } else if (event.kind === "trace") {
           lastTrace = event;

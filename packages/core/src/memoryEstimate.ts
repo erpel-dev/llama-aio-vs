@@ -81,6 +81,28 @@ export interface MemoryEstimate {
 const GiB = 1024 ** 3;
 const MiB = 1024 ** 2;
 
+/** Keep this much VRAM free on every GPU (compositor / driver / allocator slop). */
+export const VRAM_HEADROOM_BYTES = 2 * GiB;
+/** Soft “getting full” warning once remaining VRAM drops below this. */
+export const VRAM_SOFT_HEADROOM_BYTES = 4 * GiB;
+
+/** True when `used` leaves less than {@link VRAM_HEADROOM_BYTES} free on `cap`. */
+export function deviceWouldSpill(used: number, cap: number): boolean {
+  return cap > 0 && used > cap - VRAM_HEADROOM_BYTES;
+}
+
+/**
+ * llama.cpp sizes non-unified KV as n_ctx × n_seq_max. Unified KV is one buffer
+ * of n_ctx. `-np` is n_seq_max.
+ */
+export function kvSlotMultiplier(settings: Pick<LlamaLoadSettings, "maxConcurrentPredictions" | "unifiedKvCache">): number {
+  const slots = Math.max(1, Math.round(settings.maxConcurrentPredictions) || 1);
+  if (settings.unifiedKvCache || slots <= 1) {
+    return 1;
+  }
+  return slots;
+}
+
 /** Context length used for "warm / mid-chat" KV (not idle-at-load). */
 export const WARM_KV_CONTEXT = 2048;
 
@@ -219,18 +241,24 @@ export function estimateKvBytes(
 
   let total = 0;
   for (let i = 0; i < layers; i++) {
-    // Hybrid (Qwen3.5 etc.): recurrent/linear layers keep a fixed SSM state — no
-    // context-scaled KV cache. Only full-attention layers grow with n_ctx.
+    // Hybrid (Qwen3.5 / Ling KDA): recurrent/linear layers keep a fixed SSM
+    // state — no context-scaled KV. GGUF often stores n_kv=0 on those layers.
     const isRecurrent =
       recurrent && recurrent.length === layers
         ? !!recurrent[i]
-        : !!(fullInterval && (i + 1) % fullInterval !== 0);
+        : perLayerKv && perLayerKv.length === layers
+          ? perLayerKv[i]! <= 0
+          : !!(fullInterval && (i + 1) % fullInterval !== 0);
     if (isRecurrent) {
       continue;
     }
 
     const isSwa = !!(swa && pattern && pattern.length && pattern[i % pattern.length]);
-    const nKv = Math.max(1, perLayerKv?.[i] ?? defaultKvHeads);
+    const rawKv = perLayerKv && i < perLayerKv.length ? perLayerKv[i] : defaultKvHeads;
+    const nKv = rawKv === undefined || rawKv === null ? defaultKvHeads : rawKv;
+    if (nKv <= 0) {
+      continue;
+    }
     // Gemma 4 stores smaller SWA head dims; other SWA models (Muse Glimmer) keep
     // the same key/value width as the global layers.
     const keyDim = isSwa && caps.keyLengthSwa ? Math.max(1, caps.keyLengthSwa) : defaultKeyDim;
@@ -243,10 +271,14 @@ export function estimateKvBytes(
 
 /** Number of layers that contribute context-scaled KV (excludes hybrid recurrent layers). */
 export function countFullAttentionLayers(
-  caps: Pick<ModelCapabilities, "blockCount" | "fullAttentionInterval" | "recurrentLayers">
+  caps: Pick<
+    ModelCapabilities,
+    "blockCount" | "fullAttentionInterval" | "recurrentLayers" | "attentionHeadCountKvPerLayer"
+  >
 ): number {
   const layers = Math.max(1, caps.blockCount || 1);
   const recurrent = caps.recurrentLayers;
+  const perLayerKv = caps.attentionHeadCountKvPerLayer;
   const fullInterval =
     caps.fullAttentionInterval && caps.fullAttentionInterval > 1
       ? caps.fullAttentionInterval
@@ -256,7 +288,9 @@ export function countFullAttentionLayers(
     const isRecurrent =
       recurrent && recurrent.length === layers
         ? !!recurrent[i]
-        : !!(fullInterval && (i + 1) % fullInterval !== 0);
+        : perLayerKv && perLayerKv.length === layers
+          ? perLayerKv[i]! <= 0
+          : !!(fullInterval && (i + 1) % fullInterval !== 0);
     if (!isRecurrent) {
       n++;
     }
@@ -339,8 +373,8 @@ function estimateDraftFootprint(
   const cpuWeights = Math.max(0, fileSize - gpuWeights);
   const kvK = speculativeUsesDflash(settings.speculativeMode) ? "f16" : settings.cacheTypeK;
   const kvV = speculativeUsesDflash(settings.speculativeMode) ? "f16" : settings.cacheTypeV;
-  const kvBytes = estimateKvBytes(draftCaps, contextLength, kvK, kvV);
-  const kvBytesWarm = estimateKvBytes(draftCaps, warmCtx, kvK, kvV);
+  const kvBytes = estimateKvBytes(draftCaps, contextLength, kvK, kvV) * kvSlotMultiplier(settings);
+  const kvBytesWarm = estimateKvBytes(draftCaps, warmCtx, kvK, kvV) * kvSlotMultiplier(settings);
   const kvOnGpu = onGpu > 0;
   return {
     fileSizeBytes: fileSize,
@@ -371,10 +405,9 @@ interface MtpFootprint {
 }
 
 /**
- * MTP (`draft-mtp`) loads next-n heads from the same GGUF as a small draft model
- * with its own context/KV. Weights are already in the main file size for the
- * primary load; this adds the extra draft-head residency + MTP KV (~single-digit
- * % of total per llama.cpp).
+ * MTP (`draft-mtp`) loads next-n heads from the same GGUF. Those tensors are
+ * already in `fileSizeBytes`; llama.cpp `shares_model` does not add extra
+ * model weights. Only the extra MTP KV is counted.
  */
 function estimateMtpFootprint(
   caps: ModelCapabilities,
@@ -382,7 +415,6 @@ function estimateMtpFootprint(
   contextLength: number,
   warmCtx: number,
   cpuOnly: boolean,
-  mainOnGpu: boolean,
   mainKvOnGpu: boolean
 ): MtpFootprint | undefined {
   if (!speculativeUsesMtp(settings.speculativeMode)) {
@@ -394,7 +426,9 @@ function estimateMtpFootprint(
   }
   const nLayers = Math.max(1, caps.blockCount || 1);
   const fileSize = caps.fileSizeBytes || 0;
-  // Approximate next-n tensor share of the GGUF (draft-mtp re-materializes them).
+  // Next-n tensors already live in the main GGUF (llama.cpp shares_model).
+  // Counting them again made recommend drop layers / raise CPU-MoE for a cost
+  // that is not real. Keep the implied size for UI copy; do not add it to VRAM.
   const weightsBytes = fileSize * (layers / nLayers);
   // MTP heads are dense attention blocks — estimate KV as `layers` full-attn layers
   // with the main model's head dims and cache dtypes.
@@ -419,22 +453,21 @@ function estimateMtpFootprint(
     contextLength,
     settings.cacheTypeK,
     settings.cacheTypeV
-  );
+  ) * kvSlotMultiplier(settings);
   const kvBytesWarm = estimateKvBytes(
     mtpCaps,
     warmCtx,
     settings.cacheTypeK,
     settings.cacheTypeV
-  );
-  const weightsOnGpu = !cpuOnly && mainOnGpu;
+  ) * kvSlotMultiplier(settings);
   const kvOnGpu = !cpuOnly && mainKvOnGpu;
   return {
     layers,
     weightsBytes,
     kvBytes,
     kvBytesWarm,
-    gpuWeightsBytes: weightsOnGpu ? weightsBytes : 0,
-    cpuWeightsBytes: weightsOnGpu ? 0 : weightsBytes,
+    gpuWeightsBytes: 0,
+    cpuWeightsBytes: 0,
     gpuKvBytes: kvOnGpu ? kvBytes : 0,
     cpuKvBytes: kvOnGpu ? 0 : kvBytes,
     gpuKvWarmBytes: kvOnGpu ? kvBytesWarm : 0,
@@ -483,14 +516,17 @@ export function estimateMemory(
       : 0;
   const cpuVisionBytes = gpuVisionBytes > 0 ? 0 : Math.max(0, mmprojBytes);
 
-  const kvBytes = estimateKvBytes(
+  const kvBytesRaw = estimateKvBytes(
     caps,
     settings.contextLength,
     settings.cacheTypeK,
     settings.cacheTypeV
   );
   const warmCtx = Math.min(WARM_KV_CONTEXT, Math.max(512, settings.contextLength));
-  const kvBytesWarm = estimateKvBytes(caps, warmCtx, settings.cacheTypeK, settings.cacheTypeV);
+  const kvBytesWarmRaw = estimateKvBytes(caps, warmCtx, settings.cacheTypeK, settings.cacheTypeV);
+  const slotMul = kvSlotMultiplier(settings);
+  const kvBytes = kvBytesRaw * slotMul;
+  const kvBytesWarm = kvBytesWarmRaw * slotMul;
   const fullAttnLayers = countFullAttentionLayers(caps);
   const kvOnGpu = !cpuOnly && settings.offloadKvCacheToGpu && onGpu > 0;
   const overheadBytes = computeOverheadBytes(
@@ -518,7 +554,6 @@ export function estimateMemory(
         settings.contextLength,
         warmCtx,
         cpuOnly,
-        onGpu > 0,
         kvOnGpu
       );
 
@@ -540,7 +575,7 @@ export function estimateMemory(
       ? "MTP draft (weights + KV)"
       : "DFlash draft (weights + KV)"
     : mtp
-      ? `MTP head + KV (${mtp.layers} next-n)`
+      ? `MTP KV (${mtp.layers} next-n)`
       : "Speculative";
 
   const totalGpuBytes = gpuWeights + gpuKvBytes + gpuOverheadBytes + specGpuBundle + gpuVisionBytes;
@@ -611,8 +646,7 @@ export function estimateMemory(
   }
   if (mtp) {
     warnings.push(
-      `MTP overhead included: ~${formatBytes(mtp.weightsBytes)} next-n head` +
-        ` (${mtp.layers} layers) + ~${formatBytes(mtp.kvBytes)} MTP KV at full context.`
+      `MTP overhead included: next-n heads are already in the GGUF weights; extra ~${formatBytes(mtp.kvBytes)} MTP KV at full context.`
     );
   }
   if (mmprojMissing) {
@@ -621,12 +655,10 @@ export function estimateMemory(
     );
   }
 
-  // Keep ~8% free for the compositor / driver; going above this often spills even if
-  // the raw estimate is still slightly under the advertised GPU total.
-  const usableFraction = 0.92;
+  // Keep a fixed 2 GiB free on every card (not 8% of a large GPU).
   const gpus: GpuMemoryInfo[] =
     !cpuOnly && options?.gpus?.length
-      ? options.gpus.filter((g) => g.totalBytes > 0)
+      ? [...options.gpus]
       : !cpuOnly && gpu?.totalBytes
         ? [gpu]
         : [];
@@ -667,19 +699,25 @@ export function estimateMemory(
     for (let i = 0; i < gpus.length; i++) {
       const used = perGpuParts[i]!.used;
       const cap = gpus[i]!.totalBytes;
-      const pct = Math.round((used / cap) * 100);
-      const label = gpuLabel(gpus[i]!, i);
-      if (used > cap) {
+      if (!(cap > 0)) {
+        continue;
+      }
+      if (deviceWouldSpill(used, cap)) {
         willSpill = true;
-        warnings.unshift(
-          `Estimated ${label} at full context ~${formatBytes(used)} is over the full ${formatBytes(cap)} (${pct}%). Expect spill to system RAM (much slower). Lower Context Length, GPU Offload, or use a smaller quant.`
-        );
-      } else if (used > cap * usableFraction) {
-        willSpill = true;
-        warnings.unshift(
-          `Tight on ${label} at full context: ~${formatBytes(used)} of ${formatBytes(cap)} (${pct}%). Only ~${formatBytes(cap - cap * usableFraction)} is left as safe headroom for the driver — llama.cpp often spills to system RAM at this point. Lower Context Length or GPU Offload.`
-        );
-      } else if (used > cap * 0.8) {
+        const pct = Math.round((used / cap) * 100);
+        const label = gpuLabel(gpus[i]!, i);
+        if (used > cap) {
+          warnings.unshift(
+            `Estimated ${label} at full context ~${formatBytes(used)} is over the full ${formatBytes(cap)} (${pct}%). Expect spill to system RAM (much slower). Lower Context Length, GPU Offload, or use a smaller quant.`
+          );
+        } else {
+          warnings.unshift(
+            `Tight on ${label} at full context: ~${formatBytes(used)} of ${formatBytes(cap)} (${pct}%). Only ~${formatBytes(cap - used)} left — target is ${formatBytes(VRAM_HEADROOM_BYTES)} free. Lower Context Length or GPU Offload.`
+          );
+        }
+      } else if (cap - used < VRAM_SOFT_HEADROOM_BYTES) {
+        const pct = Math.round((used / cap) * 100);
+        const label = gpuLabel(gpus[i]!, i);
         warnings.push(
           `Getting full on ${label} at full context: ~${formatBytes(used)} of ${formatBytes(cap)} VRAM (${pct}%). Leave some free for the display driver.`
         );

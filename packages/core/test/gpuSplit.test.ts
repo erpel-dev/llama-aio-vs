@@ -9,6 +9,9 @@ import {
   normalizeGpuSplitMode,
   normalizeTensorSplit,
   parseTensorSplit,
+  capacityAwareTensorSplit,
+  retargetTensorSplitMainShare,
+  tensorSplitFromFractions,
   tensorSplitForMainShare,
   tensorSplitShares,
   tensorSplitSharesEqual,
@@ -20,6 +23,8 @@ describe("parseTensorSplit", () => {
     assert.deepEqual(parseTensorSplit("3,1"), [3, 1]);
     assert.deepEqual(parseTensorSplit("0.75, 0.25"), [0.75, 0.25]);
     assert.deepEqual(parseTensorSplit("3;1"), [3, 1]);
+    assert.deepEqual(parseTensorSplit("0,1"), [0, 1]);
+    assert.deepEqual(parseTensorSplit("70,0,30"), [70, 0, 30]);
   });
 
   it("rejects empty, junk, and a single value", () => {
@@ -27,7 +32,6 @@ describe("parseTensorSplit", () => {
     assert.deepEqual(parseTensorSplit("  "), []);
     assert.deepEqual(parseTensorSplit("nope"), []);
     assert.deepEqual(parseTensorSplit("3"), []);
-    assert.deepEqual(parseTensorSplit("0,1"), []);
     assert.deepEqual(parseTensorSplit(undefined), []);
   });
 });
@@ -62,6 +66,10 @@ describe("tensorSplitShares", () => {
 
   it("is a single 1 for one GPU", () => {
     assert.deepEqual(tensorSplitShares("3,1", 1, [16]), [1]);
+  });
+
+  it("does not dump 100% onto one card when the other reports 0 VRAM", () => {
+    assert.deepEqual(tensorSplitShares("", 2, [16, 0]), [0.5, 0.5]);
   });
 });
 
@@ -141,5 +149,35 @@ describe("gpuDisplayOrder", () => {
     assert.deepEqual(gpuDisplayOrder(2, 0), [0, 1]);
     assert.deepEqual(gpuDisplayOrder(2, 1), [1, 0]);
     assert.deepEqual(gpuDisplayOrder(3, 2), [2, 0, 1]);
+  });
+});
+
+describe("capacityAwareTensorSplit", () => {
+  const GiB = 1024 ** 3;
+
+  it("fills Main first, then remaining cards back-to-front", () => {
+    const ts = capacityAwareTensorSplit(
+      [16 * GiB, 16 * GiB, 16 * GiB],
+      0,
+      1 * GiB,
+      20 * GiB,
+      2 * GiB
+    );
+    const parts = parseTensorSplit(ts);
+    assert.equal(parts.length, 3);
+    assert.equal(parts[1], 0);
+    assert.ok(parts[0]! > parts[2]!);
+    assert.ok(parts[2]! > 0);
+  });
+
+  it("keeps zeros when retargeting Main’s share", () => {
+    assert.equal(retargetTensorSplitMainShare("70,0,30", 0, 0.65), "65,0,35");
+  });
+
+  it("emits percents that sum to 100", () => {
+    const ts = tensorSplitFromFractions([13, 0, 7]);
+    const parts = parseTensorSplit(ts);
+    assert.equal(parts.reduce((a, b) => a + b, 0), 100);
+    assert.equal(parts[1], 0);
   });
 });

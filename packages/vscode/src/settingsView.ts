@@ -3,7 +3,7 @@ import * as os from "os";
 import * as path from "path";
 import * as vscode from "vscode";
 import { promptUseInCopilotChat } from "./copilotChatPrompt";
-import { detectGpus, activeInstallLock } from "@llama-aio/core";
+import { detectGpus, activeInstallLock, type GpuMemoryInfo } from "@llama-aio/core";
 import { LlamaInstaller, UiBackend } from "@llama-aio/core";
 import { estimateMemory, memoryEstimateInputs, mmprojFileSize, resolveDraftCapabilities } from "@llama-aio/core";
 import { resolveModelModes } from "@llama-aio/core";
@@ -15,6 +15,18 @@ import { SettingsStore } from "@llama-aio/core";
 import { resolveLaunchMode } from "@llama-aio/core";
 import { DEFAULT_LOAD_SETTINGS, DEFAULT_REQUEST_SETTINGS, effectiveServerUiState, LlamaLoadSettings, normalizeSpeculativeMode, RequestSettings } from "@llama-aio/core";
 import { STARTER_MODEL } from "./huggingFace";
+
+function uiSpillFromMessage(msg: { willSpill?: unknown; spillWarning?: unknown }):
+  | { willSpill: boolean; warning?: string }
+  | undefined {
+  if (typeof msg.willSpill !== "boolean") {
+    return undefined;
+  }
+  return {
+    willSpill: msg.willSpill,
+    warning: typeof msg.spillWarning === "string" ? msg.spillWarning : undefined,
+  };
+}
 
 export type ModelActions = {
   downloadFromHuggingFace: () => Promise<void>;
@@ -152,7 +164,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             try {
               await this.store.updateLoadSettings(msg.payload as Partial<LlamaLoadSettings>);
               this.syncSpeculativeMode();
-              if (!(await this.confirmIfMemorySpill())) {
+              if (!(await this.confirmIfMemorySpill(uiSpillFromMessage(msg)))) {
                 break;
               }
               await this.onReload(token);
@@ -176,7 +188,11 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             this.postBootProgress("Starting llama-server…");
             let readyMessage: string | undefined;
             try {
-              if (!(await this.confirmIfMemorySpill())) {
+              if (msg.payload) {
+                await this.store.updateLoadSettings(msg.payload as Partial<LlamaLoadSettings>);
+                this.syncSpeculativeMode();
+              }
+              if (!(await this.confirmIfMemorySpill(uiSpillFromMessage(msg)))) {
                 break;
               }
               const status = await vscode.window.withProgress(
@@ -293,6 +309,12 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             await this.pushState();
             break;
           }
+          case "setWikipediaLookupEnabled": {
+            const enabled = !!(msg.payload && (msg.payload as { enabled?: boolean }).enabled);
+            await this.store.getConfig().update("wikipediaLookupEnabled", enabled);
+            await this.pushState();
+            break;
+          }
           case "installLlamaCppByTag":
             await this.modelActions.installLlamaCppByTag();
             await this.pushState();
@@ -347,11 +369,18 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     });
   }
 
+  private detectGpusForEstimate(cpuOnly: boolean): GpuMemoryInfo[] {
+    if (cpuOnly || activeInstallLock()) {
+      return [];
+    }
+    return detectGpus(false, this.processManager.resolveBinary());
+  }
+
   private currentMemoryEstimate() {
     const state = this.store.getState();
     const cpuOnly =
       this.installer.resolveActiveUiBackend() === "cpu" || this.processManager.isCpuBackend();
-    const gpus = cpuOnly || activeInstallLock() ? [] : detectGpus(false, this.processManager.resolveBinary());
+    const gpus = this.detectGpusForEstimate(cpuOnly);
     return estimateMemory(
       state.modelCapabilities,
       state.loadSettings,
@@ -367,17 +396,22 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
   }
 
   /** Ask before start/reload when estimated memory is likely to spill (VRAM or RAM). */
-  async confirmIfMemorySpill(): Promise<boolean> {
-    const est = this.currentMemoryEstimate();
-    if (!est?.willSpill) {
+  async confirmIfMemorySpill(fromUi?: { willSpill?: boolean; warning?: string }): Promise<boolean> {
+    const est = fromUi?.willSpill !== undefined ? undefined : this.currentMemoryEstimate();
+    const willSpill = fromUi?.willSpill !== undefined ? fromUi.willSpill : !!est?.willSpill;
+    if (!willSpill) {
       return true;
     }
+    const warning =
+      fromUi?.warning ||
+      est?.warnings[0] ||
+      "These settings leave too little memory headroom and may spill or thrash (much slower).";
+    // Modal dialogs already include a localized Cancel — passing "Cancel" too
+    // shows two Abbrechen buttons.
     const choice = await vscode.window.showWarningMessage(
-      est.warnings[0] ||
-        "These settings leave too little memory headroom and may spill or thrash (much slower).",
+      warning,
       { modal: true },
-      "Continue anyway",
-      "Cancel"
+      "Continue anyway"
     );
     return choice === "Continue anyway";
   }
@@ -432,7 +466,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       build.resolvedBackend ||
       (build.configuredBackend === "auto" ? "vulkan" : build.configuredBackend)) as string;
     const cpuOnly = selectedUiBackend === "cpu";
-    const gpus = cpuOnly || activeInstallLock() ? [] : detectGpus(false, this.processManager.resolveBinary());
+    const gpus = this.detectGpusForEstimate(cpuOnly);
     const gpu = gpus[0];
     const draftCaps = resolveDraftCapabilities(state.loadSettings);
     const memory = estimateMemory(caps, state.loadSettings, gpu, {
@@ -452,6 +486,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         hasLastContext: this.perf.hasLastRequestContext(),
         hasLastResponse: this.perf.hasLastResponseTrace(),
         promptReplacementsEnabled: this.store.isPromptReplacementsEnabled(),
+        wikipediaLookupEnabled: this.store.isWikipediaLookupEnabled(),
         endpoint: this.store.getEndpoint(),
         binary,
         binaryExists: fs.existsSync(binary),
@@ -1336,6 +1371,11 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       <input type="checkbox" id="promptReplacementsEnabled" title="Strip Copilot system-prompt boilerplate before llama.cpp" />
     </div>
     <div class="meta" id="replacementStats" style="margin-top:4px">Last call: —</div>
+    <div class="toggle" style="margin-top:8px">
+      <span>Wikipedia lookup</span>
+      <input type="checkbox" id="wikipediaLookupEnabled" title="Let the model call wikipedia_lookup for encyclopedic facts. Off by default." />
+    </div>
+    <div class="meta" style="margin-top:4px">Off by default. When on, the model can fetch a Wikipedia lead section before answering facts it may not know.</div>
     <div class="btn-col" style="margin-top:8px">
       <button class="secondary" id="viewContextBtn" disabled title="Open the last Copilot → llama.cpp request (messages + tools) in an editor">View last call</button>
       <button class="secondary" id="viewResponseBtn" disabled title="Open the last llama.cpp assistant stream (helps debug empty Chat replies)">View last response</button>
@@ -1979,8 +2019,8 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     function parseTensorSplit(raw) {
       const s = String(raw || '').trim();
       if (!s) return [];
-      const parts = s.split(/[,/;:\\s]+/).map(Number).filter((n) => isFinite(n) && n > 0).slice(0, 8);
-      return parts.length >= 2 ? parts : [];
+      const parts = s.split(/[,/;:\\s]+/).map(Number).filter((n) => isFinite(n) && n >= 0).slice(0, 8);
+      return parts.length >= 2 && parts.some((n) => n > 0) ? parts : [];
     }
 
     function clampMainGpu(mainGpu, n) {
@@ -2000,7 +2040,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       const totals = (gpus || []).map((g) => g.totalBytes || 0);
       while (totals.length < n) totals.push(0);
       const sum = totals.reduce((a, b) => a + b, 0);
-      if (sum <= 0) return Array.from({ length: n }, () => 1 / n);
+      if (sum <= 0 || totals.some((b) => b <= 0)) return Array.from({ length: n }, () => 1 / n);
       return totals.map((b) => b / sum);
     }
 
@@ -2069,8 +2109,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     function readTensorSplitFromUi() {
       const n = (gpuInfos && gpuInfos.length) || 1;
       if (n < 2) return '';
-      const pct = Number(($('tensorSplitRange') && $('tensorSplitRange').value) || 75);
-      return tensorSplitForMainShare(pct / 100, readMainGpuIndex(), n);
+      const raw = $('tensorSplitRange') && $('tensorSplitRange').value;
+      const pct = Number(raw);
+      const share = (Number.isFinite(pct) ? pct : 50) / 100;
+      return tensorSplitForMainShare(share, readMainGpuIndex(), n);
     }
 
     function syncTensorSplitPctLabel() {
@@ -2483,9 +2525,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       const pct = chart.capacityBytes
         ? Math.round((chart.totalBytes / chart.capacityBytes) * 100)
         : undefined;
-      // 92% is the usable ceiling used by the spill warnings (driver headroom).
-      const over = pct !== undefined && pct > 92;
-      const warn = !over && pct !== undefined && pct > 80;
+      // 2 GiB free is the usable ceiling used by the spill warnings.
+      const remaining = chart.capacityBytes != null ? chart.capacityBytes - chart.totalBytes : undefined;
+      const over = remaining !== undefined && remaining < 2 * 1024 ** 3;
+      const warn = !over && remaining !== undefined && remaining < 4 * 1024 ** 3;
       stack.classList.toggle('over', over);
       stack.classList.toggle('warn', warn);
       sub.className = 'sub' + (over ? ' over' : warn ? ' warn' : '');
@@ -2535,11 +2578,19 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         for (let i = 0; i < nLayers; i++) {
           const isRecurrent = (recurrent && recurrent.length === nLayers)
             ? !!recurrent[i]
-            : !!(fullInterval && ((i + 1) % fullInterval !== 0));
+            : (perKv && perKv.length === nLayers && Number(perKv[i]) <= 0)
+              ? true
+              : !!(fullInterval && ((i + 1) % fullInterval !== 0));
           if (isRecurrent) continue;
           fullAttnLayers++;
           const isSwa = !!(swa && pattern && pattern.length && pattern[i % pattern.length]);
-          const nKv = Math.max(1, (perKv && perKv[i]) || defaultKvHeads);
+          let nKv;
+          if (perKv && perKv.length === nLayers && Number.isFinite(perKv[i])) {
+            nKv = Number(perKv[i]);
+            if (nKv <= 0) continue;
+          } else {
+            nKv = Math.max(1, defaultKvHeads);
+          }
           const keyDim = (isSwa && memInputs.keyLengthSwa > 0) ? memInputs.keyLengthSwa : defaultKeyDim;
           const valDim = (isSwa && memInputs.valueLengthSwa > 0) ? memInputs.valueLengthSwa : defaultValDim;
           const tokens = isSwa ? Math.min(ctx, swa) : ctx;
@@ -2547,11 +2598,13 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         }
         return { bytes, fullAttnLayers };
       }
+      const slots = Math.max(1, Math.round(Number(L.maxConcurrentPredictions)) || 1);
+      const slotMul = L.unifiedKvCache || slots <= 1 ? 1 : slots;
       const fullKv = kvAt(L.contextLength);
       const warmCtx = Math.min(2048, Math.max(512, L.contextLength));
       const warmKv = kvAt(warmCtx);
-      const kvBytes = fullKv.bytes;
-      const kvBytesWarm = warmKv.bytes;
+      const kvBytes = fullKv.bytes * slotMul;
+      const kvBytesWarm = warmKv.bytes * slotMul;
       const fullAttnLayers = fullKv.fullAttnLayers;
       const kvOnGpu = !cpuOnly && !!L.offloadKvCacheToGpu && onGpu > 0;
       // Mirrors computeOverheadBytes() in memoryEstimate.ts.
@@ -2599,10 +2652,18 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           for (let i = 0; i < dLayers; i++) {
             const isRecurrent = (recurrent && recurrent.length === dLayers)
               ? !!recurrent[i]
-              : !!(fullInterval && ((i + 1) % fullInterval !== 0));
+              : (perKv && perKv.length === dLayers && Number(perKv[i]) <= 0)
+                ? true
+                : !!(fullInterval && ((i + 1) % fullInterval !== 0));
             if (isRecurrent) continue;
             const isSwa = !!(swa && pattern && pattern.length && pattern[i % pattern.length]);
-            const nKv = Math.max(1, (perKv && perKv[i]) || defaultKvHeads);
+            let nKv;
+            if (perKv && perKv.length === dLayers && Number.isFinite(perKv[i])) {
+              nKv = Number(perKv[i]);
+              if (nKv <= 0) continue;
+            } else {
+              nKv = Math.max(1, defaultKvHeads);
+            }
             const keyDim = (isSwa && draftIn.keyLengthSwa > 0) ? draftIn.keyLengthSwa : defaultKeyDim;
             const valDim = (isSwa && draftIn.valueLengthSwa > 0) ? draftIn.valueLengthSwa : defaultValDim;
             const tokens = isSwa ? Math.min(ctx, swa) : ctx;
@@ -2610,8 +2671,8 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           }
           return bytes;
         }
-        const dKv = draftKvAt(L.contextLength);
-        const dKvWarm = draftKvAt(warmCtx);
+        const dKv = draftKvAt(L.contextLength) * slotMul;
+        const dKvWarm = draftKvAt(warmCtx) * slotMul;
         const dKvOnGpu = dOnGpu > 0;
         draftGpuBundle = dGpuW + (dKvOnGpu ? dKv : 0);
         draftCpuBundle = dCpuW + (dKvOnGpu ? 0 : dKv);
@@ -2629,7 +2690,6 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       } else if ((L.speculativeMode === 'mtp' || L.speculativeMode === 'ngram-mtp') && !sidecarMtp) {
         const mtpLayers = Math.max(0, Math.floor(Number(memInputs.nextnPredictLayers) || 0));
         if (mtpLayers > 0) {
-          const mtpWeights = memInputs.fileSizeBytes * (mtpLayers / nLayers);
           function mtpKvAt(ctx) {
             const kBytes = kvElemBytes(L.cacheTypeK);
             const vBytes = kvElemBytes(L.cacheTypeV);
@@ -2639,19 +2699,18 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             const valDim = Math.max(1, memInputs.valueLength || keyDim);
             return mtpLayers * (nKv * keyDim * kBytes + nKv * valDim * vBytes) * ctx;
           }
-          const mtpKv = mtpKvAt(L.contextLength);
-          const mtpKvWarm = mtpKvAt(warmCtx);
-          const mtpWeightsOnGpu = !cpuOnly && onGpu > 0;
+          const mtpKv = mtpKvAt(L.contextLength) * slotMul;
+          const mtpKvWarm = mtpKvAt(warmCtx) * slotMul;
           const mtpKvOnGpu = kvOnGpu;
-          draftGpuBundle = (mtpWeightsOnGpu ? mtpWeights : 0) + (mtpKvOnGpu ? mtpKv : 0);
-          draftCpuBundle = (mtpWeightsOnGpu ? 0 : mtpWeights) + (mtpKvOnGpu ? 0 : mtpKv);
-          draftGpuWarmBundle = (mtpWeightsOnGpu ? mtpWeights : 0) + (mtpKvOnGpu ? mtpKvWarm : 0);
-          draftCpuWarmBundle = (mtpWeightsOnGpu ? 0 : mtpWeights) + (mtpKvOnGpu ? 0 : mtpKvWarm);
-          draftLine = 'MTP: ~' + fmtBytes(mtpWeights) + ' next-n head (' + mtpLayers +
-            ' layers) · MTP KV ~' + fmtBytes(mtpKv) + (mtpKvOnGpu ? ' (GPU)' : ' (CPU RAM)');
+          draftGpuBundle = mtpKvOnGpu ? mtpKv : 0;
+          draftCpuBundle = mtpKvOnGpu ? 0 : mtpKv;
+          draftGpuWarmBundle = mtpKvOnGpu ? mtpKvWarm : 0;
+          draftCpuWarmBundle = mtpKvOnGpu ? 0 : mtpKvWarm;
+          draftLine = 'MTP: next-n heads already in GGUF · extra KV ~' + fmtBytes(mtpKv) +
+            ' (' + mtpLayers + ' layers)' + (mtpKvOnGpu ? ' (GPU)' : ' (CPU RAM)');
           warnings.push(
-            'MTP overhead included: ~' + fmtBytes(mtpWeights) + ' next-n head (' + mtpLayers +
-            ' layers) + ~' + fmtBytes(mtpKv) + ' MTP KV at full context.'
+            'MTP overhead included: next-n heads are already in the GGUF weights; extra ~' +
+            fmtBytes(mtpKv) + ' MTP KV at full context.'
           );
         } else {
           warnings.push('MTP is on but this GGUF reports no nextn_predict_layers — speculative overhead omitted from the bars.');
@@ -2701,10 +2760,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           if (used > cap) {
             willSpill = true;
             warnings.unshift('Estimated ' + label + ' at full context ~' + fmtBytes(used) + ' is over the full ' + fmtBytes(cap) + ' (' + pct + '%). Expect spill to system RAM. Lower Context or GPU Offload.');
-          } else if (used > cap * 0.92) {
+          } else if (used > cap - 2 * 1024 ** 3) {
             willSpill = true;
-            warnings.unshift('Tight on ' + label + ' at full context: ~' + fmtBytes(used) + ' of ' + fmtBytes(cap) + ' (' + pct + '%). Only ~' + fmtBytes(cap - cap * 0.92) + ' safe headroom for the driver — often spills to system RAM. Lower Context or GPU Offload.');
-          } else if (used > cap * 0.8) {
+            warnings.unshift('Tight on ' + label + ' at full context: ~' + fmtBytes(used) + ' of ' + fmtBytes(cap) + ' (' + pct + '%). Only ~' + fmtBytes(cap - used) + ' left — target is 2 GiB free. Lower Context or GPU Offload.');
+          } else if (cap - used < 4 * 1024 ** 3) {
             warnings.push('Getting full on ' + label + ' at full context: ~' + fmtBytes(used) + ' of ' + fmtBytes(cap) + ' VRAM (' + pct + '%).');
           }
         }
@@ -2712,15 +2771,15 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           warnings.push('Tensor split is empty — llama.cpp will split by VRAM size (often 1:1). Pick the faster card as Main GPU and raise Weights on main GPU so that card gets more of the model.');
         }
       } else if (!cpuOnly && gpuInfo && gpuInfo.totalBytes) {
-        const usable = gpuInfo.totalBytes * 0.92;
+        const headroom = 2 * 1024 ** 3;
         const pct = Math.round((totalGpu / gpuInfo.totalBytes) * 100);
         if (totalGpu > gpuInfo.totalBytes) {
           willSpill = true;
           warnings.unshift('Estimated VRAM at full context ~' + fmtBytes(totalGpu) + ' is over the full ' + fmtBytes(gpuInfo.totalBytes) + ' GPU (' + pct + '%). Expect spill to system RAM. Lower Context or GPU Offload.');
-        } else if (totalGpu > usable) {
+        } else if (totalGpu > gpuInfo.totalBytes - headroom) {
           willSpill = true;
-          warnings.unshift('Tight on VRAM at full context: ~' + fmtBytes(totalGpu) + ' of ' + fmtBytes(gpuInfo.totalBytes) + ' (' + pct + '%). Only ~' + fmtBytes(gpuInfo.totalBytes - usable) + ' safe headroom for the driver — often spills to system RAM. Lower Context or GPU Offload.');
-        } else if (totalGpu > gpuInfo.totalBytes * 0.8) {
+          warnings.unshift('Tight on VRAM at full context: ~' + fmtBytes(totalGpu) + ' of ' + fmtBytes(gpuInfo.totalBytes) + ' (' + pct + '%). Only ~' + fmtBytes(gpuInfo.totalBytes - totalGpu) + ' left — target is 2 GiB free. Lower Context or GPU Offload.');
+        } else if (gpuInfo.totalBytes - totalGpu < 4 * 1024 ** 3) {
           warnings.push('Getting full at full context: ~' + fmtBytes(totalGpu) + ' of ' + fmtBytes(gpuInfo.totalBytes) + ' VRAM (' + pct + '%).');
         }
       }
@@ -3059,26 +3118,42 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       quality: { contextLength: 65536, cacheTypeK: 'f16', cacheTypeV: 'q8_0', slots: 1 },
     };
 
-    const FIT_CONTEXT_STEPS = [
-      262144, 196608, 163840, 131072, 98304, 65536, 49152, 32768, 24576, 16384, 8192,
-    ];
-
     /**
-     * Largest context from FIT_CONTEXT_STEPS whose estimate stays inside the
-     * safe per-device budget (same 92% headroom as the memory bars / willSpill).
-     * Dual GPU: each card is checked on its own — combined VRAM must not be
-     * compared to a single card. Falls back to 8192 when nothing fits.
+     * Largest context (8192…model max, aligned to 256) whose live estimate
+     * still leaves 2 GiB free on every card. Mirrors fittingContextLength in core.
      */
     function fittingContext(maxCtx) {
       if (!memInputs) return maxCtx;
       const previous = $('contextLength').value;
-      let best = 0;
-      for (const step of FIT_CONTEXT_STEPS) {
-        const ctx = Math.min(step, maxCtx);
-        if (ctx < 8192 || ctx > maxCtx) continue;
+      const align = 256;
+      const high = Math.min(maxCtx, Math.max(align, Math.floor(maxCtx / align) * align));
+      const lowMin = Math.min(8192, high);
+      function fits(ctx) {
         $('contextLength').value = ctx;
         const est = liveMemoryEstimate();
-        if (est && !est.willSpill) { best = ctx; break; }
+        return !!(est && !est.willSpill);
+      }
+      let best = lowMin;
+      if (fits(high)) {
+        $('contextLength').value = previous;
+        return high;
+      }
+      if (!fits(lowMin)) {
+        $('contextLength').value = previous;
+        return lowMin;
+      }
+      let lo = lowMin;
+      let hi = high;
+      while (lo <= hi) {
+        let mid = Math.max(align, Math.floor((lo + hi) / 2 / align) * align);
+        if (mid < lo) mid = lo;
+        if (mid > hi) break;
+        if (fits(mid)) {
+          best = mid;
+          lo = mid + align;
+        } else {
+          hi = mid - align;
+        }
       }
       $('contextLength').value = previous;
       return best || Math.min(8192, maxCtx);
@@ -3516,6 +3591,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       if (prToggle) {
         prToggle.checked = !!payload.promptReplacementsEnabled;
       }
+      const wikiToggle = $('wikipediaLookupEnabled');
+      if (wikiToggle) {
+        wikiToggle.checked = !!payload.wikipediaLookupEnabled;
+      }
       const prStats = $('replacementStats');
       if (prStats) {
         const pr = perf.promptReplacements;
@@ -3905,6 +3984,15 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         });
       });
     }
+    const wikiToggle = $('wikipediaLookupEnabled');
+    if (wikiToggle) {
+      wikiToggle.addEventListener('change', () => {
+        vscode.postMessage({
+          type: 'setWikipediaLookupEnabled',
+          payload: { enabled: !!wikiToggle.checked },
+        });
+      });
+    }
     const starterModelBtn = $('starterModelBtn');
     if (starterModelBtn) {
       starterModelBtn.addEventListener('click', () => vscode.postMessage({ type: 'downloadStarter' }));
@@ -3965,7 +4053,13 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           endpoint: '',
           message: '',
         });
-        vscode.postMessage({ type: 'reload', payload: readLoad() });
+        const live = liveMemoryEstimate();
+        vscode.postMessage({
+          type: 'reload',
+          payload: readLoad(),
+          willSpill: !!(live && live.willSpill),
+          spillWarning: live && live.warnings && live.warnings[0] ? live.warnings[0] : undefined,
+        });
         vscode.postMessage({ type: 'saveRequest', payload: readRequest() });
       } else if (action === 'start') {
         serverStarting = true;
@@ -3977,9 +4071,14 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           endpoint: '',
           message: '',
         });
-        vscode.postMessage({ type: 'saveLoad', payload: readLoad() });
+        const live = liveMemoryEstimate();
+        vscode.postMessage({
+          type: 'start',
+          payload: readLoad(),
+          willSpill: !!(live && live.willSpill),
+          spillWarning: live && live.warnings && live.warnings[0] ? live.warnings[0] : undefined,
+        });
         vscode.postMessage({ type: 'saveRequest', payload: readRequest() });
-        vscode.postMessage({ type: 'start' });
       }
     });
     $('stopBtn').addEventListener('click', () => vscode.postMessage({ type: 'stop' }));

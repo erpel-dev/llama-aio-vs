@@ -287,6 +287,39 @@ function readWindowsWmiGpus(): GpuMemoryInfo[] | undefined {
 
 /** Detected GPUs, cached briefly because sysfs/nvidia-smi are stable. */
 let cached: { at: number; binKey: string; gpus: GpuMemoryInfo[] } | undefined;
+/** Last 2+ GPU list with llama.cpp ids — kept across a flaky reload probe. */
+let lastGoodGpus: GpuMemoryInfo[] | undefined;
+
+/**
+ * Keep a previously good dual-GPU list when a re-probe drops a card or loses
+ * `--list-devices` ids. Reloading while llama-server holds Vulkan often lists
+ * one device at 0 MiB; treating that as capacity dumps the whole model on GPU 0.
+ */
+export function preferStableGpuList(
+  next: GpuMemoryInfo[],
+  previous: GpuMemoryInfo[] | undefined
+): GpuMemoryInfo[] {
+  if (!previous?.length) {
+    return next;
+  }
+  if (previous.length >= 2 && next.length < previous.length) {
+    return previous;
+  }
+  if (
+    previous.length >= 2 &&
+    previous.length === next.length &&
+    previous.some((g) => g.llamaDeviceId) &&
+    !next.some((g) => g.llamaDeviceId)
+  ) {
+    return previous;
+  }
+  return next;
+}
+
+export function resetGpuDetectionCache(): void {
+  cached = undefined;
+  lastGoodGpus = undefined;
+}
 
 /**
  * Parse `llama-server --list-devices` text. Order is llama.cpp `--tensor-split`
@@ -361,10 +394,13 @@ export function orderGpusLikeLlama(
     if (!g) {
       continue;
     }
+    const sysfsTotal = g.totalBytes > 0 ? g.totalBytes : 0;
+    const listedTotal = dev.totalBytes && dev.totalBytes > 0 ? dev.totalBytes : 0;
     ordered.push({
       ...g,
       name: g.name && !/^(amdgpu|nvidia|i915|xe)$/i.test(g.name.trim()) ? g.name : dev.name,
-      totalBytes: g.totalBytes || dev.totalBytes || 0,
+      // `||` would take a 0 MiB `--list-devices` reading over a good sysfs total.
+      totalBytes: sysfsTotal || listedTotal,
       usedBytes: dev.usedBytes ?? g.usedBytes,
       index: ordered.length,
       llamaDeviceId: dev.id,
@@ -421,6 +457,10 @@ export function detectGpus(force = false, llamaServerBinary?: string): GpuMemory
     if (listed?.length) {
       gpus = orderGpusLikeLlama(gpus, listed);
     }
+  }
+  gpus = preferStableGpuList(gpus, force ? undefined : lastGoodGpus);
+  if (gpus.length >= 2) {
+    lastGoodGpus = gpus;
   }
   cached = { at: now, binKey, gpus };
   return gpus;

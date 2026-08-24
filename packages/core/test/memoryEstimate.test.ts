@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { computeOverheadBytes, estimateKvBytes, estimateMemory } from "../src/memoryEstimate";
+import { computeOverheadBytes, estimateKvBytes, estimateMemory, kvSlotMultiplier } from "../src/memoryEstimate";
 import { denseCaps, GiB, loadSettings, moeCaps } from "./helpers";
 
 const gpu = (totalGiB: number) => ({
@@ -96,6 +96,42 @@ describe("estimateKvBytes", () => {
     const full = estimateKvBytes(denseCaps(), 32768, "q8_0", "q8_0");
     // Only every 4th layer keeps a context-scaled cache.
     assert.equal(estimateKvBytes(hybrid, 32768, "q8_0", "q8_0"), full / 4);
+  });
+
+  it("skips n_kv=0 layers instead of billing them as Q-heads (Ling / bailingmoe3 KDA)", () => {
+    const kvHeads = [0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1];
+    const ling = denseCaps({
+      blockCount: 24,
+      embeddingLength: 1536,
+      attentionHeadCount: 16,
+      attentionHeadCountKvPerLayer: kvHeads,
+      keyLength: 576,
+      valueLength: 128,
+      fileSizeBytes: 5340611552,
+    });
+    const kv = estimateKvBytes(ling, 65536, "f16", "f16");
+    const mlaOnly = 6 * (576 + 128) * 2 * 65536;
+    assert.equal(kv, mlaOnly);
+    // Old webview bug: n_kv=0 was falsy so those 18 KDA layers used 16 Q-heads.
+    const billedAsQHeads = (18 * 16 + 6) * (576 + 128) * 2 * 65536;
+    assert.ok(kv < billedAsQHeads / 20);
+
+    const at34k = estimateMemory(
+      ling,
+      loadSettings({
+        contextLength: 34091,
+        gpuOffload: 99,
+        cacheTypeK: "f16",
+        cacheTypeV: "f16",
+        physicalBatchSize: 1024,
+        splitMode: "none",
+      }),
+      gpu(16)
+    );
+    assert.ok(at34k);
+    assert.ok(at34k.kvBytes < 0.5 * GiB, `MLA KV at 34k should be ~0.27 GiB, got ${at34k.kvBytes}`);
+    assert.ok(at34k.totalGpuBytes < 9 * GiB, `total at 34k should sit near the 8.3 GiB measurement, got ${at34k.totalGpuBytes}`);
+    assert.ok(at34k.totalGpuBytes > 5 * GiB);
   });
 });
 
@@ -235,6 +271,12 @@ describe("estimateMemory", () => {
     assert.equal(withMtp.mtpLayers, 1);
     assert.ok((withMtp.mtpWeightsBytes || 0) > 0);
     assert.ok((withMtp.mtpKvBytes || 0) > 0);
+    const extra = withMtp.totalGpuBytes - base.totalGpuBytes;
+    assert.ok(
+      extra < (withMtp.mtpWeightsBytes || 0),
+      `baked-in MTP heads must not be added on top of GGUF size (extra ${extra} vs weights ${withMtp.mtpWeightsBytes})`
+    );
+    assert.ok(Math.abs(extra - (withMtp.mtpKvBytes || 0)) < 1, "GPU extra should be MTP KV only");
     assert.ok(
       withMtp.charts.vram.segments.some((s) => s.key === "draft" && s.bytes > 0),
       "VRAM chart should include an MTP segment"
@@ -327,5 +369,70 @@ describe("estimateMemory", () => {
     assert.equal(w1, 0);
     assert.ok(est.lines.some((l) => /No GPU split/i.test(l)));
     assert.ok(!est.warnings.some((w) => /split by VRAM/i.test(w)));
+  });
+
+  it("does not flag spill on GPU 0 when a 0-byte second card would have dumped the whole model there", () => {
+    const g0 = {
+      totalBytes: 16 * GiB,
+      usedBytes: 0,
+      name: "RX 9070 XT",
+      source: "test",
+      llamaDeviceId: "Vulkan0",
+    };
+    const g1 = {
+      totalBytes: 0,
+      usedBytes: 0,
+      name: "RX 9060 XT",
+      source: "test",
+      llamaDeviceId: "Vulkan1",
+    };
+    const one = estimateMemory(denseCaps(), loadSettings({ tensorSplit: "", contextLength: 32768 }), g0);
+    const two = estimateMemory(
+      denseCaps(),
+      loadSettings({ tensorSplit: "", contextLength: 32768 }),
+      g0,
+      { gpus: [g0, g1] }
+    );
+    assert.ok(one?.willSpill, "the same load on one 16 GiB card should spill");
+    assert.equal(two?.willSpill, false);
+    assert.ok(two?.charts.vram2);
+    assert.ok(two.charts.vram.totalBytes < (one?.totalGpuBytes || 0));
+  });
+
+  it("splits a ~26 GiB estimate across two 16 GiB cards without spilling", () => {
+    const g0 = { totalBytes: 16 * GiB, usedBytes: 0, name: "RX 9070 XT", source: "test" };
+    const g1 = { totalBytes: 16 * GiB, usedBytes: 0, name: "RX 9060 XT", source: "test" };
+    const est = estimateMemory(
+      denseCaps(),
+      loadSettings({ tensorSplit: "50,50", contextLength: 32768 }),
+      g0,
+      { gpus: [g0, g1] }
+    );
+    assert.ok(est);
+    assert.equal(est.willSpill, false);
+    assert.ok(est.charts.vram.totalBytes <= 16 * GiB - 2 * GiB);
+    assert.ok((est.charts.vram2?.totalBytes || 0) <= 16 * GiB - 2 * GiB);
+  });
+
+  it("multiplies KV by parallel slots when the cache is not unified", () => {
+    const one = estimateMemory(
+      denseCaps(),
+      loadSettings({ unifiedKvCache: false, maxConcurrentPredictions: 1, contextLength: 8192 }),
+      gpu(48)
+    );
+    const four = estimateMemory(
+      denseCaps(),
+      loadSettings({ unifiedKvCache: false, maxConcurrentPredictions: 4, contextLength: 8192 }),
+      gpu(48)
+    );
+    const unified = estimateMemory(
+      denseCaps(),
+      loadSettings({ unifiedKvCache: true, maxConcurrentPredictions: 4, contextLength: 8192 }),
+      gpu(48)
+    );
+    assert.ok(one && four && unified);
+    assert.equal(kvSlotMultiplier({ unifiedKvCache: false, maxConcurrentPredictions: 4 }), 4);
+    assert.equal(four.kvBytes, one.kvBytes * 4);
+    assert.equal(unified.kvBytes, one.kvBytes);
   });
 });

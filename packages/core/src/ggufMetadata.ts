@@ -467,7 +467,8 @@ export function readModelCapabilities(filePath: string): ModelCapabilities {
   ) {
     slidingWindowPattern = resolveSlidingWindowPattern(4, blockCount);
   }
-  const fullAttentionInterval = pickArchNumber("full_attention_interval");
+  const fullAttentionInterval =
+    pickArchNumber("full_attention_interval") || pickArchNumber("layer_group_size");
   let recurrentLayers = pickArchBoolArray(
     "attention.recurrent_layers",
     "attention.is_recurrent",
@@ -477,6 +478,17 @@ export function readModelCapabilities(filePath: string): ModelCapabilities {
   // when GGUF doesn't store an explicit array (llama.cpp does the same).
   if ((!recurrentLayers || recurrentLayers.length !== blockCount) && fullAttentionInterval && fullAttentionInterval > 1) {
     recurrentLayers = Array.from({ length: blockCount }, (_, i) => (i + 1) % fullAttentionInterval !== 0);
+  }
+  // Ling / bailingmoe3: KDA layers are stored as n_kv=0, MLA as n_kv=1. Treating
+  // 0 as "one head" (or as the model's 16 Q-heads) inflates KV by ~10–50×.
+  if (
+    (!recurrentLayers || recurrentLayers.length !== blockCount) &&
+    attentionHeadCountKvPerLayer &&
+    attentionHeadCountKvPerLayer.length === blockCount &&
+    attentionHeadCountKvPerLayer.some((n) => n <= 0) &&
+    attentionHeadCountKvPerLayer.some((n) => n > 0)
+  ) {
+    recurrentLayers = attentionHeadCountKvPerLayer.map((n) => n <= 0);
   }
   const expertCount = pickArchNumber("expert_count");
   const expertUsedCount = pickArchNumber("expert_used_count");

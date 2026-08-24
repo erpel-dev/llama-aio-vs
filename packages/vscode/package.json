@@ -2,7 +2,7 @@
   "name": "llama-aio-vs",
   "displayName": "Llama AIO",
   "description": "All-in-one local llama.cpp for VS Code: install, HF models, LM Studio-style settings, shared server, Copilot Chat provider.",
-  "version": "0.1.12",
+  "version": "0.1.13",
   "publisher": "erpel-dev",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -119,11 +119,42 @@
         }
       ]
     },
+    "icons": {
+      "llama-aio-model": {
+        "description": "Llama head icon shown next to Llama AIO models in the chat model picker.",
+        "default": {
+          "fontPath": "./media/llama-aio-model.woff2",
+          "fontCharacter": "\\E001"
+        }
+      }
+    },
     "languageModelChatProviders": [
       {
         "vendor": "llama-aio",
         "displayName": "Llama AIO (llama.cpp)",
         "managementCommand": "llamaAio.openSettings"
+      }
+    ],
+    "languageModelTools": [
+      {
+        "name": "wikipedia_lookup",
+        "displayName": "Wikipedia lookup",
+        "modelDescription": "Look up a topic on English Wikipedia and return the lead section. Use for facts, people, history, science, and general knowledge a small model may not know. Pass a search query, not a URL. Do not use for source code, APIs, or workspace files.",
+        "userDescription": "Search English Wikipedia and return the lead of the best matching article.",
+        "toolReferenceName": "wikipedia",
+        "canBeReferencedInPrompt": true,
+        "icon": "$(book)",
+        "when": "llamaAio.wikipediaLookup",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string",
+              "description": "Search query or article title, e.g. Ada Lovelace"
+            }
+          },
+          "required": ["query"]
+        }
       }
     ]
   },

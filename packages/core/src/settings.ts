@@ -189,6 +189,10 @@ export class SettingsStore {
     return this.getConfig().get<boolean>("promptReplacementsEnabled", true);
   }
 
+  isWikipediaLookupEnabled(): boolean {
+    return this.getConfig().get<boolean>("wikipediaLookupEnabled", false);
+  }
+
   /** Configured replacements file, falling back to the bundled defaults. */
   getPromptReplacementsFile(): string {
     const override = (this.getConfig().get<string>("promptReplacementsFile", "") || "").trim();

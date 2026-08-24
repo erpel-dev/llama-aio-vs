@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor">
+  <!-- Filled llama head for the Copilot/Cursor model picker (icon font glyph). -->
+  <!-- Ears (same winding as the head so they fill). -->
+  <path d="M9.15 8.7 L11.35 7.85 L5.85 2.15 Z"/>
+  <path d="M14.85 8.7 L18.15 2.15 L12.65 7.85 Z"/>
+  <!-- Head + neck -->
+  <path d="
+    M12 5.05
+    c-2.9 0-5.25 2.4-5.25 5.45
+    c0 1.48.55 2.75 1.42 3.68
+    c.4.42.6.98.6 1.55
+    v2.2
+    c0 .75.6 1.35 1.35 1.35
+    h3.76
+    c.75 0 1.35-.6 1.35-1.35
+    v-2.2
+    c0-.57.2-1.13.6-1.55
+    C16.7 13.25 17.25 12 17.25 10.5
+    c0-3.05-2.35-5.45-5.25-5.45
+    z"/>
+  <!-- Eye holes: opposite winding from the head so they punch through. -->
+  <path d="M9.1 10.45 a 1.05 1.05 0 1 1 2.1 0 a 1.05 1.05 0 1 1 -2.1 0"/>
+  <path d="M12.8 10.45 a 1.05 1.05 0 1 1 2.1 0 a 1.05 1.05 0 1 1 -2.1 0"/>
+</svg>

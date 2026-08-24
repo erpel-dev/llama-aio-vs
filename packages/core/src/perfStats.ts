@@ -437,7 +437,9 @@ export class PerfStats {
         lines.push("");
       }
     } else {
-      lines.push("_(none matched `<tool_call><function=…>` / `<parameter=…>`)_");
+      lines.push(
+        "_(none matched `<tool_call>` XML — Hermes `<function=` / Cursor `<arg_key>` / `<arg_value>`)_"
+      );
       lines.push("");
     }
 

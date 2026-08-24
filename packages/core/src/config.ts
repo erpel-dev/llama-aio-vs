@@ -33,6 +33,8 @@ export interface AppPreferences {
   promptReplacementsEnabled: boolean;
   /** Empty means the defaults bundled with the core package. */
   promptReplacementsFile: string;
+  /** Off by default: Copilot may call wikipedia_lookup for encyclopedic facts. */
+  wikipediaLookupEnabled: boolean;
 }
 
 /** Model selection plus the tuning that gets turned into llama-server flags. */
@@ -62,6 +64,7 @@ export const DEFAULT_APP_PREFERENCES: AppPreferences = {
   launchMode: "externalTerminal",
   promptReplacementsEnabled: true,
   promptReplacementsFile: "",
+  wikipediaLookupEnabled: false,
 };
 
 /**
@@ -95,6 +98,7 @@ function normalizePreferences(raw: Partial<AppPreferences> | undefined): AppPref
       str(src.launchMode, DEFAULT_APP_PREFERENCES.launchMode) || DEFAULT_APP_PREFERENCES.launchMode,
     promptReplacementsEnabled: src.promptReplacementsEnabled !== false,
     promptReplacementsFile: str(src.promptReplacementsFile, ""),
+    wikipediaLookupEnabled: src.wikipediaLookupEnabled === true,
   };
 }
 

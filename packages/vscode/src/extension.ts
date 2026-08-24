@@ -25,6 +25,7 @@ import * as vscode from "vscode";
 import { LlamaAioChatProvider } from "./chatProvider";
 import { promptUseInCopilotChat } from "./copilotChatPrompt";
 import { browseAndDownloadModel, downloadStarterModel, HuggingFaceClient } from "./huggingFace";
+import { WikipediaLookupTool, syncWikipediaLookupContext, WIKIPEDIA_LOOKUP_TOOL_NAME } from "./wikipediaTool";
 
 let chatProvider: LlamaAioChatProvider | undefined;
 
@@ -628,6 +629,18 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
     vscode.lm.registerLanguageModelChatProvider("llama-aio", chatProvider)
   );
+  try {
+    context.subscriptions.push(
+      vscode.lm.registerTool(WIKIPEDIA_LOOKUP_TOOL_NAME, new WikipediaLookupTool(store))
+    );
+  } catch (e) {
+    console.warn(
+      "Llama AIO: Wikipedia lookup tool was not registered:",
+      e instanceof Error ? e.message : e
+    );
+  }
+  syncWikipediaLookupContext(store);
+  context.subscriptions.push(store.onDidChange(() => syncWikipediaLookupContext(store)));
 
   context.subscriptions.push(
     store.onDidChangeExternally(() => {

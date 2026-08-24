@@ -13,8 +13,8 @@ export function normalizeGpuSplitMode(
 }
 
 /**
- * Parse llama.cpp `--tensor-split` ("3,1" / "0.75,0.25") into ≥2 positive numbers.
- * Invalid or a single value → [] (omit the flag; llama.cpp splits by VRAM).
+ * Parse llama.cpp `--tensor-split` ("3,1" / "0.75,0.25" / "70,0,30").
+ * Zeros are allowed (no layers on that device). Invalid or a single value → [].
  */
 export function parseTensorSplit(raw: unknown): number[] {
   if (typeof raw !== "string") {
@@ -27,9 +27,9 @@ export function parseTensorSplit(raw: unknown): number[] {
   const parts = s
     .split(/[,/;:\s]+/)
     .map((p) => Number(p))
-    .filter((n) => Number.isFinite(n) && n > 0)
+    .filter((n) => Number.isFinite(n) && n >= 0)
     .slice(0, 8);
-  return parts.length >= 2 ? parts : [];
+  return parts.length >= 2 && parts.some((n) => n > 0) ? parts : [];
 }
 
 /** Canonical "3,1" / "0.75,0.25", or "" if empty/invalid. */
@@ -71,7 +71,9 @@ export function tensorSplitShares(
     totals.push(0);
   }
   const sum = totals.reduce((a, b) => a + b, 0);
-  if (sum <= 0) {
+  // A 0-byte probe (common while llama-server holds Vulkan) must not dump 100%
+  // of weights onto the other card — that is the false "138% on GPU 0" warning.
+  if (sum <= 0 || totals.some((b) => b <= 0)) {
     return Array.from({ length: n }, () => 1 / n);
   }
   return totals.map((b) => b / sum);
@@ -200,6 +202,111 @@ export function tensorSplitForMainShare(
     return base + extra;
   });
   return percents.join(",");
+}
+
+/**
+ * Canonical `--tensor-split` from per-device fractions (device order).
+ * Zeros are kept so a 3-GPU "70,0,30" does not collapse to two parts.
+ */
+export function tensorSplitFromFractions(fractions: number[]): string {
+  const n = fractions.length;
+  if (n < 2) {
+    return "";
+  }
+  const safe = fractions.map((f) => (Number.isFinite(f) && f > 0 ? f : 0));
+  const sum = safe.reduce((a, b) => a + b, 0);
+  if (sum <= 0) {
+    return "";
+  }
+  const raw = safe.map((f) => (f / sum) * 100);
+  const percents = raw.map((p) => Math.floor(p));
+  let rem = 100 - percents.reduce((a, b) => a + b, 0);
+  // Remainder goes only to devices that already have a share so zeros stay zero.
+  const order = percents
+    .map((p, i) => ({ i, frac: raw[i]! - p, raw: raw[i]! }))
+    .filter((x) => x.raw > 0)
+    .sort((a, b) => b.frac - a.frac);
+  for (let k = 0; k < rem && order.length; k++) {
+    const idx = order[k % order.length]?.i;
+    if (idx !== undefined) {
+      percents[idx] = (percents[idx] || 0) + 1;
+    }
+  }
+  return percents.join(",");
+}
+
+/**
+ * Keep relative shares among non-Main devices (including zeros) while moving
+ * Main’s fraction. Used to walk a neighborhood around a capacity-aware seed.
+ */
+export function retargetTensorSplitMainShare(
+  tensorSplit: string,
+  mainGpu: number,
+  newMainShare: number
+): string {
+  const parts = parseTensorSplit(tensorSplit);
+  if (parts.length < 2) {
+    return "";
+  }
+  const n = parts.length;
+  const main = clampMainGpuIndex(mainGpu, n);
+  const sum = parts.reduce((a, b) => a + b, 0);
+  if (sum <= 0) {
+    return "";
+  }
+  const shares = parts.map((p) => p / sum);
+  const oldMain = shares[main] || 0;
+  const othersTotal = Math.max(0, 1 - oldMain);
+  const target = Math.min(0.95, Math.max(0.05, newMainShare));
+  const newOthers = Math.max(0, 1 - target);
+  const next = shares.map((s, i) => {
+    if (i === main) {
+      return target;
+    }
+    return othersTotal > 0 ? (s / othersTotal) * newOthers : 0;
+  });
+  return tensorSplitFromFractions(next);
+}
+
+/**
+ * Fill Main first up to (VRAM − headroom − extras), then remaining cards
+ * back-to-front (llama.cpp layer assignment). Returns "" when a split cannot
+ * be expressed (one GPU). Caller still has to check willSpill.
+ */
+export function capacityAwareTensorSplit(
+  vramBytes: number[],
+  mainGpu: number,
+  extrasOnMain: number,
+  weightsPlusKv: number,
+  headroomBytes: number
+): string {
+  const n = clampGpuCount(vramBytes.length);
+  if (n < 2) {
+    return "";
+  }
+  const main = clampMainGpuIndex(mainGpu, n);
+  const usable = vramBytes.slice(0, n).map((cap) => Math.max(0, cap - Math.max(0, headroomBytes)));
+  while (usable.length < n) {
+    usable.push(0);
+  }
+  usable[main] = Math.max(0, (usable[main] || 0) - Math.max(0, extrasOnMain));
+  const need = Math.max(0, weightsPlusKv);
+  if (need <= 0) {
+    return tensorSplitFromFractions(usable.map((u) => u || 0));
+  }
+  const alloc = Array.from({ length: n }, () => 0);
+  const takeMain = Math.min(usable[main] || 0, need);
+  alloc[main] = takeMain;
+  let remain = need - takeMain;
+  for (let i = n - 1; i >= 0 && remain > 0; i--) {
+    if (i === main) {
+      continue;
+    }
+    const take = Math.min(usable[i] || 0, remain);
+    alloc[i] = take;
+    remain -= take;
+  }
+  return tensorSplitFromFractions(alloc);
 }
 
 /**

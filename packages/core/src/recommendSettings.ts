@@ -1,31 +1,92 @@
 import { detectGpuMemory, detectGpus, GpuMemoryInfo } from "./gpuInfo";
-import { tensorSplitForMainShare } from "./gpuSplit";
+import {
+  capacityAwareTensorSplit,
+  mainShareFromSplit,
+  parseTensorSplit,
+  retargetTensorSplitMainShare,
+  tensorSplitForMainShare,
+} from "./gpuSplit";
 import { ModelCapabilities } from "./ggufMetadata";
-import { estimateMemory, MemoryEstimate } from "./memoryEstimate";
+import { estimateMemory, MemoryEstimate, VRAM_HEADROOM_BYTES } from "./memoryEstimate";
 import { isMtpDraftFileName } from "./modelLibrary";
 import { LlamaLoadSettings, recommendedMaxDraftTokens, speculativeUsesDflash, speculativeUsesNgram } from "./types";
 
 const GiB = 1024 ** 3;
 /** Prefer this context when the model allows it. */
 export const PREFERRED_CONTEXT = 65536;
-/** Keep at least this much VRAM unused (estimate vs GPU total). */
-export const VRAM_HEADROOM_BYTES = 2 * GiB;
-
-/** Main-GPU weight shares to try when fitting a dual-GPU split (device-order). */
-const DUAL_GPU_MAIN_SHARES = [0.5, 0.55, 0.6, 0.65, 0.7, 0.45, 0.4, 0.35, 0.3];
+/** Floor for the “fit largest context” search (and CUDA-style alignment). */
+export const FIT_CONTEXT_MIN = 8192;
+export const FIT_CONTEXT_ALIGN = 256;
 
 export interface RecommendOptions {
   cpuOnly?: boolean;
   gpu?: GpuMemoryInfo;
   /** All detected GPUs. When ≥2, recommend a tensor split before spilling to RAM. */
   gpus?: GpuMemoryInfo[];
-  /** Target free VRAM; default 2 GiB (single GPU). Dual GPU uses per-card 92% like the bars. */
+  /** Target free VRAM vs total; default 2 GiB on every card. */
   headroomBytes?: number;
   preferredContext?: number;
 }
 
 function targetContext(caps: ModelCapabilities, preferred: number): number {
   return Math.min(Math.max(512, preferred), Math.max(512, caps.maxContextLength || preferred));
+}
+
+function alignContext(n: number): number {
+  return Math.max(FIT_CONTEXT_ALIGN, Math.floor(n / FIT_CONTEXT_ALIGN) * FIT_CONTEXT_ALIGN);
+}
+
+/**
+ * Largest context in [8192, model max] (aligned to 256) whose estimate stays
+ * inside the 2 GiB per-card headroom. Falls back to 8192 (or the model max if
+ * smaller) when even that spills. With no VRAM info, returns the agent default.
+ */
+export function fittingContextLength(
+  caps: ModelCapabilities,
+  settings: LlamaLoadSettings,
+  options: RecommendOptions = {}
+): number {
+  const maxCtx = Math.max(1, caps.maxContextLength || PREFERRED_CONTEXT);
+  const high = Math.min(maxCtx, alignContext(maxCtx));
+  const lowMin = Math.min(FIT_CONTEXT_MIN, high);
+  const cpuOnly = !!options.cpuOnly;
+  const gpus = resolveGpus(options);
+  const gpu = gpus[0] || options.gpu || detectGpuMemory();
+  if (cpuOnly || !gpu?.totalBytes) {
+    return Math.min(PREFERRED_CONTEXT, maxCtx);
+  }
+
+  const fits = (ctx: number): boolean => {
+    const est = estimateFor(caps, { ...settings, contextLength: ctx }, gpu, cpuOnly, gpus);
+    return !!est && !est.willSpill;
+  };
+
+  if (fits(high)) {
+    return high;
+  }
+  if (!fits(lowMin)) {
+    return lowMin;
+  }
+
+  let lo = lowMin;
+  let hi = high;
+  let best = lowMin;
+  while (lo <= hi) {
+    let mid = alignContext(Math.floor((lo + hi) / 2));
+    if (mid < lo) {
+      mid = lo;
+    }
+    if (mid > hi) {
+      break;
+    }
+    if (fits(mid)) {
+      best = mid;
+      lo = mid + FIT_CONTEXT_ALIGN;
+    } else {
+      hi = mid - FIT_CONTEXT_ALIGN;
+    }
+  }
+  return Math.min(best, maxCtx);
 }
 
 function resolveGpus(options: RecommendOptions): GpuMemoryInfo[] {
@@ -36,19 +97,6 @@ function resolveGpus(options: RecommendOptions): GpuMemoryInfo[] {
     return [options.gpu];
   }
   return detectGpus().filter((g) => g.totalBytes > 0);
-}
-
-function peakOccupancy(est: MemoryEstimate): number {
-  const charts = [est.charts.vram, est.charts.vram2].filter(
-    (c): c is NonNullable<typeof c> => !!c
-  );
-  let peak = 0;
-  for (const c of charts) {
-    if (c.capacityBytes && c.capacityBytes > 0) {
-      peak = Math.max(peak, c.totalBytes / c.capacityBytes);
-    }
-  }
-  return peak;
 }
 
 function estimateFor(
@@ -180,11 +228,50 @@ function recommendSpeculative(current: LlamaLoadSettings, caps: ModelCapabilitie
 }
 
 /**
- * Full GPU offload with a tensor split that fills both cards. Prefers the most
- * even peak occupancy, then more weight on the Main GPU. Undefined if every
- * split still spills — caller then drops layers / raises --n-cpu-moe.
+ * Bytes parked on `--main-gpu` (compute overhead, CLIP, speculative extra).
+ * Weights + KV are tensor-split; these are not.
  */
-function fitDualGpuFullOffload(
+function mainParkedBytes(est: MemoryEstimate, settings: LlamaLoadSettings): number {
+  const vision =
+    est.layersOnGpu > 0 &&
+    (est.mmprojFileSizeBytes || 0) > 0 &&
+    settings.mmprojOffloadToGpu !== false
+      ? est.mmprojFileSizeBytes || 0
+      : 0;
+  const draftGpu = est.draftGpuWeightsBytes || 0;
+  const draftKv = draftGpu > 0 ? est.draftKvBytes || 0 : 0;
+  const mtpKv = est.kvOnGpu ? est.mtpKvBytes || 0 : 0;
+  return est.gpuOverheadBytes + vision + draftGpu + draftKv + mtpKv;
+}
+
+function splitableGpuBytes(est: MemoryEstimate): number {
+  return est.gpuWeightsBytes + (est.kvOnGpu ? est.kvBytes : 0);
+}
+
+function vramTotals(gpus: GpuMemoryInfo[]): number[] {
+  return gpus.map((g) => g.totalBytes);
+}
+
+function uniqueSplits(splits: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const s of splits) {
+    if (!s || seen.has(s)) {
+      continue;
+    }
+    seen.add(s);
+    out.push(s);
+  }
+  return out;
+}
+
+/**
+ * Full GPU offload with a tensor split that fills Main first (CLIP / MTP / compute
+ * already live there), then remaining cards back-to-front. Neighborhood-walks
+ * Main’s share if the capacity seed still spills. Undefined if every split
+ * still spills — caller then drops layers / raises --n-cpu-moe.
+ */
+function fitMultiGpuFullOffload(
   base: LlamaLoadSettings,
   caps: ModelCapabilities,
   gpu: GpuMemoryInfo,
@@ -200,35 +287,55 @@ function fitDualGpuFullOffload(
     splitMode: "layer",
     mainGpu,
   };
-  let best: { settings: LlamaLoadSettings; peak: number; share: number } | undefined;
-  for (const share of DUAL_GPU_MAIN_SHARES) {
-    const candidate = {
-      ...withAll,
-      tensorSplit: tensorSplitForMainShare(share, mainGpu, n),
-    };
-    const est = estimateFor(caps, candidate, gpu, false, gpus);
-    if (!est || est.willSpill) {
-      continue;
-    }
-    if (!fitsHeadroom(caps, candidate, gpu, false, headroom, gpus)) {
-      continue;
-    }
-    const peak = peakOccupancy(est);
-    if (
-      !best ||
-      peak < best.peak - 0.005 ||
-      (Math.abs(peak - best.peak) <= 0.005 && share > best.share)
-    ) {
-      best = { settings: candidate, peak, share };
+  const probe = estimateFor(caps, { ...withAll, tensorSplit: "", splitMode: "layer" }, gpu, false, gpus);
+  if (!probe) {
+    return undefined;
+  }
+  const extras = mainParkedBytes(probe, withAll);
+  const splitable = splitableGpuBytes(probe);
+  const vram = vramTotals(gpus);
+  const usableMain = Math.max(0, (vram[mainGpu] || 0) - Math.max(0, headroom) - extras);
+  if (splitable <= usableMain && fitsHeadroom(caps, { ...withAll, splitMode: "none", tensorSplit: "" }, gpu, false, headroom, gpus)) {
+    return { ...withAll, splitMode: "none", tensorSplit: "" };
+  }
+
+  const seed = capacityAwareTensorSplit(vram, mainGpu, extras, splitable, headroom);
+  const seedShare = seed ? mainShareFromSplit(seed, mainGpu, n, vram) : 0.5;
+  const neighborhood: string[] = [];
+  if (seed) {
+    neighborhood.push(seed);
+    for (const delta of [0.05, -0.05, 0.1, -0.1, 0.15, -0.15, 0.2, -0.2, 0.25, -0.25, 0.3, -0.3]) {
+      const next = retargetTensorSplitMainShare(seed, mainGpu, seedShare + delta);
+      if (next) {
+        neighborhood.push(next);
+      }
     }
   }
-  return best?.settings;
+  for (const share of [0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6, 0.55, 0.5, 0.45, 0.4, 0.35, 0.3]) {
+    neighborhood.push(tensorSplitForMainShare(share, mainGpu, n));
+  }
+
+  for (const tensorSplit of uniqueSplits(neighborhood)) {
+    if (parseTensorSplit(tensorSplit).length < 2) {
+      continue;
+    }
+    const candidate = { ...withAll, tensorSplit, splitMode: "layer" as const };
+    if (fitsHeadroom(caps, candidate, gpu, false, headroom, gpus)) {
+      const shares = parseTensorSplit(tensorSplit);
+      const others = shares.reduce((sum, v, i) => sum + (i === mainGpu ? 0 : v), 0);
+      if (others <= 0) {
+        return { ...withAll, splitMode: "none", tensorSplit: "" };
+      }
+      return candidate;
+    }
+  }
+  return undefined;
 }
 
 /**
  * Pick context / GPU offload / CPU MoE / speculative defaults from model + VRAM.
  *
- * - Dual GPU: split across cards first (full -ngl); only then RAM / --n-cpu-moe
+ * - Dual/N GPU: full -ngl, fill Main first (capacity-aware), remainder on the other cards; only then RAM / --n-cpu-moe
  * - MoE: full GPU offload, minimal --n-cpu-moe that leaves headroom
  * - Dense: max layers that leave headroom
  * - CPU backend: context + speculative only (GPU settings left alone; start path forces -ngl 0)
@@ -293,18 +400,32 @@ function fitOffload(
   headroom: number
 ): LlamaLoadSettings {
   if (gpus.length >= 2) {
-    const splitFit = fitDualGpuFullOffload(base, caps, gpu, gpus, headroom);
+    const splitFit = fitMultiGpuFullOffload(base, caps, gpu, gpus, headroom);
     if (splitFit) {
       return splitFit;
     }
-    // Both cards still too small for the whole model — keep a VRAM-proportional
+    // Cards still too small for the whole model — keep a capacity-aware
     // split and spill the remainder to RAM (layers or MoE experts).
-    const mainGpu = base.mainGpu || 0;
-    const vramSum = gpus.reduce((a, g) => a + g.totalBytes, 0);
-    const mainShare = vramSum > 0 ? (gpus[mainGpu]?.totalBytes ?? 0) / vramSum : 0.5;
+    const mainGpu = Math.min(Math.max(0, base.mainGpu || 0), gpus.length - 1);
+    const probe = estimateFor(
+      caps,
+      { ...base, gpuOffload: 99, nCpuMoe: 0, splitMode: "layer", mainGpu },
+      gpu,
+      false,
+      gpus
+    );
+    const extras = probe ? mainParkedBytes(probe, base) : 0;
+    const splitable = probe ? splitableGpuBytes(probe) : 0;
+    const seeded = capacityAwareTensorSplit(vramTotals(gpus), mainGpu, extras, splitable, headroom);
     base = {
       ...base,
-      tensorSplit: tensorSplitForMainShare(mainShare, mainGpu, gpus.length),
+      tensorSplit: seeded || tensorSplitForMainShare(
+        gpus.reduce((a, g) => a + g.totalBytes, 0) > 0
+          ? (gpus[mainGpu]?.totalBytes ?? 0) / gpus.reduce((a, g) => a + g.totalBytes, 0)
+          : 0.5,
+        mainGpu,
+        gpus.length
+      ),
       splitMode: "layer",
     };
   }

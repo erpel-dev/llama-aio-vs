@@ -22,6 +22,7 @@ import {
 } from "@opentui/core";
 import {
   estimateMemory,
+  fittingContextLength,
   formatBytes,
   formatGpuDeviceLabel,
   formatLicenseQuickPick,
@@ -198,10 +199,6 @@ const LOAD_PRESETS: Record<
     cacheTypeV: "q8_0",
   },
 };
-
-const FIT_CONTEXT_STEPS = [
-  262144, 196608, 163840, 131072, 98304, 65536, 49152, 32768, 24576, 16384, 8192,
-];
 
 function shortPath(p: string, max = 56): string {
   if (!p) {
@@ -2011,26 +2008,8 @@ export async function runApp(services: AppServices): Promise<void> {
     }
     const cpuOnly = services.installer.resolveActiveUiBackend() === "cpu";
     const gpus = cpuOnly ? [] : detectGpus(false, services.processManager.resolveBinary());
-    if (cpuOnly || !gpus.length) {
-      return Math.min(65536, maxCtx);
-    }
     const gpu = gpus[0];
-    let best = 0;
-    for (const step of FIT_CONTEXT_STEPS) {
-      const ctx = Math.min(step, maxCtx);
-      if (ctx < 8192) {
-        continue;
-      }
-      const est = estimateMemory(caps, { ...load, contextLength: ctx }, gpu, {
-        cpuOnly,
-        gpus,
-      });
-      if (est && !est.willSpill) {
-        best = ctx;
-        break;
-      }
-    }
-    return best || Math.min(8192, maxCtx);
+    return fittingContextLength(caps, { ...load, contextLength: maxCtx }, { cpuOnly, gpu, gpus });
   }
 
   async function applyPreset(id: string): Promise<void> {

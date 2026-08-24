@@ -4,6 +4,7 @@ import {
   gpuModelTokens,
   orderGpusLikeLlama,
   parseLlamaListDevices,
+  preferStableGpuList,
   type GpuMemoryInfo,
 } from "../src/gpuInfo";
 
@@ -59,5 +60,44 @@ describe("orderGpusLikeLlama", () => {
     assert.equal(ordered[1]?.llamaDeviceId, "Vulkan1");
     assert.match(ordered[1]?.name || "", /9060/);
     assert.equal(ordered[1]?.index, 1);
+  });
+
+  it("keeps sysfs VRAM when --list-devices reports 0 MiB", () => {
+    const pci: GpuMemoryInfo[] = [
+      { totalBytes: 16e9, name: "Radeon RX 9070 XT", source: "sysfs", pciSlot: "0000:2a:00.0" },
+      { totalBytes: 16e9, name: "Radeon RX 9060 XT", source: "sysfs", pciSlot: "0000:27:00.0" },
+    ];
+    const listed = parseLlamaListDevices(`
+Available devices:
+  Vulkan0: AMD Radeon RX 9070 XT (RADV GFX1201) (0 MiB, 0 MiB free)
+  Vulkan1: AMD Radeon RX 9060 XT (RADV GFX1200) (0 MiB, 0 MiB free)
+`);
+    const ordered = orderGpusLikeLlama(pci, listed);
+    assert.equal(ordered[0]?.totalBytes, 16e9);
+    assert.equal(ordered[1]?.totalBytes, 16e9);
+  });
+});
+
+describe("preferStableGpuList", () => {
+  const two: GpuMemoryInfo[] = [
+    { totalBytes: 16e9, name: "RX 9070 XT", source: "sysfs", llamaDeviceId: "Vulkan0" },
+    { totalBytes: 16e9, name: "RX 9060 XT", source: "sysfs", llamaDeviceId: "Vulkan1" },
+  ];
+
+  it("keeps the previous dual-GPU list when a re-probe drops a card", () => {
+    const next = [{ totalBytes: 16e9, name: "RX 9070 XT", source: "sysfs", llamaDeviceId: "Vulkan0" }];
+    const kept = preferStableGpuList(next, two);
+    assert.equal(kept.length, 2);
+    assert.equal(kept[1]?.llamaDeviceId, "Vulkan1");
+  });
+
+  it("keeps llama.cpp ids when the next probe has none", () => {
+    const next: GpuMemoryInfo[] = [
+      { totalBytes: 16e9, name: "RX 9070 XT", source: "sysfs" },
+      { totalBytes: 16e9, name: "RX 9060 XT", source: "sysfs" },
+    ];
+    const kept = preferStableGpuList(next, two);
+    assert.equal(kept[0]?.llamaDeviceId, "Vulkan0");
+    assert.equal(kept[1]?.llamaDeviceId, "Vulkan1");
   });
 });
