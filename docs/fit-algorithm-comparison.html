@@ -1,0 +1,606 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Fit algorithms — llama.cpp vs Llama AIO</title>
+  <style>
+    :root {
+      --bg: #101218;
+      --bg-2: #161922;
+      --card: #1c2030;
+      --line: #2a3144;
+      --text: #e6e9f0;
+      --muted: #8d96ab;
+      --cpp: #3ecf8e;
+      --cpp-dim: rgba(62, 207, 142, 0.14);
+      --aio: #6ea8fe;
+      --aio-dim: rgba(110, 168, 254, 0.14);
+      --keep: #7ee0b0;
+      --fix: #f0b429;
+      --fix-dim: rgba(240, 180, 41, 0.12);
+      --bad: #ff7a7a;
+      --mono: ui-monospace, "Cascadia Code", "SF Mono", Menlo, monospace;
+      --sans: "Segoe UI", system-ui, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      font-family: var(--sans);
+      background:
+        radial-gradient(1200px 500px at 10% -10%, #1a2438 0%, transparent 55%),
+        radial-gradient(900px 400px at 100% 0%, #14261e 0%, transparent 50%),
+        var(--bg);
+      color: var(--text);
+      line-height: 1.55;
+    }
+    a { color: var(--aio); }
+    code, kbd {
+      font-family: var(--mono);
+      font-size: 0.88em;
+      background: #0d1018;
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      padding: 0.08em 0.38em;
+    }
+    header.hero {
+      max-width: 1120px;
+      margin: 0 auto;
+      padding: 48px 24px 28px;
+    }
+    header.hero p.kicker {
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      font-size: 12px;
+      color: var(--muted);
+      margin: 0 0 10px;
+    }
+    h1 { font-size: clamp(28px, 4vw, 44px); letter-spacing: -0.03em; margin: 0 0 12px; }
+    .lede { font-size: 18px; color: #c5cad6; max-width: 72ch; }
+    nav.toc {
+      position: sticky; top: 0; z-index: 5;
+      backdrop-filter: blur(10px);
+      background: rgba(16, 18, 24, 0.86);
+      border-bottom: 1px solid var(--line);
+    }
+    nav.toc ul {
+      max-width: 1120px; margin: 0 auto; padding: 10px 24px;
+      display: flex; gap: 18px; flex-wrap: wrap; list-style: none;
+    }
+    nav.toc a { color: var(--muted); text-decoration: none; font-size: 13px; }
+    nav.toc a:hover { color: var(--text); }
+    main { max-width: 1120px; margin: 0 auto; padding: 28px 24px 80px; }
+    section { margin: 48px 0; }
+    h2 { font-size: 26px; letter-spacing: -0.02em; margin: 0 0 14px; }
+    h3 { font-size: 17px; margin: 22px 0 8px; }
+    p { margin: 0 0 12px; }
+    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    @media (max-width: 860px) { .grid-2 { grid-template-columns: 1fr; } }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 18px 18px 14px;
+    }
+    .card.cpp { border-top: 3px solid var(--cpp); }
+    .card.aio { border-top: 3px solid var(--aio); }
+    .card h3 { margin-top: 0; }
+    .tag {
+      display: inline-block; font-size: 11px; font-weight: 700;
+      letter-spacing: 0.08em; text-transform: uppercase;
+      padding: 2px 8px; border-radius: 999px; margin-bottom: 8px;
+    }
+    .tag.cpp { background: var(--cpp-dim); color: var(--cpp); }
+    .tag.aio { background: var(--aio-dim); color: var(--aio); }
+    ol.steps { margin: 0; padding-left: 22px; }
+    ol.steps li { margin: 6px 0; }
+    .table-wrap { overflow-x: auto; border-radius: 12px; }
+    table {
+      width: 100%; border-collapse: collapse; font-size: 14px;
+      background: var(--card); border-radius: 12px; overflow: hidden;
+    }
+    th, td {
+      text-align: left; padding: 10px 12px;
+      border-bottom: 1px solid var(--line); vertical-align: top;
+    }
+    th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; }
+    td.cpp { color: #c8f5dc; }
+    td.aio { color: #d4e6ff; }
+    .verdict { font-weight: 650; }
+    .keep { color: var(--keep); }
+    .fix { color: var(--fix); }
+    .tie { color: var(--muted); }
+    .callout {
+      border-left: 4px solid var(--fix);
+      background: var(--fix-dim);
+      padding: 12px 16px;
+      border-radius: 0 10px 10px 0;
+      margin: 16px 0;
+    }
+    .callout.keep-note { border-left-color: var(--keep); background: rgba(126, 224, 176, 0.08); }
+    .flow {
+      display: flex; flex-direction: column; gap: 8px; font-size: 13px;
+    }
+    .flow .box {
+      background: #12151f; border: 1px solid var(--line);
+      border-radius: 8px; padding: 8px 10px;
+    }
+    .flow .arrow { color: var(--muted); text-align: center; font-size: 12px; }
+    .prio {
+      display: inline-block; min-width: 4.5em; font-family: var(--mono); font-size: 12px;
+      padding: 1px 6px; border-radius: 4px; margin-right: 6px;
+    }
+    .p-high { background: rgba(255, 122, 122, 0.16); color: var(--bad); }
+    .p-med { background: var(--fix-dim); color: var(--fix); }
+    .p-low { background: rgba(141, 150, 171, 0.16); color: var(--muted); }
+    .rec { margin: 0 0 18px; padding-bottom: 16px; border-bottom: 1px solid var(--line); }
+    .rec:last-child { border-bottom: 0; }
+    .src { font-size: 13px; color: var(--muted); }
+    footer { color: var(--muted); font-size: 13px; margin-top: 40px; }
+    .hero-meta { display: flex; gap: 18px; flex-wrap: wrap; color: var(--muted); font-size: 13px; margin-top: 16px; }
+  </style>
+</head>
+<body>
+  <header class="hero">
+    <p class="kicker">Architecture note · Llama AIO</p>
+    <h1>How the two fit algorithms decide what to load</h1>
+    <p class="lede">
+      llama.cpp’s <code>--fit</code> (default on) does dummy allocations against
+      <em>free</em> device memory and rewrites <code>-c</code>, <code>-ngl</code>,
+      <code>--tensor-split</code>, and <code>--override-tensor</code>.
+      Llama AIO always passes <code>--fit off</code> and instead picks those knobs
+      in TypeScript from a GGUF-based estimate, then launches with explicit flags.
+    </p>
+    <div class="hero-meta">
+      <span>llama.cpp <code>common/fit.cpp</code> (master, 2026)</span>
+      <span>Llama AIO <code>recommendSettings.ts</code> + <code>memoryEstimate.ts</code></span>
+    </div>
+  </header>
+
+  <nav class="toc">
+    <ul>
+      <li><a href="#tldr">TL;DR</a></li>
+      <li><a href="#why-off">Why --fit off</a></li>
+      <li><a href="#measure">What they measure</a></li>
+      <li><a href="#pipelines">Pipelines</a></li>
+      <li><a href="#matrix">Matrix</a></li>
+      <li><a href="#examples">Examples</a></li>
+      <li><a href="#keep">Keep</a></li>
+      <li><a href="#better">Do better</a></li>
+    </ul>
+  </nav>
+
+  <main>
+    <section id="tldr">
+      <h2>TL;DR</h2>
+      <p>
+        They solve different jobs. llama.cpp fits <strong>at process start</strong> so a
+        CLI user can omit <code>-ngl</code> and still not OOM. Llama AIO fits
+        <strong>in the UI before start</strong> so the user can see bars, change
+        context / KV types / speculative, and then start with those exact flags.
+      </p>
+      <div class="grid-2">
+        <div class="card cpp">
+          <span class="tag cpp">llama.cpp --fit</span>
+          <h3>Maximize GPU fill, then cut until it fits</h3>
+          <p>Start from “everything on GPU at trained context.” If that overflows, shrink context first (floor <code>--fit-ctx</code>, default 4096), then move tensors to RAM. MoE experts go to CPU before dense attention. Layers can overflow mid-layer onto the next GPU.</p>
+          <p>Budget: <strong>currently free VRAM − 1024 MiB</strong> per device. Accuracy comes from <code>no_alloc</code> dummy loads and the real memory breakdown (model + context + compute).</p>
+        </div>
+        <div class="card aio">
+          <span class="tag aio">Llama AIO recommend</span>
+          <h3>Keep a coding-agent context, then spill weights</h3>
+          <p>Lock context at min(65536, model max). On two+ GPUs, try a tensor split that fully offloads. Only then raise <code>--n-cpu-moe</code> (MoE) or drop <code>-ngl</code> (dense). “Max context” is a separate preset that walks context steps.</p>
+          <p>Budget: <strong>total VRAM</strong> with 2 GiB headroom (one GPU) or 8% free per card (two+). Instant heuristic: file size, KV formula, ~400 MiB + batch overhead.</p>
+        </div>
+      </div>
+      <div class="callout keep-note">
+        <strong>The context-first vs layers-first split is a product choice, not a bug.</strong>
+        llama.cpp will happily drop a 128k window to 4096 to keep weights on GPU.
+        A Copilot-style agent wants the opposite: keep ~64k, accept some CPU experts
+        or a few RAM layers. Do not copy llama.cpp’s reduction order blindly.
+      </div>
+    </section>
+
+    <section id="why-off">
+      <h2>Why Llama AIO always sends <code>--fit off</code></h2>
+      <p>
+        llama.cpp treats <code>-ngl</code>, <code>--tensor-split</code>,
+        <code>--n-cpu-moe</code> / tensor overrides, and an explicit <code>--ctx-size</code>
+        as “user already decided.” If those are set, <code>--fit</code> either
+        aborts (“n_gpu_layers already set”) or refuses to change the allocation.
+        Llama AIO always writes those flags, so a live <code>--fit</code> pass
+        cannot refine them — it only fights the UI.
+      </p>
+      <p>
+        Speculative drafts make it worse: sidecar MTP and DFlash need
+        <code>--fit off</code> or the dummy probe mis-accounts the extra model.
+        That is the same reason the settings help text says auto-fit “breaks DFlash / Gemma 4 MTP.”
+      </p>
+      <p class="src">
+        Source: <code>packages/core/src/serverArgs.ts</code> (comment on <code>--fit off</code>);
+        llama.cpp <code>common_params_fit_impl</code> throws if <code>n_gpu_layers</code>,
+        <code>tensor_split</code>, or <code>tensor_buft_overrides</code> are already set.
+      </p>
+    </section>
+
+    <section id="measure">
+      <h2>What they measure</h2>
+      <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Piece</th>
+            <th>llama.cpp</th>
+            <th>Llama AIO</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>How VRAM is known</td>
+            <td>Backend <code>ggml_backend_dev_memory</code> — <em>free</em> and total at load time</td>
+            <td>sysfs / nvidia-smi / <code>--list-devices</code> — <em>total</em> for the fit; live used is shown but not subtracted</td>
+          </tr>
+          <tr>
+            <td>Weights</td>
+            <td>Dummy <code>llama_model_load</code> with <code>no_alloc</code>, then memory breakdown</td>
+            <td><code>fileSize × (layersOnGpu / nLayers)</code>; MoE subtracts <code>nCpuMoe × moeExpertShare</code></td>
+          </tr>
+          <tr>
+            <td>KV cache</td>
+            <td>Real context buffers at the candidate <code>n_ctx</code> (unified vs streams)</td>
+            <td>Closed-form: GQA, SWA, Gemma SWA dims, hybrid recurrent layers skipped</td>
+          </tr>
+          <tr>
+            <td>Compute / scratch</td>
+            <td>Actual graph from the dummy context</td>
+            <td><code>400 MiB + ubatch×embed×24 + batch×8×1024</code></td>
+          </tr>
+          <tr>
+            <td>Headroom</td>
+            <td><code>--fit-target</code>, default <strong>1024 MiB free per device</strong> (can be a per-GPU list)</td>
+            <td>Single GPU: <strong>2 GiB unused vs total</strong>. Multi GPU: each card &lt; <strong>92% of total</strong></td>
+          </tr>
+          <tr>
+            <td>Draft / MTP / mmproj</td>
+            <td><code>common_fit_extra_model</code> measured at the same <code>n_ctx</code>; <code>shares_model</code> zeros duplicated weights</td>
+            <td>Heuristic extras; MTP adds <code>fileSize × nextn/nLayers</code> on top of the main file; CLIP parked on main GPU</td>
+          </tr>
+          <tr>
+            <td>Multi-GPU split</td>
+            <td>Contiguous layer counts written into <code>--tensor-split</code> (e.g. <code>14,23</code>) plus regex <code>--override-tensor</code> for overflow</td>
+            <td>Percentage string from a 9-point main-GPU share grid, remainder even across the other cards; no tensor overrides</td>
+          </tr>
+        </tbody>
+      </table>
+      </div>
+      <div class="callout keep-note">
+        <strong>Using total VRAM, not free, is correct for this UI.</strong>
+        Recommendations run while a previous llama-server may still own the cards.
+        llama.cpp’s free-memory budget is right <em>at launch after the old process is gone</em>.
+        Subtracting live occupancy here would under-offload every reload.
+      </div>
+    </section>
+
+    <section id="pipelines">
+      <h2>Pipelines</h2>
+      <div class="grid-2">
+        <div class="card cpp">
+          <span class="tag cpp">llama.cpp · common_params_fit_impl</span>
+          <div class="flow">
+            <div class="box">1. Dummy-load at current params. If every device still has ≥ margin free → <strong>return, no change</strong>.</div>
+            <div class="arrow">↓ overflow</div>
+            <div class="box">2. If <code>n_ctx</code> was left at 0: interpolate context between <code>--fit-ctx</code> and trained max (align 256×streams). Multi-GPU subtracts ~½ layer of waste per card. CPU-only: context is the only lever; abort if still too big.</div>
+            <div class="arrow">↓ still short, and user did not set -ngl / -ts / -ot</div>
+            <div class="box">3. MoE: measure “all <code>*_exps</code> on CPU”. If dense-only already fits, there is surplus to spend on experts.</div>
+            <div class="arrow">↓</div>
+            <div class="box">4. Fill <strong>dense (or dense-only) layers back-to-front</strong> with regula falsi: each device gets a contiguous slice; last device keeps a full output layer.</div>
+            <div class="arrow">↓ MoE with surplus</div>
+            <div class="box">5. Convert those dense-only layers to full layers <strong>front-to-back</strong>. Try one extra partial layer: overflow FFN UP / GATE / ATTN to the next GPU or CPU via <code>--override-tensor</code>.</div>
+          </div>
+        </div>
+        <div class="card aio">
+          <span class="tag aio">Llama AIO · recommendLoadSettings</span>
+          <div class="flow">
+            <div class="box">1. Context = min(65536, model max). Enable MTP from GGUF / sidecar; preserve an explicit DFlash setup.</div>
+            <div class="arrow">↓ CPU backend</div>
+            <div class="box">Stop. Leave <code>-ngl</code> / split alone (start path forces <code>-ngl 0</code>).</div>
+            <div class="arrow">↓ GPU</div>
+            <div class="box">2. Two or more GPUs: try main shares 50–70% then 45–30%. Keep the split with lowest peak occupancy (tie → more weight on Main). Require <code>!willSpill</code> (each card &lt; 92%).</div>
+            <div class="arrow">↓ still spills</div>
+            <div class="box">3. Fall back to VRAM-proportional <code>--tensor-split</code>, then the single-GPU path.</div>
+            <div class="arrow">↓</div>
+            <div class="box">4a. <strong>MoE:</strong> <code>-ngl 99</code>, raise <code>--n-cpu-moe</code> from 0 until 2 GiB / 92% headroom.<br>4b. <strong>Dense:</strong> drop <code>-ngl</code> from all layers down to 0.</div>
+            <div class="arrow">↓ if fully on GPU with an extra 1 GiB</div>
+            <div class="box">5. Raise physical batch <code>-ub</code> to 1024 (agent prefill). Never if partial offload or CPU MoE.</div>
+          </div>
+        </div>
+      </div>
+
+      <h3>Max-context preset (AIO only)</h3>
+      <p>
+        Separate from model-select recommend. Walks
+        <code>262144, 196608, 163840, 131072, 98304, 65536, 49152, 32768, 24576, 16384, 8192</code>
+        with KV forced to q8_0 / q4_0, and takes the first step whose estimate does not
+        <code>willSpill</code>. llama.cpp instead linearly interpolates <code>n_ctx</code>
+        between <code>--fit-ctx</code> and trained max using two dummy measurements.
+      </p>
+    </section>
+
+    <section id="matrix">
+      <h2>Capability matrix</h2>
+      <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Behavior</th>
+            <th>llama.cpp</th>
+            <th>Llama AIO</th>
+            <th>Who should win</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Instant UI feedback while dragging sliders</td>
+            <td>No — dummy loads take seconds × GPUs</td>
+            <td>Yes — pure arithmetic</td>
+            <td class="verdict keep">AIO (required)</td>
+          </tr>
+          <tr>
+            <td>Absolute memory accuracy</td>
+            <td>Same numbers as the load</td>
+            <td>Heuristic; overhead and graphs are the weak spot</td>
+            <td class="verdict fix">cpp, unless AIO probes</td>
+          </tr>
+          <tr>
+            <td>Prefer agent context over max VRAM fill</td>
+            <td>No — context is the first thing it cuts</td>
+            <td>Yes — 64k then spill weights</td>
+            <td class="verdict keep">AIO for this product</td>
+          </tr>
+          <tr>
+            <td>MoE: keep dense attn on GPU, experts in RAM</td>
+            <td>Per-tensor <code>-ot</code>, including partial layers</td>
+            <td>Whole-layer <code>--n-cpu-moe</code> only</td>
+            <td class="verdict fix">cpp is finer</td>
+          </tr>
+          <tr>
+            <td>Layer overflow onto the next GPU</td>
+            <td>Yes (ATTN / UP / GATE / MoE fractions)</td>
+            <td>No — whole-layer shares only</td>
+            <td class="verdict fix">cpp on 24 GB cards</td>
+          </tr>
+          <tr>
+            <td>N ≥ 3 GPUs</td>
+            <td>Back-to-front fill, any count</td>
+            <td>Main share + even remainder; named “dual” for a reason</td>
+            <td class="verdict fix">AIO is thin here</td>
+          </tr>
+          <tr>
+            <td>Unequal VRAM (16+8, 32+12)</td>
+            <td>Each device has its own free-margin target</td>
+            <td>Share grid is not VRAM-aware until the spill fallback</td>
+            <td class="verdict fix">Bias the grid by capacity</td>
+          </tr>
+          <tr>
+            <td>Non-unified KV / parallel slots</td>
+            <td><code>n_ctx</code> × streams</td>
+            <td>Ignores <code>-np</code> in the estimate</td>
+            <td class="verdict fix">AIO should multiply KV</td>
+          </tr>
+          <tr>
+            <td>Headroom policy</td>
+            <td>Fixed 1 GiB of <em>free</em></td>
+            <td>2 GiB vs total (1 GPU) or 8% (2+)</td>
+            <td class="verdict tie">Unify; 8% of 80 GB is too shy</td>
+          </tr>
+          <tr>
+            <td>User can still override</td>
+            <td>Any explicit flag disables that axis</td>
+            <td>Recommend once; sliders stay in control</td>
+            <td class="verdict keep">Both, different UX</td>
+          </tr>
+          <tr>
+            <td>Hybrid / SWA / GQA KV</td>
+            <td>Whatever the loaded graph does</td>
+            <td>Explicit formulas (Gemma, Qwen3.5, Muse Glimmer)</td>
+            <td class="verdict keep">AIO is already careful</td>
+          </tr>
+        </tbody>
+      </table>
+      </div>
+    </section>
+
+    <section id="examples">
+      <h2>Same hardware, different answers</h2>
+      <div class="grid-2">
+        <div class="card">
+          <h3>GPT-OSS 120B mxfp4 · 1× 24 GB · want long chat</h3>
+          <p><strong>llama.cpp</strong> (unset <code>-c</code>): drop context toward 4096, keep almost all dense tensors on GPU, park most experts in RAM with <code>-ot</code>. High tok/s, short window.</p>
+          <p><strong>Llama AIO</strong> (Coding agent): keep 64k, <code>-ngl 99</code>, raise <code>--n-cpu-moe</code> until ~2 GiB headroom. Window stays useful; more expert traffic on CPU.</p>
+        </div>
+        <div class="card">
+          <h3>Dense 32B Q4 · 2× 16 GB</h3>
+          <p><strong>llama.cpp</strong>: measure both cards, assign contiguous layer counts (later layers on GPU1 first), maybe overflow one FFN tensor. Context stays at trained max if the two cards hold it.</p>
+          <p><strong>Llama AIO</strong>: try 50/50 … 70/30, pick the even-est peak. Full <code>-ngl 99</code> if the heuristic says neither card spills. If not, proportional split then drop layers — it will not overflow a single layer across the PCIe link.</p>
+        </div>
+      </div>
+    </section>
+
+    <section id="keep">
+      <h2>Keep doing this</h2>
+      <ol>
+        <li><strong>Leave <code>--fit off</code></strong> while the UI owns <code>-ngl</code> / split / MoE / ctx. Turning it on without omitting those flags is a no-op or an abort.</li>
+        <li><strong>Budget against total VRAM</strong> for recommend-on-select. Live used belongs in the “free now” line, not the fit inequality — unless you can exclude this extension’s own server.</li>
+        <li><strong>Prefer 64k then spill weights</strong> for the default / Coding agent path. That is the right bias for Copilot Chat.</li>
+        <li><strong>Keep the cheap estimator in the live bars.</strong> Dummy-loading on every slider tick would freeze the webview.</li>
+        <li><strong>Split-across-GPUs before RAM</strong> on two cards is already the right order, and it matches what users expect from llama.cpp.</li>
+        <li><strong>Raise <code>-ub</code> only when fully GPU-bound.</strong> Partial offload is CPU-bound; a bigger physical batch just wastes VRAM.</li>
+      </ol>
+    </section>
+
+    <section id="better">
+      <h2>Anything you could do better</h2>
+      <p>Ranked by impact on real loads. None of these require copying llama.cpp’s context-first policy.</p>
+
+      <div class="rec">
+        <h3><span class="prio p-high">P1</span> Unify headroom to a fixed GiB, not 8% of a huge card</h3>
+        <p>
+          One GPU requires 2 GiB free vs <em>total</em>. Two GPUs require 8% free per card.
+          On 2× 80 GB that is 6.4 GiB idle per GPU — llama.cpp would happily use all but 1 GiB.
+          On 2× 12 GB, 8% is only ~1 GiB, looser than the single-GPU rule.
+          Use the same rule everywhere: e.g. <code>min(2048 MiB, 8% of total)</code> or llama.cpp’s 1024 MiB, applied to <em>total − estimate</em>.
+        </p>
+        <p class="src"><code>recommendSettings.ts</code> <code>VRAM_HEADROOM_BYTES</code> vs <code>memoryEstimate.ts</code> <code>usableFraction = 0.92</code> and dual <code>fitsHeadroom</code> using <code>willSpill</code>.</p>
+      </div>
+
+      <div class="rec">
+        <h3><span class="prio p-high">P1</span> Emit <code>--override-tensor</code> for MoE instead of only <code>--n-cpu-moe</code></h3>
+        <p>
+          llama.cpp’s win on MoE is not the search — it is the representation.
+          <code>--n-cpu-moe N</code> moves <em>all</em> experts of the first N layers to CPU.
+          <code>-ot blk\.\d+\.ffn_(up|down|gate)_(ch|)exps=CPU</code> keeps every layer’s attention
+          (and often the dense FFN) on GPU and only spills routed experts.
+          For GPT-OSS / Qwen-MoE that is the difference between “24 GB is enough for dense + KV”
+          and “we had to CPU-MoE 20 layers.” You already know <code>moeExpertShare</code> from the GGUF tensor scan;
+          the next step is to generate the same regex llama.cpp uses when the estimate says dense-only fits.
+        </p>
+      </div>
+
+      <div class="rec">
+        <h3><span class="prio p-high">P1</span> Optional ground-truth probe via <code>llama-fit-params</code></h3>
+        <p>
+          Keep the heuristic for live bars. On model select (or a “Calibrate” button), run
+          <code>llama-fit-params</code> with <code>--fit-ctx 65536</code> (or the current target)
+          and <em>without</em> <code>-ngl</code>, then parse the printed
+          <code>-c -ngl -ts -ot</code> back into the form. That is the only way the estimate
+          matches compute-graph scratch, FA vs not, and backend-specific allocators.
+          Map llama.cpp’s context-first result back onto AIO policy: if it cut context below
+          the agent target, restore 64k and convert the extra VRAM need into more CPU experts / fewer layers.
+        </p>
+      </div>
+
+      <div class="rec">
+        <h3><span class="prio p-med">P2</span> Make the multi-GPU search capacity-aware and N-GPU</h3>
+        <p>
+          The share grid <code>[0.50 … 0.70, 0.45 … 0.30]</code> is a dual-GPU even-card heuristic.
+          It does not know that GPU0 is 32 GB and GPU1 is 12 GB until full offload fails.
+          Seed the first candidate with VRAM-proportional shares (what llama.cpp uses when
+          <code>-ts</code> is empty), then search a small neighborhood around that.
+          For 3+ cards, assign contiguous layer counts (back-to-front, like llama.cpp) rather than
+          “main gets S%, everyone else splits the rest evenly.” Put compute + mmproj + draft on Main
+          in the <em>search</em> (you already do in the bars) so Main is not over-filled with weights.
+        </p>
+        <p class="src"><code>fitDualGpuFullOffload</code>, <code>tensorSplitForMainShare</code>.</p>
+      </div>
+
+      <div class="rec">
+        <h3><span class="prio p-med">P2</span> Count parallel slots in KV</h3>
+        <p>
+          llama.cpp multiplies context by <code>n_seq_max</code> when KV is not unified.
+          AIO’s estimate is for one sequence. If a user sets Max concurrent predictions &gt; 1,
+          the bars understate KV and recommend will over-commit. Multiply KV by slots unless
+          <code>--kv-unified</code> is on (unified still grows, but not linearly with slots the same way).
+        </p>
+      </div>
+
+      <div class="rec">
+        <h3><span class="prio p-med">P2</span> Replace max-context steps with a binary search (or interpolation)</h3>
+        <p>
+          Eleven coarse steps jump from 96k to 64k to 48k. The estimate is cheap — binary-search
+          <code>n_ctx</code> between 8192 and model max (align to 256, like CUDA).
+          Optionally expose the found value as “this is the largest that still leaves headroom”
+          instead of snapping to the ladder.
+        </p>
+        <p class="src">Duplicated in <code>settingsView.ts</code> <code>fittingContext</code> and <code>packages/tui/src/app.ts</code> — one function in core would help.</p>
+      </div>
+
+      <div class="rec">
+        <h3><span class="prio p-med">P2</span> Stop double-counting baked-in MTP heads</h3>
+        <p>
+          <code>estimateMtpFootprint</code> adds <code>fileSize × (nextn / nLayers)</code> as extra GPU
+          weights even though those tensors are already in the GGUF size used for the main load.
+          llama.cpp’s extra-model path zeros <code>mb.model</code> when <code>shares_model</code> is set
+          and only adds extra context/compute. Count MTP KV (and any extra compute) but not the heads twice,
+          or the fitter will drop layers / raise CPU-MoE for a cost that is not real.
+        </p>
+      </div>
+
+      <div class="rec">
+        <h3><span class="prio p-low">P3</span> Subtract other processes’ VRAM, not this server’s</h3>
+        <p>
+          You already read <code>usedBytes</code>. If you can tell compositor / browser / a second
+          inference stack apart from the llama-server you are about to replace, subtract only the
+          foreign used. That closes the gap with llama.cpp’s free-memory target without breaking reload.
+        </p>
+      </div>
+
+      <div class="rec">
+        <h3><span class="prio p-low">P3</span> Dense partial-layer overflow on 24 GB</h3>
+        <p>
+          llama.cpp’s “one overflowing layer” exists because a single 70B layer can be several GB,
+          so rounding to whole layers wastes a card. Worth it only if you start emitting <code>-ot</code>;
+          not worth a second heuristic for <code>-ngl</code> alone.
+        </p>
+      </div>
+
+      <div class="rec">
+        <h3><span class="prio p-low">P3</span> Do not copy regula falsi</h3>
+        <p>
+          llama.cpp interpolates layer counts because each probe is a dummy load (seconds).
+          Your estimator is O(layers) arithmetic. Linear search of <code>-ngl</code> and
+          <code>n-cpu-moe</code> is already the right algorithm.
+        </p>
+      </div>
+    </section>
+
+    <section>
+      <h2>Source map</h2>
+      <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Topic</th><th>llama.cpp</th><th>Llama AIO</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Fit entry</td>
+            <td><a href="https://github.com/ggml-org/llama.cpp/blob/master/common/fit.cpp">common/fit.cpp</a> · <code>common_params_fit_impl</code></td>
+            <td><code>packages/core/src/recommendSettings.ts</code> · <code>recommendLoadSettings</code></td>
+          </tr>
+          <tr>
+            <td>Memory numbers</td>
+            <td>Dummy load + <code>llama_get_memory_breakdown</code></td>
+            <td><code>packages/core/src/memoryEstimate.ts</code> · <code>estimateMemory</code></td>
+          </tr>
+          <tr>
+            <td>Multi-GPU shares</td>
+            <td>Layer counts into <code>tensor_split[id]</code></td>
+            <td><code>packages/core/src/gpuSplit.ts</code> · <code>tensorSplitForMainShare</code></td>
+          </tr>
+          <tr>
+            <td>CLI / disable</td>
+            <td><code>--fit</code> / <code>--fit-target</code> / <code>--fit-ctx</code>; tool <code>llama-fit-params</code></td>
+            <td><code>packages/core/src/serverArgs.ts</code> always <code>--fit off</code></td>
+          </tr>
+          <tr>
+            <td>Max context preset</td>
+            <td>Linear interp when <code>n_ctx == 0</code></td>
+            <td><code>fittingContext</code> in VS Code webview and TUI</td>
+          </tr>
+          <tr>
+            <td>Design write-up</td>
+            <td><a href="https://github.com/ggml-org/llama.cpp/discussions/18049">Discussion #18049</a> · <a href="https://github.com/ggml-org/llama.cpp/pull/16653">PR #16653</a></td>
+            <td>This page</td>
+          </tr>
+        </tbody>
+      </table>
+      </div>
+    </section>
+
+    <footer>
+      Comparison of llama.cpp <code>common/fit.cpp</code> (ggml-org, 2026) with Llama AIO’s
+      recommend/estimate path. Open this file in a browser; no build step.
+    </footer>
+  </main>
+</body>
+</html>
