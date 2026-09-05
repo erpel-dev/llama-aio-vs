@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { buildServerArgs, normalizeLoadSettingsForCpuBackend, serverConfigFingerprint } from "../src/serverArgs";
 import { DEFAULT_LOAD_SETTINGS } from "../src/types";
-import { argValue, argValues, loadSettings } from "./helpers";
+import { argValue, argValues, denseCaps, loadSettings, moeCaps } from "./helpers";
 
 const MODEL = "/models/test.gguf";
 const build = (over = {}) => buildServerArgs(MODEL, "127.0.0.1", 8742, loadSettings(over));
@@ -61,6 +61,37 @@ describe("buildServerArgs", () => {
     it("is emitted when forced", () => {
       assert.equal(argValue(build({ flashAttention: "on" }), "--flash-attn"), "on");
       assert.equal(argValue(build({ flashAttention: "off" }), "--flash-attn"), "off");
+    });
+  });
+
+  describe("--lazy-mode", () => {
+    it("is omitted on auto so older builds still start", () => {
+      assert.ok(!build({ lazyMode: "auto" }).includes("--lazy-mode"));
+    });
+    it("is emitted when forced", () => {
+      assert.equal(argValue(build({ lazyMode: "on" }), "--lazy-mode"), "on");
+      assert.equal(argValue(build({ lazyMode: "off" }), "--lazy-mode"), "off");
+    });
+    it("keeps mmap with --n-cpu-moe when lazy is on", () => {
+      const args = build({ nCpuMoe: 6, tryMmap: true, lazyMode: "on" });
+      assert.equal(argValue(args, "--n-cpu-moe"), "6");
+      assert.equal(argValue(args, "--load-mode"), "mmap");
+      assert.equal(argValue(args, "--lazy-mode"), "on");
+    });
+    it("keeps mmap with --n-cpu-moe when auto lazy has a large PLE table", () => {
+      const args = buildServerArgs(
+        MODEL,
+        "127.0.0.1",
+        8742,
+        loadSettings({ nCpuMoe: 24, tryMmap: true, lazyMode: "auto" }),
+        { caps: moeCaps({ architecture: "qwen4exp", fileSizeBytes: 72 * 1024 ** 3, pleShare: 0.4 }) }
+      );
+      assert.equal(argValue(args, "--load-mode"), "mmap");
+      assert.ok(!args.includes("--lazy-mode"));
+    });
+    it("still forces load-mode none for CPU MoE when lazy is off", () => {
+      const args = build({ nCpuMoe: 6, tryMmap: true, lazyMode: "off" });
+      assert.equal(argValue(args, "--load-mode"), "none");
     });
   });
 
@@ -270,10 +301,35 @@ describe("buildServerArgs", () => {
     );
   });
 
+  it("pins PLE n-gram tables to CPU for qwen4exp", () => {
+    const args = buildServerArgs(MODEL, "127.0.0.1", 8742, loadSettings(), {
+      caps: moeCaps({ architecture: "qwen4exp", pleShare: 0.4 }),
+    });
+    assert.equal(argValue(args, "--override-tensor"), "per_layer_token_embd.=CPU");
+  });
+
+  it("does not emit a PLE override for ordinary models", () => {
+    assert.ok(!build().includes("--override-tensor"));
+    const args = buildServerArgs(MODEL, "127.0.0.1", 8742, loadSettings(), {
+      caps: denseCaps(),
+    });
+    assert.ok(!args.includes("--override-tensor"));
+  });
+
   it("loads without mmap when CPU MoE overrides are in use", () => {
     const args = build({ nCpuMoe: 6, tryMmap: true });
     assert.equal(argValue(args, "--n-cpu-moe"), "6");
     assert.equal(argValue(args, "--load-mode"), "none");
+  });
+
+  it("passes --n-cpu-ffn for dense CPU offload and forces load-mode none", () => {
+    const args = build({ nCpuFfn: 8, tryMmap: true });
+    assert.equal(argValue(args, "--n-cpu-ffn"), "8");
+    assert.equal(argValue(args, "--load-mode"), "none");
+  });
+
+  it("omits --n-cpu-ffn when unset", () => {
+    assert.ok(!build({ nCpuFfn: 0 }).includes("--n-cpu-ffn"));
   });
 
   it("keeps mmap when CPU MoE is off and tryMmap is on", () => {
@@ -377,6 +433,7 @@ describe("serverConfigFingerprint", () => {
       ["contextLength", { contextLength: 32768 }],
       ["cacheTypeK", { cacheTypeK: "f16" }],
       ["flashAttention", { flashAttention: "on" }],
+      ["lazyMode", { lazyMode: "on" }],
       ["reasoningFormat", { reasoningFormat: "none" }],
       ["reasoningBudget", { reasoningBudget: 512 }],
       ["cacheReuse", { cacheReuse: 0 }],

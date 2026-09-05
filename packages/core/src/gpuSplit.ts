@@ -355,3 +355,134 @@ const LEGACY_GPU0_FIRST = new Set(["3,1", "2,1", "4,1", "3,2"]);
 export function isLegacyGpu0FirstSplit(tensorSplit: string | undefined): boolean {
   return LEGACY_GPU0_FIRST.has(normalizeTensorSplit(tensorSplit));
 }
+
+/**
+ * llama.cpp `-ngl`: the last `layersOnGpu` layers are offloaded. Earlier
+ * layers stay on CPU.
+ */
+export function gpuLayerStart(nLayers: number, layersOnGpu: number): number {
+  const n = Math.max(0, Math.round(nLayers) || 0);
+  const onGpu = Math.min(n, Math.max(0, Math.round(layersOnGpu) || 0));
+  return n - onGpu;
+}
+
+/**
+ * Device index for each layer (`-1` = CPU).
+ *
+ * Layer split walks offloaded layers from the start of that range and fills
+ * GPU0, GPU1, … by cumulative `--tensor-split` — the same `(k+1)/n_offload`
+ * vs cumsum test llama.cpp uses. `--n-cpu-moe` / `--n-cpu-ffn` still apply
+ * to model layer index 0..N-1, so the first GPUs get the cheap residual
+ * layers and the last GPU gets the remaining full experts.
+ *
+ * Row / tensor split keeps every offloaded layer on every device; callers
+ * should fall back to the raw tensor-split fractions for those modes.
+ */
+export function assignLayerDevices(
+  nLayers: number,
+  layersOnGpu: number,
+  shares: number[],
+  splitMode: GpuSplitMode | undefined,
+  mainGpu: number
+): number[] {
+  const n = Math.max(0, Math.round(nLayers) || 0);
+  const onGpu = Math.min(n, Math.max(0, Math.round(layersOnGpu) || 0));
+  const start = n - onGpu;
+  const out = Array.from({ length: n }, () => -1);
+  if (onGpu <= 0) {
+    return out;
+  }
+  const nDev = Math.max(1, shares.length);
+  const main = Math.min(Math.max(0, Math.round(mainGpu) || 0), nDev - 1);
+  if (splitMode === "none" || nDev === 1) {
+    for (let i = start; i < n; i++) {
+      out[i] = main;
+    }
+    return out;
+  }
+  if (splitMode === "row" || splitMode === "tensor") {
+    return out;
+  }
+  for (let k = 0; k < onGpu; k++) {
+    const pos = (k + 1) / onGpu;
+    let cum = 0;
+    let dev = nDev - 1;
+    for (let d = 0; d < nDev; d++) {
+      cum += shares[d] || 0;
+      if (pos <= cum + 1e-9) {
+        dev = d;
+        break;
+      }
+    }
+    out[start + k] = dev;
+  }
+  return out;
+}
+
+export interface LayerWeightMassOptions {
+  isMoe?: boolean;
+  nCpuMoe?: number;
+  moeExpertShare?: number;
+  nCpuFfn?: number;
+  denseFfnShare?: number;
+}
+
+/** Relative GPU-resident mass of one layer (0 if the layer is on CPU). */
+export function layerGpuWeightMass(
+  layerIndex: number,
+  device: number,
+  options: LayerWeightMassOptions = {}
+): number {
+  if (device < 0) {
+    return 0;
+  }
+  if (options.isMoe) {
+    const nCpu = Math.max(0, Math.round(options.nCpuMoe || 0));
+    const share = Math.min(0.98, Math.max(0, options.moeExpertShare || 0));
+    if (layerIndex < nCpu && share > 0) {
+      return Math.max(0.02, 1 - share);
+    }
+    return 1;
+  }
+  const nCpu = Math.max(0, Math.round(options.nCpuFfn || 0));
+  const share = Math.min(0.95, Math.max(0, options.denseFfnShare || 0));
+  if (layerIndex < nCpu && share > 0) {
+    return Math.max(0.05, 1 - share);
+  }
+  return 1;
+}
+
+/**
+ * Per-device fractions of GPU-resident weights after layer assignment and
+ * `--n-cpu-moe` / `--n-cpu-ffn`. Falls back to `shares` for row/tensor split
+ * or when nothing was assigned.
+ */
+export function layerAwareWeightShares(
+  nLayers: number,
+  layersOnGpu: number,
+  shares: number[],
+  splitMode: GpuSplitMode | undefined,
+  mainGpu: number,
+  options: LayerWeightMassOptions = {}
+): number[] {
+  const nDev = Math.max(1, shares.length);
+  const fallback = shares.length === nDev ? shares : Array.from({ length: nDev }, () => 1 / nDev);
+  if (splitMode === "row" || splitMode === "tensor") {
+    return fallback;
+  }
+  const assign = assignLayerDevices(nLayers, layersOnGpu, shares, splitMode, mainGpu);
+  const mass = Array.from({ length: nDev }, () => 0);
+  let tot = 0;
+  for (let i = 0; i < assign.length; i++) {
+    const d = assign[i]!;
+    const m = layerGpuWeightMass(i, d, options);
+    if (d >= 0 && d < nDev && m > 0) {
+      mass[d] = (mass[d] || 0) + m;
+      tot += m;
+    }
+  }
+  if (tot <= 0) {
+    return fallback;
+  }
+  return mass.map((m) => m / tot);
+}

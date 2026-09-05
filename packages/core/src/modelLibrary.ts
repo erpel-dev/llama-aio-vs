@@ -23,10 +23,39 @@ const MIN_MODEL_BYTES = 32 * 1024 * 1024; // skip vocab / tiny stubs
 const MIN_MMPROJ_BYTES = 1024 * 1024; // CLIP projectors are ~20–900 MB
 const MIN_MTP_BYTES = 1024 * 1024; // sidecar MTP drafters are typically hundreds of MB
 const SKIP_NAME_RE = /^(ggml-vocab)/i;
+const GiB = 1024 * 1024 * 1024;
+/** Smaller/larger size ratio at which Foo.gguf and Foo-mtp.gguf are the same model. */
+const BAKED_IN_NEAR_COPY_RATIO = 0.85;
+/** Extra bytes still allowed for a baked-in MTP head on a multi-GB pair. */
+const BAKED_IN_MAX_EXTRA_BYTES = 2 * GiB;
+/** Unpaired `*-mtp.gguf` below this is treated as a sidecar, not a language GGUF. */
+const UNPAIRED_SIDECAR_MAX_BYTES = 2 * GiB;
+
+/** Path basename that works for OS paths and Hugging Face `dir/file.gguf` listings. */
+export function listingBaseName(name: string): string {
+  const n = (name || "").replace(/\\/g, "/");
+  const i = n.lastIndexOf("/");
+  return i >= 0 ? n.slice(i + 1) : n;
+}
+
+function listingParentName(name: string): string {
+  const n = (name || "").replace(/\\/g, "/").replace(/\/+$/, "");
+  const i = n.lastIndexOf("/");
+  if (i <= 0) {
+    return "";
+  }
+  return listingBaseName(n.slice(0, i));
+}
 
 /** True for llama.cpp vision projector GGUFs (`mmproj-F16.gguf`, …). */
 export function isMmprojFileName(name: string): boolean {
-  return /mmproj/i.test(path.basename(name));
+  return /mmproj/i.test(listingBaseName(name));
+}
+
+/** Importance-matrix dumps (`imatrix-qwen3.8-27b.gguf`) — not a runnable model. */
+export function isImatrixFileName(name: string): boolean {
+  const base = listingBaseName(name);
+  return /^imatrix[-_.]/i.test(base) || /^imatrix\.gguf$/i.test(base);
 }
 
 /**
@@ -131,15 +160,233 @@ export function mmprojFileSize(mmprojPath: string | undefined): number {
 }
 
 /**
- * True for llama.cpp sidecar MTP drafters (`mtp-gemma-4-12B-it.gguf`,
- * `gemma-4-12B-it-Q4_0-MTP.gguf`). Not DFlash (`architecture = dflash`).
+ * Name looks MTP-related: `mtp-*.gguf`, files under `MTP/`, or `*-mtp.gguf`.
+ * This is not enough to decide sidecar vs baked-in — use {@link classifyGgufFile}.
  */
 export function isMtpDraftFileName(name: string): boolean {
-  const base = path.basename(name);
-  if (!base.toLowerCase().endsWith(".gguf") || isMmprojFileName(base)) {
+  const base = listingBaseName(name);
+  if (!base.toLowerCase().endsWith(".gguf") || isMmprojFileName(base) || isImatrixFileName(base)) {
     return false;
   }
-  return /^mtp[-_]/i.test(base) || /-mtp\.gguf$/i.test(base);
+  return /^mtp[-_]/i.test(base) || /-mtp\.gguf$/i.test(base) || listingParentName(name).toLowerCase() === "mtp";
+}
+
+/** Sidecar from the name alone — Unsloth `mtp-*.gguf` or anything in an `MTP/` folder. */
+export function isConfidentMtpSidecarPath(name: string): boolean {
+  const base = listingBaseName(name);
+  if (!base.toLowerCase().endsWith(".gguf") || isMmprojFileName(base) || isImatrixFileName(base)) {
+    return false;
+  }
+  return /^mtp[-_]/i.test(base) || listingParentName(name).toLowerCase() === "mtp";
+}
+
+function hasMtpSuffix(name: string): boolean {
+  return /-mtp\.gguf$/i.test(listingBaseName(name));
+}
+
+/** Stem used to pair `Foo.gguf` with `Foo-mtp.gguf`. */
+export function mtpPairStem(name: string): string {
+  return listingBaseName(name)
+    .toLowerCase()
+    .replace(/\.gguf$/i, "")
+    .replace(/-mtp$/i, "");
+}
+
+export function extractQuantToken(name: string): string | undefined {
+  const base = listingBaseName(name).toLowerCase();
+  const m = base.match(
+    /[-_.](iq\d+_[a-z0-9]+|q\d+_k(?:_[a-z]+)?|q\d+_\d|q\d+|bf16|f16|f32)(?:-mtp)?\.gguf$/i
+  );
+  return m?.[1]?.toLowerCase();
+}
+
+export type GgufListedFile = { path: string; size: number };
+
+export type GgufFileRole = "language" | "mmproj" | "imatrix" | "mtp-sidecar" | "mtp-baked";
+
+function isNearCopySize(a: number, b: number): boolean {
+  const lo = Math.min(a, b);
+  const hi = Math.max(a, b);
+  if (lo < MIN_MODEL_BYTES || hi <= 0) {
+    return false;
+  }
+  if (lo / hi >= BAKED_IN_NEAR_COPY_RATIO) {
+    return true;
+  }
+  return lo >= 2 * GiB && hi - lo <= BAKED_IN_MAX_EXTRA_BYTES;
+}
+
+function findMtpLanguagePair(
+  mtpPath: string,
+  siblings: GgufListedFile[]
+): GgufListedFile | undefined {
+  const stem = mtpPairStem(mtpPath);
+  const self = listingBaseName(mtpPath).toLowerCase();
+  return siblings.find((s) => {
+    const base = listingBaseName(s.path).toLowerCase();
+    if (base === self || hasMtpSuffix(s.path) || isMmprojFileName(s.path) || isImatrixFileName(s.path)) {
+      return false;
+    }
+    return mtpPairStem(s.path) === stem;
+  });
+}
+
+/**
+ * Classify a GGUF in a repo or folder listing.
+ *
+ * ISTA-style `Foo-mtp.gguf` next to a near-copy `Foo.gguf` is a full language
+ * model with the MTP head baked in — not a Gemma 4 sidecar.
+ */
+export function classifyGgufFile(file: GgufListedFile, siblings: GgufListedFile[] = []): GgufFileRole {
+  if (isMmprojFileName(file.path)) {
+    return "mmproj";
+  }
+  if (isImatrixFileName(file.path)) {
+    return "imatrix";
+  }
+  if (isConfidentMtpSidecarPath(file.path)) {
+    return "mtp-sidecar";
+  }
+  if (hasMtpSuffix(file.path)) {
+    const pair = findMtpLanguagePair(file.path, siblings);
+    if (pair) {
+      if (isNearCopySize(file.size, pair.size)) {
+        return "mtp-baked";
+      }
+      if (file.size > 0 && file.size < pair.size * 0.5) {
+        return "mtp-sidecar";
+      }
+      // Tiny equal test fixtures fall through here as baked-in.
+      return file.size > 0 && file.size + BAKED_IN_MAX_EXTRA_BYTES < pair.size
+        ? "mtp-sidecar"
+        : "mtp-baked";
+    }
+    if (file.size > 0 && file.size < UNPAIRED_SIDECAR_MAX_BYTES) {
+      return "mtp-sidecar";
+    }
+    return "language";
+  }
+  return "language";
+}
+
+function tryFileSize(filePath: string): number {
+  try {
+    const st = fs.statSync(filePath);
+    return st.isFile() ? st.size : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function listGgufStats(dir: string): GgufListedFile[] {
+  let names: string[];
+  try {
+    names = fs.readdirSync(dir);
+  } catch {
+    return [];
+  }
+  const out: GgufListedFile[] = [];
+  for (const name of names) {
+    if (!name.toLowerCase().endsWith(".gguf")) {
+      continue;
+    }
+    const full = path.join(dir, name);
+    try {
+      const st = fs.statSync(full);
+      if (st.isFile()) {
+        out.push({ path: full, size: st.size });
+      }
+    } catch {
+      // skip unreadable
+    }
+  }
+  return out;
+}
+
+function siblingsForPath(filePath: string): GgufListedFile[] {
+  const trimmed = (filePath || "").trim();
+  if (!trimmed) {
+    return [];
+  }
+  const dir = path.dirname(trimmed);
+  const here = listGgufStats(dir);
+  const mtpDir = listGgufStats(path.join(dir, "MTP"));
+  return here.concat(mtpDir);
+}
+
+/** True when this file should be passed as `--model-draft` (sidecar), not started as the main GGUF. */
+export function isMtpSidecarFile(file: { path: string; size?: number }, siblings?: GgufListedFile[]): boolean {
+  const p = (file.path || "").trim();
+  if (!p) {
+    return false;
+  }
+  if (isConfidentMtpSidecarPath(p)) {
+    return true;
+  }
+  const size = file.size != null && file.size > 0 ? file.size : tryFileSize(p);
+  const sibs = siblings ?? siblingsForPath(p);
+  return classifyGgufFile({ path: p, size }, sibs) === "mtp-sidecar";
+}
+
+export function isMtpBakedInFile(file: { path: string; size?: number }, siblings?: GgufListedFile[]): boolean {
+  const p = (file.path || "").trim();
+  if (!p || isConfidentMtpSidecarPath(p)) {
+    return false;
+  }
+  const size = file.size != null && file.size > 0 ? file.size : tryFileSize(p);
+  const sibs = siblings ?? siblingsForPath(p);
+  return classifyGgufFile({ path: p, size }, sibs) === "mtp-baked";
+}
+
+/** Draft path is a full-model duplicate of `mainPath` (ISTA `Foo` + `Foo-mtp`). */
+export function isBakedInMtpNearCopy(mainPath: string, draftPath: string): boolean {
+  const main = (mainPath || "").trim();
+  const draft = (draftPath || "").trim();
+  if (!main || !draft) {
+    return false;
+  }
+  try {
+    if (fs.existsSync(main) && fs.existsSync(draft) && fs.realpathSync(main) === fs.realpathSync(draft)) {
+      return true;
+    }
+  } catch {
+    if (path.resolve(main) === path.resolve(draft)) {
+      return true;
+    }
+  }
+  const mainSize = tryFileSize(main);
+  const draftSize = tryFileSize(draft);
+  const siblings = siblingsForPath(main).concat(siblingsForPath(draft));
+  if (mainSize) {
+    siblings.push({ path: main, size: mainSize });
+  }
+  if (draftSize) {
+    siblings.push({ path: draft, size: draftSize });
+  }
+  return classifyGgufFile({ path: draft, size: draftSize }, siblings) === "mtp-baked";
+}
+
+/**
+ * Pick the sidecar that matches this language GGUF's stem / quant, else the
+ * usual Unsloth preference (`mtp-*` at repo root, then Q4).
+ */
+export function matchMtpDraftToLanguage(languagePath: string, draftPaths: string[]): string | undefined {
+  if (!draftPaths.length) {
+    return undefined;
+  }
+  const stem = mtpPairStem(languagePath);
+  const exact = draftPaths.filter((p) => mtpPairStem(p) === stem && listingBaseName(p) !== listingBaseName(languagePath));
+  if (exact.length) {
+    return preferMtpDraftPath(exact);
+  }
+  const quant = extractQuantToken(languagePath);
+  if (quant) {
+    const qMatch = draftPaths.filter((p) => extractQuantToken(p) === quant);
+    if (qMatch.length) {
+      return preferMtpDraftPath(qMatch);
+    }
+  }
+  return preferMtpDraftPath(draftPaths);
 }
 
 /** MTP mode that loads a separate GGUF via `--model-draft` (Gemma 4), not baked-in next-n heads. */
@@ -147,7 +394,8 @@ export function usesSidecarMtp(settings: {
   speculativeMode?: string;
   draftModelPath?: string;
 }): boolean {
-  return speculativeUsesMtp(settings.speculativeMode) && isMtpDraftFileName(settings.draftModelPath || "");
+  const draft = (settings.draftModelPath || "").trim();
+  return speculativeUsesMtp(settings.speculativeMode) && isMtpSidecarFile({ path: draft });
 }
 
 /**
@@ -159,8 +407,8 @@ export function preferMtpDraftPath(paths: string[]): string | undefined {
     return undefined;
   }
   const score = (p: string): number => {
-    const base = path.basename(p).toLowerCase();
-    const inMtpDir = path.basename(path.dirname(p)).toLowerCase() === "mtp";
+    const base = listingBaseName(p).toLowerCase();
+    const inMtpDir = listingParentName(p).toLowerCase() === "mtp";
     const rootPrefixed = /^mtp[-_]/.test(base);
     let quant = 0;
     if (base.includes("q4")) {
@@ -180,49 +428,79 @@ export function preferMtpDraftPath(paths: string[]): string | undefined {
   return [...paths].sort((a, b) => score(a) - score(b) || a.localeCompare(b))[0];
 }
 
-function collectMtpDraftsInDir(dir: string, found: string[]): void {
-  let names: string[];
-  try {
-    names = fs.readdirSync(dir);
-  } catch {
-    return;
-  }
-  for (const name of names) {
-    if (!name.toLowerCase().endsWith(".gguf") || !isMtpDraftFileName(name)) {
-      continue;
-    }
-    const full = path.join(dir, name);
-    try {
-      const st = fs.statSync(full);
-      if (st.isFile() && st.size >= MIN_MTP_BYTES) {
-        found.push(full);
-      }
-    } catch {
-      // skip unreadable
-    }
-  }
-}
-
 /**
  * First usable sidecar MTP GGUF next to a language model, including an `MTP/`
- * subdirectory (Unsloth's extra Q4_0 / Q8_0 / BF16 drafters).
+ * subdirectory (Unsloth's extra Q4_0 / Q8_0 / BF16 drafters). Skips ISTA-style
+ * full-model `Foo-mtp.gguf` near-copies.
  */
+/**
+ * llama.cpp cannot load Unsloth's Flash-Next `mtp-*.gguf` as `--model-draft`
+ * (`output_hc_norm.weight` missing). qwen4exp MTP stays off until the main
+ * GGUF reports next-n layers.
+ */
+export function languageRejectsSidecarMtp(modelPath: string): boolean {
+  const h = (modelPath || "").toLowerCase();
+  return (
+    /qwen4exp/.test(h) ||
+    /qwen4_exp/.test(h) ||
+    /qwen4-exp/.test(h) ||
+    /qwen3\.8[-_.]?flash/.test(h) ||
+    /qwen-?3\.8[-_.]?flash/.test(h) ||
+    /qwen38[-_.]?flash/.test(h) ||
+    /flash[-_]?next/.test(h)
+  );
+}
+
 export function findSiblingMtpDraft(modelPath: string): string | undefined {
   const trimmed = (modelPath || "").trim();
-  if (!trimmed) {
+  if (!trimmed || languageRejectsSidecarMtp(trimmed)) {
     return undefined;
   }
-  const dir = path.dirname(trimmed);
-  const found: string[] = [];
-  collectMtpDraftsInDir(dir, found);
-  collectMtpDraftsInDir(path.join(dir, "MTP"), found);
-  return preferMtpDraftPath(found);
+  const siblings = siblingsForPath(trimmed);
+  const mainSize = tryFileSize(trimmed);
+  if (mainSize) {
+    siblings.push({ path: trimmed, size: mainSize });
+  }
+  let mainKey = path.resolve(trimmed);
+  try {
+    if (fs.existsSync(trimmed)) {
+      mainKey = fs.realpathSync(trimmed);
+    }
+  } catch {
+    // keep resolve()
+  }
+  const candidates = siblings.filter((s) => {
+    if (s.size < MIN_MTP_BYTES) {
+      return false;
+    }
+    let key = path.resolve(s.path);
+    try {
+      if (fs.existsSync(s.path)) {
+        key = fs.realpathSync(s.path);
+      }
+    } catch {
+      // keep resolve()
+    }
+    return key !== mainKey && classifyGgufFile(s, siblings) === "mtp-sidecar";
+  });
+  return matchMtpDraftToLanguage(
+    trimmed,
+    candidates.map((c) => c.path)
+  );
+}
+
+function usableDraftPath(modelPath: string, draftPath: string): boolean {
+  if (!draftPath || !fs.existsSync(draftPath)) {
+    return false;
+  }
+  return !isBakedInMtpNearCopy(modelPath, draftPath);
 }
 
 /**
  * Sidecar MTP drafter to load with this language GGUF.
  * Switching models attaches a sibling `mtp-*.gguf` when one exists. Reloading
- * the same model keeps a manual pick (including a DFlash draft).
+ * the same model keeps a manual pick (including a DFlash draft). A leftover
+ * baked-in `*-mtp.gguf` near-copy is cleared so it is not passed as `--model-draft`.
  */
 export function resolveMtpDraftPath(
   modelPath: string,
@@ -231,25 +509,22 @@ export function resolveMtpDraftPath(
   speculativeMode?: string
 ): string {
   const existing = (current || "").trim();
+  const sibling = findSiblingMtpDraft(modelPath);
+
   if (!pathChanged) {
-    if (existing && fs.existsSync(existing)) {
+    if (usableDraftPath(modelPath, existing)) {
       return existing;
     }
-    if (existing && isMtpDraftFileName(existing)) {
-      return findSiblingMtpDraft(modelPath) || "";
+    if (existing && (isMtpDraftFileName(existing) || isBakedInMtpNearCopy(modelPath, existing))) {
+      return sibling || "";
     }
     return existing || "";
   }
-  const sibling = findSiblingMtpDraft(modelPath);
+
   if (sibling) {
     return sibling;
   }
-  if (
-    speculativeUsesDflash(speculativeMode) &&
-    existing &&
-    !isMtpDraftFileName(existing) &&
-    fs.existsSync(existing)
-  ) {
+  if (speculativeUsesDflash(speculativeMode) && usableDraftPath(modelPath, existing) && !isMtpSidecarFile({ path: existing })) {
     return existing;
   }
   return "";
@@ -398,11 +673,14 @@ export function discoverModelRoots(config: ConfigAccessor): ScanRoot[] {
   return unique;
 }
 
-function shouldSkipLanguageFile(name: string, size: number): boolean {
+function shouldSkipLanguageFile(name: string, size: number, siblings: GgufListedFile[] = []): boolean {
   if (!name.toLowerCase().endsWith(".gguf")) {
     return true;
   }
-  if (SKIP_NAME_RE.test(name) || isMmprojFileName(name) || isMtpDraftFileName(name)) {
+  if (SKIP_NAME_RE.test(name) || isMmprojFileName(name) || isImatrixFileName(name)) {
+    return true;
+  }
+  if (classifyGgufFile({ path: name, size }, siblings) === "mtp-sidecar") {
     return true;
   }
   if (size < MIN_MODEL_BYTES) {
@@ -414,7 +692,7 @@ function shouldSkipLanguageFile(name: string, size: number): boolean {
   return false;
 }
 
-function shouldSkipMmprojFile(name: string, size: number): boolean {
+function shouldSkipMmprojFile(name: string, size: number, _siblings: GgufListedFile[] = []): boolean {
   if (!name.toLowerCase().endsWith(".gguf") || !isMmprojFileName(name)) {
     return true;
   }
@@ -427,8 +705,11 @@ function shouldSkipMmprojFile(name: string, size: number): boolean {
   return false;
 }
 
-function shouldSkipMtpDraftFile(name: string, size: number): boolean {
-  if (!name.toLowerCase().endsWith(".gguf") || !isMtpDraftFileName(name)) {
+function shouldSkipMtpDraftFile(name: string, size: number, siblings: GgufListedFile[] = []): boolean {
+  if (!name.toLowerCase().endsWith(".gguf")) {
+    return true;
+  }
+  if (classifyGgufFile({ path: name, size }, siblings) !== "mtp-sidecar") {
     return true;
   }
   if (size < MIN_MTP_BYTES) {
@@ -443,7 +724,7 @@ function shouldSkipMtpDraftFile(name: string, size: number): boolean {
 function walkGgufs(
   root: ScanRoot,
   out: Map<string, LocalModelEntry>,
-  skip: (name: string, size: number) => boolean
+  skip: (name: string, size: number, siblings: GgufListedFile[]) => boolean
 ): void {
   if (!fs.existsSync(root.dir)) {
     return;
@@ -458,6 +739,23 @@ function walkGgufs(
       entries = fs.readdirSync(dir, { withFileTypes: true });
     } catch {
       continue;
+    }
+    const siblingStats: GgufListedFile[] = [];
+    for (const ent of entries) {
+      if (!ent.isFile() && !ent.isSymbolicLink()) {
+        continue;
+      }
+      if (!ent.name.toLowerCase().endsWith(".gguf")) {
+        continue;
+      }
+      try {
+        const st = fs.statSync(path.join(dir, ent.name));
+        if (st.isFile()) {
+          siblingStats.push({ path: ent.name, size: st.size });
+        }
+      } catch {
+        // skip unreadable
+      }
     }
     for (const ent of entries) {
       if (ent.name.startsWith(".") && ent.name !== ".cache") {
@@ -481,7 +779,7 @@ function walkGgufs(
       }
       try {
         const st = fs.statSync(full);
-        if (!st.isFile() || skip(ent.name, st.size)) {
+        if (!st.isFile() || skip(ent.name, st.size, siblingStats)) {
           continue;
         }
         // Dedupe by real path (HF snapshots often symlink into blobs/) but keep the

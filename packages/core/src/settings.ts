@@ -1,9 +1,9 @@
 import { AppConfig, ConfigAccessor, ConfigFile, toExtensionState } from "./config";
 import { Event } from "./events";
-import { clampLoadSettingsToModel, readModelCapabilities } from "./ggufMetadata";
+import { clampLoadSettingsToModel, isQwen4expArchitecture, readModelCapabilities } from "./ggufMetadata";
 import { detectGpuMemory, detectGpus } from "./gpuInfo";
 import { LlamaInstaller } from "./llamaInstaller";
-import { resolveMmprojPath, resolveMtpDraftPath, findSiblingMtpDraft, isMtpDraftFileName } from "./modelLibrary";
+import { resolveMmprojPath, resolveMtpDraftPath, findSiblingMtpDraft, isMtpSidecarFile } from "./modelLibrary";
 import { recommendLoadSettings } from "./recommendSettings";
 import {
   findLlamaServerOnPath,
@@ -57,17 +57,21 @@ export class SettingsStore {
   }
 
   /**
-   * Re-read GGUF caps when MoE expert-share (or other newer fields) are missing
-   * from a previously persisted modelCapabilities blob.
+   * Re-read GGUF caps when MoE expert-share, PLE share, or other newer fields
+   * are missing from a previously persisted modelCapabilities blob.
    */
   async refreshCapabilitiesIfStale(): Promise<boolean> {
     const state = this.getState();
     const path = (state.selectedModelPath || "").trim();
     const caps = state.modelCapabilities;
-    if (!path || !caps?.isMoe) {
+    if (!path || !caps) {
       return false;
     }
-    if (caps.moeExpertShare !== undefined && Number.isFinite(caps.moeExpertShare)) {
+    const moeNeedsShare = caps.isMoe && (caps.moeExpertShare === undefined || !Number.isFinite(caps.moeExpertShare));
+    const qwen4NeedsPle =
+      isQwen4expArchitecture(caps.architecture) &&
+      (caps.pleShare === undefined || !Number.isFinite(caps.pleShare));
+    if (!moeNeedsShare && !qwen4NeedsPle) {
       return false;
     }
     try {
@@ -98,7 +102,7 @@ export class SettingsStore {
     let loadSettings = normalizeLoadSettings({ ...state.loadSettings, ...patch });
     if (
       speculativeUsesMtp(patch.speculativeMode) &&
-      !isMtpDraftFileName(loadSettings.draftModelPath) &&
+      !isMtpSidecarFile({ path: loadSettings.draftModelPath || "" }) &&
       !(state.modelCapabilities?.nextnPredictLayers && state.modelCapabilities.nextnPredictLayers > 0)
     ) {
       const sibling = findSiblingMtpDraft(state.selectedModelPath);

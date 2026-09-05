@@ -16,6 +16,8 @@ import {
   tensorSplitShares,
   tensorSplitSharesEqual,
   effectiveTensorSplitShares,
+  assignLayerDevices,
+  layerAwareWeightShares,
 } from "../src/gpuSplit";
 
 describe("parseTensorSplit", () => {
@@ -179,5 +181,46 @@ describe("capacityAwareTensorSplit", () => {
     const parts = parseTensorSplit(ts);
     assert.equal(parts.reduce((a, b) => a + b, 0), 100);
     assert.equal(parts[1], 0);
+  });
+});
+
+describe("assignLayerDevices", () => {
+  it("gives GPU0 the first layers of a 45/55 split", () => {
+    const assign = assignLayerDevices(48, 48, [0.45, 0.55], "layer", 0);
+    assert.equal(assign[0], 0);
+    assert.equal(assign[20], 0);
+    assert.equal(assign[21], 1);
+    assert.equal(assign[47], 1);
+    assert.equal(assign.filter((d) => d === 0).length, 21);
+    assert.equal(assign.filter((d) => d === 1).length, 27);
+  });
+
+  it("offloads the last ngl layers when the model is only partly on GPU", () => {
+    const assign = assignLayerDevices(48, 24, [0.5, 0.5], "layer", 0);
+    assert.ok(assign.slice(0, 24).every((d) => d === -1));
+    assert.ok(assign.slice(24).every((d) => d >= 0));
+  });
+
+  it("parks every GPU layer on Main when split-mode is none", () => {
+    const assign = assignLayerDevices(48, 48, [0.45, 0.55], "none", 1);
+    assert.ok(assign.every((d) => d === 1));
+  });
+});
+
+describe("layerAwareWeightShares", () => {
+  it("matches tensor-split when every layer has the same mass", () => {
+    const shares = layerAwareWeightShares(48, 48, [0.75, 0.25], "layer", 0, {});
+    assert.ok(Math.abs(shares[0]! - 0.75) < 0.001);
+    assert.ok(Math.abs(shares[1]! - 0.25) < 0.001);
+  });
+
+  it("loads the later GPU with full experts after --n-cpu-moe on the first layers", () => {
+    const shares = layerAwareWeightShares(48, 48, [0.45, 0.55], "layer", 0, {
+      isMoe: true,
+      nCpuMoe: 16,
+      moeExpertShare: 0.9,
+    });
+    assert.ok(shares[1]! > 0.7, `expected GPU1 to hold most remaining experts, got ${shares[1]}`);
+    assert.ok(shares[0]! < 0.3, `expected GPU0 to be cheap after CPU-MoE, got ${shares[0]}`);
   });
 });

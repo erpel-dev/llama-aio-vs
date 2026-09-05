@@ -1,8 +1,15 @@
 import { parseTensorSplit } from "./gpuSplit";
 import type { GpuMemoryInfo } from "./gpuInfo";
+import {
+  heuristicPleShare,
+  isQwen4expArchitecture,
+  shouldPinPleToCpu,
+  type ModelCapabilities,
+} from "./ggufMetadata";
 import { usesSidecarMtp } from "./modelLibrary";
 import {
   LlamaLoadSettings,
+  lazyModeReadsFromDisk,
   normalizeLoadSettings,
   RequestSettings,
   speculativeUsesDflash,
@@ -10,9 +17,64 @@ import {
   speculativeUsesNgram,
 } from "./types";
 
+export type LlamaLoadMode = "mmap" | "mlock" | "none";
+
 /**
- * CPU builds ignore -ngl / GPU KV offload / --n-cpu-moe. Apply the same zeros
- * for launch args and dirty-fingerprint so the sidebar matches what start ships.
+ * llama.cpp `--load-mode`. Lazy PLE reads need mmap, so `--n-cpu-moe` /
+ * `--n-cpu-ffn` no longer force `none` when `--lazy-mode` will actually
+ * fault a large table.
+ */
+export function resolveLoadMode(
+  settings: LlamaLoadSettings,
+  options?: { caps?: ModelCapabilities; platform?: string }
+): LlamaLoadMode {
+  const platform = options?.platform ?? process.platform;
+  if (settings.keepModelInMemory && platform !== "win32") {
+    return "mlock";
+  }
+  const mmapRequested = settings.tryMmap || settings.keepModelInMemory;
+  if (!mmapRequested) {
+    return "none";
+  }
+  const cpuOverride = settings.nCpuMoe > 0 || (settings.nCpuFfn ?? 0) > 0;
+  if (cpuOverride && !keepMmapForLazy(settings, options?.caps)) {
+    return "none";
+  }
+  return "mmap";
+}
+
+/** Keep mmap so `--lazy-mode` can fault PLE / engram rows from disk. */
+export function keepMmapForLazy(
+  settings: LlamaLoadSettings,
+  caps?: Pick<ModelCapabilities, "architecture" | "pleShare" | "fileSizeBytes">
+): boolean {
+  const lazy = settings.lazyMode || "auto";
+  if (lazy === "off" || !settings.tryMmap) {
+    return false;
+  }
+  if (lazy === "on") {
+    return true;
+  }
+  if (!caps) {
+    return false;
+  }
+  const file = caps.fileSizeBytes || 0;
+  const share =
+    typeof caps.pleShare === "number" && Number.isFinite(caps.pleShare) && caps.pleShare > 0
+      ? caps.pleShare
+      : heuristicPleShare(caps.architecture);
+  const pleBytes = file * share;
+  if (lazyModeReadsFromDisk("auto", pleBytes)) {
+    return true;
+  }
+  // qwen4exp tables are always huge; file size may be unknown before the scan.
+  return isQwen4expArchitecture(caps.architecture) && file <= 0;
+}
+
+/**
+ * CPU builds ignore -ngl / GPU KV offload / --n-cpu-moe / --n-cpu-ffn. Apply the
+ * same zeros for launch args and dirty-fingerprint so the sidebar matches what
+ * start ships.
  */
 export function normalizeLoadSettingsForCpuBackend(
   settings: LlamaLoadSettings
@@ -23,6 +85,7 @@ export function normalizeLoadSettingsForCpuBackend(
     offloadKvCacheToGpu: false,
     mmprojOffloadToGpu: false,
     nCpuMoe: 0,
+    nCpuFfn: 0,
   };
 }
 
@@ -41,7 +104,7 @@ export function buildServerArgs(
   host: string,
   port: number,
   rawSettings: LlamaLoadSettings,
-  options?: { gpus?: GpuMemoryInfo[]; requestSampling?: RequestSettings }
+  options?: { gpus?: GpuMemoryInfo[]; requestSampling?: RequestSettings; caps?: ModelCapabilities }
 ): string[] {
   const settings = normalizeLoadSettings(rawSettings);
   const args: string[] = [
@@ -80,6 +143,13 @@ export function buildServerArgs(
 
   if (settings.nCpuMoe > 0) {
     args.push("--n-cpu-moe", String(settings.nCpuMoe));
+  }
+
+  // Dense counterpart to --n-cpu-moe: first N layers' dense FFN tensors stay
+  // in system RAM. MoE models reset this to 0 at normalize time. Only sent
+  // when non-zero, so older builds without the flag keep booting.
+  if ((settings.nCpuFfn ?? 0) > 0) {
+    args.push("--n-cpu-ffn", String(settings.nCpuFfn));
   }
 
   if (!settings.offloadKvCacheToGpu) {
@@ -126,17 +196,15 @@ export function buildServerArgs(
 
   // Prefer current --load-mode over deprecated --mmap / --mlock / --no-mmap.
   // mlock is poorly supported on Windows — fall back to mmap when pinning is requested.
-  // --n-cpu-moe uses CPU tensor overrides; llama.cpp warns that mmap then
-  // leaves expert weights mapped and is slower than --load-mode none.
-  if (settings.keepModelInMemory && process.platform !== "win32") {
-    args.push("--load-mode", "mlock");
-  } else if (
-    (!settings.tryMmap && !settings.keepModelInMemory) ||
-    settings.nCpuMoe > 0
-  ) {
-    args.push("--load-mode", "none");
-  } else {
-    args.push("--load-mode", "mmap");
+  // --n-cpu-moe / --n-cpu-ffn normally force none (mmap + overrides is slower),
+  // except when --lazy-mode needs mmap to fault a large PLE table.
+  args.push("--load-mode", resolveLoadMode(settings, { caps: options?.caps }));
+
+  // Only pass -lzm when overriding; "auto" is the llama.cpp default and older
+  // builds without the flag keep working.
+  const lazyMode = settings.lazyMode || "auto";
+  if (lazyMode !== "auto") {
+    args.push("--lazy-mode", lazyMode);
   }
 
   if (settings.ropeFreqBase != null) {
@@ -234,6 +302,13 @@ export function buildServerArgs(
   // skip it (also required for sidecar MTP / DFlash draft probes).
   args.push("--fit", "off");
 
+  // Qwen3.8-Flash-Next (and Gemma 3n-style PLE): keep the n-gram lookup table on
+  // CPU. llama.cpp's LAYER_INPUT default usually does this anyway; the override
+  // makes it explicit so -ngl 99 doesn't pull tens of GiB onto VRAM.
+  if (shouldPinPleToCpu(options?.caps)) {
+    args.push("--override-tensor", "per_layer_token_embd.=CPU");
+  }
+
   return args;
 }
 
@@ -285,11 +360,13 @@ export function serverConfigFingerprint(
     physicalBatchSize: settings.physicalBatchSize,
     maxConcurrentPredictions: settings.maxConcurrentPredictions,
     nCpuMoe: settings.nCpuMoe,
+    nCpuFfn: settings.nCpuFfn ?? 0,
     offloadKvCacheToGpu: !!settings.offloadKvCacheToGpu,
     cacheTypeK: settings.cacheTypeK || "q8_0",
     cacheTypeV: settings.cacheTypeV || "q8_0",
     keepModelInMemory: !!settings.keepModelInMemory,
     tryMmap: !!settings.tryMmap,
+    lazyMode: settings.lazyMode || "auto",
     unifiedKvCache: !!settings.unifiedKvCache,
     flashAttention: settings.flashAttention || "auto",
     reasoningFormat: settings.reasoningFormat || "deepseek-legacy",

@@ -9,7 +9,7 @@ export const WIKIPEDIA_LOOKUP_SYSTEM_HINT =
 
 const WIKI_API = "https://en.wikipedia.org/w/api.php";
 const USER_AGENT =
-  "llama-aio-vs/0.1.14 (https://github.com/erpel-dev/llama-aio-vs; Wikipedia lookup for local LLMs)";
+  "llama-aio-vs/0.1.15 (https://github.com/erpel-dev/llama-aio-vs; Wikipedia lookup for local LLMs)";
 const EXTRACT_CHARS = 1800;
 
 export type WikipediaFetch = (

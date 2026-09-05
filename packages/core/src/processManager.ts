@@ -412,8 +412,9 @@ export class ProcessManager {
     }
 
     let loadSettings = state.loadSettings;
+    let caps = state.modelCapabilities;
     try {
-      const caps = state.modelCapabilities || readModelCapabilities(model);
+      caps = state.modelCapabilities || readModelCapabilities(model);
       loadSettings = clampLoadSettingsToModel(loadSettings, caps);
       if (!state.modelCapabilities || state.modelCapabilities.path !== model) {
         await this.store.setState({
@@ -435,6 +436,7 @@ export class ProcessManager {
       // Ship request sampling defaults as CLI flags so raw clients pointing at
       // the endpoint inherit them too (our frontends send per-request values).
       requestSampling: state.requestSettings,
+      caps,
     });
     const launchMode = resolveLaunchMode(this.store.getConfig().get<string>("launchMode"));
     const configFingerprint = serverConfigFingerprint(model, loadSettings, launchMode);

@@ -6,6 +6,7 @@ import {
   isGemma4Family,
   isGlimmerFamily,
   isQwen38Family,
+  isQwen4expFamily,
   resolveModeParams,
   resolveModelModes,
 } from "../src/modelModes";
@@ -19,11 +20,31 @@ describe("isQwen38Family", () => {
     assert.equal(isQwen38Family("qwen3_8"), true);
   });
 
-  it("does not match Qwen3 8B or Qwen3.6", () => {
+  it("does not match Qwen3 8B, Qwen3.6, or Flash-Next", () => {
     assert.equal(isQwen38Family("Qwen3-8B-Q4_K_M.gguf"), false);
     assert.equal(isQwen38Family("qwen3-8b"), false);
     assert.equal(isQwen38Family("Qwen3.6-27B.gguf"), false);
     assert.equal(isQwen38Family("qwen3"), false);
+    assert.equal(isQwen38Family("Qwen3.8-Flash-Next-UD-Q4_K_XL.gguf"), false);
+    assert.equal(isQwen38Family("qwen4exp"), false);
+  });
+});
+
+describe("isQwen4expFamily", () => {
+  it("matches architecture and Flash-Next filenames", () => {
+    assert.equal(isQwen4expFamily("qwen4exp"), true);
+    assert.equal(isQwen4expFamily("qwen4_exp"), true);
+    assert.equal(isQwen4expFamily("qwen4-exp"), true);
+    assert.equal(isQwen4expFamily("Qwen3.8-Flash-Next-UD-Q4_K_XL.gguf"), true);
+    assert.equal(isQwen4expFamily("unsloth/qwen3.8-flash-next-gguf"), true);
+    assert.equal(isQwen4expFamily("qwen38-flash-next"), true);
+  });
+
+  it("does not match dense Qwen3.8 or unrelated Flash models", () => {
+    assert.equal(isQwen4expFamily("Qwen3.8-27B-UD-Q4_K_XL.gguf"), false);
+    assert.equal(isQwen4expFamily("Qwen3-8B-Q4_K_M.gguf"), false);
+    assert.equal(isQwen4expFamily("DeepSeek-V4-Flash"), false);
+    assert.equal(isQwen4expFamily("qwen3"), false);
   });
 });
 
@@ -80,6 +101,26 @@ describe("resolveModelModes", () => {
     assert.equal(set.modes["Think (Medium)"].chat_template_kwargs?.reasoning_effort, "medium");
     assert.equal(set.modes["Think (Low)"].chat_template_kwargs?.reasoning_effort, "low");
     assert.equal(set.modes["No Think"].chat_template_kwargs?.enable_thinking, false);
+  });
+
+  it("gives Flash-Next the same effort ladder with a distinct family label", () => {
+    const set = resolveModelModes(
+      denseCaps({
+        architecture: "qwen4exp",
+        name: "Qwen3.8 Flash-Next",
+        path: "/models/Qwen3.8-Flash-Next-UD-Q4_K_XL.gguf",
+      }),
+      "Qwen3.8-Flash-Next"
+    );
+    assert.ok(set);
+    assert.equal(set.familyLabel, "Qwen3.8 Flash-Next");
+    assert.equal(set.defaultMode, "Think (XHigh)");
+    assert.equal(set.modes["Think (XHigh)"].chat_template_kwargs?.reasoning_effort, "xhigh");
+    assert.equal(set.modes["Think (Low)"].chat_template_kwargs?.reasoning_effort, "low");
+    assert.equal(set.modes["No Think"].chat_template_kwargs?.enable_thinking, false);
+    // Architecture alone (no Flash-Next in the filename) still matches.
+    const archOnly = resolveModelModes(denseCaps({ architecture: "qwen4exp" }));
+    assert.equal(archOnly?.familyLabel, "Qwen3.8 Flash-Next");
   });
 
   it("keeps Qwen3.6 on Think General/Coding without reasoning_effort", () => {
@@ -161,6 +202,20 @@ describe("applyModeToRequestBody", () => {
       preserve_thinking: true,
       reasoning_effort: "medium",
     });
+    assert.equal(body.reasoning_effort, undefined);
+  });
+
+  it("does not put Flash-Next reasoning_effort at the top level of the request body", () => {
+    const set = resolveModelModes(undefined, "Qwen3.8-Flash-Next");
+    assert.ok(set);
+    const { params } = resolveModeParams(set, { reasoningEffort: "Think (XHigh)" });
+    const body: Record<string, unknown> = {};
+    applyModeToRequestBody(body, params);
+    assert.equal(
+      (body.chat_template_kwargs as Record<string, unknown>).reasoning_effort,
+      "xhigh"
+    );
+    assert.equal(body.reasoning_effort, undefined);
   });
 
   it("puts Glimmer reasoning_strength on chat_template_kwargs", () => {

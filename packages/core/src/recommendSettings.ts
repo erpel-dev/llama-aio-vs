@@ -6,9 +6,9 @@ import {
   retargetTensorSplitMainShare,
   tensorSplitForMainShare,
 } from "./gpuSplit";
-import { ModelCapabilities } from "./ggufMetadata";
+import { isQwen4expArchitecture, ModelCapabilities } from "./ggufMetadata";
 import { estimateMemory, MemoryEstimate, VRAM_HEADROOM_BYTES } from "./memoryEstimate";
-import { isMtpDraftFileName } from "./modelLibrary";
+import { isMtpBakedInFile, isMtpSidecarFile } from "./modelLibrary";
 import { LlamaLoadSettings, recommendedMaxDraftTokens, speculativeUsesDflash, speculativeUsesNgram } from "./types";
 
 const GiB = 1024 ** 3;
@@ -156,6 +156,7 @@ function tuneBatchSizes(
     !gpu?.totalBytes ||
     !fullyOffloaded ||
     settings.nCpuMoe > 0 ||
+    settings.nCpuFfn > 0 ||
     settings.evalBatchSize < FAST_PREFILL_UBATCH ||
     settings.physicalBatchSize >= FAST_PREFILL_UBATCH
   ) {
@@ -181,10 +182,15 @@ function recommendSpeculative(current: LlamaLoadSettings, caps: ModelCapabilitie
   | "draftModelPath"
   | "draftGpuOffload"
 > {
-  const sidecarMtp = isMtpDraftFileName(current.draftModelPath);
+  const rawDraft = current.draftModelPath || "";
+  let draftModelPath = isMtpBakedInFile({ path: rawDraft }) ? "" : rawDraft;
+  if (isQwen4expArchitecture(caps.architecture) && isMtpSidecarFile({ path: draftModelPath })) {
+    draftModelPath = "";
+  }
+  const sidecarMtp = isMtpSidecarFile({ path: draftModelPath });
   const mtpCapable = !!(caps.nextnPredictLayers && caps.nextnPredictLayers > 0) || sidecarMtp;
   const keepDraft = {
-    draftModelPath: current.draftModelPath || "",
+    draftModelPath,
     draftGpuOffload: current.draftGpuOffload ?? 99,
   };
   // Keep an explicit DFlash setup even when the new GGUF also has MTP heads,
@@ -284,6 +290,7 @@ function fitMultiGpuFullOffload(
     ...base,
     gpuOffload: 99,
     nCpuMoe: 0,
+    nCpuFfn: 0,
     splitMode: "layer",
     mainGpu,
   };
@@ -304,7 +311,10 @@ function fitMultiGpuFullOffload(
   const neighborhood: string[] = [];
   if (seed) {
     neighborhood.push(seed);
-    for (const delta of [0.05, -0.05, 0.1, -0.1, 0.15, -0.15, 0.2, -0.2, 0.25, -0.25, 0.3, -0.3]) {
+    for (const delta of [
+      0.02, -0.02, 0.03, -0.03, 0.04, -0.04, 0.05, -0.05, 0.1, -0.1, 0.15, -0.15, 0.2, -0.2, 0.25,
+      -0.25, 0.3, -0.3,
+    ]) {
       const next = retargetTensorSplitMainShare(seed, mainGpu, seedShare + delta);
       if (next) {
         neighborhood.push(next);
@@ -368,6 +378,7 @@ export function recommendLoadSettings(
     ...current,
     contextLength,
     nCpuMoe: 0,
+    nCpuFfn: 0,
     offloadKvCacheToGpu: current.offloadKvCacheToGpu,
     ...speculative,
     ...(gpus.length >= 2
@@ -444,15 +455,26 @@ function fitOffload(
     return { ...withAllGpu, nCpuMoe };
   }
 
-  // Dense: as many layers as possible while keeping headroom.
-  // Prefer 99 (“all”) when the full model fits.
-  for (let n = nLayers; n >= 0; n--) {
-    const gpuOffload = n >= nLayers ? 99 : n;
-    const candidate = { ...base, gpuOffload, nCpuMoe: 0 };
+  // Dense: prefer keeping every layer on the GPU and moving dense FFN tensors
+  // to system RAM (--n-cpu-ffn) before dropping whole layers — mirrors the MoE
+  // path, where experts spill to RAM first.
+  const withAllDense: LlamaLoadSettings = { ...base, gpuOffload: 99, nCpuMoe: 0, nCpuFfn: 0 };
+  for (let n = 0; n <= nLayers; n++) {
+    const candidate = { ...withAllDense, nCpuFfn: n };
     if (fitsHeadroom(caps, candidate, gpu, false, headroom, gpus)) {
       return candidate;
     }
   }
 
-  return { ...base, gpuOffload: 0, nCpuMoe: 0 };
+  // Dense: as many layers as possible while keeping headroom.
+  // Prefer 99 (“all”) when the full model fits.
+  for (let n = nLayers; n >= 0; n--) {
+    const gpuOffload = n >= nLayers ? 99 : n;
+    const candidate = { ...base, gpuOffload, nCpuMoe: 0, nCpuFfn: 0 };
+    if (fitsHeadroom(caps, candidate, gpu, false, headroom, gpus)) {
+      return candidate;
+    }
+  }
+
+  return { ...base, gpuOffload: 0, nCpuMoe: 0, nCpuFfn: 0 };
 }

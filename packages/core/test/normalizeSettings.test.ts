@@ -3,6 +3,7 @@ import { describe, it } from "node:test";
 import {
   DEFAULT_LOAD_SETTINGS,
   DEFAULT_REQUEST_SETTINGS,
+  lazyModeReadsFromDisk,
   normalizeLoadSettings,
   normalizeRequestSettings,
   recommendedMaxDraftTokens,
@@ -24,6 +25,7 @@ describe("normalizeLoadSettings", () => {
       physicalBatchSize: Infinity,
       maxConcurrentPredictions: -5,
       nCpuMoe: NaN,
+      nCpuFfn: NaN,
       contextCheckpoints: -1,
       cacheReuse: NaN,
       reasoningBudget: NaN,
@@ -79,26 +81,62 @@ describe("normalizeLoadSettings", () => {
     assert.equal(s.seed, null);
   });
 
+  it("accepts lazy-mode on/off/auto", () => {
+    assert.equal(normalizeLoadSettings({ lazyMode: "on" }).lazyMode, "on");
+    assert.equal(normalizeLoadSettings({ lazyMode: "off" }).lazyMode, "off");
+    assert.equal(normalizeLoadSettings({}).lazyMode, "auto");
+  });
+
+  it("faults PLE from disk for --lazy-mode on, or auto above 4 GiB", () => {
+    assert.equal(lazyModeReadsFromDisk("on", 1024), true);
+    assert.equal(lazyModeReadsFromDisk("off", 20 * 1024 ** 3), false);
+    assert.equal(lazyModeReadsFromDisk("auto", 3 * 1024 ** 3), false);
+    assert.equal(lazyModeReadsFromDisk("auto", 5 * 1024 ** 3), true);
+  });
+
   it("falls back on unknown enum values", () => {
     const s = normalizeLoadSettings({
       cacheTypeK: "q3_k" as never,
       flashAttention: "yes" as never,
+      lazyMode: "maybe" as never,
       reasoningFormat: "chatml" as never,
       speculativeMode: "eagle" as never,
     });
     assert.equal(s.cacheTypeK, "q8_0");
     assert.equal(s.flashAttention, "auto");
+    assert.equal(s.lazyMode, "auto");
     assert.equal(s.reasoningFormat, "deepseek-legacy");
     assert.equal(s.speculativeMode, "off");
+  });
+
+  it("accepts every cache type llama.cpp supports", () => {
+    const types = [
+      "f32",
+      "f16",
+      "bf16",
+      "q8_0",
+      "q5_1",
+      "q5_0",
+      "q4_1",
+      "q4_0",
+      "iq4_nl",
+    ] as const;
+    for (const t of types) {
+      const s = normalizeLoadSettings({ cacheTypeK: t, cacheTypeV: t });
+      assert.equal(s.cacheTypeK, t);
+      assert.equal(s.cacheTypeV, t);
+    }
   });
 
   it("keeps valid values untouched", () => {
     const wanted = {
       contextLength: 32768,
       physicalBatchSize: 1024,
+      nCpuFfn: 7,
       cacheTypeK: "f16" as const,
       cacheTypeV: "q4_0" as const,
       flashAttention: "on" as const,
+      lazyMode: "off" as const,
       reasoningBudget: 2048,
       seed: 42,
       ropeFreqBase: 1000000,

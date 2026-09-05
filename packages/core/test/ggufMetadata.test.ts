@@ -5,12 +5,15 @@ import * as path from "node:path";
 import { after, before, describe, it } from "node:test";
 import {
   clampLoadSettingsToModel,
+  heuristicPleShare,
+  isQwen4expArchitecture,
   readModelCapabilities,
   resolveSlidingWindowPattern,
   shardFileNames,
+  shouldPinPleToCpu,
   totalModelBytes,
 } from "../src/ggufMetadata";
-import { denseCaps, loadSettings } from "./helpers";
+import { denseCaps, loadSettings, moeCaps } from "./helpers";
 
 describe("shardFileNames", () => {
   it("expands a split-model name into the whole set", () => {
@@ -163,6 +166,12 @@ describe("clampLoadSettingsToModel", () => {
   it("zeroes --n-cpu-moe for dense models", () => {
     assert.equal(clampLoadSettingsToModel(loadSettings({ nCpuMoe: 12 }), denseCaps()).nCpuMoe, 0);
   });
+
+  it("zeroes --n-cpu-ffn for MoE models and clamps it to the layer count for dense", () => {
+    assert.equal(clampLoadSettingsToModel(loadSettings({ nCpuFfn: 12 }), moeCaps()).nCpuFfn, 0);
+    const clamped = clampLoadSettingsToModel(loadSettings({ nCpuFfn: 500 }), denseCaps({ blockCount: 48 }));
+    assert.equal(clamped.nCpuFfn, 48);
+  });
 });
 
 describe("resolveSlidingWindowPattern", () => {
@@ -182,5 +191,27 @@ describe("resolveSlidingWindowPattern", () => {
   it("treats period 0 as all SWA and period 1 as all dense", () => {
     assert.deepEqual(resolveSlidingWindowPattern(0, 3), [true, true, true]);
     assert.deepEqual(resolveSlidingWindowPattern(1, 3), [false, false, false]);
+  });
+});
+
+describe("qwen4exp / PLE helpers", () => {
+  it("recognizes llama.cpp and HF architecture spellings", () => {
+    assert.equal(isQwen4expArchitecture("qwen4exp"), true);
+    assert.equal(isQwen4expArchitecture("qwen4_exp"), true);
+    assert.equal(isQwen4expArchitecture("qwen4-exp"), true);
+    assert.equal(isQwen4expArchitecture("qwen35"), false);
+    assert.equal(isQwen4expArchitecture("qwen3"), false);
+  });
+
+  it("heuristically prices the PLE table only for qwen4exp", () => {
+    assert.equal(heuristicPleShare("qwen4exp"), 0.4);
+    assert.equal(heuristicPleShare("qwen3"), 0);
+  });
+
+  it("pins PLE to CPU when the share is known or the arch is qwen4exp", () => {
+    assert.equal(shouldPinPleToCpu({ architecture: "qwen4exp" }), true);
+    assert.equal(shouldPinPleToCpu({ architecture: "qwen3", pleShare: 0.3 }), true);
+    assert.equal(shouldPinPleToCpu({ architecture: "qwen3" }), false);
+    assert.equal(shouldPinPleToCpu(undefined), false);
   });
 });

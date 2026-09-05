@@ -155,7 +155,7 @@ export async function pickDraftModelFile(
 export async function pickDraftModelFromLibrary(
   store: SettingsStore
 ): Promise<string | undefined> {
-  const { readModelCapabilities, isDflashDraftArchitecture, isMtpDraftArchitecture, isMtpDraftFileName } =
+  const { readModelCapabilities, isDflashDraftArchitecture, isMtpDraftArchitecture, isMtpSidecarFile } =
     await import("@llama-aio/core");
   const { listMtpDraftEntries } = await import("@llama-aio/core");
   const config = store.getConfig();
@@ -203,7 +203,7 @@ export async function pickDraftModelFromLibrary(
           e,
           arch,
           dflash: isDflashDraftArchitecture(arch),
-          mtp: isMtpDraftArchitecture(arch) || isMtpDraftFileName(e.path),
+          mtp: isMtpDraftArchitecture(arch) || isMtpSidecarFile({ path: e.path, size: e.sizeBytes }),
         });
       }
       out.sort((a, b) => Number(b.dflash || b.mtp) - Number(a.dflash || a.mtp) || Number(b.mtp) - Number(a.mtp));

@@ -12,7 +12,6 @@ import {
   PerfStats,
   ProcessManager,
   SettingsStore,
-  isMtpDraftFileName,
   recommendedMaxDraftTokens,
   speculativeUsesMtp,
   speculativeUsesNgram,
@@ -172,24 +171,40 @@ export function activate(context: vscode.ExtensionContext): void {
       if (!selected) {
         return;
       }
-      const { readModelCapabilities, isDflashDraftArchitecture, isMtpDraftArchitecture, isMtpDraftFileName } =
-        await import("@llama-aio/core");
+      const {
+        readModelCapabilities,
+        isDflashDraftArchitecture,
+        isMtpDraftArchitecture,
+        isMtpSidecarFile,
+        isMtpBakedInFile,
+      } = await import("@llama-aio/core");
       let warn = "";
       let kind: "dflash" | "mtp" | "unknown" = "unknown";
       try {
         const caps = readModelCapabilities(selected);
         if (isDflashDraftArchitecture(caps.architecture)) {
           kind = "dflash";
-        } else if (isMtpDraftArchitecture(caps.architecture) || isMtpDraftFileName(selected)) {
+        } else if (isMtpDraftArchitecture(caps.architecture) || isMtpSidecarFile({ path: selected })) {
           kind = "mtp";
+        } else if (
+          isMtpBakedInFile({ path: selected }) ||
+          (caps.nextnPredictLayers && caps.nextnPredictLayers > 0 && (caps.blockCount || 0) >= 16)
+        ) {
+          warn =
+            `${path.basename(selected)} looks like a full language GGUF with MTP baked in, not a sidecar drafter. ` +
+            `Select it as the main model instead. Use as draft anyway?`;
         } else {
           warn =
             `Selected draft GGUF architecture is "${caps.architecture || "unknown"}" ` +
             `(DFlash expects general.architecture = dflash; Gemma 4 MTP is a sibling mtp-*.gguf). Continue anyway?`;
         }
       } catch {
-        if (isMtpDraftFileName(selected)) {
+        if (isMtpSidecarFile({ path: selected })) {
           kind = "mtp";
+        } else if (isMtpBakedInFile({ path: selected })) {
+          warn =
+            `${path.basename(selected)} looks like a full language GGUF with MTP baked in, not a sidecar drafter. ` +
+            `Select it as the main model instead. Use as draft anyway?`;
         } else {
           warn = "Could not read draft GGUF metadata. Use it anyway?";
         }

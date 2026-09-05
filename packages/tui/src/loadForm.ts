@@ -7,23 +7,36 @@ import {
   FLASH_ATTENTION_MODES,
   GPU_SPLIT_MODES,
   KV_CACHE_TYPES,
+  LAZY_MODES,
   type FlashAttention,
   type KvCacheType,
+  type LazyMode,
 } from "@llama-aio/core";
 
 export const CPU_THREAD_MAX = Math.max(1, os.cpus().length || 8);
 
 export const KV_TYPE_HELP: Record<KvCacheType, string> = {
-  f16: "Full precision — uses the most VRAM",
+  f32: "Full precision — largest KV by far",
+  f16: "Half precision — uses the most VRAM of the usual picks",
   bf16: "Brain-float — similar footprint to f16",
   q8_0: "Halves KV size with little quality loss (default)",
-  q4_0: "Smallest KV — can hurt long-context prompt speed",
+  q5_1: "5-bit with min offset — between q8_0 and q4",
+  q5_0: "5-bit — between q8_0 and q4",
+  q4_1: "4-bit with min offset — slightly better than q4_0",
+  q4_0: "Smallest classic KV — can hurt long-context prompt speed",
+  iq4_nl: "4-bit non-linear codebook — q4 size, better quality",
 };
 
 export const FLASH_HELP: Record<FlashAttention, string> = {
   auto: "Let llama.cpp decide (recommended)",
   on: "Force on — often needed for quantized V cache",
   off: "Force off — quantized V will fail to start",
+};
+
+export const LAZY_HELP: Record<LazyMode, string> = {
+  auto: "On for tensors > 4 GiB (PLE / n-gram tables)",
+  on: "Always read large host tensors from disk (needs mmap)",
+  off: "Keep the PLE table resident in RAM",
 };
 
 export type LoadFieldKind = "preset" | "number" | "enum" | "action";
@@ -182,6 +195,17 @@ export const LOAD_FIELD_DEFS: LoadFieldDef[] = [
     max: 64,
   },
   {
+    id: "nCpuFfn",
+    kind: "number",
+    label: "CPU FFN Layers",
+    help: "Keep dense FFN weights of the first N layers on CPU (--n-cpu-ffn). MoE models ignore this.",
+    step: 1,
+    store: "load",
+    key: "nCpuFfn",
+    min: 0,
+    max: 64,
+  },
+  {
     id: "cacheTypeK",
     kind: "enum",
     label: "KV Cache Type (K)",
@@ -207,6 +231,15 @@ export const LOAD_FIELD_DEFS: LoadFieldDef[] = [
     store: "load",
     key: "flashAttention",
     options: FLASH_ATTENTION_MODES.map((m) => ({ value: m, name: `${m} — ${FLASH_HELP[m]}` })),
+  },
+  {
+    id: "lazyMode",
+    kind: "enum",
+    label: "Lazy tensor reads",
+    help: "On-demand disk reads of large host tensors (--lazy-mode). Needs mmap. Auto = on above 4 GiB (Flash-Next PLE).",
+    store: "load",
+    key: "lazyMode",
+    options: LAZY_MODES.map((m) => ({ value: m, name: `${m} — ${LAZY_HELP[m]}` })),
   },
   {
     id: "offloadKvCacheToGpu",

@@ -1,6 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
-import { isMtpDraftFileName } from "./modelLibrary";
+import { isMtpBakedInFile, isMtpSidecarFile } from "./modelLibrary";
 import { LlamaLoadSettings, speculativeUsesMtp, speculativeUsesNgram } from "./types";
 
 export interface ModelCapabilities {
@@ -31,8 +31,8 @@ export interface ModelCapabilities {
   keyLengthSwa?: number;
   valueLengthSwa?: number;
   /**
-   * Hybrid models (e.g. Qwen3.5): every Nth layer is full attention; others are
-   * recurrent/linear (fixed-size state, no growing KV). Matches llama.cpp.
+   * Hybrid models (e.g. Qwen3.5 / qwen4exp): every Nth layer is full attention;
+   * others are recurrent/linear (fixed-size state, no growing KV). Matches llama.cpp.
    */
   fullAttentionInterval?: number;
   /** Per-layer: true = recurrent / linear-attention (no context-scaled KV) */
@@ -49,6 +49,20 @@ export interface ModelCapabilities {
    * Undefined when not MoE or scan failed (caller should use a heuristic).
    */
   moeExpertShare?: number;
+  /** Dense FFN intermediate size ({arch}.feed_forward_length); undefined for MoE models */
+  ffnLength?: number;
+  /**
+   * Fraction of tensor bytes that are dense FFN weights (`ffn_(gate|up|down).weight`).
+   * Used with `--n-cpu-ffn` to move dense FFN weight off the GPU estimate.
+   * Undefined when the scan failed (caller should use a heuristic).
+   */
+  denseFfnShare?: number;
+  /**
+   * Fraction of tensor bytes that are per-layer embedding / PLE n-gram tables
+   * (`per_layer_token_embd`). llama.cpp keeps these as host lookups (not GPU
+   * compute); Qwen3.8-Flash-Next's table is tens of GiB.
+   */
+  pleShare?: number;
   /** Total MoE experts if present */
   expertCount?: number;
   /** Experts used per token if present */
@@ -359,6 +373,36 @@ export function measureMoeExpertShare(filePath: string): number | undefined {
   }
 }
 
+/**
+ * Share of GGUF tensor bytes belonging to dense FFN weights
+ * (`ffn_(gate|up|down).weight`) — the tensors `--n-cpu-ffn` moves to CPU.
+ */
+function computeDenseFfnShare(
+  tensors: Array<{ name: string; offset: number }>,
+  dataStart: number,
+  fileSize: number
+): number | undefined {
+  if (!tensors.length || fileSize <= dataStart) {
+    return undefined;
+  }
+  const sorted = [...tensors].sort((a, b) => a.offset - b.offset);
+  let total = 0;
+  let ffn = 0;
+  for (let i = 0; i < sorted.length; i++) {
+    const off = sorted[i].offset;
+    const next = i + 1 < sorted.length ? sorted[i + 1].offset : Math.max(off, fileSize - dataStart);
+    const size = Math.max(0, next - off);
+    total += size;
+    if (/ffn_(?:gate|up|down)\.weight$/i.test(sorted[i].name)) {
+      ffn += size;
+    }
+  }
+  if (total <= 0 || ffn <= 0) {
+    return undefined;
+  }
+  return Math.min(0.95, Math.max(0.05, ffn / total));
+}
+
 /** Heuristic when tensor scan is unavailable. */
 export function heuristicMoeExpertShare(expertCount?: number): number {
   if (!expertCount || expertCount <= 0) {
@@ -374,6 +418,82 @@ export function heuristicMoeExpertShare(expertCount?: number): number {
     return 0.8;
   }
   return 0.75;
+}
+
+/**
+ * llama.cpp `general.architecture` for Qwen3.8-Flash-Next (HF `qwen4_exp`).
+ * Underscores/hyphens are stripped so `qwen4_exp` and `qwen4-exp` match.
+ */
+export function isQwen4expArchitecture(architecture?: string): boolean {
+  const a = (architecture || "").toLowerCase().replace(/[_-]/g, "");
+  return a === "qwen4exp";
+}
+
+/**
+ * Share of GGUF tensor bytes belonging to the PLE / engram lookup table.
+ * Matches llama.cpp `per_layer_token_embd` (not the small `*.ple.*` projections).
+ */
+function computePleShare(
+  tensors: Array<{ name: string; offset: number }>,
+  dataStart: number,
+  fileSize: number
+): number | undefined {
+  if (!tensors.length || fileSize <= dataStart) {
+    return undefined;
+  }
+  const sorted = [...tensors].sort((a, b) => a.offset - b.offset);
+  let total = 0;
+  let ple = 0;
+  for (let i = 0; i < sorted.length; i++) {
+    const off = sorted[i].offset;
+    const next = i + 1 < sorted.length ? sorted[i + 1].offset : Math.max(off, fileSize - dataStart);
+    const size = Math.max(0, next - off);
+    total += size;
+    if (/per_layer_token_embd/i.test(sorted[i].name) || /ple_ngram/i.test(sorted[i].name)) {
+      ple += size;
+    }
+  }
+  if (total <= 0 || ple <= 0) {
+    return undefined;
+  }
+  return Math.min(0.95, Math.max(0.01, ple / total));
+}
+
+/** When the GGUF scan misses PLE tensors on qwen4exp, assume ~40% of the file. */
+export function heuristicPleShare(architecture?: string): number {
+  return isQwen4expArchitecture(architecture) ? 0.4 : 0;
+}
+
+/** Pin the PLE n-gram table to CPU (`--override-tensor per_layer_token_embd.=CPU`). */
+export function shouldPinPleToCpu(
+  caps?: Pick<ModelCapabilities, "architecture" | "pleShare">
+): boolean {
+  if (!caps) {
+    return false;
+  }
+  if (typeof caps.pleShare === "number" && Number.isFinite(caps.pleShare) && caps.pleShare > 0) {
+    return true;
+  }
+  return isQwen4expArchitecture(caps.architecture);
+}
+
+/**
+ * Heuristic dense FFN tensor share when the scan is unavailable: per layer,
+ * FFN holds 3 × embed × ffn_len elements vs ~4 × embed² for attention.
+ * Llama-style (ffn = 4×embed) → 75%; SwiGLU (~8/3×embed) → ~67%.
+ */
+export function heuristicDenseFfnShare(
+  ffnLength?: number,
+  embeddingLength?: number
+): number {
+  const ffn = Math.max(0, ffnLength || 0);
+  const embed = Math.max(0, embeddingLength || 0);
+  if (ffn <= 0 || embed <= 0) {
+    return 0.7;
+  }
+  const ffnElems = 3 * ffn;
+  const attnElems = 4 * embed;
+  return Math.min(0.95, Math.max(0.05, ffnElems / (ffnElems + attnElems)));
 }
 
 export function readModelCapabilities(filePath: string): ModelCapabilities {
@@ -506,6 +626,18 @@ export function readModelCapabilities(filePath: string): ModelCapabilities {
       heuristicMoeExpertShare(expertCount);
   }
 
+  // Dense FFN pricing for --n-cpu-ffn. Only meaningful for non-MoE models —
+  // MoE routers keep their experts in ffn_*_exps tensors, matched separately.
+  const ffnLength = pickArchNumber("feed_forward_length");
+  const denseFfnShare = !isMoe && ffnLength
+    ? computeDenseFfnShare(tensors, dataStart, fileSizeBytes || 0) ??
+      heuristicDenseFfnShare(ffnLength, embeddingLength)
+    : undefined;
+
+  const pleShare =
+    computePleShare(tensors, dataStart, fileSizeBytes || 0) ??
+    (isQwen4expArchitecture(arch) ? heuristicPleShare(arch) : undefined);
+
   return {
     path: filePath,
     name,
@@ -528,6 +660,9 @@ export function readModelCapabilities(filePath: string): ModelCapabilities {
     shardCount,
     shardsFound,
     moeExpertShare,
+    ffnLength,
+    denseFfnShare,
+    pleShare,
     expertCount,
     expertUsedCount,
     isMoe,
@@ -619,10 +754,24 @@ export function clampLoadSettingsToModel(
   const nCpuMoe = caps.isMoe
     ? Math.min(Math.max(0, settings.nCpuMoe), caps.blockCount)
     : 0;
+  // Dense counterpart: --n-cpu-ffn targets dense FFN tensors, which MoE models
+  // only have as (tiny) shared experts — reset it there.
+  const nCpuFfn = caps.isMoe
+    ? 0
+    : Math.min(Math.max(0, settings.nCpuFfn ?? 0), caps.blockCount);
 
   let speculativeMode = settings.speculativeMode;
+  let draftModelPath = typeof settings.draftModelPath === "string" ? settings.draftModelPath.trim() : "";
+  if (draftModelPath && isMtpBakedInFile({ path: draftModelPath })) {
+    draftModelPath = "";
+  }
   const bakedMtp = !!(caps.nextnPredictLayers && caps.nextnPredictLayers > 0);
-  const sidecarMtp = isMtpDraftFileName(settings.draftModelPath);
+  // qwen4exp Unsloth `mtp-*.gguf` is not a llama.cpp `--model-draft` (missing
+  // output_hc_norm.weight). Treat as no sidecar so Start does not pass it.
+  if (isQwen4expArchitecture(caps.architecture) && isMtpSidecarFile({ path: draftModelPath })) {
+    draftModelPath = "";
+  }
+  const sidecarMtp = isMtpSidecarFile({ path: draftModelPath });
   // MTP without next-n layers and without a sidecar drafter crashes llama-server
   // ("model doesn't contain MTP layers").
   if (speculativeUsesMtp(speculativeMode) && !bakedMtp && !sidecarMtp) {
@@ -636,10 +785,11 @@ export function clampLoadSettingsToModel(
     contextLength,
     gpuOffload,
     nCpuMoe,
+    nCpuFfn,
     cpuThreads: Math.min(Math.max(1, settings.cpuThreads), 256),
     maxConcurrentPredictions: Math.min(Math.max(1, settings.maxConcurrentPredictions), 64),
     speculativeMode,
-    draftModelPath: typeof settings.draftModelPath === "string" ? settings.draftModelPath.trim() : "",
+    draftModelPath,
     draftGpuOffload: Math.min(Math.max(0, settings.draftGpuOffload ?? 99), 999),
     mmprojPath: typeof settings.mmprojPath === "string" ? settings.mmprojPath.trim() : "",
   };

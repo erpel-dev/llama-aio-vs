@@ -3,12 +3,14 @@
  */
 import * as vscode from "vscode";
 import {
+  companionDownloadHint,
+  describeLanguageGgufFile,
   formatLicenseQuickPick,
   languageGgufFiles,
   licenseFromTags,
   preferredMmprojFile,
   preferredMtpDraftFile,
-  isMtpDraftFileName,
+  isMtpSidecarFile,
   resolveLicenseUrl,
   STARTER_MODEL,
   HuggingFaceClient,
@@ -132,18 +134,16 @@ export async function browseAndDownloadModel(
     return undefined;
   }
 
-  const mmproj = preferredMmprojFile(files);
-  const mtpDraft = preferredMtpDraftFile(files);
-  const extras = [mmproj?.path, mtpDraft?.path].filter(Boolean).map((p) => (p as string).split("/").pop());
+  const extras = companionDownloadHint(files);
   const pickedFile = await vscode.window.showQuickPick(
     languageFiles.map((f) => ({
       label: f.path,
-      description: formatBytes(f.size),
+      description: describeLanguageGgufFile(f, files),
       file: f,
     })),
     {
-      title: extras.length
-        ? `Select a GGUF to download  ·  will also fetch ${extras.join(", ")}`
+      title: extras
+        ? `Select a GGUF to download  ·  will also fetch ${extras}`
         : "Select a GGUF file to download",
       matchOnDescription: true,
     }
@@ -165,7 +165,7 @@ export async function browseAndDownloadModel(
         progress
       );
       await downloadCompanionMmproj(hf, pickedModel.model.id, progress, files);
-      await downloadCompanionMtpDraft(hf, pickedModel.model.id, progress, files);
+      await downloadCompanionMtpDraft(hf, pickedModel.model.id, progress, files, pickedFile.file.path);
       return modelDest;
     }
   );
@@ -176,7 +176,7 @@ export async function browseAndDownloadModel(
     ? ` · vision ${state.loadSettings.mmprojPath.split(/[/\\]/).pop()}`
     : "";
   const mtp =
-    isMtpDraftFileName(state.loadSettings.draftModelPath)
+    isMtpSidecarFile({ path: state.loadSettings.draftModelPath })
       ? ` · MTP ${state.loadSettings.draftModelPath.split(/[/\\]/).pop()}`
       : "";
   const lic = pickedModel.license.badge;
@@ -218,16 +218,17 @@ async function downloadCompanionMtpDraft(
   hf: HuggingFaceClient,
   repoId: string,
   progress: vscode.Progress<{ message?: string; increment?: number }>,
-  files?: HfFileHit[]
+  files?: HfFileHit[],
+  languagePath?: string
 ): Promise<string | undefined> {
   try {
     const listing = files ?? (await hf.listGgufFiles(repoId));
-    const picked = preferredMtpDraftFile(listing);
+    const picked = preferredMtpDraftFile(listing, languagePath);
     if (!picked) {
       return undefined;
     }
     progress.report({ message: `Downloading MTP drafter ${picked.path}…` });
-    return await hf.downloadPreferredMtpDraft(repoId, listing, progress);
+    return await hf.downloadPreferredMtpDraft(repoId, listing, progress, languagePath);
   } catch (e) {
     void vscode.window.showWarningMessage(
       `Model downloaded, but the MTP drafter failed: ${e instanceof Error ? e.message : String(e)}`

@@ -1,6 +1,13 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { computeOverheadBytes, estimateKvBytes, estimateMemory, kvSlotMultiplier } from "../src/memoryEstimate";
+import {
+  computeOverheadBytes,
+  estimateKvBytes,
+  estimateMemory,
+  inferComputeBackend,
+  kvSlotMultiplier,
+  peerGpuOverheadBytes,
+} from "../src/memoryEstimate";
 import { denseCaps, GiB, loadSettings, moeCaps } from "./helpers";
 
 const gpu = (totalGiB: number) => ({
@@ -25,10 +32,31 @@ describe("estimateKvBytes", () => {
     assert.equal(k8, f16 * 0.75); // K is half of a symmetric cache
   });
 
-  it("prices q4_0 at a quarter of f16", () => {
+  it("prices q4_0 at 9/32 of f16 (18 B per 32 elems)", () => {
     const f16 = estimateKvBytes(caps, 8192, "f16", "f16");
     const q4 = estimateKvBytes(caps, 8192, "q4_0", "q4_0");
-    assert.equal(q4, f16 / 4);
+    assert.equal(q4, f16 * (0.5625 / 2));
+  });
+
+  it("sizes the full llama.cpp cache-type set correctly", () => {
+    const perToken = estimateKvBytes(caps, 1, "f32", "f32");
+    for (const [type, ratio] of [
+      ["f32", 1],
+      ["f16", 0.5],
+      ["bf16", 0.5],
+      ["q8_0", 0.25],
+      ["q5_1", 0.1875],
+      ["q5_0", 0.171875],
+      ["q4_1", 0.15625],
+      ["q4_0", 0.140625],
+      ["iq4_nl", 0.140625],
+    ] as const) {
+      assert.equal(
+        estimateKvBytes(caps, 1, type, type),
+        perToken * ratio,
+        `unexpected size ratio for ${type}`,
+      );
+    }
   });
 
   it("caps sliding-window layers at the window size", () => {
@@ -98,6 +126,12 @@ describe("estimateKvBytes", () => {
     assert.equal(estimateKvBytes(hybrid, 32768, "q8_0", "q8_0"), full / 4);
   });
 
+  it("derives the same hybrid skip from fullAttentionInterval (qwen4exp GDN)", () => {
+    const hybrid = denseCaps({ architecture: "qwen4exp", fullAttentionInterval: 4 });
+    const full = estimateKvBytes(denseCaps(), 32768, "q8_0", "q8_0");
+    assert.equal(estimateKvBytes(hybrid, 32768, "q8_0", "q8_0"), full / 4);
+  });
+
   it("skips n_kv=0 layers instead of billing them as Q-heads (Ling / bailingmoe3 KDA)", () => {
     const kvHeads = [0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1];
     const ling = denseCaps({
@@ -142,6 +176,47 @@ describe("computeOverheadBytes", () => {
     const bigBatch = computeOverheadBytes(5120, 512, 4096);
     assert.ok(bigUbatch > small, "-ub should raise the compute buffer");
     assert.ok(bigUbatch - small > bigBatch - small, "-ub should dominate -b");
+  });
+
+  it("grows with context and is larger on Vulkan than CUDA", () => {
+    const at8k = computeOverheadBytes(2560, 1024, 2048, {
+      contextLength: 8192,
+      backend: "vulkan",
+      flashAttention: "auto",
+    });
+    const at64k = computeOverheadBytes(2560, 1024, 2048, {
+      contextLength: 65536,
+      backend: "vulkan",
+      flashAttention: "auto",
+    });
+    const cuda64k = computeOverheadBytes(2560, 1024, 2048, {
+      contextLength: 65536,
+      backend: "cuda",
+      flashAttention: "auto",
+    });
+    assert.ok(at64k > at8k, "64k graph should exceed an 8k graph");
+    assert.ok(at64k > cuda64k, "Vulkan heaps are fatter than CUDA");
+    assert.ok(at64k > 2 * GiB, "64k Vulkan compute was the ~3 GiB hole on the 9070");
+  });
+
+  it("sizes a peer-GPU heap below the main-GPU graph", () => {
+    const main = computeOverheadBytes(2560, 1024, 2048, {
+      contextLength: 65536,
+      backend: "vulkan",
+    });
+    const peer = peerGpuOverheadBytes(2560, 1024, "vulkan");
+    assert.ok(peer > 2 * GiB, "each Vulkan device reserves ~2.5 GiB of heap slop");
+    assert.ok(peer < main);
+  });
+
+  it("reads Vulkan/CUDA from llama.cpp device ids", () => {
+    assert.equal(inferComputeBackend(true, []), "cpu");
+    assert.equal(
+      inferComputeBackend(false, [{ llamaDeviceId: "Vulkan0" }, { llamaDeviceId: "Vulkan1" }]),
+      "vulkan"
+    );
+    assert.equal(inferComputeBackend(false, [{ llamaDeviceId: "CUDA0" }]), "cuda");
+    assert.equal(inferComputeBackend(false, []), "unknown");
   });
 
   it("stays finite for junk input", () => {
@@ -190,6 +265,75 @@ describe("estimateMemory", () => {
     const none = estimateMemory(moeCaps(), loadSettings({ nCpuMoe: 0 }), gpu(48));
     const some = estimateMemory(moeCaps(), loadSettings({ nCpuMoe: 24 }), gpu(48));
     assert.ok(some!.gpuWeightsBytes < none!.gpuWeightsBytes);
+  });
+
+  it("keeps the PLE n-gram table in RAM even at full GPU offload", () => {
+    const file = 90 * GiB;
+    const caps = moeCaps({
+      architecture: "qwen4exp",
+      fileSizeBytes: file,
+      pleShare: 0.4,
+      fullAttentionInterval: 4,
+    });
+    const est = estimateMemory(
+      caps,
+      loadSettings({ gpuOffload: 99, nCpuMoe: 0, lazyMode: "off" }),
+      gpu(80)
+    );
+    assert.ok(est);
+    assert.equal(est.cpuWeightsBytes, file * 0.4);
+    assert.equal(est.gpuWeightsBytes, file * 0.6);
+    assert.ok(est.warnings.some((w) => /stays in system RAM/i.test(w)));
+  });
+
+  it("omits a lazily-read PLE table from the RAM bar", () => {
+    const file = 90 * GiB;
+    const caps = moeCaps({
+      architecture: "qwen4exp",
+      fileSizeBytes: file,
+      pleShare: 0.4,
+      fullAttentionInterval: 4,
+    });
+    const est = estimateMemory(
+      caps,
+      loadSettings({ gpuOffload: 99, nCpuMoe: 0, lazyMode: "on", tryMmap: true }),
+      gpu(80)
+    );
+    assert.ok(est);
+    assert.equal(est.cpuWeightsBytes, 0);
+    assert.equal(est.gpuWeightsBytes, file * 0.6);
+    assert.ok(est.warnings.some((w) => /read from disk/i.test(w)));
+  });
+
+  it("does not move PLE bytes onto the GPU for dense models without a table", () => {
+    const est = estimateMemory(denseCaps(), loadSettings({ gpuOffload: 99 }), gpu(48));
+    assert.equal(est?.cpuWeightsBytes, 0);
+  });
+
+  it("credits --n-cpu-ffn with moving dense FFN weights off the GPU", () => {
+    const caps = denseCaps({ ffnLength: 13824, embeddingLength: 5120 });
+    const none = estimateMemory(caps, loadSettings({ nCpuFfn: 0 }), gpu(48));
+    const some = estimateMemory(caps, loadSettings({ nCpuFfn: 24 }), gpu(48));
+    assert.ok(some!.gpuWeightsBytes < none!.gpuWeightsBytes);
+    // Heuristic share: 3·ffn / (3·ffn + 4·embed) ≈ 0.619 for 13824/5120.
+    const expectedDeduct = caps.fileSizeBytes! * (24 / 48) * (3 * 13824 / (3 * 13824 + 4 * 5120));
+    assert.ok(
+      Math.abs((none!.gpuWeightsBytes - some!.gpuWeightsBytes) - expectedDeduct) < 1,
+      `expected ~${expectedDeduct} moved, got ${none!.gpuWeightsBytes - some!.gpuWeightsBytes}`,
+    );
+  });
+
+  it("ignores --n-cpu-ffn for MoE models", () => {
+    const none = estimateMemory(moeCaps(), loadSettings({ nCpuFfn: 0 }), gpu(48));
+    const some = estimateMemory(moeCaps(), loadSettings({ nCpuFfn: 24 }), gpu(48));
+    assert.equal(some!.gpuWeightsBytes, none!.gpuWeightsBytes);
+  });
+
+  it("ignores --n-cpu-ffn on the CPU backend", () => {
+    const caps = denseCaps({ ffnLength: 13824 });
+    const none = estimateMemory(caps, loadSettings({ nCpuFfn: 0 }), gpu(48), { cpuOnly: true });
+    const some = estimateMemory(caps, loadSettings({ nCpuFfn: 24 }), gpu(48), { cpuOnly: true });
+    assert.equal(some!.gpuWeightsBytes, none!.gpuWeightsBytes);
   });
 
   it("returns undefined for unreadable models", () => {
@@ -311,7 +455,8 @@ describe("estimateMemory", () => {
     const oh0 = est.charts.vram.segments.find((s) => s.key === "overhead")!.bytes;
     const oh1 = est.charts.vram2!.segments.find((s) => s.key === "overhead")!.bytes;
     assert.ok(oh0 > 0);
-    assert.equal(oh1, 0);
+    assert.ok(oh1 > 0, "layer-split peers have their own device heap");
+    assert.ok(oh0 > oh1, "main GPU keeps the graph / driver tax");
     assert.ok(est.charts.vram.capacityBytes === 16 * GiB);
     assert.ok(est.charts.vram2!.capacityBytes === 16 * GiB);
   });
@@ -332,7 +477,7 @@ describe("estimateMemory", () => {
     const wOther = est.charts.vram2!.segments.find((s) => s.key === "weights")!.bytes;
     assert.ok(Math.abs(wMain / (wMain + wOther) - 0.75) < 0.001);
     assert.ok(est.charts.vram.segments.find((s) => s.key === "overhead")!.bytes > 0);
-    assert.equal(est.charts.vram2!.segments.find((s) => s.key === "overhead")!.bytes, 0);
+    assert.ok(est.charts.vram2!.segments.find((s) => s.key === "overhead")!.bytes > 0);
   });
 
   it("flags spill when either GPU is over capacity", () => {
@@ -367,6 +512,7 @@ describe("estimateMemory", () => {
     const w1 = est.charts.vram2?.segments.find((s) => s.key === "weights")?.bytes ?? 0;
     assert.ok(w0 > 0);
     assert.equal(w1, 0);
+    assert.equal(est.charts.vram2?.segments.find((s) => s.key === "overhead")?.bytes ?? 0, 0);
     assert.ok(est.lines.some((l) => /No GPU split/i.test(l)));
     assert.ok(!est.warnings.some((w) => /split by VRAM/i.test(w)));
   });
@@ -394,9 +540,11 @@ describe("estimateMemory", () => {
       { gpus: [g0, g1] }
     );
     assert.ok(one?.willSpill, "the same load on one 16 GiB card should spill");
-    assert.equal(two?.willSpill, false);
     assert.ok(two?.charts.vram2);
-    assert.ok(two.charts.vram.totalBytes < (one?.totalGpuBytes || 0));
+    assert.ok(
+      two.charts.vram.totalBytes < (one?.totalGpuBytes || 0) * 0.7,
+      "a 0-byte second card must not dump 100% of weights onto GPU 0"
+    );
   });
 
   it("splits a ~26 GiB estimate across two 16 GiB cards without spilling", () => {
@@ -412,6 +560,131 @@ describe("estimateMemory", () => {
     assert.equal(est.willSpill, false);
     assert.ok(est.charts.vram.totalBytes <= 16 * GiB - 2 * GiB);
     assert.ok((est.charts.vram2?.totalBytes || 0) <= 16 * GiB - 2 * GiB);
+  });
+
+  it("prices Vulkan dual-GPU compute near RADV occupancy for Flash-Next", () => {
+    const MiB = 1024 ** 2;
+    const caps = moeCaps({
+      architecture: "qwen4exp",
+      fileSizeBytes: 81961823936,
+      embeddingLength: 2560,
+      attentionHeadCount: 24,
+      attentionHeadCountKv: 2,
+      keyLength: 256,
+      valueLength: 256,
+      fullAttentionInterval: 4,
+      pleShare: 0.4,
+      moeExpertShare: 0.9,
+      expertCount: 512,
+    });
+    const g0 = {
+      totalBytes: 16304 * MiB,
+      usedBytes: 0,
+      name: "RX 9070",
+      source: "test",
+      llamaDeviceId: "Vulkan0",
+    };
+    const g1 = {
+      totalBytes: 16304 * MiB,
+      usedBytes: 0,
+      name: "RX 9060 XT",
+      source: "test",
+      llamaDeviceId: "Vulkan1",
+    };
+    const est = estimateMemory(
+      caps,
+      loadSettings({
+        contextLength: 65536,
+        gpuOffload: 48,
+        nCpuMoe: 16,
+        tensorSplit: "45,55",
+        cacheTypeK: "q8_0",
+        cacheTypeV: "q5_1",
+        evalBatchSize: 2048,
+        physicalBatchSize: 1024,
+        mainGpu: 0,
+        lazyMode: "auto",
+        tryMmap: true,
+      }),
+      g0,
+      { gpus: [g0, g1] }
+    );
+    assert.ok(est?.charts.vram2);
+    // --n-cpu-moe 16 + layer split 45,55: first layers (cheap) on the 9070,
+    // remaining full experts on the 9060. Live: 9070 ~12 GiB, 9060 15.8 + GTT.
+    const w0 = est.charts.vram.segments.find((s) => s.key === "weights")!.bytes;
+    const w1 = est.charts.vram2.segments.find((s) => s.key === "weights")!.bytes;
+    assert.ok(w1 > w0 * 1.8, `9060 should hold the leftover experts (${w0} vs ${w1})`);
+    assert.ok(
+      est.charts.vram2.totalBytes > 15.9 * GiB,
+      `9060 demand ${est.charts.vram2.totalBytes} should exceed 16 GiB (GTT spill)`
+    );
+    assert.ok(est.willSpill);
+    assert.ok(est.warnings.some((w) => /later cards hold more expert weight/i.test(w)));
+    const oh0 = est.charts.vram.segments.find((s) => s.key === "overhead")!.bytes;
+    const oh1 = est.charts.vram2.segments.find((s) => s.key === "overhead")!.bytes;
+    assert.ok(oh0 > 4 * GiB, "main-GPU graph + Vulkan heap reserve");
+    assert.ok(oh1 > 2 * GiB && oh1 < oh0);
+  });
+
+  it("adds Vulkan heap reserve so a 62/38 Flash-Next split looks full on both 16 GB cards", () => {
+    const MiB = 1024 ** 2;
+    const caps = moeCaps({
+      architecture: "qwen4exp",
+      fileSizeBytes: 81961823936,
+      embeddingLength: 2560,
+      attentionHeadCount: 24,
+      attentionHeadCountKv: 2,
+      keyLength: 256,
+      valueLength: 256,
+      fullAttentionInterval: 4,
+      pleShare: 0.4,
+      moeExpertShare: 0.9,
+      expertCount: 512,
+    });
+    const g0 = {
+      totalBytes: 16304 * MiB,
+      usedBytes: 0,
+      name: "RX 9070",
+      source: "test",
+      llamaDeviceId: "Vulkan0",
+    };
+    const g1 = {
+      totalBytes: 16304 * MiB,
+      usedBytes: 0,
+      name: "RX 9060 XT",
+      source: "test",
+      llamaDeviceId: "Vulkan1",
+    };
+    const est = estimateMemory(
+      caps,
+      loadSettings({
+        contextLength: 65536,
+        gpuOffload: 48,
+        nCpuMoe: 16,
+        tensorSplit: "62,38",
+        cacheTypeK: "q8_0",
+        cacheTypeV: "q5_1",
+        evalBatchSize: 2048,
+        physicalBatchSize: 1024,
+        mainGpu: 0,
+        lazyMode: "auto",
+        tryMmap: true,
+      }),
+      g0,
+      { gpus: [g0, g1] }
+    );
+    assert.ok(est?.charts.vram2);
+    // Live sysfs/LACT: both cards 15.4–15.9 GiB. Old bars were 13.2 / 13.8.
+    assert.ok(
+      est.charts.vram.totalBytes > 14.8 * GiB,
+      `9070 bar ${est.charts.vram.totalBytes} should sit near the 15.4 GiB measurement`
+    );
+    assert.ok(
+      est.charts.vram2.totalBytes > 14.8 * GiB,
+      `9060 bar ${est.charts.vram2.totalBytes} should sit near the 15.9 GiB measurement`
+    );
+    assert.ok(est.willSpill);
   });
 
   it("multiplies KV by parallel slots when the cache is not unified", () => {

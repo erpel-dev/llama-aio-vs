@@ -26,9 +26,37 @@ export {
 export type { ModelCapabilities };
 
 /** llama.cpp --cache-type-k / --cache-type-v */
-export type KvCacheType = "f16" | "bf16" | "q8_0" | "q4_0";
+export type KvCacheType =
+  | "f32"
+  | "f16"
+  | "bf16"
+  | "q8_0"
+  | "q5_1"
+  | "q5_0"
+  | "q4_1"
+  | "q4_0"
+  | "iq4_nl";
 
-export const KV_CACHE_TYPES: readonly KvCacheType[] = ["f16", "bf16", "q8_0", "q4_0"];
+/**
+ * All types llama.cpp accepts for --cache-type-k / --cache-type-v
+ * (common/arg.cpp: kv_cache_types), ordered most → least precise.
+ */
+export const KV_CACHE_TYPES: readonly KvCacheType[] = [
+  "f32",
+  "f16",
+  "bf16",
+  "q8_0",
+  "q5_1",
+  "q5_0",
+  "q4_1",
+  "q4_0",
+  "iq4_nl",
+];
+
+/** True for cache types stored below 16 bits (need the Flash Attention path for V). */
+export function isQuantizedKvCacheType(type: KvCacheType): boolean {
+  return type !== "f32" && type !== "f16" && type !== "bf16";
+}
 
 export function normalizeKvCacheType(value: unknown, fallback: KvCacheType = "q8_0"): KvCacheType {
   return typeof value === "string" && (KV_CACHE_TYPES as readonly string[]).includes(value)
@@ -66,6 +94,34 @@ export function normalizeFlashAttention(
   return typeof value === "string" && (FLASH_ATTENTION_MODES as readonly string[]).includes(value)
     ? (value as FlashAttention)
     : fallback;
+}
+
+/**
+ * llama.cpp `-lzm` / `--lazy-mode`: on-demand reads of large host tensors
+ * (PLE / `per_layer_token_embd`). Requires mmap. `auto` = on for tensors > 4 GiB.
+ */
+export type LazyMode = "auto" | "on" | "off";
+
+export const LAZY_MODES: readonly LazyMode[] = ["auto", "on", "off"];
+
+/** llama.cpp `--lazy-mode auto` threshold. */
+export const LAZY_MODE_AUTO_MIN_BYTES = 4 * 1024 ** 3;
+
+export function normalizeLazyMode(value: unknown, fallback: LazyMode = "auto"): LazyMode {
+  return typeof value === "string" && (LAZY_MODES as readonly string[]).includes(value)
+    ? (value as LazyMode)
+    : fallback;
+}
+
+/** True when `--lazy-mode` will fault this PLE table from disk instead of keeping it resident. */
+export function lazyModeReadsFromDisk(lazyMode: LazyMode, pleBytes: number): boolean {
+  if (lazyMode === "on") {
+    return true;
+  }
+  if (lazyMode === "off") {
+    return false;
+  }
+  return Number.isFinite(pleBytes) && pleBytes > LAZY_MODE_AUTO_MIN_BYTES;
 }
 
 /**
@@ -179,6 +235,8 @@ export interface LlamaLoadSettings {
   maxConcurrentPredictions: number;
   /** MoE: force expert tensors of first N layers onto CPU (--n-cpu-moe) */
   nCpuMoe: number;
+  /** Dense: force FFN tensors of first N layers onto CPU (--n-cpu-ffn); MoE models ignore this */
+  nCpuFfn: number;
   /** Offload KV cache to GPU (default true; false => --no-kv-offload) */
   offloadKvCacheToGpu: boolean;
   /** Key cache dtype (--cache-type-k / -ctk); default q8_0 */
@@ -189,6 +247,11 @@ export interface LlamaLoadSettings {
   keepModelInMemory: boolean;
   /** Use mmap (--mmap / --no-mmap) */
   tryMmap: boolean;
+  /**
+   * On-demand reads of large host tensors (`-lzm` / `--lazy-mode`).
+   * `auto` is the llama.cpp default (on for tensors > 4 GiB). Requires mmap.
+   */
+  lazyMode: LazyMode;
   /** Unified KV cache (-kvu / --kv-unified; false => --no-kv-unified) */
   unifiedKvCache: boolean;
   /** Flash Attention (-fa); "auto" leaves the llama.cpp default alone */
@@ -301,11 +364,13 @@ export const DEFAULT_LOAD_SETTINGS: LlamaLoadSettings = {
   physicalBatchSize: 512,
   maxConcurrentPredictions: 1,
   nCpuMoe: 0,
+  nCpuFfn: 0,
   offloadKvCacheToGpu: true,
   cacheTypeK: "q8_0",
   cacheTypeV: "q8_0",
   keepModelInMemory: false,
   tryMmap: true,
+  lazyMode: "auto",
   unifiedKvCache: true,
   flashAttention: "auto",
   contextCheckpoints: 32,
@@ -414,11 +479,13 @@ export function normalizeLoadSettings(raw: Partial<LlamaLoadSettings> | undefine
     ),
     maxConcurrentPredictions: int(s.maxConcurrentPredictions, 1, 64, d.maxConcurrentPredictions),
     nCpuMoe: int(s.nCpuMoe, 0, 999, d.nCpuMoe),
+    nCpuFfn: int(s.nCpuFfn, 0, 999, d.nCpuFfn),
     offloadKvCacheToGpu: toBoolean(s.offloadKvCacheToGpu, d.offloadKvCacheToGpu),
     cacheTypeK: normalizeKvCacheType(s.cacheTypeK),
     cacheTypeV: normalizeKvCacheType(s.cacheTypeV),
     keepModelInMemory: toBoolean(s.keepModelInMemory, d.keepModelInMemory),
     tryMmap: toBoolean(s.tryMmap, d.tryMmap),
+    lazyMode: normalizeLazyMode(s.lazyMode),
     unifiedKvCache: toBoolean(s.unifiedKvCache, d.unifiedKvCache),
     flashAttention: normalizeFlashAttention(s.flashAttention),
     contextCheckpoints: int(s.contextCheckpoints, 0, 4096, d.contextCheckpoints),
@@ -517,4 +584,6 @@ export interface HfFileHit {
   path: string;
   size: number;
   url: string;
+  /** Set when this row stands for a split GGUF (`-00001-of-00004`, …). */
+  shardCount?: number;
 }

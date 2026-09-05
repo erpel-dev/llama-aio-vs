@@ -4,7 +4,9 @@
  * OpenAI-compatible chat completions (chat_template_kwargs + sampling).
  *
  * Qwen3 / 3.5 / 3.6: enable_thinking + temperature (Think General / Coding / No Think).
- * Qwen3.8: reasoning_effort (xhigh | medium | low) inside chat_template_kwargs.
+ * Qwen3.8 dense: reasoning_effort (xhigh | medium | low) inside chat_template_kwargs.
+ * Qwen3.8-Flash-Next (qwen4exp): same effort ladder; llama.cpp injects it via
+ * chat_template_kwargs (not a top-level body field — that is vLLM-only).
  * Muse Glimmer: reasoning_strength (low | medium | high | xhigh); thinking cannot be off.
  * Gemma 4: enable_thinking on/off (template injects <|think|>); official top_k is 64.
  */
@@ -79,41 +81,55 @@ const QWEN3_THINKING_MODES: ModelModeSet = {
 };
 
 /**
- * Qwen3.8 family (vLLM-Copilot Qwen-Qwen3.8-27B.json).
- * Labels expose the template's reasoning_effort values (xhigh / medium / low).
- * vLLM-Copilot's 27B draft only ships Deep (xhigh) + Balanced (medium); Low is
- * an official template level so Copilot can select it too.
+ * Qwen3.8 family (vLLM-Copilot Qwen-Qwen3.8-27B.json) and Qwen3.8-Flash-Next
+ * (Qwen-Qwen3.8-Flash-Next.json). Labels expose the template's reasoning_effort
+ * values (xhigh / medium / low).
+ *
+ * vLLM-Copilot's presets only ship Deep (xhigh) + Balanced (medium). Low is an
+ * official template level (unknown values raise), so Copilot can select it too.
+ *
+ * llama.cpp / Unsloth pass `reasoning_effort` inside chat_template_kwargs.
+ * vLLM-Copilot puts it at the top level of the vLLM extra body — that does not
+ * reach llama-server's Jinja context, so we keep it in kwargs here.
  */
+const QWEN38_EFFORT_MODES: Record<string, ModelModeParams> = {
+  "Think (XHigh)": {
+    chat_template_kwargs: {
+      enable_thinking: true,
+      preserve_thinking: true,
+      reasoning_effort: "xhigh",
+    },
+    ...QWEN_THINK_SAMPLING,
+  },
+  "Think (Medium)": {
+    chat_template_kwargs: {
+      enable_thinking: true,
+      preserve_thinking: true,
+      reasoning_effort: "medium",
+    },
+    ...QWEN_THINK_SAMPLING,
+  },
+  "Think (Low)": {
+    chat_template_kwargs: {
+      enable_thinking: true,
+      preserve_thinking: true,
+      reasoning_effort: "low",
+    },
+    ...QWEN_THINK_SAMPLING,
+  },
+  "No Think": QWEN_NO_THINK,
+};
+
 const QWEN38_THINKING_MODES: ModelModeSet = {
   familyLabel: "Qwen3.8",
   defaultMode: "Think (XHigh)",
-  modes: {
-    "Think (XHigh)": {
-      chat_template_kwargs: {
-        enable_thinking: true,
-        preserve_thinking: true,
-        reasoning_effort: "xhigh",
-      },
-      ...QWEN_THINK_SAMPLING,
-    },
-    "Think (Medium)": {
-      chat_template_kwargs: {
-        enable_thinking: true,
-        preserve_thinking: true,
-        reasoning_effort: "medium",
-      },
-      ...QWEN_THINK_SAMPLING,
-    },
-    "Think (Low)": {
-      chat_template_kwargs: {
-        enable_thinking: true,
-        preserve_thinking: true,
-        reasoning_effort: "low",
-      },
-      ...QWEN_THINK_SAMPLING,
-    },
-    "No Think": QWEN_NO_THINK,
-  },
+  modes: QWEN38_EFFORT_MODES,
+};
+
+const QWEN4EXP_THINKING_MODES: ModelModeSet = {
+  familyLabel: "Qwen3.8 Flash-Next",
+  defaultMode: "Think (XHigh)",
+  modes: QWEN38_EFFORT_MODES,
 };
 
 /** Gemma 4 / Muse Glimmer model-card sampling (top_k 64, not Qwen's 20). */
@@ -173,8 +189,31 @@ function haystack(caps?: ModelCapabilities, modelId?: string): string {
   return [caps?.architecture, caps?.name, caps?.path, modelId].filter(Boolean).join(" ").toLowerCase();
 }
 
-/** Qwen3.8 family — not Qwen3-8B (`qwen3-8b` / `qwen3-8B`). */
+/**
+ * Qwen3.8-Flash-Next / qwen4exp — must run before {@link isQwen38Family}
+ * because filenames contain `Qwen3.8`.
+ */
+export function isQwen4expFamily(hay: string): boolean {
+  const h = hay.toLowerCase();
+  if (/qwen4exp/.test(h) || /qwen4_exp/.test(h) || /qwen4-exp/.test(h)) {
+    return true;
+  }
+  if (!/qwen/.test(h)) {
+    return false;
+  }
+  return (
+    /qwen3\.8[-_.]?flash/.test(h) ||
+    /qwen-?3\.8[-_.]?flash/.test(h) ||
+    /qwen38[-_.]?flash/.test(h) ||
+    /flash[-_]?next/.test(h)
+  );
+}
+
+/** Qwen3.8 dense family — not Qwen3-8B and not Flash-Next. */
 export function isQwen38Family(hay: string): boolean {
+  if (isQwen4expFamily(hay)) {
+    return false;
+  }
   const h = hay.toLowerCase();
   return /qwen3\.8/.test(h) || /qwen-?3\.8/.test(h) || /\bqwen38\b/.test(h) || /qwen3_8/.test(h);
 }
@@ -206,6 +245,9 @@ export function resolveModelModes(
   modelId?: string
 ): ModelModeSet | undefined {
   const h = haystack(caps, modelId);
+  if (isQwen4expFamily(h)) {
+    return QWEN4EXP_THINKING_MODES;
+  }
   if (isQwen38Family(h)) {
     return QWEN38_THINKING_MODES;
   }

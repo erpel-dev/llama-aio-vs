@@ -1,9 +1,27 @@
 import * as os from "os";
 import { formatGpuDeviceLabel, GpuMemoryInfo } from "./gpuInfo";
-import { gpuDisplayOrder, parseTensorSplit, effectiveTensorSplitShares } from "./gpuSplit";
-import { heuristicMoeExpertShare, ModelCapabilities, readModelCapabilities } from "./ggufMetadata";
-import { mmprojFileSize, isMtpDraftFileName, usesSidecarMtp } from "./modelLibrary";
-import { KvCacheType, LlamaLoadSettings, speculativeUsesDflash, speculativeUsesMtp } from "./types";
+import {
+  assignLayerDevices,
+  gpuDisplayOrder,
+  parseTensorSplit,
+  effectiveTensorSplitShares,
+  layerAwareWeightShares,
+} from "./gpuSplit";
+import {
+  heuristicDenseFfnShare,
+  heuristicMoeExpertShare,
+  ModelCapabilities,
+  readModelCapabilities,
+} from "./ggufMetadata";
+import { mmprojFileSize, isMtpSidecarFile, usesSidecarMtp } from "./modelLibrary";
+import { resolveLoadMode } from "./serverArgs";
+import {
+  KvCacheType,
+  lazyModeReadsFromDisk,
+  LlamaLoadSettings,
+  speculativeUsesDflash,
+  speculativeUsesMtp,
+} from "./types";
 
 export interface MemoryBarSegment {
   key: "weights" | "vision" | "kv" | "overhead" | "draft";
@@ -49,7 +67,10 @@ export interface MemoryEstimate {
   /** Vision projector GGUF size when `--mmproj` is set. */
   mmprojFileSizeBytes?: number;
   overheadBytes: number;
+  /** Main-GPU compute / graph / driver (not tensor-split). */
   gpuOverheadBytes: number;
+  /** Per extra GPU that has a layer share (Vulkan/CUDA device heap + sched). */
+  peerGpuOverheadBytes: number;
   cpuOverheadBytes: number;
   /** Est. at full configured context (used for spill warnings + primary bars). */
   totalGpuBytes: number;
@@ -152,20 +173,135 @@ function buildGpuBarChart(
   };
 }
 
+/** Backend used to size compute/graph slop (Vulkan heaps are much fatter than CUDA). */
+export type ComputeBackend = "vulkan" | "cuda" | "metal" | "cpu" | "unknown";
+
+export interface ComputeOverheadOptions {
+  contextLength?: number;
+  backend?: ComputeBackend;
+  flashAttention?: string;
+}
+
+const BACKEND_OVERHEAD: Record<
+  ComputeBackend,
+  { driverBytes: number; peerBytes: number; graphElemBytes: number; deviceReservedBytes: number }
+> = {
+  // Calibrated against RADV occupancy on Qwen3.8-Flash-Next 64k / dual 16 GB.
+  // Weights+KV+graph still sat ~2.5 GiB under sysfs/LACT on every card that
+  // had layers (13.2 vs 15.8 on the 9070 at 62,38). CUDA stays leaner.
+  vulkan: {
+    driverBytes: 768 * MiB,
+    peerBytes: 512 * MiB,
+    graphElemBytes: 12,
+    deviceReservedBytes: 2.5 * GiB,
+  },
+  cuda: { driverBytes: 384 * MiB, peerBytes: 256 * MiB, graphElemBytes: 8, deviceReservedBytes: 0 },
+  metal: { driverBytes: 384 * MiB, peerBytes: 256 * MiB, graphElemBytes: 8, deviceReservedBytes: 0 },
+  cpu: { driverBytes: 0, peerBytes: 0, graphElemBytes: 0, deviceReservedBytes: 0 },
+  unknown: {
+    driverBytes: 512 * MiB,
+    peerBytes: 384 * MiB,
+    graphElemBytes: 10,
+    deviceReservedBytes: 0,
+  },
+};
+
+export function inferComputeBackend(
+  cpuOnly?: boolean,
+  gpus?: Array<{ llamaDeviceId?: string }>
+): ComputeBackend {
+  if (cpuOnly) {
+    return "cpu";
+  }
+  const ids = (gpus || []).map((g) => (g.llamaDeviceId || "").toLowerCase());
+  if (ids.some((id) => id.startsWith("vulkan"))) {
+    return "vulkan";
+  }
+  if (ids.some((id) => /^(cuda|rocm|hip)/.test(id))) {
+    return "cuda";
+  }
+  if (ids.some((id) => id.startsWith("metal"))) {
+    return "metal";
+  }
+  return "unknown";
+}
+
+function safePositive(v: number, fallback: number): number {
+  return Number.isFinite(v) && v > 0 ? v : fallback;
+}
+
+function clampOverheadEmbed(embeddingLength: number): number {
+  return Math.max(2048, safePositive(embeddingLength, 4096));
+}
+
+function clampOverheadUbatch(physicalBatchSize: number): number {
+  return Math.min(Math.max(32, safePositive(physicalBatchSize, 512)), 8192);
+}
+
+function clampOverheadBatch(evalBatchSize: number): number {
+  return Math.min(Math.max(32, safePositive(evalBatchSize, 2048)), 8192);
+}
+
+function clampOverheadContext(contextLength: number | undefined): number {
+  return Math.min(Math.max(512, safePositive(contextLength ?? 4096, 4096)), 262144);
+}
+
 /**
- * Compute / graph scratch. The activation buffers scale with the *physical*
- * batch (-ub) and hidden size; -b only adds a smaller scheduling buffer.
+ * Main-GPU compute / graph / driver. Activations scale with `-ub` and hidden
+ * size; the graph workspace also grows with context (Flash Attention keeps
+ * that O(n_ctx·n_embd), not O(n_ctx²)). `-b` only adds a small staging buffer.
  */
 export function computeOverheadBytes(
   embeddingLength: number,
   physicalBatchSize: number,
-  evalBatchSize: number
+  evalBatchSize: number,
+  options?: ComputeOverheadOptions
 ): number {
-  const safe = (v: number, fallback: number) => (Number.isFinite(v) && v > 0 ? v : fallback);
-  const embed = Math.max(2048, safe(embeddingLength, 4096));
-  const ubatch = Math.min(Math.max(32, safe(physicalBatchSize, 512)), 8192);
-  const batch = Math.min(Math.max(32, safe(evalBatchSize, 2048)), 8192);
-  return Math.round(400 * MiB + ubatch * embed * 24 + batch * 8 * 1024);
+  const backend = options?.backend || "unknown";
+  if (backend === "cpu") {
+    return Math.round(256 * MiB);
+  }
+  const tax = BACKEND_OVERHEAD[backend] || BACKEND_OVERHEAD.unknown;
+  const embed = clampOverheadEmbed(embeddingLength);
+  const ubatch = clampOverheadUbatch(physicalBatchSize);
+  const batch = clampOverheadBatch(evalBatchSize);
+  const ctx = clampOverheadContext(options?.contextLength);
+  const faOff = (options?.flashAttention || "auto") === "off";
+  const graphElem = faOff ? Math.max(tax.graphElemBytes, 36) : tax.graphElemBytes;
+  // Several f32 residual / FFN streams (old *24 was ~4× too small).
+  const activations = ubatch * embed * 96;
+  const batchBuf = batch * 8 * 1024;
+  const graphRaw = ctx * embed * graphElem;
+  // Wide dense models at 64k+ would otherwise invent a 4 GiB graph and
+  // push Recommend off full offload on two 16 GB cards. Flash-Next 64k
+  // (2560×12) sits under the Vulkan cap; 131k hits it.
+  const graphCap = faOff
+    ? 6 * GiB
+    : backend === "vulkan"
+      ? 2.5 * GiB
+      : backend === "cuda"
+        ? 1.75 * GiB
+        : 2 * GiB;
+  const graph = Math.min(graphRaw, graphCap);
+  return Math.round(tax.driverBytes + tax.deviceReservedBytes + activations + batchBuf + graph);
+}
+
+/**
+ * Extra device heap + a smaller sched buffer on every non-main GPU that
+ * actually receives layers. llama.cpp builds a ggml backend per device.
+ */
+export function peerGpuOverheadBytes(
+  embeddingLength: number,
+  physicalBatchSize: number,
+  backend: ComputeBackend = "unknown"
+): number {
+  if (backend === "cpu") {
+    return 0;
+  }
+  const tax = BACKEND_OVERHEAD[backend] || BACKEND_OVERHEAD.unknown;
+  const embed = clampOverheadEmbed(embeddingLength);
+  const ubatch = clampOverheadUbatch(physicalBatchSize);
+  return Math.round(tax.peerBytes + tax.deviceReservedBytes + ubatch * embed * 32);
 }
 
 function layersOnGpu(settings: LlamaLoadSettings, blockCount: number): number {
@@ -184,42 +320,55 @@ function layersOnGpu(settings: LlamaLoadSettings, blockCount: number): number {
  */
 export function kvCacheTypeElemBytes(type: KvCacheType | undefined): number {
   switch (type) {
+    case "iq4_nl":
+      return 0.5625; // 4-bit super-block, non-linear codebook (18 B / 32 elems)
     case "q4_0":
-      return 0.5;
+      return 0.5625; // 18 B / 32 elems (block scale)
+    case "q4_1":
+      return 0.625; // 20 B / 32 elems (block scale + min)
+    case "q5_0":
+      return 0.6875; // 22 B / 32 elems
+    case "q5_1":
+      return 0.75; // 24 B / 32 elems
     case "q8_0":
       return 1;
     case "bf16":
     case "f16":
+      return 2;
+    case "f32":
+      return 4;
     default:
       return 2;
   }
 }
 
+type KvCaps = Pick<
+  ModelCapabilities,
+  | "blockCount"
+  | "embeddingLength"
+  | "attentionHeadCount"
+  | "attentionHeadCountKv"
+  | "attentionHeadCountKvPerLayer"
+  | "keyLength"
+  | "valueLength"
+  | "keyLengthSwa"
+  | "valueLengthSwa"
+  | "slidingWindow"
+  | "slidingWindowPattern"
+  | "fullAttentionInterval"
+  | "recurrentLayers"
+>;
+
 /**
- * Rough KV-cache size for the given K/V cache dtypes (default f16).
- * Handles GQA, per-layer KV heads, and sliding-window attention (e.g. Gemma 4).
+ * Per-layer KV bytes (0 on recurrent / n_kv=0 layers). Used to put KV on the
+ * same GPU that owns the layer under `--split-mode layer`.
  */
-export function estimateKvBytes(
-  caps: Pick<
-    ModelCapabilities,
-    | "blockCount"
-    | "embeddingLength"
-    | "attentionHeadCount"
-    | "attentionHeadCountKv"
-    | "attentionHeadCountKvPerLayer"
-    | "keyLength"
-    | "valueLength"
-    | "keyLengthSwa"
-    | "valueLengthSwa"
-    | "slidingWindow"
-    | "slidingWindowPattern"
-    | "fullAttentionInterval"
-    | "recurrentLayers"
-  >,
+export function estimateKvBytesPerLayer(
+  caps: KvCaps,
   contextLength: number,
   cacheTypeK: KvCacheType = "q8_0",
   cacheTypeV: KvCacheType = "q8_0"
-): number {
+): number[] {
   const layers = Math.max(1, caps.blockCount || 1);
   const qHeads = Math.max(1, caps.attentionHeadCount || 8);
   const defaultKvHeads = Math.max(1, caps.attentionHeadCountKv || qHeads);
@@ -239,7 +388,7 @@ export function estimateKvBytes(
   const kBytes = kvCacheTypeElemBytes(cacheTypeK);
   const vBytes = kvCacheTypeElemBytes(cacheTypeV);
 
-  let total = 0;
+  const perLayer: number[] = [];
   for (let i = 0; i < layers; i++) {
     // Hybrid (Qwen3.5 / Ling KDA): recurrent/linear layers keep a fixed SSM
     // state — no context-scaled KV. GGUF often stores n_kv=0 on those layers.
@@ -250,6 +399,7 @@ export function estimateKvBytes(
           ? perLayerKv[i]! <= 0
           : !!(fullInterval && (i + 1) % fullInterval !== 0);
     if (isRecurrent) {
+      perLayer.push(0);
       continue;
     }
 
@@ -257,6 +407,7 @@ export function estimateKvBytes(
     const rawKv = perLayerKv && i < perLayerKv.length ? perLayerKv[i] : defaultKvHeads;
     const nKv = rawKv === undefined || rawKv === null ? defaultKvHeads : rawKv;
     if (nKv <= 0) {
+      perLayer.push(0);
       continue;
     }
     // Gemma 4 stores smaller SWA head dims; other SWA models (Muse Glimmer) keep
@@ -264,9 +415,25 @@ export function estimateKvBytes(
     const keyDim = isSwa && caps.keyLengthSwa ? Math.max(1, caps.keyLengthSwa) : defaultKeyDim;
     const valDim = isSwa && caps.valueLengthSwa ? Math.max(1, caps.valueLengthSwa) : defaultValDim;
     const tokens = isSwa && swa ? Math.min(contextLength, swa) : contextLength;
-    total += (nKv * keyDim * kBytes + nKv * valDim * vBytes) * tokens;
+    perLayer.push((nKv * keyDim * kBytes + nKv * valDim * vBytes) * tokens);
   }
-  return total;
+  return perLayer;
+}
+
+/**
+ * Rough KV-cache size for the given K/V cache dtypes (default f16).
+ * Handles GQA, per-layer KV heads, and sliding-window attention (e.g. Gemma 4).
+ */
+export function estimateKvBytes(
+  caps: KvCaps,
+  contextLength: number,
+  cacheTypeK: KvCacheType = "q8_0",
+  cacheTypeV: KvCacheType = "q8_0"
+): number {
+  return estimateKvBytesPerLayer(caps, contextLength, cacheTypeK, cacheTypeV).reduce(
+    (a, b) => a + b,
+    0
+  );
 }
 
 /** Number of layers that contribute context-scaled KV (excludes hybrid recurrent layers). */
@@ -308,6 +475,32 @@ export function resolveMoeExpertShare(caps: ModelCapabilities): number {
   return heuristicMoeExpertShare(caps.expertCount);
 }
 
+/**
+ * Fraction of per-layer weight bytes that are dense FFN tensors — what
+ * `--n-cpu-ffn` moves to CPU. 0 for MoE models (their FFN is routed experts,
+ * handled by `--n-cpu-moe`).
+ */
+export function resolveDenseFfnShare(caps: ModelCapabilities): number {
+  if (caps.isMoe) {
+    return 0;
+  }
+  if (caps.denseFfnShare !== undefined && Number.isFinite(caps.denseFfnShare)) {
+    return Math.min(0.95, Math.max(0.05, caps.denseFfnShare));
+  }
+  return heuristicDenseFfnShare(caps.ffnLength, caps.embeddingLength);
+}
+
+/**
+ * PLE / engram lookup table share. llama.cpp treats `per_layer_token_embd` as
+ * a host-side gather, so these bytes stay in system RAM even at `-ngl 99`.
+ */
+export function resolvePleShare(caps: ModelCapabilities): number {
+  if (caps.pleShare !== undefined && Number.isFinite(caps.pleShare)) {
+    return Math.min(0.95, Math.max(0, caps.pleShare));
+  }
+  return 0;
+}
+
 /** Load DFlash or sidecar-MTP draft GGUF caps when a draft path is set. */
 export function resolveDraftCapabilities(
   settings: LlamaLoadSettings,
@@ -316,7 +509,7 @@ export function resolveDraftCapabilities(
   const path = (settings.draftModelPath || "").trim();
   const wantDraft =
     speculativeUsesDflash(settings.speculativeMode) ||
-    (speculativeUsesMtp(settings.speculativeMode) && isMtpDraftFileName(path));
+    (speculativeUsesMtp(settings.speculativeMode) && isMtpSidecarFile({ path }));
   if (!wantDraft) {
     return undefined;
   }
@@ -498,14 +691,31 @@ export function estimateMemory(
   const onGpu = cpuOnly ? 0 : layersOnGpu(settings, nLayers);
   const frac = onGpu / nLayers;
   const moeExpertShare = resolveMoeExpertShare(caps);
+  const denseFfnShare = resolveDenseFfnShare(caps);
+  const pleShare = resolvePleShare(caps);
+  const pleBytes = fileSize * pleShare;
+  const loadMode = resolveLoadMode(settings, { caps });
+  const pleFromDisk =
+    pleBytes > 0 &&
+    loadMode === "mmap" &&
+    lazyModeReadsFromDisk(settings.lazyMode || "auto", pleBytes);
 
   // MoE experts are most of the file; --n-cpu-moe keeps those of the first N layers on CPU.
+  // PLE n-gram tables are host lookups (llama.cpp LAYER_INPUT) — never on GPU.
   let gpuWeights = fileSize * frac;
+  if (!cpuOnly && onGpu > 0 && pleBytes > 0) {
+    gpuWeights = Math.max(0, gpuWeights - pleBytes);
+  }
   if (!cpuOnly && caps.isMoe && settings.nCpuMoe > 0 && onGpu > 0 && moeExpertShare > 0) {
     const moeCpuLayers = Math.min(settings.nCpuMoe, onGpu);
     gpuWeights = Math.max(0, gpuWeights - fileSize * (moeCpuLayers / nLayers) * moeExpertShare);
   }
-  let cpuWeights = Math.max(0, fileSize - gpuWeights);
+  // Dense FFN is the bulk of a dense layer; --n-cpu-ffn keeps those of the first N layers on CPU.
+  if (!cpuOnly && !caps.isMoe && settings.nCpuFfn > 0 && onGpu > 0 && denseFfnShare > 0) {
+    const ffnCpuLayers = Math.min(settings.nCpuFfn, onGpu);
+    gpuWeights = Math.max(0, gpuWeights - fileSize * (ffnCpuLayers / nLayers) * denseFfnShare);
+  }
+  let cpuWeights = Math.max(0, fileSize - gpuWeights - (pleFromDisk ? pleBytes : 0));
   const mmprojBytes = mmprojFileSize(settings.mmprojPath);
   const mmprojMissing = !!(settings.mmprojPath || "").trim() && mmprojBytes <= 0;
   // CLIP is a separate model: GPU-offloaded by default, not tensor-split with the LLM.
@@ -529,14 +739,83 @@ export function estimateMemory(
   const kvBytesWarm = kvBytesWarmRaw * slotMul;
   const fullAttnLayers = countFullAttentionLayers(caps);
   const kvOnGpu = !cpuOnly && settings.offloadKvCacheToGpu && onGpu > 0;
+  const gpusForBackend: GpuMemoryInfo[] =
+    !cpuOnly && options?.gpus?.length
+      ? [...options.gpus]
+      : !cpuOnly && gpu?.totalBytes
+        ? [gpu]
+        : [];
+  const computeBackend = inferComputeBackend(cpuOnly, gpusForBackend);
   const overheadBytes = computeOverheadBytes(
     caps.embeddingLength || 0,
     settings.physicalBatchSize,
-    settings.evalBatchSize
+    settings.evalBatchSize,
+    {
+      contextLength: settings.contextLength,
+      backend: computeBackend,
+      flashAttention: settings.flashAttention,
+    }
   );
   const gpuOverheadBytes = onGpu > 0 ? overheadBytes : 0;
+  const peerOverheadEach =
+    onGpu > 0 && gpusForBackend.length >= 2 && settings.splitMode !== "none"
+      ? peerGpuOverheadBytes(caps.embeddingLength || 0, settings.physicalBatchSize, computeBackend)
+      : 0;
   const cpuOverheadBytes = onGpu > 0 ? Math.round(overheadBytes * 0.15) : Math.round(overheadBytes * 0.5);
+  const gpus = gpusForBackend;
+  const shares = effectiveTensorSplitShares(
+    settings.tensorSplit,
+    settings.splitMode,
+    settings.mainGpu || 0,
+    gpus.length,
+    gpus.map((g) => g.totalBytes)
+  );
+  const mainGpuIndex = gpus.length
+    ? Math.min(Math.max(0, settings.mainGpu || 0), gpus.length - 1)
+    : 0;
+  const layerMassOpts = {
+    isMoe: !!caps.isMoe,
+    nCpuMoe: settings.nCpuMoe,
+    moeExpertShare,
+    nCpuFfn: settings.nCpuFfn,
+    denseFfnShare,
+  };
+  const weightShares =
+    gpus.length >= 2
+      ? layerAwareWeightShares(
+          nLayers,
+          onGpu,
+          shares,
+          settings.splitMode,
+          mainGpuIndex,
+          layerMassOpts
+        )
+      : shares;
+  const layerAssign =
+    gpus.length >= 2 && settings.splitMode !== "row" && settings.splitMode !== "tensor"
+      ? assignLayerDevices(nLayers, onGpu, shares, settings.splitMode, mainGpuIndex)
+      : undefined;
+  const kvPerLayerFull = layerAssign
+    ? estimateKvBytesPerLayer(caps, settings.contextLength, settings.cacheTypeK, settings.cacheTypeV)
+    : undefined;
+  const peerCount = gpus.filter((_, i) => i !== mainGpuIndex && (shares[i] || 0) > 0).length;
+  const totalPeerBytes = peerOverheadEach * peerCount;
   const gpuKvBytes = kvOnGpu ? kvBytes : 0;
+  const kvOnDevice = (dev: number): number => {
+    if (!kvOnGpu) {
+      return 0;
+    }
+    if (!layerAssign || !kvPerLayerFull) {
+      return gpuKvBytes * (shares[dev] || 0);
+    }
+    let sum = 0;
+    for (let i = 0; i < layerAssign.length; i++) {
+      if (layerAssign[i] === dev) {
+        sum += kvPerLayerFull[i] || 0;
+      }
+    }
+    return sum * slotMul;
+  };
   const cpuKvBytes = kvOnGpu ? 0 : kvBytes;
   const gpuKvWarm = kvOnGpu ? kvBytesWarm : 0;
   const cpuKvWarm = kvOnGpu ? 0 : kvBytesWarm;
@@ -578,9 +857,11 @@ export function estimateMemory(
       ? `MTP KV (${mtp.layers} next-n)`
       : "Speculative";
 
-  const totalGpuBytes = gpuWeights + gpuKvBytes + gpuOverheadBytes + specGpuBundle + gpuVisionBytes;
+  const totalGpuBytes =
+    gpuWeights + gpuKvBytes + gpuOverheadBytes + totalPeerBytes + specGpuBundle + gpuVisionBytes;
   const totalCpuBytes = cpuWeights + cpuKvBytes + cpuOverheadBytes + specCpuBundle + cpuVisionBytes;
-  const totalGpuBytesWarm = gpuWeights + gpuKvWarm + gpuOverheadBytes + specGpuWarmBundle + gpuVisionBytes;
+  const totalGpuBytesWarm =
+    gpuWeights + gpuKvWarm + gpuOverheadBytes + totalPeerBytes + specGpuWarmBundle + gpuVisionBytes;
   const totalCpuBytesWarm = cpuWeights + cpuKvWarm + cpuOverheadBytes + specCpuWarmBundle + cpuVisionBytes;
   const systemRamTotalBytes = os.totalmem();
 
@@ -623,6 +904,37 @@ export function estimateMemory(
     warnings.push(
       `CPU MoE layers = ${settings.nCpuMoe}: ~${Math.round(moeExpertShare * 100)}% of weights are experts; those layers’ experts stay in system RAM.`
     );
+    if (
+      gpus.length >= 2 &&
+      settings.splitMode !== "none" &&
+      settings.splitMode !== "row" &&
+      settings.splitMode !== "tensor" &&
+      weightShares.some((w, i) => (w || 0) > (shares[i] || 0) + 0.08)
+    ) {
+      warnings.push(
+        "Layer split + CPU MoE: llama.cpp assigns the first layers (cheap after --n-cpu-moe) to earlier GPUs, so later cards hold more expert weight than the tensor-split percentages suggest."
+      );
+    }
+  }
+  if (!cpuOnly && !caps.isMoe && settings.nCpuFfn > 0) {
+    warnings.push(
+      `CPU FFN layers = ${settings.nCpuFfn}: ~${Math.round(denseFfnShare * 100)}% of per-layer weights are dense FFN; those layers’ FFN stays in system RAM.`
+    );
+  }
+  if (!cpuOnly && onGpu > 0 && pleBytes > 0) {
+    if (pleFromDisk) {
+      warnings.push(
+        `PLE n-gram table (~${formatBytes(pleBytes)}, ${Math.round(pleShare * 100)}% of file) is read from disk (--lazy-mode); RAM bars omit the resident table.`
+      );
+    } else {
+      const lazyWantsDisk = lazyModeReadsFromDisk(settings.lazyMode || "auto", pleBytes);
+      warnings.push(
+        `PLE n-gram table (~${formatBytes(pleBytes)}, ${Math.round(pleShare * 100)}% of file) stays in system RAM.` +
+          (lazyWantsDisk && loadMode !== "mmap"
+            ? ` Lazy mode needs mmap (current load-mode ${loadMode}).`
+            : "")
+      );
+    }
   }
   if (speculativeUsesDflash(settings.speculativeMode) && !draft) {
     warnings.push(
@@ -656,28 +968,12 @@ export function estimateMemory(
   }
 
   // Keep a fixed 2 GiB free on every card (not 8% of a large GPU).
-  const gpus: GpuMemoryInfo[] =
-    !cpuOnly && options?.gpus?.length
-      ? [...options.gpus]
-      : !cpuOnly && gpu?.totalBytes
-        ? [gpu]
-        : [];
-  const shares = effectiveTensorSplitShares(
-    settings.tensorSplit,
-    settings.splitMode,
-    settings.mainGpu || 0,
-    gpus.length,
-    gpus.map((g) => g.totalBytes)
-  );
-  const mainGpuIndex = gpus.length
-    ? Math.min(Math.max(0, settings.mainGpu || 0), gpus.length - 1)
-    : 0;
   const perGpuParts = gpus.map((_, i) => {
     const share = shares[i] || 0;
     const isMain = i === mainGpuIndex;
-    const weights = gpuWeights * share;
-    const kv = gpuKvBytes * share;
-    const overhead = isMain ? gpuOverheadBytes : 0;
+    const weights = gpuWeights * (weightShares[i] || 0);
+    const kv = kvOnDevice(i);
+    const overhead = share <= 0 ? 0 : isMain ? gpuOverheadBytes : peerOverheadEach;
     const spec = isMain ? specGpuBundle : 0;
     const vision = isMain ? gpuVisionBytes : 0;
     return { weights, kv, overhead, spec, vision, used: weights + kv + overhead + spec + vision };
@@ -807,6 +1103,11 @@ export function estimateMemory(
         (cpuWeights > MiB ? ` · RAM: ~${formatBytes(cpuWeights)}` : "") +
         (caps.isMoe && moeExpertShare > 0
           ? ` · MoE experts ~${Math.round(moeExpertShare * 100)}% of file`
+          : "") +
+        (pleShare > 0
+          ? pleFromDisk
+            ? ` · PLE table ~${Math.round(pleShare * 100)}% on disk`
+            : ` · PLE table ~${Math.round(pleShare * 100)}% in RAM`
           : "")
     );
     lines.push(
@@ -854,7 +1155,9 @@ export function estimateMemory(
         (totalCpuBytes > MiB ? ` · system RAM: ~${formatBytes(totalCpuBytes)}` : "")
     );
   }
-  lines.push("Bars show estimate at full context. Actual use varies by quant, MoE, and backend.");
+  lines.push(
+    "Bars show estimate at full context, including Vulkan/CUDA compute and per-GPU heaps. Actual use still varies by quant and driver."
+  );
 
   const vramSummary = (() => {
     if (cpuOnly) {
@@ -963,6 +1266,7 @@ export function estimateMemory(
     mmprojFileSizeBytes: mmprojBytes > 0 ? mmprojBytes : undefined,
     overheadBytes,
     gpuOverheadBytes,
+    peerGpuOverheadBytes: peerOverheadEach,
     cpuOverheadBytes,
     totalGpuBytes,
     totalCpuBytes,
@@ -1007,6 +1311,10 @@ export function memoryEstimateInputs(
     isMoe: !!c.isMoe,
     moeExpertShare: c.moeExpertShare ?? null,
     expertCount: c.expertCount || 0,
+    ffnLength: c.ffnLength || 0,
+    denseFfnShare: c.denseFfnShare ?? null,
+    pleShare: c.pleShare ?? null,
+    architecture: c.architecture || "",
     nextnPredictLayers: c.nextnPredictLayers || 0,
   });
   return {

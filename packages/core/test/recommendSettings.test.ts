@@ -43,6 +43,21 @@ describe("recommendLoadSettings", () => {
     assert.ok(r.nCpuMoe > 0);
   });
 
+  it("raises --n-cpu-ffn before dropping layers for dense models when it fits", () => {
+    // 24 GiB card: full model + KV (~25 GiB) does not fit; FFN-on-CPU does.
+    const caps = denseCaps({ ffnLength: 13824 });
+    const r = recommendLoadSettings(loadSettings(), caps, { gpu: gpu(24) });
+    assert.equal(r.gpuOffload, 99, "expected full layer offload with FFN on CPU");
+    assert.ok(r.nCpuFfn > 0, "expected --n-cpu-ffn > 0 when all layers stay on GPU");
+    const est = estimateMemory(caps, r, gpu(24));
+    assert.ok(est && !est.willSpill);
+  });
+
+  it("resets --n-cpu-ffn when recommending for an MoE model", () => {
+    const r = recommendLoadSettings(loadSettings({ nCpuFfn: 12 }), moeCaps(), { gpu: gpu(80) });
+    assert.equal(r.nCpuFfn, 0);
+  });
+
   it("preserves DFlash when recommending for a non-MTP target", () => {
     const withDflash = recommendLoadSettings(
       loadSettings({
@@ -94,6 +109,19 @@ describe("recommendLoadSettings", () => {
     );
     assert.equal(r.speculativeMode, "dflash");
     assert.equal(r.maxDraftTokens, 15);
+  });
+
+  it("does not enable MTP from a Flash-Next mtp-* sidecar", () => {
+    const r = recommendLoadSettings(
+      loadSettings({
+        speculativeMode: "mtp",
+        draftModelPath: "/models/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf",
+      }),
+      moeCaps({ architecture: "qwen4exp", nextnPredictLayers: 0, pleShare: 0.4 }),
+      { gpu: gpu(48) }
+    );
+    assert.equal(r.speculativeMode, "off");
+    assert.equal(r.draftModelPath, "");
   });
 
   it("enables MTP only for models that report next-n layers", () => {
@@ -174,8 +202,15 @@ describe("recommendLoadSettings", () => {
     const two16 = [gpu(16), gpu(16)];
 
     it("splits a dense model across both cards instead of spilling to RAM", () => {
+      // One 16 GB card: 18 GiB weights + 64k KV + compute do not leave 2 GiB
+      // free even with --n-cpu-ffn. Two cards keep every layer on GPU.
       const one = recommendLoadSettings(loadSettings(), denseCaps(), { gpu: gpu(16) });
-      assert.ok(one.gpuOffload < 99, `expected partial offload on one 16 GiB GPU, got ${one.gpuOffload}`);
+      const oneEst = estimateMemory(denseCaps(), one, two16[0]);
+      assert.ok(oneEst && !oneEst.willSpill);
+      assert.ok(
+        one.gpuOffload < 99 || one.nCpuFfn > 0,
+        `expected a RAM spill of layers or FFN on one card, got gpuOffload ${one.gpuOffload}, nCpuFfn ${one.nCpuFfn}`
+      );
 
       const two = recommendLoadSettings(loadSettings(), denseCaps(), { gpus: two16 });
       assert.equal(two.gpuOffload, 99);

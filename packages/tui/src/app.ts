@@ -27,11 +27,11 @@ import {
   formatGpuDeviceLabel,
   formatLicenseQuickPick,
   formatModelSize,
+  companionDownloadHint,
+  describeLanguageGgufFile,
   languageGgufFiles,
   licenseFromTags,
   listLocalModelEntries,
-  preferredMmprojFile,
-  preferredMtpDraftFile,
   STARTER_MODEL,
   streamChatCompletion,
   parseTensorSplit,
@@ -39,7 +39,7 @@ import {
   mainShareFromSplit,
   isLegacyGpu0FirstSplit,
   alignTensorSplitToMainGpu,
-  isMtpDraftFileName,
+  isMtpSidecarFile,
   recommendedMaxDraftTokens,
   recommendedNgramSizes,
   speculativeUsesDflash,
@@ -51,6 +51,7 @@ import {
   type HfModelHit,
   type FlashAttention,
   type KvCacheType,
+  type LazyMode,
   type LlamaLoadSettings,
   type NgramSpecVariant,
   type MemoryBarChart,
@@ -855,6 +856,9 @@ export async function runApp(services: AppServices): Promise<void> {
       if (field.key === "flashAttention") {
         return load.flashAttention;
       }
+      if (field.key === "lazyMode") {
+        return load.lazyMode || "auto";
+      }
       if (field.key === "speculativeMode") {
         return load.speculativeMode || "off";
       }
@@ -887,6 +891,7 @@ export async function runApp(services: AppServices): Promise<void> {
     if (field.key === "cpuThreads") return load.cpuThreads;
     if (field.key === "maxConcurrentPredictions") return load.maxConcurrentPredictions;
     if (field.key === "nCpuMoe") return load.nCpuMoe;
+    if (field.key === "nCpuFfn") return load.nCpuFfn;
     if (field.key === "evalBatchSize") return load.evalBatchSize;
     if (field.key === "physicalBatchSize") return load.physicalBatchSize;
     if (field.key === "maxDraftTokens") return load.maxDraftTokens;
@@ -1071,12 +1076,16 @@ export async function runApp(services: AppServices): Promise<void> {
       await services.store.updateLoadSettings({ flashAttention: value as FlashAttention });
       return;
     }
+    if (field.key === "lazyMode") {
+      await services.store.updateLoadSettings({ lazyMode: value as LazyMode });
+      return;
+    }
     if (field.key === "speculativeMode") {
       const mode = normalizeSpeculativeMode(value);
       const load = services.store.getState().loadSettings;
       await services.store.updateLoadSettings({
         speculativeMode: mode,
-        maxDraftTokens: recommendedMaxDraftTokens(mode, load.maxDraftTokens, isMtpDraftFileName(load.draftModelPath)),
+        maxDraftTokens: recommendedMaxDraftTokens(mode, load.maxDraftTokens, isMtpSidecarFile({ path: load.draftModelPath })),
       });
       return;
     }
@@ -1596,14 +1605,12 @@ export async function runApp(services: AppServices): Promise<void> {
     modelSearch.visible = false;
     modelSelect.options = hfFiles.map((f) => ({
       name: f.path,
-      description: formatBytes(f.size),
+      description: describeLanguageGgufFile(f, hfAllFiles),
       value: f.path,
     }));
-    const mmproj = preferredMmprojFile(hfAllFiles);
-    const mtp = preferredMtpDraftFile(hfAllFiles);
-    const extras = [mmproj?.path, mtp?.path].filter(Boolean).map((p) => path.basename(p as string));
-    modelHint.content = extras.length
-      ? `${hfPickedRepo?.id} · ${hfFiles.length} GGUF · also fetches ${extras.join(", ")} · Enter download · Esc back`
+    const extras = companionDownloadHint(hfAllFiles);
+    modelHint.content = extras
+      ? `${hfPickedRepo?.id} · ${hfFiles.length} GGUF · also fetches ${extras} · Enter download · Esc back`
       : `${hfPickedRepo?.id} · ${hfFiles.length} GGUF file(s) · Enter download · Esc back`;
     modelSelect.focus();
     renderer.requestRender();
@@ -1687,7 +1694,7 @@ export async function runApp(services: AppServices): Promise<void> {
             refreshStatus();
             renderer.requestRender();
           },
-        });
+        }, filePath);
       } catch {
         // Optional sidecar MTP drafter.
       }
