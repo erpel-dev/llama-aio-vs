@@ -6,6 +6,7 @@ import { after, before, describe, it } from "node:test";
 import {
   clampLoadSettingsToModel,
   heuristicPleShare,
+  isLinearRecurrentHybrid,
   isQwen4expArchitecture,
   readModelCapabilities,
   resolveSlidingWindowPattern,
@@ -213,5 +214,16 @@ describe("qwen4exp / PLE helpers", () => {
     assert.equal(shouldPinPleToCpu({ architecture: "qwen3", pleShare: 0.3 }), true);
     assert.equal(shouldPinPleToCpu({ architecture: "qwen3" }), false);
     assert.equal(shouldPinPleToCpu(undefined), false);
+  });
+
+  it("gates the RCO graph discount on qwen35 only, never qwen4exp", () => {
+    assert.equal(isLinearRecurrentHybrid({ architecture: "qwen35" }), true);
+    assert.equal(isLinearRecurrentHybrid({ architecture: "qwen35moe" }), true);
+    assert.equal(isLinearRecurrentHybrid({ architecture: "qwen3.5" }), true);
+    assert.equal(isLinearRecurrentHybrid({ architecture: "QWEN35" }), true);
+    assert.equal(isLinearRecurrentHybrid({ architecture: "qwen4exp" }), false);
+    assert.equal(isLinearRecurrentHybrid({ architecture: "qwen4_exp" }), false);
+    assert.equal(isLinearRecurrentHybrid({ architecture: "qwen3" }), false);
+    assert.equal(isLinearRecurrentHybrid(undefined), false);
   });
 });

@@ -430,6 +430,23 @@ export function isQwen4expArchitecture(architecture?: string): boolean {
 }
 
 /**
+ * True for linear-recurrent hybrids whose non-full layers carry a fixed SSM
+ * state instead of context-scaled attention (Qwen3.5 RCO: arch `qwen35` /
+ * `qwen35moe`). qwen4exp (Flash-Next) is a full/SWA interleave, not RCO —
+ * its GGUF reuses the interval marker but every layer keeps context-scaled
+ * KV, so the graph discount must not apply there.
+ */
+export function isLinearRecurrentHybrid(caps?: {
+  architecture?: string;
+}): boolean {
+  const arch = (caps?.architecture || "").toLowerCase().replace(/[._-]/g, "");
+  if (isQwen4expArchitecture(arch)) {
+    return false;
+  }
+  return arch.startsWith("qwen35");
+}
+
+/**
  * Share of GGUF tensor bytes belonging to the PLE / engram lookup table.
  * Matches llama.cpp `per_layer_token_embd` (not the small `*.ple.*` projections).
  */

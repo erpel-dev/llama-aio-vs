@@ -1510,8 +1510,8 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
   </div>
 
   <div class="row">
-    <div class="label"><span class="name tip" data-flag="-c, --ctx-size" data-help="Size of the prompt context (default: 0 = loaded from model).">Context Length</span><input type="number" id="contextLength" min="512" step="512" /></div>
-    <input type="range" id="contextLengthRange" min="512" max="131072" step="512" />
+    <div class="label"><span class="name tip" data-flag="-c, --ctx-size" data-help="Size of the prompt context (default: 0 = loaded from model).">Context Length</span><input type="number" id="contextLength" min="512" step="256" /></div>
+    <input type="range" id="contextLengthRange" min="512" max="131072" step="1" />
     <div class="hint" id="ctxHint">Tokens for prompt + generation</div>
   </div>
   <div class="row" id="gpuOffloadRow">
@@ -2767,28 +2767,50 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       const ubatchForOverhead = Math.min(Math.max(32, L.physicalBatchSize || 512), 8192);
       const batchForOverhead = Math.min(Math.max(32, L.evalBatchSize || 2048), 8192);
       const ctxForOverhead = Math.min(Math.max(512, L.contextLength || 4096), 262144);
+      const splitNone = L.splitMode === 'none';
+      const vulkanDeviceCount = (onGpu > 0 && ohBackend === 'vulkan')
+        ? ((gpusForOh.length >= 2 && !splitNone) ? gpusForOh.length : 1)
+        : 0;
+      // Mirrors vulkanDeviceReservedBytes() / vulkanDriverBytes(): 384 MiB
+      // driver + 256 MiB slop on one Vulkan device (768+1024 double-counted
+      // RADV). 768 MiB driver + 2.5 GiB reserve when layers are split.
       const ohTax = {
         vulkan: { driver: 768 * 1024 * 1024, peer: 512 * 1024 * 1024, graph: 12, reserved: 2.5 * 1024 ** 3 },
         cuda: { driver: 384 * 1024 * 1024, peer: 256 * 1024 * 1024, graph: 8, reserved: 0 },
         metal: { driver: 384 * 1024 * 1024, peer: 256 * 1024 * 1024, graph: 8, reserved: 0 },
         unknown: { driver: 512 * 1024 * 1024, peer: 384 * 1024 * 1024, graph: 10, reserved: 0 },
       }[ohBackend] || { driver: 512 * 1024 * 1024, peer: 384 * 1024 * 1024, graph: 10, reserved: 0 };
+      const reservedBytes = ohBackend === 'vulkan'
+        ? (vulkanDeviceCount > 1 ? 2.5 * 1024 ** 3 : (vulkanDeviceCount === 1 ? 256 * 1024 * 1024 : 0))
+        : (ohTax.reserved || 0);
+      const driverBytes = ohBackend === 'vulkan'
+        ? (vulkanDeviceCount > 1 ? ohTax.driver : (vulkanDeviceCount === 1 ? 384 * 1024 * 1024 : 0))
+        : ohTax.driver;
       const graphElem = L.flashAttention === 'off' ? Math.max(ohTax.graph, 36) : ohTax.graph;
-      const graphRaw = ctxForOverhead * embedForOverhead * graphElem;
+      // Linear-recurrent hybrids (Qwen3.5 RCO) run a smaller graph; full/SWA
+      // interleaves such as Flash-Next keep the dense graph even though their
+      // GGUF reuses the same interval marker. Inline mirror of
+      // isLinearRecurrentHybrid(): this is webview JS, the TS import above is
+      // not in scope here.
+      const archNorm = String((memInputs && memInputs.architecture) || '').toLowerCase().replace(/[._-]/g, '');
+      const discountRecurrent = archNorm !== 'qwen4exp' && archNorm.indexOf('qwen35') === 0;
+      const fullAttnFrac = discountRecurrent && nLayers > 0
+        ? Math.min(1, Math.max(0.05, fullAttnLayers / nLayers))
+        : 1;
+      const graphRaw = ctxForOverhead * embedForOverhead * graphElem * fullAttnFrac;
       const graphCap = L.flashAttention === 'off'
         ? 6 * 1024 * 1024 * 1024
         : (ohBackend === 'vulkan' ? 2.5 * 1024 ** 3 : (ohBackend === 'cuda' ? 1.75 * 1024 ** 3 : 2 * 1024 ** 3));
       const overhead = ohBackend === 'cpu'
         ? Math.round(256 * 1024 * 1024)
         : Math.round(
-          ohTax.driver +
-          (ohTax.reserved || 0) +
+          driverBytes +
+          reservedBytes +
           ubatchForOverhead * embedForOverhead * 96 +
           batchForOverhead * 8 * 1024 +
           Math.min(graphRaw, graphCap)
         );
       const gpuOverhead = onGpu > 0 ? overhead : 0;
-      const splitNone = L.splitMode === 'none';
       const peerOverhead = (onGpu > 0 && gpusForOh.length >= 2 && !splitNone && ohBackend !== 'cpu')
         ? Math.round(ohTax.peer + (ohTax.reserved || 0) + ubatchForOverhead * embedForOverhead * 32)
         : 0;
@@ -3264,14 +3286,52 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       }
     }
 
-    function bindRange(numId, rangeId) {
+    let liveMemRaf = 0;
+    function scheduleLiveMemory() {
+      if (liveMemRaf) return;
+      liveMemRaf = requestAnimationFrame(() => {
+        liveMemRaf = 0;
+        refreshMemoryLive();
+      });
+    }
+
+    /**
+     * Keep the number input in sync with a range. align (context length) uses
+     * step=1 on the range so the thumb tracks the pointer on a 256k-wide axis;
+     * the saved value still snaps. Writing range.value during input fights
+     * native dragging in Chromium.
+     */
+    function bindRange(numId, rangeId, align) {
       const num = $(numId);
       const range = $(rangeId);
       if (!num || !range) return;
-      num.addEventListener('input', () => { range.value = num.value; refreshMemoryLive(); });
-      range.addEventListener('input', () => { num.value = range.value; refreshMemoryLive(); });
+      function snap(v) {
+        const min = Number(range.min);
+        const max = Number(range.max);
+        let n = Number(v);
+        if (!Number.isFinite(n)) n = Number.isFinite(min) ? min : 0;
+        if (align > 0) n = Math.round(n / align) * align;
+        if (Number.isFinite(min)) n = Math.max(min, n);
+        if (Number.isFinite(max) && max >= min) n = Math.min(max, n);
+        return n;
+      }
+      num.addEventListener('input', () => {
+        range.value = String(snap(num.value));
+        scheduleLiveMemory();
+      });
+      range.addEventListener('input', () => {
+        num.value = String(snap(range.value));
+        scheduleLiveMemory();
+      });
+      if (align > 0) {
+        range.addEventListener('change', () => {
+          const n = snap(range.value);
+          num.value = String(n);
+          range.value = String(n);
+        });
+      }
     }
-    bindRange('contextLength', 'contextLengthRange');
+    bindRange('contextLength', 'contextLengthRange', 256);
     bindRange('gpuOffload', 'gpuOffloadRange');
     bindRange('cpuThreads', 'cpuThreadsRange');
     bindRange('nCpuMoe', 'nCpuMoeRange');
@@ -3454,7 +3514,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       const el = $(id);
       if (!el) continue;
       el.addEventListener('change', () => { scheduleSaveLoad(); refreshMemoryLive(); });
-      el.addEventListener('input', () => { scheduleSaveLoad(); refreshMemoryLive(); });
+      el.addEventListener('input', () => { scheduleSaveLoad(); scheduleLiveMemory(); });
     }
 
     // Request defaults apply to the next chat call (no server reload). Persist on edit.
@@ -3578,6 +3638,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       $('contextLength').max = String(maxCtx);
       $('contextLengthRange').max = String(maxCtx);
       $('contextLengthRange').min = '512';
+      $('contextLengthRange').step = '1';
       // Slider max = actual layer count (legacy 99/"all" is shown as all layers).
       $('gpuOffload').max = String(modelBlockCount);
       $('gpuOffloadRange').max = String(modelBlockCount);

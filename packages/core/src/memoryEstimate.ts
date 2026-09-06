@@ -10,6 +10,7 @@ import {
 import {
   heuristicDenseFfnShare,
   heuristicMoeExpertShare,
+  isLinearRecurrentHybrid,
   ModelCapabilities,
   readModelCapabilities,
 } from "./ggufMetadata";
@@ -180,15 +181,32 @@ export interface ComputeOverheadOptions {
   contextLength?: number;
   backend?: ComputeBackend;
   flashAttention?: string;
+  /** Share of layers that carry context-scaled attention state (0..1), used
+   * only when `discountRecurrentGraph` is set. Linear-recurrent hybrids
+   * (Qwen3.5 RCO: fixed SSM state, KV billed only on full-attn layers) run
+   * smaller graphs; plain full/SWA interleaves (e.g. Flash-Next) do not.
+   * Defaults to 1 (dense) when omitted. */
+  fullAttentionFraction?: number;
+  /** Opt-in: scale the graph workspace by `fullAttentionFraction`. Only the
+   * caller that proved the model is linear-recurrent sets this. */
+  discountRecurrentGraph?: boolean;
+  /**
+   * Vulkan devices that actually hold layers. 1 = `--split-mode none` or a
+   * single card (smaller RADV heap). 2+ = a real tensor split (Flash-Next
+   * dual-16 GB calibration). Omitted defaults to 1.
+   */
+  vulkanDeviceCount?: number;
 }
 
 const BACKEND_OVERHEAD: Record<
   ComputeBackend,
   { driverBytes: number; peerBytes: number; graphElemBytes: number; deviceReservedBytes: number }
 > = {
-  // Calibrated against RADV occupancy on Qwen3.8-Flash-Next 64k / dual 16 GB.
-  // Weights+KV+graph still sat ~2.5 GiB under sysfs/LACT on every card that
-  // had layers (13.2 vs 15.8 on the 9070 at 62,38). CUDA stays leaner.
+  // Dual-GPU `deviceReservedBytes` is the Flash-Next 64k / two 16 GB RADV
+  // residual (weights+KV+graph still ~2.5 GiB under sysfs/LACT per card).
+  // Single-device loads use {@link vulkanDeviceReservedBytes} and
+  // {@link vulkanSingleDeviceDriverBytes} instead — 768 MiB driver + 1 GiB
+  // reserve double-counted RADV heap (Ornith-1.5-9B: 13.6 GiB est vs 12.4 LACT).
   vulkan: {
     driverBytes: 768 * MiB,
     peerBytes: 512 * MiB,
@@ -246,6 +264,38 @@ function clampOverheadContext(contextLength: number | undefined): number {
   return Math.min(Math.max(512, safePositive(contextLength ?? 4096, 4096)), 262144);
 }
 
+/** RADV heap slop that is not already billed as graph / activations / driver. */
+const VULKAN_SINGLE_DEVICE_RESERVED_BYTES = 256 * MiB;
+const VULKAN_MULTI_DEVICE_RESERVED_BYTES = 2.5 * GiB;
+/** One-card Vulkan driver tax. Dual-GPU keeps {@link BACKEND_OVERHEAD} 768 MiB. */
+const VULKAN_SINGLE_DEVICE_DRIVER_BYTES = 384 * MiB;
+
+/**
+ * Per-device Vulkan reserve. One card (or `--split-mode none`): 256 MiB of
+ * allocator slop on top of a 384 MiB driver tax — 768+1024 MiB was ~2× the
+ * Ornith-1.5-9B LACT residual. Two or more cards that hold layers keep the
+ * 2.5 GiB Flash-Next dual-GPU calibration. CUDA/Metal stay at 0 via
+ * {@link BACKEND_OVERHEAD}.
+ */
+export function vulkanDeviceReservedBytes(devicesWithLayers: number): number {
+  if (!Number.isFinite(devicesWithLayers) || devicesWithLayers <= 0) {
+    return 0;
+  }
+  return devicesWithLayers <= 1
+    ? VULKAN_SINGLE_DEVICE_RESERVED_BYTES
+    : VULKAN_MULTI_DEVICE_RESERVED_BYTES;
+}
+
+/** Vulkan driver bytes: 384 MiB on one device, 768 MiB when layers are split. */
+export function vulkanDriverBytes(devicesWithLayers: number): number {
+  if (!Number.isFinite(devicesWithLayers) || devicesWithLayers <= 0) {
+    return 0;
+  }
+  return devicesWithLayers <= 1
+    ? VULKAN_SINGLE_DEVICE_DRIVER_BYTES
+    : BACKEND_OVERHEAD.vulkan.driverBytes;
+}
+
 /**
  * Main-GPU compute / graph / driver. Activations scale with `-ub` and hidden
  * size; the graph workspace also grows with context (Flash Attention keeps
@@ -271,7 +321,18 @@ export function computeOverheadBytes(
   // Several f32 residual / FFN streams (old *24 was ~4× too small).
   const activations = ubatch * embed * 96;
   const batchBuf = batch * 8 * 1024;
-  const graphRaw = ctx * embed * graphElem;
+  // Linear-recurrent hybrids (Qwen3.5 RCO) keep a fixed SSM state off the
+  // full-attn layers, so only the full-attention share bills the graph term.
+  // Plain full/SWA interleaves (e.g. Flash-Next qwen4exp) still run dense
+  // graphs: GGUF gives them the same interval marker but every layer keeps
+  // context-scaled KV, so the discount stays opt-in (clamped to 0.05 so a
+  // degenerate value cannot zero the graph entirely).
+  const rawFraction = options?.discountRecurrentGraph ? options?.fullAttentionFraction : undefined;
+  const fullFraction =
+    rawFraction === undefined || !Number.isFinite(rawFraction)
+      ? 1
+      : Math.min(1, Math.max(0.05, rawFraction));
+  const graphRaw = ctx * embed * graphElem * fullFraction;
   // Wide dense models at 64k+ would otherwise invent a 4 GiB graph and
   // push Recommend off full offload on two 16 GB cards. Flash-Next 64k
   // (2560×12) sits under the Vulkan cap; 131k hits it.
@@ -283,7 +344,11 @@ export function computeOverheadBytes(
         ? 1.75 * GiB
         : 2 * GiB;
   const graph = Math.min(graphRaw, graphCap);
-  return Math.round(tax.driverBytes + tax.deviceReservedBytes + activations + batchBuf + graph);
+  const vulkanDevices = options?.vulkanDeviceCount ?? 1;
+  const reserved =
+    backend === "vulkan" ? vulkanDeviceReservedBytes(vulkanDevices) : tax.deviceReservedBytes;
+  const driver = backend === "vulkan" ? vulkanDriverBytes(vulkanDevices) : tax.driverBytes;
+  return Math.round(driver + reserved + activations + batchBuf + graph);
 }
 
 /**
@@ -746,6 +811,10 @@ export function estimateMemory(
         ? [gpu]
         : [];
   const computeBackend = inferComputeBackend(cpuOnly, gpusForBackend);
+  const fullAttentionFraction = fullAttnLayers / nLayers;
+  const splitAcrossGpus =
+    onGpu > 0 && gpusForBackend.length >= 2 && settings.splitMode !== "none";
+  const vulkanDeviceCount = onGpu <= 0 ? 0 : splitAcrossGpus ? gpusForBackend.length : 1;
   const overheadBytes = computeOverheadBytes(
     caps.embeddingLength || 0,
     settings.physicalBatchSize,
@@ -754,11 +823,14 @@ export function estimateMemory(
       contextLength: settings.contextLength,
       backend: computeBackend,
       flashAttention: settings.flashAttention,
+      fullAttentionFraction,
+      discountRecurrentGraph: isLinearRecurrentHybrid(caps),
+      vulkanDeviceCount,
     }
   );
   const gpuOverheadBytes = onGpu > 0 ? overheadBytes : 0;
   const peerOverheadEach =
-    onGpu > 0 && gpusForBackend.length >= 2 && settings.splitMode !== "none"
+    splitAcrossGpus && computeBackend !== "cpu"
       ? peerGpuOverheadBytes(caps.embeddingLength || 0, settings.physicalBatchSize, computeBackend)
       : 0;
   const cpuOverheadBytes = onGpu > 0 ? Math.round(overheadBytes * 0.15) : Math.round(overheadBytes * 0.5);

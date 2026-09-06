@@ -7,6 +7,8 @@ import {
   inferComputeBackend,
   kvSlotMultiplier,
   peerGpuOverheadBytes,
+  vulkanDeviceReservedBytes,
+  vulkanDriverBytes,
 } from "../src/memoryEstimate";
 import { denseCaps, GiB, loadSettings, moeCaps } from "./helpers";
 
@@ -196,17 +198,208 @@ describe("computeOverheadBytes", () => {
     });
     assert.ok(at64k > at8k, "64k graph should exceed an 8k graph");
     assert.ok(at64k > cuda64k, "Vulkan heaps are fatter than CUDA");
-    assert.ok(at64k > 2 * GiB, "64k Vulkan compute was the ~3 GiB hole on the 9070");
+    // Dense 2560-hidden at 64k on one Vulkan device: 0.375 GiB driver + 0.25 GiB
+    // reserve + ~0.24 GiB activations + ~2.0 GiB graph ≈ 2.9 GiB.
+    assert.ok(at64k > 2.5 * GiB, "64k Vulkan compute should stay above 2.5 GiB");
+    const dual64k = computeOverheadBytes(2560, 1024, 2048, {
+      contextLength: 65536,
+      backend: "vulkan",
+      flashAttention: "auto",
+      vulkanDeviceCount: 2,
+    });
+    assert.ok(dual64k - at64k > 2 * GiB, "dual-GPU RADV heap is the extra ~2.1 GiB");
   });
 
   it("sizes a peer-GPU heap below the main-GPU graph", () => {
     const main = computeOverheadBytes(2560, 1024, 2048, {
       contextLength: 65536,
       backend: "vulkan",
+      vulkanDeviceCount: 2,
     });
     const peer = peerGpuOverheadBytes(2560, 1024, "vulkan");
-    assert.ok(peer > 2 * GiB, "each Vulkan device reserves ~2.5 GiB of heap slop");
+    assert.ok(peer > 2 * GiB, "peer GPUs keep the 2.5 GiB dual-device RADV heap");
     assert.ok(peer < main);
+  });
+
+  it("uses 384 MiB driver + 256 MiB reserve on one Vulkan device", () => {
+    assert.equal(vulkanDeviceReservedBytes(0), 0);
+    assert.equal(vulkanDeviceReservedBytes(1), 256 * 1024 ** 2);
+    assert.equal(vulkanDeviceReservedBytes(2), 2.5 * GiB);
+    assert.equal(vulkanDriverBytes(0), 0);
+    assert.equal(vulkanDriverBytes(1), 384 * 1024 ** 2);
+    assert.equal(vulkanDriverBytes(2), 768 * 1024 ** 2);
+    const single = computeOverheadBytes(5120, 256, 512, {
+      contextLength: 42496,
+      backend: "vulkan",
+      fullAttentionFraction: 16 / 65,
+      discountRecurrentGraph: true,
+      vulkanDeviceCount: 1,
+    });
+    const dual = computeOverheadBytes(5120, 256, 512, {
+      contextLength: 42496,
+      backend: "vulkan",
+      fullAttentionFraction: 16 / 65,
+      discountRecurrentGraph: true,
+      vulkanDeviceCount: 2,
+    });
+    assert.equal(
+      dual - single,
+      vulkanDriverBytes(2) -
+        vulkanDriverBytes(1) +
+        vulkanDeviceReservedBytes(2) -
+        vulkanDeviceReservedBytes(1)
+    );
+    assert.ok(single < 1.6 * GiB, "27B single-card overhead should sit near 1.2 GiB, not 2.5");
+    const cuda = computeOverheadBytes(5120, 256, 512, {
+      contextLength: 42496,
+      backend: "cuda",
+      fullAttentionFraction: 16 / 65,
+      discountRecurrentGraph: true,
+      vulkanDeviceCount: 2,
+    });
+    assert.ok(cuda < single, "CUDA has no extra RADV heap");
+  });
+
+  it("discounts the graph workspace for linear-recurrent hybrids only", () => {
+    const dense = computeOverheadBytes(5120, 256, 512, {
+      contextLength: 131072,
+      backend: "vulkan",
+    });
+    const hybrid = computeOverheadBytes(5120, 256, 512, {
+      contextLength: 131072,
+      backend: "vulkan",
+      fullAttentionFraction: 16 / 65,
+      discountRecurrentGraph: true,
+    });
+    assert.ok(hybrid < dense, "recurrent layers must not bill attention graph workspace");
+    assert.ok(dense - hybrid > 0.5 * GiB, "hybrid discount should be material at 131k");
+    const def = computeOverheadBytes(5120, 256, 512, {
+      contextLength: 131072,
+      backend: "vulkan",
+    });
+    assert.equal(def, dense);
+    const ungated = computeOverheadBytes(5120, 256, 512, {
+      contextLength: 131072,
+      backend: "vulkan",
+      fullAttentionFraction: 16 / 65,
+    });
+    assert.equal(ungated, dense, "Flash-Next-style SWA interleaves keep the dense graph");
+  });
+
+  it("wires the RCO gate through estimateMemory (qwen35 < qwen4exp)", () => {
+    const base = {
+      blockCount: 65,
+      embeddingLength: 5120,
+      attentionHeadCount: 40,
+      attentionHeadCountKv: 8,
+      keyLength: 128,
+      valueLength: 128,
+      fullAttentionInterval: 4,
+      fileSizeBytes: 10 * GiB,
+    };
+    const settings = loadSettings({
+      contextLength: 131072,
+      gpuOffload: 99,
+      physicalBatchSize: 256,
+      evalBatchSize: 512,
+      splitMode: "none",
+    });
+    const rco = estimateMemory(denseCaps({ architecture: "qwen35", ...base }), settings, gpu(48));
+    const flash = estimateMemory(
+      denseCaps({ architecture: "qwen4exp", ...base }),
+      settings,
+      gpu(48)
+    );
+    assert.ok(rco && flash);
+    // Same weights, same layer/KV geometry — only the graph discount differs.
+    assert.equal(rco.kvBytes, flash.kvBytes);
+    assert.ok(
+      rco.overheadBytes < flash.overheadBytes,
+      `qwen35 overhead ${rco.overheadBytes} should be below qwen4exp ${flash.overheadBytes}`
+    );
+  });
+
+  it("prices a single-Vulkan 27B RCO near LACT, not the dual-GPU 2.5 GiB heap", () => {
+    const g0 = {
+      totalBytes: 16 * GiB,
+      usedBytes: 0,
+      name: "RX 9070 XT",
+      source: "test",
+      llamaDeviceId: "Vulkan0",
+    };
+    const g1 = {
+      totalBytes: 16 * GiB,
+      usedBytes: 0,
+      name: "RX 9060 XT",
+      source: "test",
+      llamaDeviceId: "Vulkan1",
+    };
+    const caps = denseCaps({
+      architecture: "qwen35",
+      fileSizeBytes: Math.round(9.76 * GiB),
+      blockCount: 65,
+      embeddingLength: 5120,
+      fullAttentionInterval: 4,
+    });
+    const settings = loadSettings({
+      contextLength: 42496,
+      gpuOffload: 65,
+      physicalBatchSize: 256,
+      evalBatchSize: 512,
+      splitMode: "none",
+      cacheTypeK: "q8_0",
+      cacheTypeV: "q5_1",
+    });
+    const est = estimateMemory(caps, settings, g0, { gpus: [g0, g1] });
+    assert.ok(est);
+    assert.ok(est.overheadBytes < 1.6 * GiB, `overhead ${est.overheadBytes} still has dual-GPU slop`);
+    assert.ok(est.overheadBytes > 0.9 * GiB, `overhead ${est.overheadBytes} dropped the real RADV heap`);
+    assert.equal(est.charts.vram2?.segments.find((s) => s.key === "overhead")?.bytes ?? 0, 0);
+  });
+
+  it("prices Ornith-class 9B RCO overhead near LACT (~1.4 GiB, not ~2.5)", () => {
+    const g0 = {
+      totalBytes: 16 * GiB,
+      usedBytes: 0,
+      name: "RX 9070 XT",
+      source: "test",
+      llamaDeviceId: "Vulkan0",
+    };
+    const g1 = {
+      totalBytes: 16 * GiB,
+      usedBytes: 0,
+      name: "RX 9060 XT",
+      source: "test",
+      llamaDeviceId: "Vulkan1",
+    };
+    const caps = denseCaps({
+      architecture: "qwen35",
+      fileSizeBytes: Math.round(9.5 * GiB),
+      blockCount: 32,
+      embeddingLength: 4096,
+      attentionHeadCount: 32,
+      attentionHeadCountKv: 8,
+      keyLength: 128,
+      valueLength: 128,
+      fullAttentionInterval: 4,
+    });
+    const settings = loadSettings({
+      contextLength: 48128,
+      gpuOffload: 99,
+      physicalBatchSize: 512,
+      evalBatchSize: 2048,
+      splitMode: "none",
+      cacheTypeK: "f16",
+      cacheTypeV: "f16",
+    });
+    const est = estimateMemory(caps, settings, g0, { gpus: [g0, g1] });
+    assert.ok(est);
+    assert.ok(est.kvBytes > 1.4 * GiB && est.kvBytes < 1.55 * GiB, `KV ${est.kvBytes}`);
+    assert.ok(
+      est.overheadBytes < 1.55 * GiB,
+      `overhead ${est.overheadBytes} is still ~2× the 12.4 vs 13.6 GiB LACT gap`
+    );
+    assert.ok(est.overheadBytes > 1.1 * GiB, `overhead ${est.overheadBytes} undershot compute+RADV`);
   });
 
   it("reads Vulkan/CUDA from llama.cpp device ids", () => {
