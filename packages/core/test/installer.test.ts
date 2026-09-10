@@ -5,6 +5,7 @@ import {
   candidateAssetNames,
   compareReleaseTags,
   createClearableTimeoutSignal,
+  describeGithubHttpError,
   describeMissingAsset,
   parseNightlyTagFile,
   parseStableReleaseTag,
@@ -198,10 +199,102 @@ describe("buildArchiveExtractCommand", () => {
   });
 });
 
-const GH_HEADERS = {
+const GH_HEADERS: Record<string, string> = {
   "User-Agent": "llama-aio-vs",
   Accept: "application/vnd.github+json",
+  // Unauthenticated api.github.com allows 60 requests/hour/IP; a dev machine
+  // (or CI without a token) can burn that in one session and then every run
+  // gets HTTP 403. A token lifts it to 5000/hour.
+  ...(process.env.GITHUB_TOKEN ? { Authorization: `Bearer ${process.env.GITHUB_TOKEN}` } : {}),
 };
+
+interface GhAsset {
+  name: string;
+  browser_download_url: string;
+  url?: string;
+  size: number;
+}
+
+/**
+ * GitHub answers 403/429 once the unauthenticated rate limit is hit, and
+ * 5xx for its own outages. Those say nothing about our code, so a network
+ * integration test must skip rather than fail the build (`make` runs this
+ * suite). Any other unexpected status — a 404 for a release that vanished —
+ * is a real signal and still fails.
+ */
+function isUnavailable(status: number): boolean {
+  return status === 403 || status === 429 || status >= 500;
+}
+
+function skipMessage(what: string, status: number): string {
+  const hint =
+    status === 403 || status === 429
+      ? "GitHub API rate limit (set GITHUB_TOKEN to raise it from 60/h)"
+      : "GitHub unavailable";
+  return `${hint}: ${what} → HTTP ${status}`;
+}
+
+/** Release JSON for `tag`, or undefined when GitHub is unavailable (test skips). */
+async function releaseOrSkip(
+  t: { skip: (msg?: string) => void },
+  tag: string
+): Promise<{ assets: GhAsset[] } | undefined> {
+  const url = `https://api.github.com/repos/ggml-org/llama.cpp/releases/tags/${encodeURIComponent(tag)}`;
+  let res: Response;
+  try {
+    res = await fetch(url, { headers: GH_HEADERS, signal: AbortSignal.timeout(15_000) });
+  } catch (err) {
+    t.skip(`GitHub unreachable: ${err instanceof Error ? err.message : err}`);
+    return undefined;
+  }
+  if (isUnavailable(res.status)) {
+    t.skip(skipMessage("release lookup", res.status));
+    return undefined;
+  }
+  assert.equal(res.ok, true, `API ${res.status}`);
+  return (await res.json()) as { assets: GhAsset[] };
+}
+
+describe("describeGithubHttpError", () => {
+  const res = (headers: Record<string, string> = {}) =>
+    new Response("", { status: 403, headers });
+
+  it("explains a rate limit instead of dumping the JSON body", () => {
+    const msg = describeGithubHttpError(
+      403,
+      res({ "x-ratelimit-remaining": "0" }),
+      '{"message":"API rate limit exceeded for 1.2.3.4."}'
+    );
+    assert.match(msg, /GitHub API rate limit reached \(HTTP 403\)/);
+    assert.match(msg, /60\/hour/);
+    assert.match(msg, /Install from archive/);
+    assert.doesNotMatch(msg, /message/, "raw JSON must not leak into the message");
+  });
+
+  it("includes the reset wait when GitHub reports one", () => {
+    const reset = Math.floor((Date.now() + 5 * 60_000) / 1000);
+    const msg = describeGithubHttpError(
+      429,
+      res({ "x-ratelimit-reset": String(reset) }),
+      "rate limit"
+    );
+    assert.match(msg, /Try again in ~[45] min/);
+  });
+
+  it("keeps the plain message for a 403 that is not a rate limit", () => {
+    // A genuinely forbidden request (e.g. blocked) must not claim a limit.
+    const msg = describeGithubHttpError(403, res(), '{"message":"Forbidden"}');
+    assert.match(msg, /^HTTP 403: /);
+    assert.doesNotMatch(msg, /rate limit reached/);
+  });
+
+  it("keeps the plain message for non-403 statuses", () => {
+    const notFound = describeGithubHttpError(404, res(), '{"message":"Not Found"}');
+    assert.match(notFound, /^HTTP 404: /);
+    const server = describeGithubHttpError(500, res(), "boom");
+    assert.match(server, /^HTTP 500: /);
+  });
+});
 
 describe("GitHub llama.cpp fetch", () => {
   async function latestTagOrSkip(t: { skip: (msg?: string) => void }): Promise<string | undefined> {
@@ -226,24 +319,26 @@ describe("GitHub llama.cpp fetch", () => {
     if (!tag) {
       return;
     }
-    const res = await fetch(
-      `https://api.github.com/repos/ggml-org/llama.cpp/releases/tags/${encodeURIComponent(tag)}`,
-      { headers: GH_HEADERS, signal: AbortSignal.timeout(15_000) }
-    );
-    assert.equal(res.ok, true, `API ${res.status}`);
-    const release = (await res.json()) as {
-      assets: Array<{ name: string; browser_download_url: string; url: string; size: number }>;
-    };
+    const release = await releaseOrSkip(t, tag);
+    if (!release) {
+      return;
+    }
     const backend = process.platform === "linux" ? "vulkan" : "cpu";
     const picked = pickAsset(release.assets, backend);
     assert.ok(picked, `no ${backend} asset in ${tag}`);
-    const assetUrl = picked.url || picked.browser_download_url;
+    // Prefer the browser_download_url: it is always present, and the
+    // api.github.com asset endpoint redirects through another rate-limited hop.
+    const assetUrl = picked.browser_download_url;
     const head = await fetch(assetUrl, {
       method: "HEAD",
       headers: { "User-Agent": "llama-aio-vs", Accept: "application/octet-stream" },
       redirect: "follow",
       signal: AbortSignal.timeout(20_000),
     });
+    if (isUnavailable(head.status)) {
+      t.skip(skipMessage(`HEAD ${picked.name}`, head.status));
+      return;
+    }
     assert.ok(head.ok, `HEAD ${picked.name} → HTTP ${head.status}`);
     const len = Number(head.headers.get("content-length") || 0);
     assert.ok(len > 1_000_000, `${picked.name} is only ${len} bytes`);
@@ -254,18 +349,16 @@ describe("GitHub llama.cpp fetch", () => {
     if (!tag) {
       return;
     }
-    const res = await fetch(
-      `https://api.github.com/repos/ggml-org/llama.cpp/releases/tags/${encodeURIComponent(tag)}`,
-      { headers: GH_HEADERS, signal: AbortSignal.timeout(15_000) }
-    );
-    assert.equal(res.ok, true, `API ${res.status}`);
-    const release = (await res.json()) as {
-      assets: Array<{ name: string; browser_download_url: string; url: string; size: number }>;
-    };
+    const release = await releaseOrSkip(t, tag);
+    if (!release) {
+      return;
+    }
     const backend = process.platform === "linux" ? "vulkan" : "cpu";
     const picked = pickAsset(release.assets, backend);
-    assert.ok(picked?.url, `no ${backend} API asset URL in ${tag}`);
-    const part = await fetch(picked.url, {
+    assert.ok(picked, `no ${backend} asset in ${tag}`);
+    const url = picked.browser_download_url;
+    assert.ok(url, `no ${backend} asset URL in ${tag}`);
+    const part = await fetch(url, {
       headers: {
         "User-Agent": "llama-aio-vs",
         Accept: "application/octet-stream",
@@ -274,6 +367,10 @@ describe("GitHub llama.cpp fetch", () => {
       redirect: "follow",
       signal: AbortSignal.timeout(20_000),
     });
+    if (isUnavailable(part.status)) {
+      t.skip(skipMessage(`partial GET ${picked.name}`, part.status));
+      return;
+    }
     assert.ok(part.ok || part.status === 206, `partial GET HTTP ${part.status}`);
     const buf = Buffer.from(await part.arrayBuffer());
     const gzip = buf[0] === 0x1f && buf[1] === 0x8b;

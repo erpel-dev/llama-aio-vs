@@ -45,10 +45,19 @@ export interface MemoryEstimate {
   layersOnGpu: number;
   gpuWeightsBytes: number;
   cpuWeightsBytes: number;
-  /** KV at configured context length (full). */
+  /**
+   * KV at configured context length (full), **including** the per-slot
+   * recurrent/SSM state on hybrid layers (see {@link recurrentStateBytes}).
+   * `estimateKvBytes(caps, ctx, k, v)` alone is the attention-only part.
+   */
   kvBytes: number;
-  /** KV if only a short prompt is in use (~2k tokens). */
+  /** KV if only a short prompt is in use (~2k tokens), same state inclusion. */
   kvBytesWarm: number;
+  /**
+   * Per-slot recurrent / SSM state bytes folded into {@link kvBytes}
+   * (0 for dense and pure-attention models).
+   */
+  recurrentStateBytes?: number;
   kvOnGpu: boolean;
   /** MoE expert weight fraction used for --n-cpu-moe accounting. */
   moeExpertShare?: number;
@@ -145,6 +154,56 @@ function gpuLabel(gpu: GpuMemoryInfo, index: number): string {
   return formatGpuDeviceLabel(gpu, index);
 }
 
+/** GTT in use is “heavy” once it is real, larger than VRAM use and material. */
+const GTT_HEAVY_MIN_BYTES = 1 * GiB;
+
+/**
+ * Detect a card that is holding its share in **system RAM** rather than VRAM.
+ *
+ * RADV silently satisfies large Vulkan allocations out of GTT (GPU-mapped host
+ * memory) when the device-local BAR window is too small — a card with
+ * Resizable BAR off shows `mem_info_vis_vram_total` well under its real VRAM.
+ * The visible symptom is a card with almost no VRAM used, a large GTT figure,
+ * and no speed-up, while the estimate (which only knows VRAM) still claims the
+ * model is split across both cards.
+ *
+ * Returns a user-facing warning, or `undefined` when the card looks healthy.
+ * Field data (9070 XT + 9060 XT, b10517 Vulkan): the second card reported
+ * ~0.1 GiB VRAM against ~14.2 GiB GTT while doing no work.
+ */
+export function hostFallbackWarning(
+  gpu: GpuMemoryInfo | undefined,
+  index: number
+): string | undefined {
+  const cap = gpu?.totalBytes || 0;
+  if (!gpu || cap <= 0) {
+    return undefined;
+  }
+  const vramUsed = gpu.usedBytes ?? 0;
+  const gttUsed = gpu.gttUsedBytes ?? 0;
+  const visTotal = gpu.visVramTotalBytes ?? 0;
+  const smallBar = visTotal > 0 && visTotal < cap / 2;
+  const gttHeavy =
+    gttUsed >= GTT_HEAVY_MIN_BYTES &&
+    gttUsed > Math.max(vramUsed * 2, cap * 0.25);
+  if (!gttHeavy && !(smallBar && gttUsed >= GTT_HEAVY_MIN_BYTES)) {
+    return undefined;
+  }
+  const label = gpuLabel(gpu, index);
+  const barBit = smallBar
+    ? ` Its visible-VRAM window is only ~${formatBytes(visTotal)} of ${formatBytes(cap)} ` +
+      `(Resizable BAR / Above 4G off)`
+    : "";
+  return (
+    `${label} is using system RAM, not VRAM: ~${formatBytes(gttUsed)} in GTT` +
+    (vramUsed > 0 ? ` vs ~${formatBytes(vramUsed)} VRAM` : " with ~0 VRAM") +
+    `.${barBit}` +
+    ` Layers placed on this card read weights over PCIe, so they run at host-memory speed and the ` +
+    `rest of the model only gets one card's bandwidth. Either enable Resizable BAR, drop to one GPU ` +
+    `(--split-mode none), or size the split so this card is not asked to hold layers.`
+  );
+}
+
 function buildGpuBarChart(
   index: number,
   gpu: GpuMemoryInfo | undefined,
@@ -196,6 +255,12 @@ export interface ComputeOverheadOptions {
    * dual-16 GB calibration). Omitted defaults to 1.
    */
   vulkanDeviceCount?: number;
+  /**
+   * Skip the 2.5 GiB Flash-Next dual-GPU RADV reserve. Defaults to true when
+   * `discountRecurrentGraph` is set (Qwen3.5 RCO measured ~2.5 GiB over LACT
+   * per card at 60k on two 16 GB cards). Flash-Next keeps the fat heap.
+   */
+  compactVulkanHeap?: boolean;
 }
 
 const BACKEND_OVERHEAD: Record<
@@ -272,18 +337,22 @@ const VULKAN_SINGLE_DEVICE_DRIVER_BYTES = 384 * MiB;
 
 /**
  * Per-device Vulkan reserve. One card (or `--split-mode none`): 256 MiB of
- * allocator slop on top of a 384 MiB driver tax — 768+1024 MiB was ~2× the
- * Ornith-1.5-9B LACT residual. Two or more cards that hold layers keep the
- * 2.5 GiB Flash-Next dual-GPU calibration. CUDA/Metal stay at 0 via
- * {@link BACKEND_OVERHEAD}.
+ * allocator slop. Two or more cards that hold layers keep the 2.5 GiB
+ * Flash-Next dual-GPU calibration unless `compactHeap` is set (Qwen3.5 RCO:
+ * that 2.5 GiB/card was the entire 13.9 vs 11.4 GiB LACT gap). CUDA/Metal
+ * stay at 0 via {@link BACKEND_OVERHEAD}.
  */
-export function vulkanDeviceReservedBytes(devicesWithLayers: number): number {
+export function vulkanDeviceReservedBytes(
+  devicesWithLayers: number,
+  compactHeap = false
+): number {
   if (!Number.isFinite(devicesWithLayers) || devicesWithLayers <= 0) {
     return 0;
   }
-  return devicesWithLayers <= 1
-    ? VULKAN_SINGLE_DEVICE_RESERVED_BYTES
-    : VULKAN_MULTI_DEVICE_RESERVED_BYTES;
+  if (devicesWithLayers <= 1 || compactHeap) {
+    return VULKAN_SINGLE_DEVICE_RESERVED_BYTES;
+  }
+  return VULKAN_MULTI_DEVICE_RESERVED_BYTES;
 }
 
 /** Vulkan driver bytes: 384 MiB on one device, 768 MiB when layers are split. */
@@ -345,8 +414,14 @@ export function computeOverheadBytes(
         : 2 * GiB;
   const graph = Math.min(graphRaw, graphCap);
   const vulkanDevices = options?.vulkanDeviceCount ?? 1;
+  const compactHeap =
+    options?.compactVulkanHeap !== undefined
+      ? options.compactVulkanHeap
+      : !!options?.discountRecurrentGraph;
   const reserved =
-    backend === "vulkan" ? vulkanDeviceReservedBytes(vulkanDevices) : tax.deviceReservedBytes;
+    backend === "vulkan"
+      ? vulkanDeviceReservedBytes(vulkanDevices, compactHeap)
+      : tax.deviceReservedBytes;
   const driver = backend === "vulkan" ? vulkanDriverBytes(vulkanDevices) : tax.driverBytes;
   return Math.round(driver + reserved + activations + batchBuf + graph);
 }
@@ -358,7 +433,8 @@ export function computeOverheadBytes(
 export function peerGpuOverheadBytes(
   embeddingLength: number,
   physicalBatchSize: number,
-  backend: ComputeBackend = "unknown"
+  backend: ComputeBackend = "unknown",
+  compactVulkanHeap = false
 ): number {
   if (backend === "cpu") {
     return 0;
@@ -366,7 +442,11 @@ export function peerGpuOverheadBytes(
   const tax = BACKEND_OVERHEAD[backend] || BACKEND_OVERHEAD.unknown;
   const embed = clampOverheadEmbed(embeddingLength);
   const ubatch = clampOverheadUbatch(physicalBatchSize);
-  return Math.round(tax.peerBytes + tax.deviceReservedBytes + ubatch * embed * 32);
+  const reserved =
+    backend === "vulkan"
+      ? vulkanDeviceReservedBytes(2, compactVulkanHeap)
+      : tax.deviceReservedBytes;
+  return Math.round(tax.peerBytes + reserved + ubatch * embed * 32);
 }
 
 function layersOnGpu(settings: LlamaLoadSettings, blockCount: number): number {
@@ -445,11 +525,7 @@ export function estimateKvBytesPerLayer(
   const swa = caps.slidingWindow && caps.slidingWindow > 0 ? caps.slidingWindow : undefined;
   const pattern = caps.slidingWindowPattern;
   const perLayerKv = caps.attentionHeadCountKvPerLayer;
-  const recurrent = caps.recurrentLayers;
-  const fullInterval =
-    caps.fullAttentionInterval && caps.fullAttentionInterval > 1
-      ? caps.fullAttentionInterval
-      : undefined;
+  const recurrentMask = recurrentLayerMask(caps);
   const kBytes = kvCacheTypeElemBytes(cacheTypeK);
   const vBytes = kvCacheTypeElemBytes(cacheTypeV);
 
@@ -457,13 +533,7 @@ export function estimateKvBytesPerLayer(
   for (let i = 0; i < layers; i++) {
     // Hybrid (Qwen3.5 / Ling KDA): recurrent/linear layers keep a fixed SSM
     // state — no context-scaled KV. GGUF often stores n_kv=0 on those layers.
-    const isRecurrent =
-      recurrent && recurrent.length === layers
-        ? !!recurrent[i]
-        : perLayerKv && perLayerKv.length === layers
-          ? perLayerKv[i]! <= 0
-          : !!(fullInterval && (i + 1) % fullInterval !== 0);
-    if (isRecurrent) {
+    if (recurrentMask[i]) {
       perLayer.push(0);
       continue;
     }
@@ -486,8 +556,96 @@ export function estimateKvBytesPerLayer(
 }
 
 /**
- * Rough KV-cache size for the given K/V cache dtypes (default f16).
- * Handles GQA, per-layer KV heads, and sliding-window attention (e.g. Gemma 4).
+ * Per-layer recurrent mask (true = linear / SSM layer with a fixed-size state,
+ * no context-scaled KV). Precedence matches `estimateKvBytesPerLayer`: an
+ * explicit `recurrent_layers` array, then per-layer KV heads (`n_kv <= 0` marks
+ * a recurrent layer, e.g. Ling / bailingmoe3 KDA), then `full_attention_interval`.
+ */
+export function recurrentLayerMask(
+  caps: Pick<
+    ModelCapabilities,
+    "blockCount" | "fullAttentionInterval" | "recurrentLayers" | "attentionHeadCountKvPerLayer"
+  >
+): boolean[] {
+  const layers = Math.max(1, caps.blockCount || 1);
+  const recurrent = caps.recurrentLayers;
+  if (recurrent && recurrent.length === layers) {
+    return recurrent.map((v) => !!v);
+  }
+  const perLayerKv = caps.attentionHeadCountKvPerLayer;
+  if (perLayerKv && perLayerKv.length === layers) {
+    return perLayerKv.map((n) => n <= 0);
+  }
+  const interval =
+    caps.fullAttentionInterval && caps.fullAttentionInterval > 1
+      ? caps.fullAttentionInterval
+      : undefined;
+  return Array.from({ length: layers }, (_, i) => !!(interval && (i + 1) % interval !== 0));
+}
+
+type SsmCaps = Pick<
+  ModelCapabilities,
+  | "blockCount"
+  | "embeddingLength"
+  | "fullAttentionInterval"
+  | "recurrentLayers"
+  | "attentionHeadCountKvPerLayer"
+  | "ssmStateSize"
+  | "ssmInnerSize"
+  | "ssmConvKernel"
+  | "ssmGroupCount"
+>;
+
+/** Guard rails for `ssm.*` values read out of a potentially odd GGUF header. */
+const MAX_SSM_STATE_SIZE = 4096;
+const MAX_SSM_INNER_SIZE = 1_000_000;
+
+/**
+ * Per-layer recurrent (SSM / linear-attention) state bytes **per sequence
+ * slot**. Recurrent layers keep no context-scaled KV, but llama.cpp still
+ * allocates a fixed f32 state buffer for each of them:
+ *
+ * - conv state: `(d_conv − 1) × (d_inner + 2·n_group·d_state)`
+ * - ssm state:  `d_inner × d_state`
+ *
+ * State is per sequence, so callers multiply by {@link kvSlotMultiplier}. All
+ * zeros when the GGUF exposes no `ssm.*` geometry or the model has no recurrent
+ * layers, so dense estimates are unchanged. Deliberately approximate: hybrid
+ * layouts differ (Mamba2 vs. gated delta net) but both are the same order.
+ */
+export function estimateRecurrentStateBytesPerLayer(caps: SsmCaps): number[] {
+  const mask = recurrentLayerMask(caps);
+  const zeros = () => mask.map(() => 0);
+  if (!mask.some(Boolean)) {
+    return zeros();
+  }
+  const rawState = safePositive(caps.ssmStateSize || 0, 0);
+  if (rawState <= 0 || rawState > MAX_SSM_STATE_SIZE) {
+    return zeros();
+  }
+  const dState = Math.round(rawState);
+  const rawInner = safePositive(caps.ssmInnerSize || 0, safePositive(caps.embeddingLength || 0, 0));
+  if (rawInner <= 0 || rawInner > MAX_SSM_INNER_SIZE) {
+    return zeros();
+  }
+  const dInner = Math.round(rawInner);
+  const dConv = Math.min(16, Math.max(2, Math.round(safePositive(caps.ssmConvKernel || 0, 4))));
+  const nGroup = Math.min(
+    Math.round(dInner),
+    Math.max(1, Math.round(safePositive(caps.ssmGroupCount || 0, 1)))
+  );
+  const convChannels = dInner + 2 * nGroup * dState;
+  // f32 state buffers (llama.cpp keeps recurrent state in f32).
+  const perLayerBytes = (dInner * dState + (dConv - 1) * convChannels) * 4;
+  return mask.map((isRecurrent) => (isRecurrent ? perLayerBytes : 0));
+}
+
+/**
+ * Rough KV-cache size for the given K/V cache dtypes (default `q8_0`, matching
+ * {@link DEFAULT_LOAD_SETTINGS}). Handles GQA, per-layer KV heads, and
+ * sliding-window attention (e.g. Gemma 4). Recurrent/SSM layers contribute 0
+ * here — their fixed state is billed by
+ * {@link estimateRecurrentStateBytesPerLayer}.
  */
 export function estimateKvBytes(
   caps: KvCaps,
@@ -508,26 +666,7 @@ export function countFullAttentionLayers(
     "blockCount" | "fullAttentionInterval" | "recurrentLayers" | "attentionHeadCountKvPerLayer"
   >
 ): number {
-  const layers = Math.max(1, caps.blockCount || 1);
-  const recurrent = caps.recurrentLayers;
-  const perLayerKv = caps.attentionHeadCountKvPerLayer;
-  const fullInterval =
-    caps.fullAttentionInterval && caps.fullAttentionInterval > 1
-      ? caps.fullAttentionInterval
-      : undefined;
-  let n = 0;
-  for (let i = 0; i < layers; i++) {
-    const isRecurrent =
-      recurrent && recurrent.length === layers
-        ? !!recurrent[i]
-        : perLayerKv && perLayerKv.length === layers
-          ? perLayerKv[i]! <= 0
-          : !!(fullInterval && (i + 1) % fullInterval !== 0);
-    if (!isRecurrent) {
-      n++;
-    }
-  }
-  return n;
+  return recurrentLayerMask(caps).filter((isRecurrent) => !isRecurrent).length;
 }
 
 export function resolveMoeExpertShare(caps: ModelCapabilities): number {
@@ -607,6 +746,47 @@ interface DraftFootprint {
 }
 
 /**
+ * KV geometry to use for a draft / speculative GGUF.
+ *
+ * A sidecar `mtp-*.gguf` carries the **parent model's** metadata — the same
+ * `block_count`, `full_attention_interval` and recurrent mask — while holding
+ * only the next-n head weights. Sizing its cache from `block_count` billed
+ * ~16 layers of full-context KV that llama.cpp never allocates: an MTP head
+ * proposes at most `--spec-draft-n-max` tokens, so only the next-n layers keep
+ * cache. There is no draft-specific tensor split, but that is unrelated to
+ * cache geometry.
+ *
+ * Measured on the live machine (Qwen3.8-27B + `mtp-Qwen3.8-27B-Q4_0.gguf`,
+ * 83200 ctx, f16/f16, `--tensor-split 44,56`): the main card read 18.84 GiB
+ * estimated against **12.00 GiB** in sysfs, and 5.08 GiB of the difference was
+ * this single term. DFlash drafts are complete models, so they keep their own
+ * geometry. The parent's hybrid markers are dropped for the next-n layers so
+ * they are billed as plain attention — a length-mismatched mask would zero
+ * them out instead.
+ */
+function draftKvCaps(
+  draftCaps: ModelCapabilities,
+  settings: LlamaLoadSettings
+): ModelCapabilities {
+  if (!usesSidecarMtp(settings)) {
+    return draftCaps;
+  }
+  const layers = Math.max(1, Math.floor(draftCaps.nextnPredictLayers || 1));
+  if (layers >= Math.max(1, draftCaps.blockCount || 1)) {
+    return draftCaps;
+  }
+  return {
+    ...draftCaps,
+    blockCount: layers,
+    fullAttentionInterval: undefined,
+    recurrentLayers: undefined,
+    attentionHeadCountKvPerLayer: undefined,
+    slidingWindow: undefined,
+    slidingWindowPattern: undefined,
+  };
+}
+
+/**
  * Draft weights + KV. DFlash forces f16/f16 draft KV; sidecar MTP uses the
  * main cache dtypes. KV sits with the draft weights (GPU when any draft layers
  * are offloaded).
@@ -631,8 +811,9 @@ function estimateDraftFootprint(
   const cpuWeights = Math.max(0, fileSize - gpuWeights);
   const kvK = speculativeUsesDflash(settings.speculativeMode) ? "f16" : settings.cacheTypeK;
   const kvV = speculativeUsesDflash(settings.speculativeMode) ? "f16" : settings.cacheTypeV;
-  const kvBytes = estimateKvBytes(draftCaps, contextLength, kvK, kvV) * kvSlotMultiplier(settings);
-  const kvBytesWarm = estimateKvBytes(draftCaps, warmCtx, kvK, kvV) * kvSlotMultiplier(settings);
+  const kvCaps = draftKvCaps(draftCaps, settings);
+  const kvBytes = estimateKvBytes(kvCaps, contextLength, kvK, kvV) * kvSlotMultiplier(settings);
+  const kvBytesWarm = estimateKvBytes(kvCaps, warmCtx, kvK, kvV) * kvSlotMultiplier(settings);
   const kvOnGpu = onGpu > 0;
   return {
     fileSizeBytes: fileSize,
@@ -800,8 +981,14 @@ export function estimateMemory(
   const warmCtx = Math.min(WARM_KV_CONTEXT, Math.max(512, settings.contextLength));
   const kvBytesWarmRaw = estimateKvBytes(caps, warmCtx, settings.cacheTypeK, settings.cacheTypeV);
   const slotMul = kvSlotMultiplier(settings);
-  const kvBytes = kvBytesRaw * slotMul;
-  const kvBytesWarm = kvBytesWarmRaw * slotMul;
+  // Recurrent (SSM / linear-attention) layers keep no context-scaled KV, but
+  // llama.cpp still allocates a fixed f32 state buffer per layer and per
+  // sequence slot. It lives in the same cache buffer as KV, so it is billed
+  // here and follows the same GPU/RAM placement and the full/warm split.
+  const recurrentStatePerLayer = estimateRecurrentStateBytesPerLayer(caps);
+  const recurrentStateBytes = recurrentStatePerLayer.reduce((a, b) => a + b, 0) * slotMul;
+  const kvBytes = kvBytesRaw * slotMul + recurrentStateBytes;
+  const kvBytesWarm = kvBytesWarmRaw * slotMul + recurrentStateBytes;
   const fullAttnLayers = countFullAttentionLayers(caps);
   const kvOnGpu = !cpuOnly && settings.offloadKvCacheToGpu && onGpu > 0;
   const gpusForBackend: GpuMemoryInfo[] =
@@ -812,6 +999,7 @@ export function estimateMemory(
         : [];
   const computeBackend = inferComputeBackend(cpuOnly, gpusForBackend);
   const fullAttentionFraction = fullAttnLayers / nLayers;
+  const rcoHeap = isLinearRecurrentHybrid(caps);
   const splitAcrossGpus =
     onGpu > 0 && gpusForBackend.length >= 2 && settings.splitMode !== "none";
   const vulkanDeviceCount = onGpu <= 0 ? 0 : splitAcrossGpus ? gpusForBackend.length : 1;
@@ -824,14 +1012,20 @@ export function estimateMemory(
       backend: computeBackend,
       flashAttention: settings.flashAttention,
       fullAttentionFraction,
-      discountRecurrentGraph: isLinearRecurrentHybrid(caps),
+      discountRecurrentGraph: rcoHeap,
+      compactVulkanHeap: rcoHeap,
       vulkanDeviceCount,
     }
   );
   const gpuOverheadBytes = onGpu > 0 ? overheadBytes : 0;
   const peerOverheadEach =
     splitAcrossGpus && computeBackend !== "cpu"
-      ? peerGpuOverheadBytes(caps.embeddingLength || 0, settings.physicalBatchSize, computeBackend)
+      ? peerGpuOverheadBytes(
+          caps.embeddingLength || 0,
+          settings.physicalBatchSize,
+          computeBackend,
+          rcoHeap
+        )
       : 0;
   const cpuOverheadBytes = onGpu > 0 ? Math.round(overheadBytes * 0.15) : Math.round(overheadBytes * 0.5);
   const gpus = gpusForBackend;
@@ -868,7 +1062,12 @@ export function estimateMemory(
       ? assignLayerDevices(nLayers, onGpu, shares, settings.splitMode, mainGpuIndex)
       : undefined;
   const kvPerLayerFull = layerAssign
-    ? estimateKvBytesPerLayer(caps, settings.contextLength, settings.cacheTypeK, settings.cacheTypeV)
+    ? estimateKvBytesPerLayer(
+        caps,
+        settings.contextLength,
+        settings.cacheTypeK,
+        settings.cacheTypeV
+      ).map((bytes, i) => bytes + (recurrentStatePerLayer[i] || 0))
     : undefined;
   const peerCount = gpus.filter((_, i) => i !== mainGpuIndex && (shares[i] || 0) > 0).length;
   const totalPeerBytes = peerOverheadEach * peerCount;
@@ -1046,7 +1245,13 @@ export function estimateMemory(
     const weights = gpuWeights * (weightShares[i] || 0);
     const kv = kvOnDevice(i);
     const overhead = share <= 0 ? 0 : isMain ? gpuOverheadBytes : peerOverheadEach;
-    const spec = isMain ? specGpuBundle : 0;
+    // The draft follows `--tensor-split` like the main model: there is no
+    // draft-specific split flag (`--spec-draft-device` only narrows the device
+    // list), so parking the whole draft on the main GPU overstated that card
+    // by the draft's full size — 1.3 GiB of weights plus KV on the measured
+    // 9070/9060 pair, enough to fake a spill on a card with 4 GiB free.
+    const spec = specGpuBundle * (weightShares[i] || 0);
+    // `--mmproj` is a separate model and is genuinely not tensor-split.
     const vision = isMain ? gpuVisionBytes : 0;
     return { weights, kv, overhead, spec, vision, used: weights + kv + overhead + spec + vision };
   });
@@ -1091,6 +1296,15 @@ export function estimateMemory(
         );
       }
     }
+    // Runtime observation, not a prediction — deliberately does not set
+    // `willSpill` (that drives the Recommend search, which can only change
+    // settings, not the card's BAR window).
+    for (let i = 0; i < gpus.length; i++) {
+      const hint = hostFallbackWarning(gpus[i], i);
+      if (hint) {
+        warnings.unshift(hint);
+      }
+    }
     if (
       gpus.length >= 2 &&
       settings.splitMode !== "none" &&
@@ -1123,6 +1337,12 @@ export function estimateMemory(
           `Live ${gpuLabel(g, i)} free now: ~${formatBytes(free)} (current occupancy — not part of the estimate bars)`
         );
       }
+      if ((g.gttUsedBytes || 0) > 0) {
+        lines.push(
+          `Live ${gpuLabel(g, i)} GTT now: ~${formatBytes(g.gttUsedBytes!)} of host RAM mapped to the GPU` +
+            ` (VRAM in use ~${formatBytes(g.usedBytes || 0)})`
+        );
+      }
     }
     if (gpus.length >= 2) {
       const mainLabel = gpus[mainGpuIndex]
@@ -1146,6 +1366,7 @@ export function estimateMemory(
     lines.push(`Weights in RAM: ~${formatBytes(cpuWeights)} (${nLayers} layers)`);
     lines.push(
       `KV @ full ${settings.contextLength.toLocaleString()} ctx: ~${formatBytes(kvBytes)} (system RAM)` +
+        (recurrentStateBytes > 0 ? " (incl. recurrent state)" : "") +
         (fullAttnLayers < nLayers ? ` · ${fullAttnLayers}/${nLayers} full-attn layers` : "")
     );
     if (draft) {
@@ -1156,8 +1377,8 @@ export function estimateMemory(
     }
     if (mtp) {
       lines.push(
-        `MTP in RAM: ~${formatBytes(mtp.weightsBytes)} next-n head` +
-          ` + ~${formatBytes(mtp.kvBytes)} MTP KV`
+        `MTP: next-n heads already in the GGUF weights (~${formatBytes(mtp.weightsBytes)})` +
+          ` · MTP KV ~${formatBytes(mtp.kvBytes)} (RAM)`
       );
     }
     if (mmprojBytes > 0) {
@@ -1184,6 +1405,7 @@ export function estimateMemory(
     );
     lines.push(
       `KV @ full ${settings.contextLength.toLocaleString()} ctx: ~${formatBytes(kvBytes)}` +
+        (recurrentStateBytes > 0 ? " (incl. recurrent state)" : "") +
         (kvOnGpu ? " (GPU)" : " (CPU RAM)") +
         (fullAttnLayers < nLayers ? ` · ${fullAttnLayers}/${nLayers} full-attn layers` : "")
     );
@@ -1197,8 +1419,7 @@ export function estimateMemory(
     }
     if (mtp) {
       lines.push(
-        `MTP: ~${formatBytes(mtp.gpuWeightsBytes || mtp.cpuWeightsBytes)} next-n head` +
-          ` (${mtp.layers} layers)` +
+        `MTP: next-n heads already in the GGUF weights (~${formatBytes(mtp.weightsBytes)})` +
           ` · MTP KV ~${formatBytes(mtp.kvBytes)}` +
           (mtp.gpuKvBytes > 0 ? " (GPU)" : " (CPU RAM)")
       );
@@ -1327,6 +1548,7 @@ export function estimateMemory(
     kvBytes,
     kvBytesWarm,
     kvOnGpu,
+    recurrentStateBytes: recurrentStateBytes > 0 ? recurrentStateBytes : undefined,
     moeExpertShare: caps.isMoe ? moeExpertShare : undefined,
     draftFileSizeBytes: draft?.fileSizeBytes,
     draftGpuWeightsBytes: draft?.gpuWeightsBytes,
@@ -1380,6 +1602,10 @@ export function memoryEstimateInputs(
     slidingWindowPattern: c.slidingWindowPattern || null,
     fullAttentionInterval: c.fullAttentionInterval || 0,
     recurrentLayers: c.recurrentLayers || null,
+    ssmStateSize: c.ssmStateSize || 0,
+    ssmInnerSize: c.ssmInnerSize || 0,
+    ssmConvKernel: c.ssmConvKernel || 0,
+    ssmGroupCount: c.ssmGroupCount || 0,
     isMoe: !!c.isMoe,
     moeExpertShare: c.moeExpertShare ?? null,
     expertCount: c.expertCount || 0,

@@ -134,13 +134,40 @@ async function githubFetch(
   throw lastErr;
 }
 
+/**
+ * Turn a rate-limited GitHub API response into something a user can act on.
+ * Unauthenticated api.github.com allows 60 requests/hour/IP, and the raw body
+ * is a JSON blob that reads like a crash rather than a temporary limit.
+ */
+export function describeGithubHttpError(status: number, res: Response, body: string): string {
+  if (status !== 403 && status !== 429) {
+    return `HTTP ${status}: ${body.slice(0, 200)}`;
+  }
+  const remaining = res.headers.get("x-ratelimit-remaining");
+  const reset = Number(res.headers.get("x-ratelimit-reset") || 0);
+  const limited = status === 429 || remaining === "0" || /rate limit/i.test(body);
+  if (!limited) {
+    return `HTTP ${status}: ${body.slice(0, 200)}`;
+  }
+  let when = "";
+  if (Number.isFinite(reset) && reset > 0) {
+    const mins = Math.max(1, Math.ceil((reset * 1000 - Date.now()) / 60_000));
+    when = ` Try again in ~${mins} min.`;
+  }
+  return (
+    `GitHub API rate limit reached (HTTP ${status}).${when} ` +
+    `Anonymous requests are capped at 60/hour; wait for the limit to reset, ` +
+    `or use “Install from archive…” with a file you download from the releases page.`
+  );
+}
+
 async function httpGetJson<T>(url: string, headers: Record<string, string> = {}): Promise<T> {
   const res = await githubFetch(url, {
     headers: { Accept: "application/vnd.github+json", ...headers },
   });
   const body = await res.text();
   if (!res.ok) {
-    throw new Error(`HTTP ${res.status}: ${body.slice(0, 200)}`);
+    throw new Error(describeGithubHttpError(res.status, res, body));
   }
   return JSON.parse(body) as T;
 }

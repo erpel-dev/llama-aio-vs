@@ -19,6 +19,23 @@ export interface GpuMemoryInfo {
   index?: number;
   /** llama.cpp `--list-devices` id (`Vulkan0`, `CUDA1`) when known. */
   llamaDeviceId?: string;
+  /**
+   * GTT in use: system RAM currently mapped for this GPU (Linux amdgpu
+   * `mem_info_gtt_used`). A card whose GTT dwarfs its VRAM use is holding the
+   * model in host memory — RADV does that when the device-local BAR window is
+   * too small (`mem_info_vis_vram_total`) or the allocation is host-visible.
+   */
+  gttUsedBytes?: number;
+  /** GTT aperture size (`mem_info_gtt_total`). */
+  gttTotalBytes?: number;
+  /**
+   * Visible (BAR-mapped) VRAM total — `mem_info_vis_vram_total`. A value far
+   * below `totalBytes` means Resizable BAR / Above-4G is off, which pushes
+   * large Vulkan allocations into GTT.
+   */
+  visVramTotalBytes?: number;
+  /** Used part of the visible VRAM window (`mem_info_vis_vram_used`). */
+  visVramUsedBytes?: number;
 }
 
 export interface LlamaListedDevice {
@@ -146,6 +163,24 @@ function readSysfsGpus(): GpuMemoryInfo[] | undefined {
           usedBytes = u;
         }
       }
+      // Host-memory + BAR-window counters. Without these the app cannot tell
+      // "idle card" apart from "card quietly holding the model in system RAM".
+      const readMemCounter = (file: string): number | undefined => {
+        try {
+          const p = path.join(deviceDir, file);
+          if (!fs.existsSync(p)) {
+            return undefined;
+          }
+          const v = Number(fs.readFileSync(p, "utf8").trim());
+          return Number.isFinite(v) ? v : undefined;
+        } catch {
+          return undefined;
+        }
+      };
+      const gttUsedBytes = readMemCounter("mem_info_gtt_used");
+      const gttTotalBytes = readMemCounter("mem_info_gtt_total");
+      const visVramTotalBytes = readMemCounter("mem_info_vis_vram_total");
+      const visVramUsedBytes = readMemCounter("mem_info_vis_vram_used");
       let uevent = "";
       try {
         uevent = fs.readFileSync(path.join(deviceDir, "uevent"), "utf8");
@@ -160,6 +195,10 @@ function readSysfsGpus(): GpuMemoryInfo[] | undefined {
         name,
         source: `sysfs:${ent}`,
         pciSlot,
+        gttUsedBytes,
+        gttTotalBytes,
+        visVramTotalBytes,
+        visVramUsedBytes,
       });
     } catch {
       // ignore card
@@ -385,7 +424,13 @@ export function orderGpusLikeLlama(
       ? unused.findIndex((g) => gpuModelTokens(g.name || "").some((t) => tokens.includes(t)))
       : -1;
     if (idx < 0) {
-      idx = unused.length ? 0 : -1;
+      // Positional fallback is only safe for a card we cannot identify at all
+      // (`amdgpu`, a blank lspci name). Stealing a card that clearly carries a
+      // *different* model number would attach this `VulkanN` id — and with it
+      // `--main-gpu` / `--tensor-split` and the VRAM total — to the wrong
+      // physical device, which reads as "the small card is idle".
+      const unidentifiable = unused.findIndex((g) => gpuModelTokens(g.name || "").length === 0);
+      idx = unidentifiable;
     }
     if (idx < 0) {
       continue;

@@ -234,8 +234,10 @@ function recommendSpeculative(current: LlamaLoadSettings, caps: ModelCapabilitie
 }
 
 /**
- * Bytes parked on `--main-gpu` (compute overhead, CLIP, speculative extra).
- * Weights + KV are tensor-split; these are not.
+ * Bytes parked on `--main-gpu` (compute overhead + CLIP). Weights, KV **and the
+ * speculative draft** follow `--tensor-split` — there is no draft-specific
+ * split flag — so reserving the whole draft against Main understated what the
+ * other cards can take.
  */
 function mainParkedBytes(est: MemoryEstimate, settings: LlamaLoadSettings): number {
   const vision =
@@ -244,10 +246,7 @@ function mainParkedBytes(est: MemoryEstimate, settings: LlamaLoadSettings): numb
     settings.mmprojOffloadToGpu !== false
       ? est.mmprojFileSizeBytes || 0
       : 0;
-  const draftGpu = est.draftGpuWeightsBytes || 0;
-  const draftKv = draftGpu > 0 ? est.draftKvBytes || 0 : 0;
-  const mtpKv = est.kvOnGpu ? est.mtpKvBytes || 0 : 0;
-  return est.gpuOverheadBytes + vision + draftGpu + draftKv + mtpKv;
+  return est.gpuOverheadBytes + vision;
 }
 
 function splitableGpuBytes(est: MemoryEstimate): number {

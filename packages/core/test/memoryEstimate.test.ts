@@ -4,12 +4,15 @@ import {
   computeOverheadBytes,
   estimateKvBytes,
   estimateMemory,
+  estimateRecurrentStateBytesPerLayer,
+  hostFallbackWarning,
   inferComputeBackend,
   kvSlotMultiplier,
   peerGpuOverheadBytes,
   vulkanDeviceReservedBytes,
   vulkanDriverBytes,
 } from "../src/memoryEstimate";
+import { ModelCapabilities } from "../src/ggufMetadata";
 import { denseCaps, GiB, loadSettings, moeCaps } from "./helpers";
 
 const gpu = (totalGiB: number) => ({
@@ -171,6 +174,146 @@ describe("estimateKvBytes", () => {
   });
 });
 
+describe("estimateRecurrentStateBytesPerLayer", () => {
+  /** qwen35-style hybrid: every 4th layer is full attention (layers 3, 7, …). */
+  const hybrid = (overrides: Partial<ModelCapabilities> = {}) =>
+    denseCaps({
+      architecture: "qwen35",
+      blockCount: 8,
+      embeddingLength: 1024,
+      fullAttentionInterval: 4,
+      ...overrides,
+    });
+  const ssm = { ssmStateSize: 128, ssmInnerSize: 1024, ssmConvKernel: 4, ssmGroupCount: 1 };
+  // (d_inner·d_state + (d_conv−1)·(d_inner + 2·n_group·d_state)) · f32
+  const perLayer = (1024 * 128 + 3 * (1024 + 2 * 1 * 128)) * 4;
+
+  it("bills a fixed f32 state on recurrent layers only", () => {
+    const bytes = estimateRecurrentStateBytesPerLayer(hybrid(ssm));
+    assert.equal(bytes.length, 8);
+    assert.equal(bytes.filter((b) => b > 0).length, 6, "2 of 8 layers are full attention");
+    assert.equal(bytes[0], perLayer);
+    assert.equal(bytes[3], 0);
+    assert.equal(bytes[7], 0);
+  });
+
+  it("stays 0 for dense models and hybrids without ssm geometry", () => {
+    const sum = (v: number[]) => v.reduce((a, b) => a + b, 0);
+    assert.equal(sum(estimateRecurrentStateBytesPerLayer(denseCaps())), 0);
+    assert.equal(sum(estimateRecurrentStateBytesPerLayer(hybrid())), 0);
+  });
+
+  it("ignores absurd ssm geometry instead of inventing GiBs", () => {
+    const sum = (v: number[]) => v.reduce((a, b) => a + b, 0);
+    assert.equal(sum(estimateRecurrentStateBytesPerLayer(hybrid({ ...ssm, ssmStateSize: 10_000_000 }))), 0);
+    assert.equal(sum(estimateRecurrentStateBytesPerLayer(hybrid({ ...ssm, ssmInnerSize: 10_000_000 }))), 0);
+  });
+
+  it("folds state into the KV bucket and scales it with slots", () => {
+    const caps = hybrid(ssm);
+    const kvOnly = estimateKvBytes(caps, 8192, "q8_0", "q8_0");
+    const kvWarmOnly = estimateKvBytes(caps, 2048, "q8_0", "q8_0");
+    const state = perLayer * 6;
+    const one = estimateMemory(
+      caps,
+      loadSettings({ contextLength: 8192, unifiedKvCache: false, maxConcurrentPredictions: 1 }),
+      gpu(48)
+    );
+    const four = estimateMemory(
+      caps,
+      loadSettings({ contextLength: 8192, unifiedKvCache: false, maxConcurrentPredictions: 4 }),
+      gpu(48)
+    );
+    assert.ok(one && four);
+    // Six recurrent layers × fixed state, billed once (state is context-free).
+    assert.equal(one.recurrentStateBytes, state);
+    assert.equal(one.kvBytes, kvOnly + state);
+    // Unlike the KV, state neither grows with ctx nor shrinks when warm.
+    assert.equal(one.kvBytesWarm, kvWarmOnly + state, "warm KV still carries the full state");
+    assert.equal(four.kvBytes, (kvOnly + state) * 4, "state is per sequence slot");
+    assert.equal(four.recurrentStateBytes, state * 4);
+  });
+
+  it("leaves dense estimates byte-identical", () => {
+    const withSsmKeys = denseCaps({ ...ssm });
+    const plain = denseCaps();
+    const settings = loadSettings({ contextLength: 8192 });
+    assert.equal(
+      estimateMemory(withSsmKeys, settings, gpu(48))?.kvBytes,
+      estimateMemory(plain, settings, gpu(48))?.kvBytes
+    );
+  });
+});
+
+describe("hostFallbackWarning", () => {
+  const MiB = 1024 ** 2;
+  /** The reported field case: 9060 XT idle in VRAM, ~14 GiB of GTT. */
+  const idleInGtt = {
+    totalBytes: 15.9 * GiB,
+    usedBytes: 0.1 * GiB,
+    gttUsedBytes: 14.2 * GiB,
+    gttTotalBytes: 16 * GiB,
+    visVramTotalBytes: 256 * MiB,
+    name: "Radeon RX 9060 XT",
+    source: "test",
+    llamaDeviceId: "Vulkan1",
+  };
+  const healthy = {
+    totalBytes: 15.9 * GiB,
+    usedBytes: 12.5 * GiB,
+    gttUsedBytes: 0.6 * GiB,
+    gttTotalBytes: 16 * GiB,
+    visVramTotalBytes: 16 * GiB,
+    name: "Radeon RX 9070 XT",
+    source: "test",
+    llamaDeviceId: "Vulkan0",
+  };
+
+  it("flags a card holding the model in GTT instead of VRAM", () => {
+    const msg = hostFallbackWarning(idleInGtt, 1);
+    assert.ok(msg, "expected a warning");
+    assert.ok(msg!.includes("Vulkan1"), msg!);
+    assert.ok(/system RAM, not VRAM/.test(msg!), msg!);
+    assert.ok(/14.2 GiB in GTT/.test(msg!), msg!);
+    assert.ok(/Resizable BAR/.test(msg!), msg!);
+  });
+
+  it("stays quiet for a card that is genuinely using its VRAM", () => {
+    assert.equal(hostFallbackWarning(healthy, 0), undefined);
+  });
+
+  it("needs both a real GTT figure and a small BAR window to speak up", () => {
+    // Large GTT but a full BAR window: RADV is behaving, not falling back.
+    assert.equal(hostFallbackWarning({ ...healthy, gttUsedBytes: 14 * GiB }, 0), undefined);
+    // Small BAR window but nothing resident yet.
+    assert.equal(hostFallbackWarning({ ...healthy, gttUsedBytes: 64 * MiB }, 0), undefined);
+    assert.equal(hostFallbackWarning(undefined, 0), undefined);
+  });
+
+  it("warns without the BAR fields when GTT clearly dominates (non-sysfs sources)", () => {
+    const msg = hostFallbackWarning(
+      { totalBytes: 16 * GiB, usedBytes: 0, gttUsedBytes: 9 * GiB, source: "test" },
+      1
+    );
+    assert.ok(msg && /with ~0 VRAM/.test(msg), msg ?? "expected a warning");
+  });
+
+  it("is surfaced by estimateMemory when the collector reports GTT", () => {
+    const g0 = { ...healthy, usedBytes: 0 } as never;
+    const g1 = { ...idleInGtt } as never;
+    const est = estimateMemory(denseCaps(), loadSettings({ contextLength: 8192 }), g0, {
+      gpus: [g0, g1],
+    });
+    assert.ok(est);
+    assert.ok(
+      est.warnings.some((w) => /system RAM, not VRAM/.test(w)),
+      `warnings: ${est.warnings.join(" | ")}`
+    );
+    // A runtime observation must not feed the predictive spill search.
+    assert.ok(est.lines.some((l) => /GTT now/.test(l)));
+  });
+});
+
 describe("computeOverheadBytes", () => {
   it("grows with the physical batch, not just the logical batch", () => {
     const small = computeOverheadBytes(5120, 512, 2048);
@@ -219,12 +362,16 @@ describe("computeOverheadBytes", () => {
     const peer = peerGpuOverheadBytes(2560, 1024, "vulkan");
     assert.ok(peer > 2 * GiB, "peer GPUs keep the 2.5 GiB dual-device RADV heap");
     assert.ok(peer < main);
+    const peerRco = peerGpuOverheadBytes(5120, 256, "vulkan", true);
+    assert.ok(peerRco < 1 * GiB, "RCO peers skip the 2.5 GiB Flash-Next heap");
+    assert.ok(peerRco > 0.7 * GiB, "RCO peers still bill driver + 256 MiB slop");
   });
 
   it("uses 384 MiB driver + 256 MiB reserve on one Vulkan device", () => {
     assert.equal(vulkanDeviceReservedBytes(0), 0);
     assert.equal(vulkanDeviceReservedBytes(1), 256 * 1024 ** 2);
     assert.equal(vulkanDeviceReservedBytes(2), 2.5 * GiB);
+    assert.equal(vulkanDeviceReservedBytes(2, true), 256 * 1024 ** 2);
     assert.equal(vulkanDriverBytes(0), 0);
     assert.equal(vulkanDriverBytes(1), 384 * 1024 ** 2);
     assert.equal(vulkanDriverBytes(2), 768 * 1024 ** 2);
@@ -242,13 +389,7 @@ describe("computeOverheadBytes", () => {
       discountRecurrentGraph: true,
       vulkanDeviceCount: 2,
     });
-    assert.equal(
-      dual - single,
-      vulkanDriverBytes(2) -
-        vulkanDriverBytes(1) +
-        vulkanDeviceReservedBytes(2) -
-        vulkanDeviceReservedBytes(1)
-    );
+    assert.equal(dual - single, vulkanDriverBytes(2) - vulkanDriverBytes(1));
     assert.ok(single < 1.6 * GiB, "27B single-card overhead should sit near 1.2 GiB, not 2.5");
     const cuda = computeOverheadBytes(5120, 256, 512, {
       contextLength: 42496,
@@ -355,6 +496,60 @@ describe("computeOverheadBytes", () => {
     assert.ok(est.overheadBytes < 1.6 * GiB, `overhead ${est.overheadBytes} still has dual-GPU slop`);
     assert.ok(est.overheadBytes > 0.9 * GiB, `overhead ${est.overheadBytes} dropped the real RADV heap`);
     assert.equal(est.charts.vram2?.segments.find((s) => s.key === "overhead")?.bytes ?? 0, 0);
+  });
+
+  it("prices dual-Vulkan 27B RCO near LACT, not the 2.5 GiB Flash-Next heap", () => {
+    const g0 = {
+      totalBytes: 16 * GiB,
+      usedBytes: 0,
+      name: "RX 9070 XT",
+      source: "test",
+      llamaDeviceId: "Vulkan0",
+    };
+    const g1 = {
+      totalBytes: 16 * GiB,
+      usedBytes: 0,
+      name: "RX 9060 XT",
+      source: "test",
+      llamaDeviceId: "Vulkan1",
+    };
+    const caps = denseCaps({
+      architecture: "qwen35",
+      fileSizeBytes: Math.round(16.2 * GiB),
+      blockCount: 65,
+      embeddingLength: 5120,
+      attentionHeadCount: 40,
+      attentionHeadCountKv: 8,
+      keyLength: 128,
+      valueLength: 128,
+      fullAttentionInterval: 4,
+    });
+    const settings = loadSettings({
+      contextLength: 61440,
+      gpuOffload: 65,
+      physicalBatchSize: 256,
+      evalBatchSize: 512,
+      tensorSplit: "50,50",
+      cacheTypeK: "q8_0",
+      cacheTypeV: "q5_1",
+      mainGpu: 0,
+    });
+    const est = estimateMemory(caps, settings, g0, { gpus: [g0, g1] });
+    assert.ok(est?.charts.vram2);
+    const oh0 = est.charts.vram.segments.find((s) => s.key === "overhead")!.bytes;
+    const oh1 = est.charts.vram2.segments.find((s) => s.key === "overhead")!.bytes;
+    assert.ok(oh0 < 2.3 * GiB, `main overhead ${oh0} still has the 2.5 GiB Flash-Next heap`);
+    assert.ok(oh0 > 1.4 * GiB, `main overhead ${oh0} dropped driver/graph`);
+    assert.ok(oh1 < 1.1 * GiB, `peer overhead ${oh1} still has the 2.5 GiB Flash-Next heap`);
+    assert.ok(oh1 > 0.7 * GiB, `peer overhead ${oh1} dropped the 256 MiB slop`);
+    assert.ok(
+      est.charts.vram.totalBytes < 13 * GiB,
+      `9070 bar ${est.charts.vram.totalBytes} should sit near LACT 11.4 GiB, not 13.9`
+    );
+    assert.ok(
+      est.charts.vram2.totalBytes < 13 * GiB,
+      `9060 bar ${est.charts.vram2.totalBytes} should sit near live ~11 GiB, not 13.7`
+    );
   });
 
   it("prices Ornith-class 9B RCO overhead near LACT (~1.4 GiB, not ~2.5)", () => {
@@ -617,6 +812,122 @@ describe("estimateMemory", () => {
     assert.ok(
       withMtp.charts.vram.segments.some((s) => s.key === "draft" && s.bytes > 0),
       "VRAM chart should include an MTP segment"
+    );
+    // Regression: the GPU line used to read `gpuWeightsBytes || cpuWeightsBytes`
+    // (both 0 by design) and rendered "MTP: ~0 B next-n head".
+    const mtpLine = withMtp.lines.find((l) => l.startsWith("MTP:"));
+    assert.ok(mtpLine, "expected an MTP line");
+    assert.ok(!/~0 B/.test(mtpLine!), `MTP line should show the head size, got: ${mtpLine}`);
+    assert.ok(mtpLine!.includes("next-n heads already in the GGUF weights"), mtpLine!);
+  });
+
+  it("sizes a sidecar MTP draft from its next-n layers, not the parent block_count", () => {
+    // Real file: mtp-Qwen3.8-27B-Q4_0.gguf is 1.28 GiB and declares the parent's
+    // block_count (65) + interval (4) while holding a single next-n head.
+    const draft = denseCaps({
+      name: "mtp-draft",
+      architecture: "qwen35",
+      fileSizeBytes: Math.round(1.28 * GiB),
+      blockCount: 65,
+      embeddingLength: 5120,
+      attentionHeadCount: 40,
+      attentionHeadCountKv: 4,
+      keyLength: 128,
+      valueLength: 128,
+      fullAttentionInterval: 4,
+      nextnPredictLayers: 1,
+    });
+    const settings = loadSettings({
+      speculativeMode: "mtp",
+      draftModelPath: "/models/mtp-Qwen3.8-27B-Q4_0.gguf",
+      draftGpuOffload: 99,
+      contextLength: 83200,
+      cacheTypeK: "f16",
+      cacheTypeV: "f16",
+    });
+    const est = estimateMemory(denseCaps(), settings, gpu(48), { draftCaps: draft });
+    assert.ok(est);
+    assert.equal(est.draftFileSizeBytes, draft.fileSizeBytes);
+    // One next-n layer of f16 KV: 4 kv heads × 128 dims × 2 B × 2 (K+V) × 83200.
+    const oneLayer = 4 * 128 * 2 * 2 * 83200;
+    assert.ok(
+      Math.abs((est.draftKvBytes || 0) - oneLayer) < 1024,
+      `draft KV ${est.draftKvBytes} should be one next-n layer (~${oneLayer})`,
+    );
+    // The old geometry billed all 16 full-attn layers of the parent's mask.
+    assert.ok(
+      (est.draftKvBytes || 0) < oneLayer * 2,
+      `draft KV ${est.draftKvBytes} still bills the parent's 16 full-attn layers`,
+    );
+  });
+
+  it("keeps a DFlash draft's own layer geometry", () => {
+    const draft = denseCaps({
+      name: "dflash-draft",
+      architecture: "dflash",
+      fileSizeBytes: Math.round(1.28 * GiB),
+      blockCount: 8,
+      nextnPredictLayers: 1,
+      fullAttentionInterval: undefined,
+    });
+    const est = estimateMemory(
+      denseCaps(),
+      loadSettings({
+        speculativeMode: "dflash",
+        draftModelPath: "/models/draft.gguf",
+        draftGpuOffload: 99,
+        contextLength: 83200,
+        cacheTypeK: "f16",
+        cacheTypeV: "f16",
+      }),
+      gpu(48),
+      { draftCaps: draft }
+    );
+    // All 8 draft layers keep cache — DFlash is a full model, not an MTP head.
+    // denseCaps geometry: 8 kv heads × 128 dims × 2 B × 2 (K+V) × 83200.
+    const perLayer = 8 * 128 * 2 * 2 * 83200;
+    assert.ok(
+      (est?.draftKvBytes || 0) > perLayer * 7,
+      `DFlash draft KV ${est?.draftKvBytes} must cover every draft layer`,
+    );
+  });
+
+  it("splits the speculative draft across GPUs like --tensor-split", () => {
+    const g0 = { totalBytes: 16 * GiB, usedBytes: 0, name: "RX 9070 XT", source: "t", llamaDeviceId: "Vulkan0" };
+    const g1 = { totalBytes: 16 * GiB, usedBytes: 0, name: "RX 9060 XT", source: "t", llamaDeviceId: "Vulkan1" };
+    const draft = denseCaps({
+      name: "mtp-draft",
+      architecture: "qwen35",
+      fileSizeBytes: Math.round(1.28 * GiB),
+      blockCount: 65,
+      fullAttentionInterval: 4,
+      nextnPredictLayers: 1,
+    });
+    const est = estimateMemory(
+      denseCaps({ architecture: "qwen35", blockCount: 65, fullAttentionInterval: 4 }),
+      loadSettings({
+        speculativeMode: "mtp",
+        draftModelPath: "/models/mtp-Qwen3.8-27B-Q4_0.gguf",
+        draftGpuOffload: 99,
+        contextLength: 32768,
+        tensorSplit: "44,56",
+        splitMode: "layer",
+        mainGpu: 0,
+      }),
+      g0,
+      { gpus: [g0, g1], draftCaps: draft }
+    );
+    assert.ok(est?.charts.vram2);
+    const draft0 = est.charts.vram.segments.find((s) => s.key === "draft")?.bytes ?? 0;
+    const draft1 = est.charts.vram2!.segments.find((s) => s.key === "draft")?.bytes ?? 0;
+    assert.ok(draft0 > 0, "main GPU keeps its share of the draft");
+    // Regression: the whole draft used to be parked on Main, which pushed the
+    // 9070 XT bar to 118% of a 16 GB card while sysfs showed 12 GiB.
+    assert.ok(draft1 > 0, "the second GPU must carry its share of the draft too");
+    const draftTotal = (est.draftFileSizeBytes || 0) + (est.draftKvBytes || 0);
+    assert.ok(
+      Math.abs(draft0 + draft1 - draftTotal) < 2048,
+      `draft bundle must be conserved: ${draft0} + ${draft1} vs ${draftTotal}`,
     );
   });
 

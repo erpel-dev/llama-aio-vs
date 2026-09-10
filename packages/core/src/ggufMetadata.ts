@@ -37,6 +37,19 @@ export interface ModelCapabilities {
   fullAttentionInterval?: number;
   /** Per-layer: true = recurrent / linear-attention (no context-scaled KV) */
   recurrentLayers?: boolean[];
+  /**
+   * Recurrent (SSM / linear-attention) state geometry from `{arch}.ssm.*`.
+   * Recurrent layers carry no context-scaled KV, but llama.cpp still allocates
+   * a fixed f32 state buffer per layer **per sequence slot**. Undefined when the
+   * GGUF has no `ssm.*` keys (dense or non-SSM hybrid).
+   */
+  ssmStateSize?: number;
+  /** SSM inner (expanded) width — `ssm.inner_size`; falls back to `embedding_length` */
+  ssmInnerSize?: number;
+  /** SSM depthwise conv kernel width — `ssm.conv_kernel` (llama.cpp default 4) */
+  ssmConvKernel?: number;
+  /** SSM groups — `ssm.group_count` (llama.cpp default 1) */
+  ssmGroupCount?: number;
   /** Total size on disk (bytes), summed over all shards — proxy for weight memory */
   fileSizeBytes?: number;
   /** Number of shards the split GGUF declares (1 for a single file) */
@@ -631,6 +644,12 @@ export function readModelCapabilities(filePath: string): ModelCapabilities {
   const expertUsedCount = pickArchNumber("expert_used_count");
   const ropeFreqBase = pickArchNumber("rope.freq_base");
   const nextnPredictLayers = pickArchNumber("nextn_predict_layers");
+  // Recurrent-state geometry (Mamba-style SSM / gated delta net). Absent on
+  // dense and pure-attention hybrids, so the state term stays 0 there.
+  const ssmStateSize = pickArchNumber("ssm.state_size");
+  const ssmInnerSize = pickArchNumber("ssm.inner_size");
+  const ssmConvKernel = pickArchNumber("ssm.conv_kernel");
+  const ssmGroupCount = pickArchNumber("ssm.group_count");
   const fileType = meta["general.file_type"];
 
   const { bytes: fileSizeBytes, shardCount, shardsFound } = totalModelBytes(filePath);
@@ -673,6 +692,10 @@ export function readModelCapabilities(filePath: string): ModelCapabilities {
     slidingWindowPattern,
     fullAttentionInterval,
     recurrentLayers,
+    ssmStateSize,
+    ssmInnerSize,
+    ssmConvKernel,
+    ssmGroupCount,
     fileSizeBytes,
     shardCount,
     shardsFound,

@@ -560,6 +560,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               slidingWindowPattern: caps.slidingWindowPattern,
               fullAttentionInterval: caps.fullAttentionInterval,
               recurrentLayers: caps.recurrentLayers,
+              ssmStateSize: caps.ssmStateSize,
+              ssmInnerSize: caps.ssmInnerSize,
+              ssmConvKernel: caps.ssmConvKernel,
+              ssmGroupCount: caps.ssmGroupCount,
               pleShare: caps.pleShare,
             }
           : null,
@@ -2292,7 +2296,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             gpuWeights * (wShares[i0] || 0),
             kvFor(i0),
             overheadForGpu(i0, mainIdx, shares[i0] || 0, gpuOverhead, peerOverhead),
-            mainIdx === i0 ? (draftGpu || 0) : 0,
+            (draftGpu || 0) * (wShares[i0] || 0),
             specLabel,
             labeled,
             mainIdx === i0 ? (gpuVision || 0) : 0
@@ -2316,7 +2320,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             gpuWeights * (wShares[i1] || 0),
             kvFor(i1),
             overheadForGpu(i1, mainIdx, shares[i1] || 0, gpuOverhead, peerOverhead),
-            mainIdx === i1 ? (draftGpu || 0) : 0,
+            (draftGpu || 0) * (wShares[i1] || 0),
             specLabel,
             labeled,
             mainIdx === i1 ? (gpuVision || 0) : 0
@@ -2706,6 +2710,16 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       const perKv = memInputs.attentionHeadCountKvPerLayer;
       const recurrent = memInputs.recurrentLayers;
       const fullInterval = memInputs.fullAttentionInterval > 1 ? memInputs.fullAttentionInterval : 0;
+      // Recurrent (SSM / linear-attention) layers keep no growing KV, but hold a
+      // fixed f32 state per layer per sequence slot. Mirrors
+      // estimateRecurrentStateBytesPerLayer() in core/memoryEstimate.ts.
+      const ssmStateSize = Math.max(0, Math.round(Number(memInputs.ssmStateSize) || 0));
+      const ssmInnerSize = Math.max(0, Math.round(Number(memInputs.ssmInnerSize) || Number(memInputs.embeddingLength) || 0));
+      const ssmConvKernel = Math.min(16, Math.max(2, Math.round(Number(memInputs.ssmConvKernel) || 4)));
+      const ssmGroupCount = Math.max(1, Math.round(Number(memInputs.ssmGroupCount) || 1));
+      const ssmPerLayerBytes = (ssmStateSize > 0 && ssmStateSize <= 4096 && ssmInnerSize > 0 && ssmInnerSize <= 1000000)
+        ? (ssmInnerSize * ssmStateSize + (ssmConvKernel - 1) * (ssmInnerSize + 2 * ssmGroupCount * ssmStateSize)) * 4
+        : 0;
       function kvElemBytes(t) {
         // Mirrors kvCacheTypeElemBytes in core/memoryEstimate.ts (block-quant scale overhead included)
         if (t === 'q4_0' || t === 'iq4_nl') return 0.5625;
@@ -2727,7 +2741,11 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             : (perKv && perKv.length === nLayers && Number(perKv[i]) <= 0)
               ? true
               : !!(fullInterval && ((i + 1) % fullInterval !== 0));
-          if (isRecurrent) continue;
+          if (isRecurrent) {
+            // Fixed per-slot SSM state (context-independent, still device memory).
+            bytes += ssmPerLayerBytes;
+            continue;
+          }
           fullAttnLayers++;
           const isSwa = !!(swa && pattern && pattern.length && pattern[i % pattern.length]);
           let nKv;
@@ -2772,8 +2790,15 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         ? ((gpusForOh.length >= 2 && !splitNone) ? gpusForOh.length : 1)
         : 0;
       // Mirrors vulkanDeviceReservedBytes() / vulkanDriverBytes(): 384 MiB
-      // driver + 256 MiB slop on one Vulkan device (768+1024 double-counted
-      // RADV). 768 MiB driver + 2.5 GiB reserve when layers are split.
+      // driver + 256 MiB slop on one Vulkan device. Split Flash-Next keeps
+      // 768 MiB driver + 2.5 GiB reserve; Qwen3.5 RCO keeps the 256 MiB
+      // slop even when split (that 2.5 GiB/card was the 13.9 vs 11.4 gap).
+      // Linear-recurrent hybrids (Qwen3.5 RCO) also run a smaller graph;
+      // full/SWA interleaves such as Flash-Next keep the dense graph.
+      // Inline isLinearRecurrentHybrid(): this is webview JS, the TS import
+      // above is not in scope here.
+      const archNorm = String((memInputs && memInputs.architecture) || '').toLowerCase().replace(/[._-]/g, '');
+      const discountRecurrent = archNorm !== 'qwen4exp' && archNorm.indexOf('qwen35') === 0;
       const ohTax = {
         vulkan: { driver: 768 * 1024 * 1024, peer: 512 * 1024 * 1024, graph: 12, reserved: 2.5 * 1024 ** 3 },
         cuda: { driver: 384 * 1024 * 1024, peer: 256 * 1024 * 1024, graph: 8, reserved: 0 },
@@ -2781,19 +2806,12 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         unknown: { driver: 512 * 1024 * 1024, peer: 384 * 1024 * 1024, graph: 10, reserved: 0 },
       }[ohBackend] || { driver: 512 * 1024 * 1024, peer: 384 * 1024 * 1024, graph: 10, reserved: 0 };
       const reservedBytes = ohBackend === 'vulkan'
-        ? (vulkanDeviceCount > 1 ? 2.5 * 1024 ** 3 : (vulkanDeviceCount === 1 ? 256 * 1024 * 1024 : 0))
+        ? (vulkanDeviceCount <= 0 ? 0 : ((vulkanDeviceCount > 1 && !discountRecurrent) ? 2.5 * 1024 ** 3 : 256 * 1024 * 1024))
         : (ohTax.reserved || 0);
       const driverBytes = ohBackend === 'vulkan'
         ? (vulkanDeviceCount > 1 ? ohTax.driver : (vulkanDeviceCount === 1 ? 384 * 1024 * 1024 : 0))
         : ohTax.driver;
       const graphElem = L.flashAttention === 'off' ? Math.max(ohTax.graph, 36) : ohTax.graph;
-      // Linear-recurrent hybrids (Qwen3.5 RCO) run a smaller graph; full/SWA
-      // interleaves such as Flash-Next keep the dense graph even though their
-      // GGUF reuses the same interval marker. Inline mirror of
-      // isLinearRecurrentHybrid(): this is webview JS, the TS import above is
-      // not in scope here.
-      const archNorm = String((memInputs && memInputs.architecture) || '').toLowerCase().replace(/[._-]/g, '');
-      const discountRecurrent = archNorm !== 'qwen4exp' && archNorm.indexOf('qwen35') === 0;
       const fullAttnFrac = discountRecurrent && nLayers > 0
         ? Math.min(1, Math.max(0.05, fullAttnLayers / nLayers))
         : 1;
@@ -2811,8 +2829,11 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           Math.min(graphRaw, graphCap)
         );
       const gpuOverhead = onGpu > 0 ? overhead : 0;
+      const peerReserved = ohBackend === 'vulkan'
+        ? (discountRecurrent ? 256 * 1024 * 1024 : (ohTax.reserved || 0))
+        : (ohTax.reserved || 0);
       const peerOverhead = (onGpu > 0 && gpusForOh.length >= 2 && !splitNone && ohBackend !== 'cpu')
-        ? Math.round(ohTax.peer + (ohTax.reserved || 0) + ubatchForOverhead * embedForOverhead * 32)
+        ? Math.round(ohTax.peer + peerReserved + ubatchForOverhead * embedForOverhead * 32)
         : 0;
       const cpuOverhead = onGpu > 0 ? Math.round(overhead * 0.15) : Math.round(overhead * 0.5);
 
@@ -2842,22 +2863,29 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           const defaultKvHeads = Math.max(1, draftIn.attentionHeadCountKv || heads);
           const defaultKeyDim = Math.max(1, draftIn.keyLength || Math.floor((draftIn.embeddingLength || heads * 128) / heads));
           const defaultValDim = Math.max(1, draftIn.valueLength || defaultKeyDim);
-          const swa = draftIn.slidingWindow > 0 ? draftIn.slidingWindow : 0;
-          const pattern = draftIn.slidingWindowPattern;
-          const perKv = draftIn.attentionHeadCountKvPerLayer;
-          const recurrent = draftIn.recurrentLayers;
-          const fullInterval = draftIn.fullAttentionInterval > 1 ? draftIn.fullAttentionInterval : 0;
+          // Mirrors draftKvCaps() in core/memoryEstimate.ts: a sidecar mtp-*.gguf
+          // carries the parent's block_count/interval/recurrent mask but holds
+          // only the next-n heads, so its cache is one next-n layer, not the
+          // parent's 16 full-attn layers (~5 GiB of cache that never exists).
+          const nextn = Math.max(1, Math.floor(Number(draftIn.nextnPredictLayers) || 1));
+          const sidecarReduced = sidecarMtp && nextn < dLayers;
+          const kvLayers = sidecarReduced ? nextn : dLayers;
+          const swa = !sidecarReduced && draftIn.slidingWindow > 0 ? draftIn.slidingWindow : 0;
+          const pattern = sidecarReduced ? null : draftIn.slidingWindowPattern;
+          const perKv = sidecarReduced ? null : draftIn.attentionHeadCountKvPerLayer;
+          const recurrent = sidecarReduced ? null : draftIn.recurrentLayers;
+          const fullInterval = !sidecarReduced && draftIn.fullAttentionInterval > 1 ? draftIn.fullAttentionInterval : 0;
           let bytes = 0;
-          for (let i = 0; i < dLayers; i++) {
-            const isRecurrent = (recurrent && recurrent.length === dLayers)
+          for (let i = 0; i < kvLayers; i++) {
+            const isRecurrent = (recurrent && recurrent.length === kvLayers)
               ? !!recurrent[i]
-              : (perKv && perKv.length === dLayers && Number(perKv[i]) <= 0)
+              : (perKv && perKv.length === kvLayers && Number(perKv[i]) <= 0)
                 ? true
                 : !!(fullInterval && ((i + 1) % fullInterval !== 0));
             if (isRecurrent) continue;
             const isSwa = !!(swa && pattern && pattern.length && pattern[i % pattern.length]);
             let nKv;
-            if (perKv && perKv.length === dLayers && Number.isFinite(perKv[i])) {
+            if (perKv && perKv.length === kvLayers && Number.isFinite(perKv[i])) {
               nKv = Number(perKv[i]);
               if (nKv <= 0) continue;
             } else {
@@ -2980,7 +3008,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         for (let i = 0; i < gpuInfos.length; i++) {
           const g = gpuInfos[i];
           const share = shares[i] || 0;
-          const used = gpuWeights * (liveWeightShares[i] || 0) + (liveKvPerGpu[i] || 0) + overheadForGpu(i, mainIdx, share, gpuOverhead, peerOverhead) + (i === mainIdx ? draftGpuBundle : 0) + (i === mainIdx ? gpuVisionBytes : 0);
+          const used = gpuWeights * (liveWeightShares[i] || 0) + (liveKvPerGpu[i] || 0) + overheadForGpu(i, mainIdx, share, gpuOverhead, peerOverhead) + (draftGpuBundle * (liveWeightShares[i] || 0)) + (i === mainIdx ? gpuVisionBytes : 0);
           const cap = g.totalBytes;
           if (!cap) continue;
           const pct = Math.round((used / cap) * 100);
@@ -2994,6 +3022,28 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           } else if (cap - used < 4 * 1024 ** 3) {
             warnings.push('Getting full on ' + label + ' at full context: ~' + fmtBytes(used) + ' of ' + fmtBytes(cap) + ' VRAM (' + pct + '%).');
           }
+        }
+        // Mirrors hostFallbackWarning() in core/memoryEstimate.ts: a card whose
+        // GTT dwarfs its VRAM use is holding its share in system RAM (RADV does
+        // this when the BAR window is small), so the VRAM bars above overstate
+        // what that card actually contributes.
+        for (let i = 0; i < gpuInfos.length; i++) {
+          const g = gpuInfos[i];
+          const cap = g.totalBytes || 0;
+          if (!cap) continue;
+          const vramUsed = g.usedBytes || 0;
+          const gttUsed = g.gttUsedBytes || 0;
+          const visTotal = g.visVramTotalBytes || 0;
+          const smallBar = visTotal > 0 && visTotal < cap / 2;
+          const gttHeavy = gttUsed >= 1024 ** 3 && gttUsed > Math.max(vramUsed * 2, cap * 0.25);
+          if (!gttHeavy && !(smallBar && gttUsed >= 1024 ** 3)) continue;
+          warnings.unshift(
+            gpuLabel(g, i) + ' is using system RAM, not VRAM: ~' + fmtBytes(gttUsed) + ' in GTT' +
+            (vramUsed > 0 ? ' vs ~' + fmtBytes(vramUsed) + ' VRAM' : ' with ~0 VRAM') + '.' +
+            (smallBar ? ' Its visible-VRAM window is only ~' + fmtBytes(visTotal) + ' of ' + fmtBytes(cap) + ' (Resizable BAR / Above 4G off).' : '') +
+            ' Layers on this card read weights over PCIe, so they run at host-memory speed. ' +
+            'Enable Resizable BAR, drop to one GPU (--split-mode none), or resize the split.'
+          );
         }
         if (gpuInfos.length >= 2 && L.splitMode !== 'none' && parseTensorSplit(L.tensorSplit).length < 2) {
           warnings.push('Tensor split is empty — llama.cpp will split by VRAM size (often 1:1). Pick the faster card as Main GPU and raise Weights on main GPU so that card gets more of the model.');
@@ -3025,6 +3075,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           if (g.usedBytes != null) {
             const free = Math.max(0, g.totalBytes - g.usedBytes);
             lines.push('Live ' + gpuLabel(g, i) + ' free now: ~' + fmtBytes(free) + ' (current occupancy — not part of the estimate bars)');
+          }
+          if ((g.gttUsedBytes || 0) > 0) {
+            lines.push('Live ' + gpuLabel(g, i) + ' GTT now: ~' + fmtBytes(g.gttUsedBytes) + ' of host RAM mapped to the GPU (VRAM in use ~' + fmtBytes(g.usedBytes || 0) + ')');
           }
         }
         if (gpuInfos.length >= 2) {
