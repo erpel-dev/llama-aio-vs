@@ -1,5 +1,7 @@
 import {
   ConfigFile,
+  DownloadAbortError,
+  downloadManager,
   describeConfigLocation,
   ensureDirs,
   getInstallDir,
@@ -17,6 +19,7 @@ import {
   speculativeUsesNgram,
   UiBackend,
 } from "@llama-aio/core";
+import { DownloadPanel, formatDownloadStatusLine } from "./downloadPanel";
 import { openModelFileDialog, pickDownloadedModel, pickDraftModelFromLibrary, pickMmprojFromLibrary } from "./modelPicker";
 import { SettingsViewProvider } from "./settingsView";
 import * as path from "path";
@@ -120,11 +123,14 @@ export function activate(context: vscode.ExtensionContext): void {
 
   let settingsView!: SettingsViewProvider;
 
-  const downloadFromHuggingFace = async () => {
+  const downloadFromHuggingFace = async (query?: string) => {
     try {
-      const selected = await browseAndDownloadModel(hf, store);
+      const selected = await browseAndDownloadModel(hf, store, query);
       await afterModelSelected(selected, settingsView, processManager, store);
     } catch (e) {
+      if (e instanceof DownloadAbortError) {
+        return;
+      }
       vscode.window.showErrorMessage(
         `Browse/download failed: ${e instanceof Error ? e.message : String(e)}`
       );
@@ -136,6 +142,9 @@ export function activate(context: vscode.ExtensionContext): void {
       const selected = await downloadStarterModel(hf, store);
       await afterModelSelected(selected, settingsView, processManager, store);
     } catch (e) {
+      if (e instanceof DownloadAbortError) {
+        return;
+      }
       vscode.window.showErrorMessage(
         `Starter download failed: ${e instanceof Error ? e.message : String(e)}\n` +
           `Try “Download from Hugging Face…” instead.`
@@ -156,13 +165,21 @@ export function activate(context: vscode.ExtensionContext): void {
 
   const pickDownloaded = async () => {
     try {
-      const selected = await pickDownloadedModel(hf, store);
+      const selected = await pickDownloadedModel(hf, store, {
+        cpuOnly: installer.resolveActiveUiBackend() === "cpu" || processManager.isCpuBackend(),
+        llamaServerBinary: processManager.resolveBinary(),
+        loadSettings: store.getState().loadSettings,
+      });
       await afterModelSelected(selected, settingsView, processManager, store);
     } catch (e) {
       vscode.window.showErrorMessage(
         `Select model failed: ${e instanceof Error ? e.message : String(e)}`
       );
     }
+  };
+
+  const showDownloads = async () => {
+    DownloadPanel.show(store);
   };
 
   const pickDraftModel = async () => {
@@ -634,6 +651,7 @@ export function activate(context: vscode.ExtensionContext): void {
       installLlamaCppByTag,
       installLlamaCppFromArchive,
       switchBackend,
+      showDownloads,
     },
     () => chatProvider?.notifyChanged()
   );
@@ -671,6 +689,22 @@ export function activate(context: vscode.ExtensionContext): void {
   statusBar.command = "llamaAio.showStatus";
   statusBar.tooltip = "Llama AIO server status";
   context.subscriptions.push(statusBar);
+
+  const downloadBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 90);
+  downloadBar.command = "llamaAio.showDownloads";
+  downloadBar.tooltip = "Llama AIO downloads";
+  context.subscriptions.push(downloadBar);
+  context.subscriptions.push({
+    dispose: downloadManager.subscribe((jobs) => {
+      const line = formatDownloadStatusLine(jobs);
+      if (!line) {
+        downloadBar.hide();
+        return;
+      }
+      downloadBar.text = line;
+      downloadBar.show();
+    }),
+  });
 
   let serverReadyCache = false;
   // The installed-build summary only changes on install / backend switch. Do
@@ -769,7 +803,10 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("llamaAio.installLlamaCpp", installLlamaCpp),
     vscode.commands.registerCommand("llamaAio.installLlamaCppByTag", installLlamaCppByTag),
     vscode.commands.registerCommand("llamaAio.installLlamaCppFromArchive", installLlamaCppFromArchive),
-    vscode.commands.registerCommand("llamaAio.browseModels", downloadFromHuggingFace),
+    vscode.commands.registerCommand("llamaAio.browseModels", (query?: string) =>
+      downloadFromHuggingFace(typeof query === "string" ? query : undefined)
+    ),
+    vscode.commands.registerCommand("llamaAio.showDownloads", showDownloads),
     vscode.commands.registerCommand("llamaAio.openModelFile", openGgufFile),
     vscode.commands.registerCommand("llamaAio.selectLocalModel", pickDownloaded),
     vscode.commands.registerCommand("llamaAio.selectDraftModel", pickDraftModel),
