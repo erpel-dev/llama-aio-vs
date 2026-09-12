@@ -20,6 +20,7 @@ import {
   getLlamaServerBinary,
   getLockPath,
   InstallBackendId,
+  whichOnPath,
   withBinaryDirEnv,
 } from "./paths";
 import { stopLlamaServersUsingDir, isPidAlive, executableIsUnderDir } from "./processIdentity";
@@ -585,21 +586,40 @@ export function inferBackendFromAsset(assetName: string | undefined): string | u
   return undefined;
 }
 
+/** PATH lookup without spawning a shell (`sh -c command -v` cost a fork per call). */
 function commandExists(bin: string): boolean {
-  try {
-    if (process.platform === "win32") {
-      execFileSync("where.exe", [bin], { stdio: "ignore" });
-    } else {
-      execFileSync("sh", ["-c", `command -v ${bin}`], { stdio: "ignore" });
-    }
-    return true;
-  } catch {
-    return false;
+  return !!whichOnPath(bin);
+}
+
+/**
+ * Hardware presence does not change while the extension host runs, but these
+ * probes used to run `nvidia-smi` (up to 3 s) on every status-bar tick and
+ * every sidebar refresh via resolveActiveUiBackend(). Cache them.
+ */
+export const HARDWARE_DETECT_TTL_MS = 5 * 60 * 1000;
+const hardwareCache = new Map<string, { value: boolean; at: number }>();
+
+function cachedDetect(key: string, probe: () => boolean, now = Date.now()): boolean {
+  const hit = hardwareCache.get(key);
+  if (hit && now - hit.at < HARDWARE_DETECT_TTL_MS) {
+    return hit.value;
   }
+  const value = probe();
+  hardwareCache.set(key, { value, at: now });
+  return value;
+}
+
+/** Forget cached GPU/Vulkan detection (tests, or after a driver install). */
+export function resetHardwareDetectionCache(): void {
+  hardwareCache.clear();
 }
 
 /** True when an NVIDIA GPU / CUDA runtime looks present on this machine. */
 export function detectCudaHardware(): boolean {
+  return cachedDetect("cuda", detectCudaHardwareUncached);
+}
+
+function detectCudaHardwareUncached(): boolean {
   if (process.env.CUDA_PATH || process.env.CUDA_HOME) {
     return true;
   }
@@ -625,6 +645,10 @@ export function detectCudaHardware(): boolean {
 
 /** True when Vulkan looks usable (or we can at least install the Vulkan build). */
 export function detectVulkanHardware(): boolean {
+  return cachedDetect("vulkan", detectVulkanHardwareUncached);
+}
+
+function detectVulkanHardwareUncached(): boolean {
   if (process.platform === "darwin") {
     return false;
   }

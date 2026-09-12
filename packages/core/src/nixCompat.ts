@@ -68,9 +68,19 @@ interface ProbeCacheEntry {
   mtimeMs: number;
   size: number;
   result: BinaryProbeResult;
+  /** Failures expire; successes are trusted until the file changes. */
+  expiresAt?: number;
 }
 
 const probeCache = new Map<string, ProbeCacheEntry>();
+
+/**
+ * A failed `--version` probe is remembered briefly (keyed by mtime/size), so a
+ * broken binary does not cost an 8 s spawn on every status-bar tick. Short
+ * enough that a freshly installed binary is retried promptly even if it
+ * happened to keep the same size and mtime.
+ */
+export const FAILED_PROBE_TTL_MS = 30_000;
 
 /** Drop cached `--version` results (call after replacing the binary). */
 export function invalidateLlamaServerProbeCache(binary?: string): void {
@@ -98,7 +108,12 @@ export function probeLlamaServerRunnable(
     try {
       const st = fs.statSync(binary);
       const cached = probeCache.get(key);
-      if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size) {
+      if (
+        cached &&
+        cached.mtimeMs === st.mtimeMs &&
+        cached.size === st.size &&
+        (cached.expiresAt === undefined || cached.expiresAt > Date.now())
+      ) {
         return cached.result;
       }
     } catch {
@@ -172,17 +187,21 @@ export function probeLlamaServerRunnable(
     };
   }
 
-  // Only cache successes — a failed probe during an in-progress replace
-  // must not stick after the new binary is in place.
-  if (!options?.wrapper && probe.ok) {
+  // Successes stick until the file changes. Failures are kept only briefly:
+  // a probe that ran during an in-progress replace must not outlive the new
+  // binary, but re-spawning a known-broken one every few seconds is worse.
+  if (!options?.wrapper) {
     try {
       const st = fs.statSync(binary);
-      probeCache.set(key, { mtimeMs: st.mtimeMs, size: st.size, result: probe });
+      probeCache.set(key, {
+        mtimeMs: st.mtimeMs,
+        size: st.size,
+        result: probe,
+        expiresAt: probe.ok ? undefined : Date.now() + FAILED_PROBE_TTL_MS,
+      });
     } catch {
-      // ignore
+      probeCache.delete(key);
     }
-  } else if (!probe.ok) {
-    probeCache.delete(key);
   }
   return probe;
 }
