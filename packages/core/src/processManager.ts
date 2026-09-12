@@ -32,6 +32,7 @@ import { buildServerArgs, serverConfigFingerprint, SettingsStore } from "./setti
 import { normalizeLoadSettingsForCpuBackend } from "./serverArgs";
 import { ServerStatus } from "./types";
 import { activeInstallLock } from "./installSwap";
+import { acquireLaunchLock, activeLaunchLock, LaunchLockHandle } from "./launchLock";
 
 interface LockFile {
   pid: number;
@@ -74,7 +75,48 @@ export class ProcessManager {
   private launchToken: LaunchToken | undefined;
   private nextLaunchId = 1;
 
+  /**
+   * PIDs this ProcessManager spawned itself (launchers / servers). They are
+   * trusted without a command-line check even when the OS hides it from us.
+   */
+  private readonly spawnedPids = new Set<number>();
+
+  /**
+   * Identity verdicts for lock-file PIDs, keyed by pid → lock.startedAt. A PID
+   * cannot be reused while the process is alive, so a verdict stays valid
+   * until the lock is rewritten for a new launch.
+   */
+  private readonly pidIdentity = new Map<number, { startedAt: string; ours: boolean }>();
+
   constructor(private readonly store: SettingsStore) {}
+
+  /**
+   * True when `lock.pid` is (still) a llama-server — or a launcher we spawned —
+   * rather than an unrelated process that inherited the number after a crash.
+   * Result is cached per pid/launch so status polling stays cheap.
+   */
+  private lockPidIsOurs(lock: LockFile): boolean {
+    if (!isPidAlive(lock.pid)) {
+      this.spawnedPids.delete(lock.pid);
+      return false;
+    }
+    if (this.spawnedPids.has(lock.pid)) {
+      return true;
+    }
+    const cached = this.pidIdentity.get(lock.pid);
+    if (cached && cached.startedAt === lock.startedAt) {
+      return cached.ours;
+    }
+    const ours = isLlamaServerProcess(lock.pid);
+    this.pidIdentity.set(lock.pid, { startedAt: lock.startedAt, ours });
+    return ours;
+  }
+
+  private rememberSpawned(pid: number | undefined): void {
+    if (pid && pid > 0) {
+      this.spawnedPids.add(pid);
+    }
+  }
 
   isStarting(): boolean {
     return !!this.boot || !!this.launchToken;
@@ -161,7 +203,7 @@ export class ProcessManager {
       ? { starting: true as const, startMessage: this.boot.message }
       : { starting: false as const, startMessage: undefined };
 
-    if (lock && isPidAlive(lock.pid)) {
+    if (lock && this.lockPidIsOurs(lock)) {
       return {
         running: !this.boot, // still booting = not yet "ready" for UI purposes
         pid: lock.pid,
@@ -198,6 +240,13 @@ export class ProcessManager {
           configDirty: this.boot ? false : this.isConfigDirty(lock),
           ...bootFields,
         };
+      }
+      // Dead (or reused) pid and nothing of ours on the port: the lock is
+      // stale. Drop it so status polling stops scanning the port every tick —
+      // unless a launch is still in flight here or in another window, whose
+      // provisional lock this may be.
+      if (!this.boot && !activeLaunchLock()) {
+        this.clearLock();
       }
     }
 
@@ -316,9 +365,12 @@ export class ProcessManager {
       this.updateBootMessage(msg);
       onProgress?.(msg);
     };
+    let fileLock: LaunchLockHandle | undefined;
     try {
+      fileLock = acquireLaunchLock("start");
       return await this.startInner(modelPath, report);
     } finally {
+      fileLock?.release();
       this.releaseLaunch(owned);
     }
   }
@@ -367,7 +419,7 @@ export class ProcessManager {
     }
 
     const lock = this.readLock();
-    if (lock && isPidAlive(lock.pid)) {
+    if (lock && this.lockPidIsOurs(lock)) {
       if (lock.configFingerprint && !this.lockMatchesDesired(lock, model)) {
         report("Stopping previous server…");
         await this.stop(true);
@@ -477,6 +529,7 @@ export class ProcessManager {
       if (!launcherPid) {
         throw new Error("Failed to open external terminal for llama-server.");
       }
+      this.rememberSpawned(launcherPid);
     } else {
       const logFd = fs.openSync(logPath, "a");
       const child = spawn(launch.command, spawnArgv, {
@@ -491,6 +544,7 @@ export class ProcessManager {
       if (!launcherPid) {
         throw new Error("Failed to spawn llama-server (no pid).");
       }
+      this.rememberSpawned(launcherPid);
       child.unref();
     }
 
@@ -526,7 +580,7 @@ export class ProcessManager {
       if (await this.isHttpReady()) {
         const serverPids = this.findPidsOnPort(port);
         const pid = serverPids[0] || launcherPid;
-        this.writeLock({
+        const finalLock: LockFile = {
           pid,
           port,
           host,
@@ -536,7 +590,10 @@ export class ProcessManager {
           args,
           launchMode,
           configFingerprint,
-        });
+        };
+        this.writeLock(finalLock);
+        // We just watched this pid answer on our port — no need to re-inspect it.
+        this.pidIdentity.set(pid, { startedAt: finalLock.startedAt, ours: true });
         return {
           running: true,
           pid,
@@ -663,8 +720,16 @@ export class ProcessManager {
     const lock = this.readLock();
     const port = lock?.port ?? this.store.getPort();
     const pids = new Set<number>();
-    if (lock?.pid) {
-      pids.add(lock.pid);
+    // Never signal a PID just because it is written in the lock file: after a
+    // crash the OS may have handed that number to an unrelated process.
+    if (lock?.pid && isPidAlive(lock.pid)) {
+      if (this.lockPidIsOurs(lock)) {
+        pids.add(lock.pid);
+      } else {
+        console.warn(
+          `Llama AIO: lock pid ${lock.pid} is no longer llama-server (pid reused) — not killing it.`
+        );
+      }
     }
     // Also clean up stale llama-servers holding our port (missed locks, crashed
     // launchers). Anything else on the port belongs to another application and
@@ -672,7 +737,7 @@ export class ProcessManager {
     const occupants = this.queryPidsOnPort(port) ?? [];
     const foreign: number[] = [];
     for (const pid of occupants) {
-      if (pid === lock?.pid || isLlamaServerProcess(pid)) {
+      if (pids.has(pid) || isLlamaServerProcess(pid)) {
         pids.add(pid);
       } else {
         foreign.push(pid);
@@ -806,13 +871,16 @@ export class ProcessManager {
       this.updateBootMessage(msg);
       onProgress?.(msg);
     };
+    let fileLock: LaunchLockHandle | undefined;
     try {
+      fileLock = acquireLaunchLock("reload");
       report("Stopping server for reload…");
       await this.stop(true);
       await sleep(400);
       // Keep boot active across inner start — don't nest beginBoot/endBoot via start().
       return await this.startInner(undefined, report);
     } finally {
+      fileLock?.release();
       this.releaseLaunch(owned);
     }
   }
@@ -831,7 +899,21 @@ export class ProcessManager {
 
   private writeLock(data: LockFile): void {
     ensureDirs(getLockDir());
-    fs.writeFileSync(getLockPath(), JSON.stringify(data, null, 2), "utf8");
+    // Other windows poll this file; write it atomically so they never read a
+    // half-written JSON document.
+    const target = getLockPath();
+    const tmp = `${target}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(data, null, 2), "utf8");
+    try {
+      fs.renameSync(tmp, target);
+    } catch {
+      fs.writeFileSync(target, JSON.stringify(data, null, 2), "utf8");
+      try {
+        fs.unlinkSync(tmp);
+      } catch {
+        // ignore
+      }
+    }
   }
 
   private clearLock(): void {
