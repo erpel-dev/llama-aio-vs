@@ -3,7 +3,7 @@ import * as os from "os";
 import * as path from "path";
 import * as vscode from "vscode";
 import { HuggingFaceClient } from "./huggingFace";
-import { formatModelSize, listLocalModelEntries } from "@llama-aio/core";
+import { formatModelSize, invalidateModelLibraryCache, listLocalModelEntries } from "@llama-aio/core";
 import { getModelsDir } from "@llama-aio/core";
 import { SettingsStore } from "@llama-aio/core";
 
@@ -61,7 +61,11 @@ export async function pickDownloadedModel(
       title: "Llama AIO: Scanning local GGUF libraries…",
       cancellable: false,
     },
-    async () => listLocalModelEntries(config)
+    async () => {
+      // An explicit pick should see files dropped into the folder just now.
+      invalidateModelLibraryCache();
+      return listLocalModelEntries(config);
+    }
   );
 
   if (!local.length) {
@@ -168,6 +172,7 @@ export async function pickDraftModelFromLibrary(
       cancellable: false,
     },
     async (progress) => {
+      invalidateModelLibraryCache();
       const local = [
         ...listLocalModelEntries(config),
         ...listMtpDraftEntries(config),
@@ -300,6 +305,7 @@ export async function pickMmprojFromLibrary(store: SettingsStore): Promise<strin
       cancellable: false,
     },
     async () => {
+      invalidateModelLibraryCache();
       const entries = listMmprojEntries(config);
       if (!sibling) {
         return entries;

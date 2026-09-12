@@ -647,6 +647,59 @@ describe("estimateMemory", () => {
     const off = estimateMemory(denseCaps(), loadSettings({ offloadKvCacheToGpu: false }), gpu(48));
     assert.ok(on!.totalGpuBytes > off!.totalGpuBytes);
     assert.ok(off!.totalCpuBytes > on!.totalCpuBytes);
+    assert.equal(off!.gpuKvBytes, 0);
+    assert.equal(off!.cpuKvBytes, off!.kvBytes);
+  });
+
+  it("puts all KV in VRAM at full offload", () => {
+    const est = estimateMemory(denseCaps(), loadSettings({ gpuOffload: 99 }), gpu(48))!;
+    assert.equal(est.gpuKvBytes, est.kvBytes);
+    assert.equal(est.cpuKvBytes, 0);
+  });
+
+  it("bills only the offloaded layers' KV to VRAM under partial offload", () => {
+    const full = estimateMemory(denseCaps(), loadSettings({ gpuOffload: 99 }), gpu(48))!;
+    const half = estimateMemory(denseCaps(), loadSettings({ gpuOffload: 24 }), gpu(48))!;
+    // Uniform layers: 24/48 of the cache follows the offloaded layers.
+    assert.ok(Math.abs(half.gpuKvBytes - full.kvBytes / 2) < 1024);
+    assert.ok(Math.abs(half.cpuKvBytes - full.kvBytes / 2) < 1024);
+    assert.equal(half.gpuKvBytes + half.cpuKvBytes, half.kvBytes);
+    assert.ok(half.totalGpuBytes < full.totalGpuBytes);
+    assert.ok(half.totalCpuBytes > full.totalCpuBytes);
+    assert.ok(half.warnings.some((w) => /KV cache follows the layers/.test(w)));
+    assert.equal(half.charts.ram.segments.find((s) => s.key === "kv")?.bytes, half.cpuKvBytes);
+  });
+
+  it("uses per-layer KV sizes when splitting: the last (offloaded) layers may be SWA", () => {
+    // Layers 0-11 dense/full, 12-23 sliding-window: offloading the last 12
+    // puts only the small SWA caches on the GPU.
+    const caps = denseCaps({
+      blockCount: 24,
+      slidingWindow: 1024,
+      slidingWindowPattern: Array.from({ length: 24 }, (_, i) => i >= 12),
+    });
+    const est = estimateMemory(
+      caps,
+      loadSettings({ gpuOffload: 12, contextLength: 32768 }),
+      gpu(48)
+    )!;
+    assert.ok(est.gpuKvBytes < est.cpuKvBytes / 8, "SWA layers must be much smaller than full ones");
+  });
+
+  it("does not spill a partially-offloaded model whose KV would only overflow if all of it were in VRAM", () => {
+    // 12 GiB card, 18 GiB model, 24/48 layers → 9 GiB weights on GPU. Full KV
+    // at 64k ≈ 3 GiB (q8_0, 48×8×128×2). Billing all KV to the GPU would spill;
+    // only half of it really lands there.
+    const est = estimateMemory(
+      denseCaps(),
+      loadSettings({ gpuOffload: 24, contextLength: 65536 }),
+      gpu(12)
+    )!;
+    assert.ok(est.gpuKvBytes < est.kvBytes);
+    assert.ok(
+      est.totalGpuBytes < 9 * GiB + est.kvBytes,
+      "total VRAM must not include the CPU layers' KV"
+    );
   });
 
   it("credits --n-cpu-moe with moving expert weights off the GPU", () => {

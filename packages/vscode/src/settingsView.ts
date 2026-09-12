@@ -7,13 +7,19 @@ import { detectGpus, activeInstallLock, type GpuMemoryInfo } from "@llama-aio/co
 import { LlamaInstaller, UiBackend } from "@llama-aio/core";
 import { estimateMemory, memoryEstimateInputs, mmprojFileSize, resolveDraftCapabilities } from "@llama-aio/core";
 import { resolveModelModes } from "@llama-aio/core";
-import { listActiveModelSourceDirs, listLocalModelEntries, findSiblingMtpDraft, isMtpSidecarFile } from "@llama-aio/core";
+import {
+  listActiveModelSourceDirs,
+  listLocalModelEntries,
+  findSiblingMtpDraft,
+  invalidateModelLibraryCache,
+  isMtpSidecarFile,
+} from "@llama-aio/core";
 import { getModelsDir } from "@llama-aio/core";
 import { PerfStats } from "@llama-aio/core";
 import { LaunchToken, LAUNCH_IN_PROGRESS_MSG, ProcessManager } from "@llama-aio/core";
 import { SettingsStore } from "@llama-aio/core";
 import { resolveLaunchMode } from "@llama-aio/core";
-import { DEFAULT_LOAD_SETTINGS, DEFAULT_REQUEST_SETTINGS, effectiveServerUiState, isQwen4expArchitecture, LlamaLoadSettings, normalizeSpeculativeMode, RequestSettings } from "@llama-aio/core";
+import { capsMissDefaultSwaPattern, DEFAULT_LOAD_SETTINGS, DEFAULT_REQUEST_SETTINGS, effectiveServerUiState, isQwen4expArchitecture, LlamaLoadSettings, normalizeSpeculativeMode, RequestSettings } from "@llama-aio/core";
 import { STARTER_MODEL } from "./huggingFace";
 
 function uiSpillFromMessage(msg: { willSpill?: unknown; spillWarning?: unknown }):
@@ -229,6 +235,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             await this.pushState();
             break;
           case "refresh":
+            invalidateModelLibraryCache();
             await this.pushState();
             break;
           case "setLaunchMode": {
@@ -427,8 +434,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     if (!this.view) {
       return;
     }
-    // Paint Server ready/stopped before GPU probes and library scans.
-    await this.postStatusNow();
+    // Paint Server ready/stopped before GPU probes and library scans. Reuse
+    // that probe below instead of a second /health round-trip.
+    const httpReady = await this.postStatusNow();
     this.syncSpeculativeMode();
     let state = this.store.getState();
     // Refresh GGUF caps when older state lacks size / arch dims needed for estimates.
@@ -439,10 +447,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         // Stale caps from before SWA / per-layer KV support (e.g. Gemma 4).
         (state.modelCapabilities.architecture === "gemma4" &&
           !state.modelCapabilities.slidingWindowPattern) ||
-        (state.modelCapabilities.architecture === "muse-glimmer" &&
-          (!state.modelCapabilities.slidingWindowPattern ||
-            state.modelCapabilities.slidingWindowPattern.length <
-              (state.modelCapabilities.blockCount || 0))) ||
+        // Stale caps from before llama.cpp's hard-coded SWA layouts were known
+        // (Muse Glimmer, Gemma 2/3, gpt-oss, Llama 4, …).
+        capsMissDefaultSwaPattern(state.modelCapabilities) ||
         // Stale caps from before hybrid full-attention interval (e.g. Qwen3.5 / qwen4exp).
         ((state.modelCapabilities.architecture === "qwen35" ||
           state.modelCapabilities.architecture === "qwen35moe" ||
@@ -460,7 +467,6 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     }
 
     const status = this.processManager.getStatus();
-    const httpReady = await this.processManager.isHttpReady();
     const binary = this.processManager.resolveBinary();
     const modelsDir = getModelsDir(this.store.getConfig());
     const localEntries = listLocalModelEntries(this.store.getConfig());
@@ -598,10 +604,13 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     });
   }
 
-  /** Patch the Server card from live process state (does not wait on Copilot dialogs). */
-  async postStatusNow(): Promise<void> {
+  /**
+   * Patch the Server card from live process state (does not wait on Copilot
+   * dialogs). Returns the /health result so callers can reuse it.
+   */
+  async postStatusNow(): Promise<boolean> {
     if (!this.view) {
-      return;
+      return false;
     }
     const status = this.processManager.getStatus();
     const httpReady = await this.processManager.isHttpReady();
@@ -625,6 +634,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         perfLines: this.perf.detailLines(),
       },
     });
+    return httpReady;
   }
 
   /** Update the DFlash draft hint immediately (before a full pushState finishes). */
@@ -2273,7 +2283,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       return i === mainIdx ? gpuOverhead : (peerOverhead || 0);
     }
 
-    function buildCharts(gpuWeights, cpuWeights, kvBytes, kvOnGpu, gpuOverhead, cpuOverhead, totalGpu, totalCpu, draftGpu, draftCpu, specLabel, split, gpuVision, cpuVision, peerOverhead, weightShares, kvPerGpu) {
+    function buildCharts(gpuWeights, cpuWeights, gpuKv, cpuKv, gpuOverhead, cpuOverhead, totalGpu, totalCpu, draftGpu, draftCpu, specLabel, split, gpuVision, cpuVision, peerOverhead, weightShares, kvPerGpu) {
       const gpus = (!cpuOnlyLive() && gpuInfos && gpuInfos.length) ? gpuInfos : (gpuInfo ? [gpuInfo] : []);
       const shares = effectiveTensorSplitShares(
         split && split.tensorSplit,
@@ -2283,7 +2293,6 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       );
       const wShares = (weightShares && weightShares.length === shares.length) ? weightShares : shares;
       const mainIdx = gpus.length ? clampMainGpu(split && split.mainGpu, gpus.length) : 0;
-      const gpuKv = kvOnGpu ? kvBytes : 0;
       const kvFor = (i) => (kvPerGpu && kvPerGpu[i] != null) ? kvPerGpu[i] : gpuKv * (shares[i] || 0);
       const labeled = gpus.length >= 2;
       const order = gpuDisplayOrder(gpus, mainIdx);
@@ -2335,7 +2344,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             { key: 'weights', label: 'Weights', bytes: cpuWeights },
             { key: 'vision', label: 'Vision (CLIP)', bytes: cpuVision || 0 },
             { key: 'draft', label: specLabel || 'Speculative', bytes: draftCpu || 0 },
-            { key: 'kv', label: 'KV cache (full ctx)', bytes: kvOnGpu ? 0 : kvBytes },
+            { key: 'kv', label: 'KV cache (full ctx)', bytes: cpuKv },
             { key: 'overhead', label: 'Overhead', bytes: cpuOverhead },
           ],
           totalBytes: totalCpu,
@@ -2730,10 +2739,14 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         if (t === 'f32') return 4;
         return 2; // f16 / bf16
       }
+      // llama.cpp offloads the *last* onGpu layers; each layer's KV lives on the
+      // device that owns the layer. Mirrors estimateMemory() in core.
+      const firstGpuLayer = Math.max(0, nLayers - onGpu);
       function kvAt(ctx) {
         const kBytes = kvElemBytes(L.cacheTypeK);
         const vBytes = kvElemBytes(L.cacheTypeV);
         let bytes = 0;
+        let gpuBytes = 0;
         let fullAttnLayers = 0;
         for (let i = 0; i < nLayers; i++) {
           const isRecurrent = (recurrent && recurrent.length === nLayers)
@@ -2744,6 +2757,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           if (isRecurrent) {
             // Fixed per-slot SSM state (context-independent, still device memory).
             bytes += ssmPerLayerBytes;
+            if (i >= firstGpuLayer) gpuBytes += ssmPerLayerBytes;
             continue;
           }
           fullAttnLayers++;
@@ -2758,9 +2772,11 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           const keyDim = (isSwa && memInputs.keyLengthSwa > 0) ? memInputs.keyLengthSwa : defaultKeyDim;
           const valDim = (isSwa && memInputs.valueLengthSwa > 0) ? memInputs.valueLengthSwa : defaultValDim;
           const tokens = isSwa ? Math.min(ctx, swa) : ctx;
-          bytes += (nKv * keyDim * kBytes + nKv * valDim * vBytes) * tokens;
+          const layerBytes = (nKv * keyDim * kBytes + nKv * valDim * vBytes) * tokens;
+          bytes += layerBytes;
+          if (i >= firstGpuLayer) gpuBytes += layerBytes;
         }
-        return { bytes, fullAttnLayers };
+        return { bytes, gpuBytes, fullAttnLayers };
       }
       const slots = Math.max(1, Math.round(Number(L.maxConcurrentPredictions)) || 1);
       const slotMul = L.unifiedKvCache || slots <= 1 ? 1 : slots;
@@ -2771,6 +2787,12 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       const kvBytesWarm = warmKv.bytes * slotMul;
       const fullAttnLayers = fullKv.fullAttnLayers;
       const kvOnGpu = !cpuOnly && !!L.offloadKvCacheToGpu && onGpu > 0;
+      // Under partial offload only the offloaded layers' KV is in VRAM.
+      const gpuKv = kvOnGpu ? fullKv.gpuBytes * slotMul : 0;
+      const gpuKvWarm = kvOnGpu ? warmKv.gpuBytes * slotMul : 0;
+      const cpuKv = Math.max(0, kvBytes - gpuKv);
+      const cpuKvWarm = Math.max(0, kvBytesWarm - gpuKvWarm);
+      const kvSplit = kvOnGpu && cpuKv > 1024 * 1024;
       // Mirrors computeOverheadBytes() / peerGpuOverheadBytes() in memoryEstimate.ts.
       const gpusForOh = (!cpuOnly && gpuInfos && gpuInfos.length) ? gpuInfos : (gpuInfo ? [gpuInfo] : []);
       const ohIds = gpusForOh.map((g) => String((g && g.llamaDeviceId) || '').toLowerCase());
@@ -2973,14 +2995,14 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       const liveKvShares = (!cpuOnly && gpusForOh.length >= 2)
         ? layerAwareWeightSharesLive(nLayers, onGpu, liveShares, L.splitMode, L.mainGpu, {})
         : liveShares;
-      const liveKvPerGpu = liveShares.map((_, i) => (kvOnGpu ? kvBytes * (liveKvShares[i] || 0) : 0));
+      const liveKvPerGpu = liveShares.map((_, i) => (kvOnGpu ? gpuKv * (liveKvShares[i] || 0) : 0));
       const liveMainIdx = gpusForOh.length ? Math.min(Math.max(0, Number(L.mainGpu) || 0), gpusForOh.length - 1) : 0;
       const livePeerCount = gpusForOh.filter((_, i) => i !== liveMainIdx && (liveShares[i] || 0) > 0).length;
       const totalPeer = peerOverhead * livePeerCount;
-      const totalGpu = gpuWeights + (kvOnGpu ? kvBytes : 0) + gpuOverhead + totalPeer + draftGpuBundle + gpuVisionBytes;
-      const totalCpu = cpuWeights + (kvOnGpu ? 0 : kvBytes) + cpuOverhead + draftCpuBundle + cpuVisionBytes;
-      const totalGpuWarm = gpuWeights + (kvOnGpu ? kvBytesWarm : 0) + gpuOverhead + totalPeer + draftGpuWarmBundle + gpuVisionBytes;
-      const totalCpuWarm = cpuWeights + (kvOnGpu ? 0 : kvBytesWarm) + cpuOverhead + draftCpuWarmBundle + cpuVisionBytes;
+      const totalGpu = gpuWeights + gpuKv + gpuOverhead + totalPeer + draftGpuBundle + gpuVisionBytes;
+      const totalCpu = cpuWeights + cpuKv + cpuOverhead + draftCpuBundle + cpuVisionBytes;
+      const totalGpuWarm = gpuWeights + gpuKvWarm + gpuOverhead + totalPeer + draftGpuWarmBundle + gpuVisionBytes;
+      const totalCpuWarm = cpuWeights + cpuKvWarm + cpuOverhead + draftCpuWarmBundle + cpuVisionBytes;
       if (cpuOnly) {
         warnings.push('CPU backend: no GPU acceleration — weights, KV cache, and compute use system RAM (GPU Offload is ignored).');
       }
@@ -2989,6 +3011,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       }
       if (!cpuOnly && onGpu === 0) warnings.push('GPU offload is 0 — weights run from system RAM.');
       if (!cpuOnly && !L.offloadKvCacheToGpu) warnings.push('KV cache (~' + fmtBytes(kvBytes) + ' at full context) is in system RAM.');
+      else if (kvSplit) warnings.push('KV cache follows the layers: ~' + fmtBytes(gpuKv) + ' in VRAM for the ' + onGpu + ' offloaded layers, ~' + fmtBytes(cpuKv) + ' in system RAM for the ' + (nLayers - onGpu) + ' CPU layers (at full context).');
       if (!cpuOnly && memInputs.isMoe && L.nCpuMoe > 0) {
         warnings.push('CPU MoE layers = ' + L.nCpuMoe + ': ~' + Math.round(expertShare * 100) + '% of weights are experts; those layers’ experts stay in system RAM.');
         if (
@@ -3102,12 +3125,16 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         if (draftLine) lines.push(draftLine);
         if (mmprojBytes > 0) lines.push('Vision projector in RAM: ~' + fmtBytes(mmprojBytes));
         if (kvBytesWarm < kvBytes) {
+          lines.push('KV @ ~' + warmCtx.toLocaleString() + ' ctx (mid-chat): ~' + fmtBytes(kvBytesWarm) + ' → total ~' + fmtBytes(totalCpuWarm));
         }
         lines.push('Est. total system RAM at full context: ~' + fmtBytes(totalCpu));
       } else {
         lines.push('Weights on GPU: ~' + fmtBytes(gpuWeights) + ' (' + onGpu + '/' + nLayers + ' layers)' + (cpuWeights > 1024*1024 ? ' · RAM: ~' + fmtBytes(cpuWeights) : '') +
           (memInputs.isMoe && expertShare > 0 ? (' · MoE experts ~' + Math.round(expertShare * 100) + '% of file') : ''));
-        lines.push('KV @ full ' + Number(L.contextLength).toLocaleString() + ' ctx: ~' + fmtBytes(kvBytes) + (kvOnGpu ? ' (GPU)' : ' (CPU RAM)') +
+        const kvPlacement = kvSplit
+          ? ' (~' + fmtBytes(gpuKv) + ' GPU · ~' + fmtBytes(cpuKv) + ' CPU RAM)'
+          : (kvOnGpu ? ' (GPU)' : ' (CPU RAM)');
+        lines.push('KV @ full ' + Number(L.contextLength).toLocaleString() + ' ctx: ~' + fmtBytes(kvBytes) + kvPlacement +
           (fullAttnLayers < nLayers ? (' · ' + fullAttnLayers + '/' + nLayers + ' full-attn layers') : ''));
         if (draftLine) lines.push(draftLine);
         if (mmprojBytes > 0) {
@@ -3118,6 +3145,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             : (L.mmprojOffloadToGpu === false ? ' (CPU RAM, --no-mmproj-offload)' : ' (CPU RAM)')));
         }
         if (kvBytesWarm < kvBytes) {
+          lines.push('KV @ ~' + warmCtx.toLocaleString() + ' ctx (mid-chat): ~' + fmtBytes(kvBytesWarm) +
+            (kvSplit ? ' (~' + fmtBytes(gpuKvWarm) + ' GPU · ~' + fmtBytes(cpuKvWarm) + ' CPU RAM)' : (kvOnGpu ? ' (GPU)' : ' (CPU RAM)')) +
+            ' → VRAM ~' + fmtBytes(totalGpuWarm));
         }
         lines.push('Est. total at full context — VRAM: ~' + fmtBytes(totalGpu) + (totalCpu > 1024*1024 ? ' · system RAM: ~' + fmtBytes(totalCpu) : ''));
       }
@@ -3127,7 +3157,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         : ((L.speculativeMode === 'mtp' || L.speculativeMode === 'ngram-mtp') && draftGpuBundle + draftCpuBundle > 0
           ? 'MTP head + KV'
           : 'Speculative');
-      const charts = buildCharts(gpuWeights, cpuWeights, kvBytes, kvOnGpu, gpuOverhead, cpuOverhead, totalGpu, totalCpu, draftGpuBundle, draftCpuBundle, specLabel, { tensorSplit: L.tensorSplit, mainGpu: L.mainGpu, splitMode: L.splitMode }, gpuVisionBytes, cpuVisionBytes, peerOverhead, liveWeightShares, liveKvPerGpu);
+      const charts = buildCharts(gpuWeights, cpuWeights, gpuKv, cpuKv, gpuOverhead, cpuOverhead, totalGpu, totalCpu, draftGpuBundle, draftCpuBundle, specLabel, { tensorSplit: L.tensorSplit, mainGpu: L.mainGpu, splitMode: L.splitMode }, gpuVisionBytes, cpuVisionBytes, peerOverhead, liveWeightShares, liveKvPerGpu);
       if (cpuOnly) {
         charts.vram.capacityBytes = undefined;
       }
@@ -3158,7 +3188,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           (charts.vram.capacityBytes ? ' of ' + fmtBytes(charts.vram.capacityBytes) + (p0 !== undefined ? ' (' + p0 + '%)' : '') : '') +
           ' · ' + gpuLabel(g1, order[1]) + ' ~' + fmtBytes(charts.vram2.totalBytes) +
           (charts.vram2.capacityBytes ? ' of ' + fmtBytes(charts.vram2.capacityBytes) + (p1 !== undefined ? ' (' + p1 + '%)' : '') : '') +
-          ' · KV ~' + fmtBytes(kvBytes) + (kvOnGpu ? ' on GPU' : ' in RAM') +
+          ' · KV ~' + fmtBytes(kvBytes) + (kvSplit ? ' (~' + fmtBytes(gpuKv) + ' on GPU)' : (kvOnGpu ? ' on GPU' : ' in RAM')) +
           ' · ' + onGpu + '/' + nLayers + ' layers offloaded' + specSuffix;
       } else {
         const pct = gpuInfo && gpuInfo.totalBytes
@@ -3166,7 +3196,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           : undefined;
         summary = 'VRAM ~' + fmtBytes(totalGpu) +
           (gpuInfo && gpuInfo.totalBytes ? ' of ' + fmtBytes(gpuInfo.totalBytes) + (pct !== undefined ? ' (' + pct + '%)' : '') : '') +
-          ' · KV ~' + fmtBytes(kvBytes) + (kvOnGpu ? ' on GPU' : ' in RAM') +
+          ' · KV ~' + fmtBytes(kvBytes) + (kvSplit ? ' (~' + fmtBytes(gpuKv) + ' on GPU)' : (kvOnGpu ? ' on GPU' : ' in RAM')) +
           ' · ' + onGpu + '/' + nLayers + ' layers offloaded' + specSuffix;
       }
       return {

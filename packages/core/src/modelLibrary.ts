@@ -805,8 +805,48 @@ function walkGgufs(
   }
 }
 
+/**
+ * Library scans walk ~25 candidate roots (LM Studio, HF cache, Jan, …) and
+ * stat every GGUF. The sidebar asks for the list on every refresh, so hold the
+ * result briefly; anything that adds or removes a model calls
+ * {@link invalidateModelLibraryCache}.
+ */
+export const MODEL_LIBRARY_CACHE_TTL_MS = 10_000;
+type LibraryScanKind = "language" | "mmproj" | "mtp-draft";
+const libraryCache = new Map<string, { at: number; entries: LocalModelEntry[] }>();
+
+/** Drop cached library scans (after downloads, imports, deletions, or a manual refresh). */
+export function invalidateModelLibraryCache(): void {
+  libraryCache.clear();
+}
+
+function libraryCacheKey(kind: LibraryScanKind, config: ConfigAccessor): string {
+  const extra = (config.get<string[]>("extraModelDirs") || []).map((d) => (d || "").trim());
+  return [kind, getModelsDir(config), ...extra].join("\u0000");
+}
+
+function cachedScan(
+  kind: LibraryScanKind,
+  config: ConfigAccessor,
+  scan: () => LocalModelEntry[]
+): LocalModelEntry[] {
+  const key = libraryCacheKey(kind, config);
+  const now = Date.now();
+  const hit = libraryCache.get(key);
+  if (hit && now - hit.at < MODEL_LIBRARY_CACHE_TTL_MS) {
+    return hit.entries.map((e) => ({ ...e }));
+  }
+  const entries = scan();
+  libraryCache.set(key, { at: now, entries });
+  return entries.map((e) => ({ ...e }));
+}
+
 /** Scan Llama AIO library + common third-party download folders for GGUF models. */
 export function listLocalModelEntries(config: ConfigAccessor): LocalModelEntry[] {
+  return cachedScan("language", config, () => scanLocalModelEntries(config));
+}
+
+function scanLocalModelEntries(config: ConfigAccessor): LocalModelEntry[] {
   const map = new Map<string, LocalModelEntry>();
   for (const root of discoverModelRoots(config)) {
     walkGgufs(root, map, shouldSkipLanguageFile);
@@ -828,20 +868,24 @@ export function listLocalModelEntries(config: ConfigAccessor): LocalModelEntry[]
 
 /** Same roots as listLocalModelEntries, but only vision projector GGUFs. */
 export function listMmprojEntries(config: ConfigAccessor): LocalModelEntry[] {
-  const map = new Map<string, LocalModelEntry>();
-  for (const root of discoverModelRoots(config)) {
-    walkGgufs(root, map, shouldSkipMmprojFile);
-  }
-  return [...map.values()].sort((a, b) => path.basename(a.path).localeCompare(path.basename(b.path)));
+  return cachedScan("mmproj", config, () => {
+    const map = new Map<string, LocalModelEntry>();
+    for (const root of discoverModelRoots(config)) {
+      walkGgufs(root, map, shouldSkipMmprojFile);
+    }
+    return [...map.values()].sort((a, b) => path.basename(a.path).localeCompare(path.basename(b.path)));
+  });
 }
 
 /** Same roots as listLocalModelEntries, but only sidecar MTP draft GGUFs. */
 export function listMtpDraftEntries(config: ConfigAccessor): LocalModelEntry[] {
-  const map = new Map<string, LocalModelEntry>();
-  for (const root of discoverModelRoots(config)) {
-    walkGgufs(root, map, shouldSkipMtpDraftFile);
-  }
-  return [...map.values()].sort((a, b) => path.basename(a.path).localeCompare(path.basename(b.path)));
+  return cachedScan("mtp-draft", config, () => {
+    const map = new Map<string, LocalModelEntry>();
+    for (const root of discoverModelRoots(config)) {
+      walkGgufs(root, map, shouldSkipMtpDraftFile);
+    }
+    return [...map.values()].sort((a, b) => path.basename(a.path).localeCompare(path.basename(b.path)));
+  });
 }
 
 /**

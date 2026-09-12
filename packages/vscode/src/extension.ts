@@ -283,6 +283,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   const afterBackendInstall = async (wasReady: boolean) => {
     const info = installer.getInstalledInfo();
+    void refreshStatusBar(true);
     const label = info.binaryVersion || info.tag || processManager.resolveBinary();
     if (info.binaryRunnable === false) {
       void vscode.window.showWarningMessage(
@@ -526,6 +527,7 @@ export function activate(context: vscode.ExtensionContext): void {
     }
 
     await installer.setBackend(backend);
+    void refreshStatusBar(true);
     const wasReady = await processManager.isHttpReady();
 
     if (backend === "path") {
@@ -671,10 +673,23 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(statusBar);
 
   let serverReadyCache = false;
-  const refreshStatusBar = async () => {
+  // The installed-build summary only changes on install / backend switch. Do
+  // not re-probe the binary and re-detect GPUs on every 5 s tick — refresh it
+  // on demand (after installs) and at most once a minute otherwise.
+  const BUILD_INFO_TTL_MS = 60_000;
+  let buildInfoAt = 0;
+  let buildInfo: ReturnType<LlamaInstaller["getInstalledInfo"]> | undefined;
+  const currentBuildInfo = (force = false) => {
+    if (force || !buildInfo || Date.now() - buildInfoAt > BUILD_INFO_TTL_MS) {
+      buildInfo = installer.getInstalledInfo();
+      buildInfoAt = Date.now();
+    }
+    return buildInfo;
+  };
+  const refreshStatusBar = async (forceBuildInfo = false) => {
     const status = processManager.getStatus();
     serverReadyCache = status.running || (await processManager.isHttpReady());
-    const build = installer.getInstalledInfo();
+    const build = currentBuildInfo(forceBuildInfo);
     statusBar.text = perf.statusBarText(serverReadyCache);
     statusBar.tooltip = [
       "Llama AIO",

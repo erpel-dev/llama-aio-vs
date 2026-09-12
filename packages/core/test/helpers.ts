@@ -37,6 +37,57 @@ export function loadSettings(overrides: Partial<LlamaLoadSettings> = {}): LlamaL
   return { ...DEFAULT_LOAD_SETTINGS, ...overrides };
 }
 
+export type MiniGgufValue =
+  | { type: "string"; value: string }
+  | { type: "u32"; value: number }
+  | { type: "u32[]"; value: number[] }
+  | { type: "bool[]"; value: boolean[] };
+
+/**
+ * Bytes of a header-only GGUF v3 file (no tensors) carrying `kv`. Enough for
+ * `readModelCapabilities` to exercise metadata-derived fields.
+ */
+export function miniGguf(kv: Record<string, MiniGgufValue>): Buffer {
+  const parts: Buffer[] = [];
+  const u32 = (n: number) => {
+    const b = Buffer.alloc(4);
+    b.writeUInt32LE(n, 0);
+    return b;
+  };
+  const u64 = (n: number) => {
+    const b = Buffer.alloc(8);
+    b.writeBigUInt64LE(BigInt(n), 0);
+    return b;
+  };
+  const str = (s: string) => Buffer.concat([u64(Buffer.byteLength(s)), Buffer.from(s, "utf8")]);
+  parts.push(u32(0x46554747), u32(3), u64(0), u64(Object.keys(kv).length));
+  for (const [key, entry] of Object.entries(kv)) {
+    parts.push(str(key));
+    switch (entry.type) {
+      case "string":
+        parts.push(u32(8), str(entry.value));
+        break;
+      case "u32":
+        parts.push(u32(4), u32(entry.value));
+        break;
+      case "u32[]":
+        parts.push(u32(9), u32(4), u64(entry.value.length), ...entry.value.map(u32));
+        break;
+      case "bool[]":
+        parts.push(
+          u32(9),
+          u32(7),
+          u64(entry.value.length),
+          ...entry.value.map((v) => Buffer.from([v ? 1 : 0]))
+        );
+        break;
+    }
+  }
+  // Pad so the file has a non-empty "data" section like a real model.
+  parts.push(Buffer.alloc(64));
+  return Buffer.concat(parts);
+}
+
 /** Value that follows `flag` in an argv array, or undefined when absent. */
 export function argValue(args: string[], flag: string): string | undefined {
   const i = args.indexOf(flag);

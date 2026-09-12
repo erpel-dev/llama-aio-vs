@@ -7,10 +7,12 @@ import {
   createClearableTimeoutSignal,
   describeGithubHttpError,
   describeMissingAsset,
+  detectCudaHardware,
   parseNightlyTagFile,
   parseStableReleaseTag,
   pickAsset,
   pickNewestBuildTag,
+  resetHardwareDetectionCache,
   resolveLatestReleaseTag,
 } from "../src/llamaInstaller";
 
@@ -18,6 +20,36 @@ const asset = (name: string) => ({
   name,
   browser_download_url: `https://example/${name}`,
   size: 1,
+});
+
+describe("detectCudaHardware cache", () => {
+  it("serves the cached verdict until reset", () => {
+    const saved = { CUDA_PATH: process.env.CUDA_PATH, CUDA_HOME: process.env.CUDA_HOME };
+    try {
+      process.env.CUDA_PATH = "/opt/cuda-fake";
+      delete process.env.CUDA_HOME;
+      resetHardwareDetectionCache();
+      assert.equal(detectCudaHardware(), true);
+
+      delete process.env.CUDA_PATH;
+      assert.equal(detectCudaHardware(), true, "cached — no re-probe on the next tick");
+
+      resetHardwareDetectionCache();
+      assert.equal(typeof detectCudaHardware(), "boolean");
+    } finally {
+      if (saved.CUDA_PATH === undefined) {
+        delete process.env.CUDA_PATH;
+      } else {
+        process.env.CUDA_PATH = saved.CUDA_PATH;
+      }
+      if (saved.CUDA_HOME === undefined) {
+        delete process.env.CUDA_HOME;
+      } else {
+        process.env.CUDA_HOME = saved.CUDA_HOME;
+      }
+      resetHardwareDetectionCache();
+    }
+  });
 });
 
 describe("createClearableTimeoutSignal", () => {

@@ -259,6 +259,51 @@ export function resolveSlidingWindowPattern(
   return Array.from({ length: n }, (_, i) => flags[i % flags.length]!);
 }
 
+/**
+ * Architectures whose GGUFs usually omit `attention.sliding_window_pattern`
+ * because llama.cpp hard-codes the layout in `llama_model::load_hparams`
+ * (`set_swa_pattern(N)`: SWA when `il % N < N-1`). Without this table every
+ * layer was billed as a full-context layer, overestimating KV 2–5× for
+ * Gemma 2/3, gpt-oss and Llama 4.
+ *
+ * `window` is llama.cpp's fallback `n_swa` when the GGUF has no
+ * `attention.sliding_window` key (Llama 4 never writes one).
+ */
+const ARCH_SWA_DEFAULTS: Record<string, { period: number; window?: number }> = {
+  "muse-glimmer": { period: 4 },
+  gemma2: { period: 2, window: 4096 },
+  gemma3: { period: 6, window: 1024 },
+  gemma3n: { period: 5, window: 512 },
+  "gemma-embedding": { period: 6, window: 1024 },
+  "gpt-oss": { period: 2, window: 128 },
+  llama4: { period: 4, window: 8192 },
+  cohere2: { period: 4, window: 4096 },
+  exaone4: { period: 4 },
+};
+
+/** llama.cpp's built-in SWA layout for `arch`, when it has one. */
+export function defaultSwaLayout(
+  arch: string | undefined
+): { period: number; window?: number } | undefined {
+  return ARCH_SWA_DEFAULTS[(arch || "").toLowerCase()];
+}
+
+/** True when capabilities read before this table existed should be refreshed. */
+export function capsMissDefaultSwaPattern(caps: {
+  architecture?: string;
+  slidingWindowPattern?: boolean[];
+  blockCount?: number;
+}): boolean {
+  const layout = defaultSwaLayout(caps.architecture);
+  if (!layout) {
+    return false;
+  }
+  return (
+    !caps.slidingWindowPattern ||
+    caps.slidingWindowPattern.length < (caps.blockCount || 0)
+  );
+}
+
 /** Read GGUF key/value metadata (header only — does not scan tensors). */
 export function readGgufMetadata(filePath: string): Record<string, GgufValue> {
   const fd = fs.openSync(filePath, "r");
@@ -526,7 +571,64 @@ export function heuristicDenseFfnShare(
   return Math.min(0.95, Math.max(0.05, ffnElems / (ffnElems + attnElems)));
 }
 
+interface CapsCacheEntry {
+  mtimeMs: number;
+  size: number;
+  at: number;
+  caps: ModelCapabilities;
+}
+
+/**
+ * Parsed headers keyed by path, validated against mtime/size. The TTL bounds
+ * staleness for inputs the stat cannot see (shards appearing next to the file).
+ */
+const CAPS_CACHE_TTL_MS = 30_000;
+const CAPS_CACHE_MAX = 32;
+const capsCache = new Map<string, CapsCacheEntry>();
+
+/** Forget parsed GGUF headers (tests, or after files were replaced in place). */
+export function invalidateModelCapabilitiesCache(filePath?: string): void {
+  if (!filePath) {
+    capsCache.clear();
+    return;
+  }
+  capsCache.delete(path.resolve(filePath));
+}
+
+/**
+ * Header-only GGUF parse, memoised. Reading a header is a handful of small
+ * reads, but the sidebar re-requested it (plus the draft model's) on every
+ * refresh, and large tensor lists make it a noticeable part of a click.
+ */
 export function readModelCapabilities(filePath: string): ModelCapabilities {
+  const key = path.resolve(filePath);
+  const now = Date.now();
+  let st: fs.Stats | undefined;
+  try {
+    st = fs.statSync(filePath);
+  } catch {
+    // fall through — the uncached read reports the real error
+  }
+  const hit = st ? capsCache.get(key) : undefined;
+  if (hit && st && hit.mtimeMs === st.mtimeMs && hit.size === st.size && now - hit.at < CAPS_CACHE_TTL_MS) {
+    return structuredClone(hit.caps);
+  }
+  const caps = readModelCapabilitiesUncached(filePath);
+  if (st) {
+    capsCache.delete(key);
+    capsCache.set(key, { mtimeMs: st.mtimeMs, size: st.size, at: now, caps: structuredClone(caps) });
+    while (capsCache.size > CAPS_CACHE_MAX) {
+      const oldest = capsCache.keys().next().value;
+      if (oldest === undefined) {
+        break;
+      }
+      capsCache.delete(oldest);
+    }
+  }
+  return caps;
+}
+
+function readModelCapabilitiesUncached(filePath: string): ModelCapabilities {
   const fd = fs.openSync(filePath, "r");
   let meta: Record<string, GgufValue>;
   let dataStart = 0;
@@ -603,19 +705,21 @@ export function readModelCapabilities(filePath: string): ModelCapabilities {
   const valueLength = pickArchNumber("attention.value_length", "value_length");
   const keyLengthSwa = pickArchNumber("attention.key_length_swa");
   const valueLengthSwa = pickArchNumber("attention.value_length_swa");
-  const slidingWindow = pickArchNumber("attention.sliding_window", "sliding_window");
+  let slidingWindow = pickArchNumber("attention.sliding_window", "sliding_window");
   let slidingWindowPattern = resolveSlidingWindowPattern(
     pickArchRaw("attention.sliding_window_pattern"),
     blockCount
   );
-  // llama.cpp muse-glimmer defaults the period to 4 when the key is missing.
-  if (
-    !slidingWindowPattern &&
-    slidingWindow &&
-    slidingWindow > 0 &&
-    (arch || "").toLowerCase() === "muse-glimmer"
-  ) {
-    slidingWindowPattern = resolveSlidingWindowPattern(4, blockCount);
+  // llama.cpp hard-codes the SWA layout for several families (Gemma 2/3,
+  // gpt-oss, Llama 4, …) instead of reading it from the GGUF.
+  const swaDefault = defaultSwaLayout(arch);
+  if (swaDefault) {
+    if (!(slidingWindow && slidingWindow > 0) && swaDefault.window) {
+      slidingWindow = swaDefault.window;
+    }
+    if (!slidingWindowPattern && slidingWindow && slidingWindow > 0) {
+      slidingWindowPattern = resolveSlidingWindowPattern(swaDefault.period, blockCount);
+    }
   }
   const fullAttentionInterval =
     pickArchNumber("full_attention_interval") || pickArchNumber("layer_group_size");
