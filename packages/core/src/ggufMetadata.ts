@@ -571,7 +571,64 @@ export function heuristicDenseFfnShare(
   return Math.min(0.95, Math.max(0.05, ffnElems / (ffnElems + attnElems)));
 }
 
+interface CapsCacheEntry {
+  mtimeMs: number;
+  size: number;
+  at: number;
+  caps: ModelCapabilities;
+}
+
+/**
+ * Parsed headers keyed by path, validated against mtime/size. The TTL bounds
+ * staleness for inputs the stat cannot see (shards appearing next to the file).
+ */
+const CAPS_CACHE_TTL_MS = 30_000;
+const CAPS_CACHE_MAX = 32;
+const capsCache = new Map<string, CapsCacheEntry>();
+
+/** Forget parsed GGUF headers (tests, or after files were replaced in place). */
+export function invalidateModelCapabilitiesCache(filePath?: string): void {
+  if (!filePath) {
+    capsCache.clear();
+    return;
+  }
+  capsCache.delete(path.resolve(filePath));
+}
+
+/**
+ * Header-only GGUF parse, memoised. Reading a header is a handful of small
+ * reads, but the sidebar re-requested it (plus the draft model's) on every
+ * refresh, and large tensor lists make it a noticeable part of a click.
+ */
 export function readModelCapabilities(filePath: string): ModelCapabilities {
+  const key = path.resolve(filePath);
+  const now = Date.now();
+  let st: fs.Stats | undefined;
+  try {
+    st = fs.statSync(filePath);
+  } catch {
+    // fall through — the uncached read reports the real error
+  }
+  const hit = st ? capsCache.get(key) : undefined;
+  if (hit && st && hit.mtimeMs === st.mtimeMs && hit.size === st.size && now - hit.at < CAPS_CACHE_TTL_MS) {
+    return structuredClone(hit.caps);
+  }
+  const caps = readModelCapabilitiesUncached(filePath);
+  if (st) {
+    capsCache.delete(key);
+    capsCache.set(key, { mtimeMs: st.mtimeMs, size: st.size, at: now, caps: structuredClone(caps) });
+    while (capsCache.size > CAPS_CACHE_MAX) {
+      const oldest = capsCache.keys().next().value;
+      if (oldest === undefined) {
+        break;
+      }
+      capsCache.delete(oldest);
+    }
+  }
+  return caps;
+}
+
+function readModelCapabilitiesUncached(filePath: string): ModelCapabilities {
   const fd = fs.openSync(filePath, "r");
   let meta: Record<string, GgufValue>;
   let dataStart = 0;

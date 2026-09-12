@@ -7,7 +7,13 @@ import { detectGpus, activeInstallLock, type GpuMemoryInfo } from "@llama-aio/co
 import { LlamaInstaller, UiBackend } from "@llama-aio/core";
 import { estimateMemory, memoryEstimateInputs, mmprojFileSize, resolveDraftCapabilities } from "@llama-aio/core";
 import { resolveModelModes } from "@llama-aio/core";
-import { listActiveModelSourceDirs, listLocalModelEntries, findSiblingMtpDraft, isMtpSidecarFile } from "@llama-aio/core";
+import {
+  listActiveModelSourceDirs,
+  listLocalModelEntries,
+  findSiblingMtpDraft,
+  invalidateModelLibraryCache,
+  isMtpSidecarFile,
+} from "@llama-aio/core";
 import { getModelsDir } from "@llama-aio/core";
 import { PerfStats } from "@llama-aio/core";
 import { LaunchToken, LAUNCH_IN_PROGRESS_MSG, ProcessManager } from "@llama-aio/core";
@@ -229,6 +235,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             await this.pushState();
             break;
           case "refresh":
+            invalidateModelLibraryCache();
             await this.pushState();
             break;
           case "setLaunchMode": {
@@ -427,8 +434,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     if (!this.view) {
       return;
     }
-    // Paint Server ready/stopped before GPU probes and library scans.
-    await this.postStatusNow();
+    // Paint Server ready/stopped before GPU probes and library scans. Reuse
+    // that probe below instead of a second /health round-trip.
+    const httpReady = await this.postStatusNow();
     this.syncSpeculativeMode();
     let state = this.store.getState();
     // Refresh GGUF caps when older state lacks size / arch dims needed for estimates.
@@ -459,7 +467,6 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     }
 
     const status = this.processManager.getStatus();
-    const httpReady = await this.processManager.isHttpReady();
     const binary = this.processManager.resolveBinary();
     const modelsDir = getModelsDir(this.store.getConfig());
     const localEntries = listLocalModelEntries(this.store.getConfig());
@@ -597,10 +604,13 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     });
   }
 
-  /** Patch the Server card from live process state (does not wait on Copilot dialogs). */
-  async postStatusNow(): Promise<void> {
+  /**
+   * Patch the Server card from live process state (does not wait on Copilot
+   * dialogs). Returns the /health result so callers can reuse it.
+   */
+  async postStatusNow(): Promise<boolean> {
     if (!this.view) {
-      return;
+      return false;
     }
     const status = this.processManager.getStatus();
     const httpReady = await this.processManager.isHttpReady();
@@ -624,6 +634,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         perfLines: this.perf.detailLines(),
       },
     });
+    return httpReady;
   }
 
   /** Update the DFlash draft hint immediately (before a full pushState finishes). */

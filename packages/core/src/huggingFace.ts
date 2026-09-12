@@ -15,6 +15,7 @@ import type { ProgressReporter } from "./llamaInstaller";
 import { formatBytes } from "./memoryEstimate";
 import {
   classifyGgufFile,
+  invalidateModelLibraryCache,
   isMmprojFileName,
   languageRejectsSidecarMtp,
   listLocalModelEntries,
@@ -439,6 +440,7 @@ export class HuggingFaceClient {
       });
     });
     fs.renameSync(dest + ".partial", dest);
+    invalidateModelLibraryCache();
     return dest;
   }
 

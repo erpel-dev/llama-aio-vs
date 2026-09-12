@@ -8,6 +8,7 @@ import {
   clampLoadSettingsToModel,
   defaultSwaLayout,
   heuristicPleShare,
+  invalidateModelCapabilitiesCache,
   isLinearRecurrentHybrid,
   isQwen4expArchitecture,
   readModelCapabilities,
@@ -326,5 +327,59 @@ describe("qwen4exp / PLE helpers", () => {
     assert.equal(isLinearRecurrentHybrid({ architecture: "qwen4_exp" }), false);
     assert.equal(isLinearRecurrentHybrid({ architecture: "qwen3" }), false);
     assert.equal(isLinearRecurrentHybrid(undefined), false);
+  });
+});
+
+describe("readModelCapabilities cache", () => {
+  const tmp: string[] = [];
+  after(() => {
+    invalidateModelCapabilitiesCache();
+    for (const p of tmp) {
+      fs.rmSync(p, { force: true });
+    }
+  });
+
+  function writeCaps(arch: string, name: string, dest: string) {
+    fs.writeFileSync(
+      dest,
+      miniGguf({
+        "general.architecture": { type: "string", value: arch },
+        "general.name": { type: "string", value: name },
+        [`${arch}.block_count`]: { type: "u32", value: 8 },
+        [`${arch}.context_length`]: { type: "u32", value: 8192 },
+        [`${arch}.embedding_length`]: { type: "u32", value: 1024 },
+        [`${arch}.attention.head_count`]: { type: "u32", value: 8 },
+        [`${arch}.attention.head_count_kv`]: { type: "u32", value: 2 },
+      })
+    );
+  }
+
+  it("returns a clone so callers cannot poison the memo", () => {
+    const p = path.join(os.tmpdir(), `llama-aio-caps-clone-${process.pid}.gguf`);
+    tmp.push(p);
+    writeCaps("qwen3", "orig", p);
+    invalidateModelCapabilitiesCache(p);
+    const first = readModelCapabilities(p);
+    first.name = "mutated";
+    const second = readModelCapabilities(p);
+    assert.equal(second.name, "orig");
+    assert.notEqual(first, second);
+  });
+
+  it("re-reads after invalidation even when mtime and size stay the same", () => {
+    const p = path.join(os.tmpdir(), `llama-aio-caps-inv-${process.pid}.gguf`);
+    tmp.push(p);
+    writeCaps("qwen3", "alpha", p);
+    const stamp = Math.floor(Date.now() / 1000) - 90;
+    fs.utimesSync(p, stamp, stamp);
+    invalidateModelCapabilitiesCache(p);
+    assert.equal(readModelCapabilities(p).name, "alpha");
+
+    writeCaps("qwen3", "bravo", p);
+    fs.utimesSync(p, stamp, stamp);
+    assert.equal(readModelCapabilities(p).name, "alpha", "same mtime/size served from cache");
+
+    invalidateModelCapabilitiesCache(p);
+    assert.equal(readModelCapabilities(p).name, "bravo");
   });
 });
