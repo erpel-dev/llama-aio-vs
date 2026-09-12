@@ -22,7 +22,13 @@ import {
   formatExceedContextError,
   messagesHaveImageParts,
 } from "@llama-aio/core";
-import { decodeSseLines, parseXmlToolCalls, stripXmlToolCalls, toolCallSlot } from "@llama-aio/core";
+import {
+  decodeSseLines,
+  LiveTextGate,
+  parseXmlToolCalls,
+  stripXmlToolCalls,
+  toolCallSlot,
+} from "@llama-aio/core";
 import {
   duplicateToolCallHint,
   fingerprintsSinceLastUserMessage,
@@ -383,9 +389,10 @@ function stripThinkTags(text: string): string {
 
 /**
  * Streams OpenAI-compatible SSE and yields text / tool-call events.
- * When tools are enabled, content is buffered until the end so Qwen-style
- * <tool_call> XML (content-only chat format) can be converted into tool calls
- * instead of being shown as plain text / silently dropped.
+ * When tools are enabled, content is streamed through a {@link LiveTextGate}
+ * that withholds only a short look-ahead tail, so Qwen-style <tool_call> XML
+ * (content-only chat format) can still be converted into tool calls instead
+ * of being shown as plain text — without freezing Agent mode until the end.
  */
 async function* streamChatCompletions(
   endpoint: string,
@@ -438,6 +445,7 @@ async function* streamChatCompletions(
 
   let assembledText = "";
   let assembledReasoning = "";
+  const liveGate = toolsEnabled ? new LiveTextGate() : undefined;
   const toolCalls: Array<{ id: string; name: string; arguments: string }> = [];
   let lastTimings: LlamaTimings | undefined;
   let lastUsage: LlamaUsage | undefined;
@@ -506,9 +514,15 @@ async function* streamChatCompletions(
         assembledText += delta.content;
         completionChars += delta.content.length;
         progressed = true;
-        // Live-stream only when tools are not involved (no XML tool-call risk).
-        if (!toolsEnabled) {
+        if (!liveGate) {
           yield { kind: "text", text: delta.content };
+        } else {
+          // Tools enabled: stream everything except a short tail that could
+          // still become a <tool_call> / <think> opener.
+          const live = liveGate.push(delta.content);
+          if (live) {
+            yield { kind: "text", text: live };
+          }
         }
       }
 
@@ -622,14 +636,24 @@ async function* streamChatCompletions(
   const xmlCalls = emittedStructured ? [] : parseXmlToolCalls(textForParse);
   const visible = stripXmlToolCalls(textForParse);
 
-  // When tools were enabled we buffered; emit clean visible text once.
-  if (toolsEnabled && visible) {
-    yield { kind: "text", text: visible };
-  } else if (toolsEnabled && !visible && !emittedStructured && !xmlCalls.length && assembledReasoning) {
-    // Still thinking-only after the budget — surface it so Chat is not empty.
-    const reasoningVisible = stripThinkTags(assembledReasoning);
-    if (reasoningVisible) {
-      yield { kind: "text", text: reasoningVisible };
+  // Tools enabled: emit whatever the live gate still owes (held-back tail, or
+  // text after a tool-call block) so the shown text equals `visible`.
+  if (liveGate) {
+    const remainder = liveGate.finish(visible);
+    if (remainder) {
+      yield { kind: "text", text: remainder };
+    } else if (
+      !liveGate.emittedText &&
+      !visible &&
+      !emittedStructured &&
+      !xmlCalls.length &&
+      assembledReasoning
+    ) {
+      // Still thinking-only after the budget — surface it so Chat is not empty.
+      const reasoningVisible = stripThinkTags(assembledReasoning);
+      if (reasoningVisible) {
+        yield { kind: "text", text: reasoningVisible };
+      }
     }
   }
 
