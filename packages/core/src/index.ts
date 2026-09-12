@@ -4,6 +4,8 @@
  */
 
 export * from "./chatClient";
+export * from "./downloadManager";
+export * from "./httpDownload";
 export * from "./config";
 export * from "./contextBreakdown";
 export * from "./events";
@@ -18,6 +20,7 @@ export * from "./llamaInstaller";
 export * from "./llamaTimings";
 export * from "./memoryEstimate";
 export * from "./modelLibrary";
+export * from "./modelPickerInfo";
 export * from "./modelModes";
 export * from "./nixCompat";
 export * from "./paths";

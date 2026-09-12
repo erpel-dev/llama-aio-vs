@@ -586,4 +586,6 @@ export interface HfFileHit {
   url: string;
   /** Set when this row stands for a split GGUF (`-00001-of-00004`, …). */
   shardCount?: number;
+  /** Hex sha256 from the HF tree `lfs.oid` field when present. */
+  sha256?: string;
 }

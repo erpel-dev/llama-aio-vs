@@ -10,6 +10,8 @@ export interface LocalModelEntry {
   /** Display source, e.g. "LM Studio", "Llama AIO" */
   source: string;
   sizeBytes: number;
+  /** When this row stands for a split GGUF (`-00001-of-00005`, …). */
+  shardCount?: number;
 }
 
 interface ScanRoot {
@@ -805,6 +807,63 @@ function walkGgufs(
   }
 }
 
+const SHARD_NAME_RE = /^(.*)-(\d{5})-of-(\d{5})\.gguf$/i;
+
+/**
+ * Group key for a split GGUF on disk (`Foo-00002-of-00005.gguf` → dirname + stem).
+ * Same idea as Hugging Face `splitGgufGroupKey`, but for OS paths.
+ */
+export function localShardGroupKey(filePath: string): string | undefined {
+  const base = listingBaseName(filePath);
+  const m = SHARD_NAME_RE.exec(base);
+  if (!m) {
+    return undefined;
+  }
+  const total = Number(m[3]);
+  if (!Number.isFinite(total) || total < 1 || total > 999) {
+    return undefined;
+  }
+  return path.join(path.dirname(filePath), m[1]!.toLowerCase());
+}
+
+/** Drop `-00001-of-00005` so a split set shows as one model name. */
+export function displayGgufTitle(filePath: string): string {
+  const base = listingBaseName(filePath);
+  const m = SHARD_NAME_RE.exec(base);
+  const stem = m?.[1] || base.replace(/\.gguf$/i, "");
+  return stem;
+}
+
+/**
+ * One library row per split GGUF. Points at the first shard; `sizeBytes` is the
+ * sum of every part we found (B-38).
+ */
+export function collapseLocalModelEntries(entries: LocalModelEntry[]): LocalModelEntry[] {
+  const groups = new Map<string, LocalModelEntry[]>();
+  const singles: LocalModelEntry[] = [];
+  for (const e of entries) {
+    const stem = localShardGroupKey(e.path);
+    if (!stem) {
+      singles.push(e);
+      continue;
+    }
+    const key = `${e.source}\0${stem}`;
+    const group = groups.get(key) || [];
+    group.push(e);
+    groups.set(key, group);
+  }
+  const collapsed = [...groups.values()].map((group) => {
+    const sorted = [...group].sort((a, b) => listingBaseName(a.path).localeCompare(listingBaseName(b.path)));
+    const first = sorted[0]!;
+    return {
+      ...first,
+      sizeBytes: group.reduce((sum, part) => sum + (part.sizeBytes || 0), 0),
+      shardCount: group.length,
+    };
+  });
+  return [...singles, ...collapsed];
+}
+
 /**
  * Library scans walk ~25 candidate roots (LM Studio, HF cache, Jan, …) and
  * stat every GGUF. The sidebar asks for the list on every refresh, so hold the
@@ -851,7 +910,7 @@ function scanLocalModelEntries(config: ConfigAccessor): LocalModelEntry[] {
   for (const root of discoverModelRoots(config)) {
     walkGgufs(root, map, shouldSkipLanguageFile);
   }
-  return [...map.values()].sort((a, b) => {
+  return collapseLocalModelEntries([...map.values()]).sort((a, b) => {
     if (a.source !== b.source) {
       // Llama AIO first, then alpha by source, then name
       if (a.source === "Llama AIO") {

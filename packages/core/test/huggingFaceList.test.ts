@@ -44,6 +44,20 @@ describe("ggufHitsFromTree", () => {
       ].sort()
     );
   });
+
+  it("copies lfs size and sha256 onto the hit", () => {
+    const hits = ggufHitsFromTree("org/model", [
+      {
+        type: "file",
+        path: "model-Q4_K_M.gguf",
+        size: 133,
+        lfs: { oid: "sha256:" + "ab".repeat(32), size: 12345 },
+      },
+    ]);
+    assert.equal(hits[0]?.size, 12345);
+    assert.equal(hits[0]?.sha256, "ab".repeat(32));
+    assert.match(hits[0]?.url || "", /org\/model\/resolve\/main\/model-Q4_K_M\.gguf/);
+  });
 });
 
 describe("split GGUF picker collapse", () => {

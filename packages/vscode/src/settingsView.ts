@@ -46,6 +46,7 @@ export type ModelActions = {
   installLlamaCppByTag: () => Promise<void>;
   installLlamaCppFromArchive: () => Promise<void>;
   switchBackend: (backend: UiBackend) => Promise<void>;
+  showDownloads: () => Promise<void>;
 };
 
 /**
@@ -249,6 +250,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           case "downloadModel":
             await this.modelActions.downloadFromHuggingFace();
             await this.pushState();
+            break;
+          case "showDownloads":
+            await this.modelActions.showDownloads();
             break;
           case "downloadStarter":
             await this.modelActions.downloadStarter();
@@ -1466,6 +1470,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       <button class="primary" id="downloadModelBtn">⬇ Download from Hugging Face…</button>
       <button class="secondary" id="openFileBtn">📂 Open GGUF file…</button>
       <button class="secondary" id="pickDownloadedBtn">📚 Choose from downloaded…</button>
+      <button class="secondary" id="showDownloadsBtn">⬇ Downloads</button>
     </div>
     <div class="row" style="margin-top:12px;margin-bottom:0">
       <div class="label"><span class="name tip" data-flag="-mm, --mmproj" data-help="Path to a multimodal projector GGUF. llama-server loads it with the language model so Copilot Chat can send images. Auto-attached when a sibling mmproj-*.gguf sits next to the model.">Vision projector</span></div>
@@ -4352,6 +4357,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     }
 
     $('downloadModelBtn').addEventListener('click', () => vscode.postMessage({ type: 'downloadModel' }));
+    const showDownloadsBtn = $('showDownloadsBtn');
+    if (showDownloadsBtn) {
+      showDownloadsBtn.addEventListener('click', () => vscode.postMessage({ type: 'showDownloads' }));
+    }
     const viewContextBtn = $('viewContextBtn');
     if (viewContextBtn) {
       viewContextBtn.addEventListener('click', () => vscode.postMessage({ type: 'viewLastCall' }));
