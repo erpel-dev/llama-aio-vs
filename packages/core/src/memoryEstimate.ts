@@ -54,6 +54,13 @@ export interface MemoryEstimate {
   /** KV if only a short prompt is in use (~2k tokens), same state inclusion. */
   kvBytesWarm: number;
   /**
+   * Split of {@link kvBytes} by placement. llama.cpp keeps a layer's KV on the
+   * device that owns the layer, so under partial offload only the offloaded
+   * layers' KV is in VRAM even when KV offload is enabled.
+   */
+  gpuKvBytes: number;
+  cpuKvBytes: number;
+  /**
    * Per-slot recurrent / SSM state bytes folded into {@link kvBytes}
    * (0 for dense and pure-attention models).
    */
@@ -972,14 +979,21 @@ export function estimateMemory(
       : 0;
   const cpuVisionBytes = gpuVisionBytes > 0 ? 0 : Math.max(0, mmprojBytes);
 
-  const kvBytesRaw = estimateKvBytes(
+  const kvPerLayerRaw = estimateKvBytesPerLayer(
     caps,
     settings.contextLength,
     settings.cacheTypeK,
     settings.cacheTypeV
   );
+  const kvBytesRaw = kvPerLayerRaw.reduce((a, b) => a + b, 0);
   const warmCtx = Math.min(WARM_KV_CONTEXT, Math.max(512, settings.contextLength));
-  const kvBytesWarmRaw = estimateKvBytes(caps, warmCtx, settings.cacheTypeK, settings.cacheTypeV);
+  const kvPerLayerWarmRaw = estimateKvBytesPerLayer(
+    caps,
+    warmCtx,
+    settings.cacheTypeK,
+    settings.cacheTypeV
+  );
+  const kvBytesWarmRaw = kvPerLayerWarmRaw.reduce((a, b) => a + b, 0);
   const slotMul = kvSlotMultiplier(settings);
   // Recurrent (SSM / linear-attention) layers keep no context-scaled KV, but
   // llama.cpp still allocates a fixed f32 state buffer per layer and per
@@ -991,6 +1005,25 @@ export function estimateMemory(
   const kvBytesWarm = kvBytesWarmRaw * slotMul + recurrentStateBytes;
   const fullAttnLayers = countFullAttentionLayers(caps);
   const kvOnGpu = !cpuOnly && settings.offloadKvCacheToGpu && onGpu > 0;
+  // llama.cpp keeps each layer's KV on the device that owns the layer. With
+  // `-ngl N` the *last* N layers are offloaded, so under partial offload only
+  // their KV lands in VRAM — the rest stays in system RAM even with KV offload
+  // on. Billing all of it to the GPU faked spills for every partially-
+  // offloaded model.
+  const firstGpuLayer = Math.max(0, nLayers - onGpu);
+  const gpuLayerKvSum = (perLayer: number[]): number => {
+    let sum = 0;
+    for (let i = firstGpuLayer; i < perLayer.length; i++) {
+      sum += (perLayer[i] || 0) + (recurrentStatePerLayer[i] || 0);
+    }
+    return sum * slotMul;
+  };
+  const gpuKvBytes = kvOnGpu ? gpuLayerKvSum(kvPerLayerRaw) : 0;
+  const gpuKvWarm = kvOnGpu ? gpuLayerKvSum(kvPerLayerWarmRaw) : 0;
+  const cpuKvBytes = Math.max(0, kvBytes - gpuKvBytes);
+  const cpuKvWarm = Math.max(0, kvBytesWarm - gpuKvWarm);
+  /** True when KV is split between VRAM and RAM (partial offload with KV on GPU). */
+  const kvSplit = kvOnGpu && cpuKvBytes > MiB;
   const gpusForBackend: GpuMemoryInfo[] =
     !cpuOnly && options?.gpus?.length
       ? [...options.gpus]
@@ -1071,7 +1104,6 @@ export function estimateMemory(
     : undefined;
   const peerCount = gpus.filter((_, i) => i !== mainGpuIndex && (shares[i] || 0) > 0).length;
   const totalPeerBytes = peerOverheadEach * peerCount;
-  const gpuKvBytes = kvOnGpu ? kvBytes : 0;
   const kvOnDevice = (dev: number): number => {
     if (!kvOnGpu) {
       return 0;
@@ -1087,9 +1119,6 @@ export function estimateMemory(
     }
     return sum * slotMul;
   };
-  const cpuKvBytes = kvOnGpu ? 0 : kvBytes;
-  const gpuKvWarm = kvOnGpu ? kvBytesWarm : 0;
-  const cpuKvWarm = kvOnGpu ? 0 : kvBytesWarm;
 
   const draftCaps = resolveDraftCapabilities(settings, options?.draftCaps);
   const draft = draftCaps
@@ -1169,6 +1198,11 @@ export function estimateMemory(
   if (!cpuOnly && !settings.offloadKvCacheToGpu) {
     warnings.push(
       `KV cache (~${formatBytes(kvBytes)} at full context) is in system RAM, not VRAM.`
+    );
+  } else if (kvSplit) {
+    warnings.push(
+      `KV cache follows the layers: ~${formatBytes(gpuKvBytes)} in VRAM for the ${onGpu} offloaded layers, ` +
+        `~${formatBytes(cpuKvBytes)} in system RAM for the ${nLayers - onGpu} CPU layers (at full context).`
     );
   }
   if (!cpuOnly && caps.isMoe && settings.nCpuMoe > 0) {
@@ -1403,10 +1437,15 @@ export function estimateMemory(
             : ` · PLE table ~${Math.round(pleShare * 100)}% in RAM`
           : "")
     );
+    const kvPlacement = kvSplit
+      ? ` (~${formatBytes(gpuKvBytes)} GPU · ~${formatBytes(cpuKvBytes)} CPU RAM)`
+      : kvOnGpu
+        ? " (GPU)"
+        : " (CPU RAM)";
     lines.push(
       `KV @ full ${settings.contextLength.toLocaleString()} ctx: ~${formatBytes(kvBytes)}` +
         (recurrentStateBytes > 0 ? " (incl. recurrent state)" : "") +
-        (kvOnGpu ? " (GPU)" : " (CPU RAM)") +
+        kvPlacement +
         (fullAttnLayers < nLayers ? ` · ${fullAttnLayers}/${nLayers} full-attn layers` : "")
     );
     if (draft) {
@@ -1439,7 +1478,11 @@ export function estimateMemory(
     if (kvBytesWarm < kvBytes) {
       lines.push(
         `KV @ ~${warmCtx.toLocaleString()} ctx (mid-chat): ~${formatBytes(kvBytesWarm)}` +
-          (kvOnGpu ? " (GPU)" : " (CPU RAM)") +
+          (kvSplit
+            ? ` (~${formatBytes(gpuKvWarm)} GPU · ~${formatBytes(cpuKvWarm)} CPU RAM)`
+            : kvOnGpu
+              ? " (GPU)"
+              : " (CPU RAM)") +
           ` → VRAM ~${formatBytes(totalGpuBytesWarm)}`
       );
     }
@@ -1469,7 +1512,10 @@ export function estimateMemory(
           (specCpuBundle > MiB ? ` (+${formatBytes(specCpuBundle)} RAM)` : "")
         : "";
     const visionBit = mmprojBytes > 0 ? ` · vision +${formatBytes(mmprojBytes)}` : "";
-    const kvBit = ` · KV ~${formatBytes(kvBytes)}${kvOnGpu ? " on GPU" : " in RAM"} · ${onGpu}/${nLayers} layers`;
+    const kvBit =
+      ` · KV ~${formatBytes(kvBytes)}` +
+      (kvSplit ? ` (~${formatBytes(gpuKvBytes)} on GPU)` : kvOnGpu ? " on GPU" : " in RAM") +
+      ` · ${onGpu}/${nLayers} layers`;
     if (gpus.length >= 2 && perGpuParts.length >= 2) {
       const order = gpuDisplayOrder(gpus.length, mainGpuIndex).slice(0, 2);
       const parts = order.map((i) => {
@@ -1547,6 +1593,8 @@ export function estimateMemory(
     cpuWeightsBytes: cpuWeights,
     kvBytes,
     kvBytesWarm,
+    gpuKvBytes,
+    cpuKvBytes,
     kvOnGpu,
     recurrentStateBytes: recurrentStateBytes > 0 ? recurrentStateBytes : undefined,
     moeExpertShare: caps.isMoe ? moeExpertShare : undefined,
