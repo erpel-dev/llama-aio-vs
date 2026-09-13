@@ -2,9 +2,9 @@
  * Hugging Face GGUF search + download (frontend-agnostic).
  * Progress uses the same ProgressReporter shape as LlamaInstaller.
  */
-import * as fs from "fs";
 import * as https from "https";
 import * as path from "path";
+import { downloadHttpFile } from "./httpDownload";
 import { shardFileNames } from "./ggufMetadata";
 import {
   licenseFromModelDetail,
@@ -15,6 +15,7 @@ import type { ProgressReporter } from "./llamaInstaller";
 import { formatBytes } from "./memoryEstimate";
 import {
   classifyGgufFile,
+  invalidateModelLibraryCache,
   isMmprojFileName,
   languageRejectsSidecarMtp,
   listLocalModelEntries,
@@ -24,7 +25,7 @@ import {
   preferMtpDraftPath,
   type GgufFileRole,
 } from "./modelLibrary";
-import { ensureDirs, getModelsDir } from "./paths";
+import { getModelsDir } from "./paths";
 import type { SettingsStore } from "./settings";
 import type { HfFileHit, HfModelHit } from "./types";
 
@@ -87,16 +88,48 @@ export function posixDirname(filePath: string): string {
   return i >= 0 ? n.slice(0, i) : "";
 }
 
+export function huggingfaceOrigin(): string {
+  const raw = (
+    process.env.HF_ENDPOINT ||
+    process.env.HUGGING_FACE_HUB_ENDPOINT ||
+    "https://huggingface.co"
+  ).trim();
+  return raw.replace(/\/$/, "") || "https://huggingface.co";
+}
+
+export function huggingfaceUrl(pathname: string): string {
+  const pathPart = pathname.startsWith("/") ? pathname : `/${pathname}`;
+  return `${huggingfaceOrigin()}${pathPart}`;
+}
+
+export function huggingfaceModelPage(modelId: string): string {
+  return huggingfaceUrl(`/${modelId}`);
+}
+
+function lfsSha256(oid: string | undefined): string | undefined {
+  if (!oid) {
+    return undefined;
+  }
+  const hex = oid.replace(/^sha256:/i, "").trim().toLowerCase();
+  return /^[0-9a-f]{64}$/.test(hex) ? hex : undefined;
+}
+
 export function ggufHitsFromTree(
   modelId: string,
-  tree: Array<{ path: string; type: string; size?: number }>
+  tree: Array<{
+    path: string;
+    type: string;
+    size?: number;
+    lfs?: { oid?: string; size?: number };
+  }>
 ): HfFileHit[] {
   return tree
     .filter((f) => f.type === "file" && f.path.toLowerCase().endsWith(".gguf"))
     .map((f) => ({
       path: f.path,
-      size: f.size || 0,
-      url: `https://huggingface.co/${modelId}/resolve/main/${f.path}`,
+      size: f.lfs?.size || f.size || 0,
+      sha256: lfsSha256(f.lfs?.oid),
+      url: huggingfaceUrl(`/${modelId}/resolve/main/${f.path}`),
     }))
     .sort((a, b) => a.path.localeCompare(b.path));
 }
@@ -272,51 +305,6 @@ function requestJsonPages<T>(url: string, token?: string): Promise<T[]> {
   });
 }
 
-function downloadToFile(
-  url: string,
-  dest: string,
-  token: string | undefined,
-  onProgress?: (pct: number, received: number, total: number) => void
-): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const headers: Record<string, string> = { "User-Agent": "llama-aio-vs" };
-    if (token) {
-      headers.Authorization = `Bearer ${token}`;
-    }
-    const go = (u: string) => {
-      https
-        .get(u, { headers }, (res) => {
-          if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-            go(res.headers.location);
-            res.resume();
-            return;
-          }
-          if (!res.statusCode || res.statusCode >= 400) {
-            reject(new Error(`Download failed: HTTP ${res.statusCode}`));
-            res.resume();
-            return;
-          }
-          const total = Number(res.headers["content-length"] || 0);
-          let received = 0;
-          ensureDirs(path.dirname(dest));
-          const out = fs.createWriteStream(dest);
-          res.on("data", (chunk: Buffer) => {
-            received += chunk.length;
-            if (onProgress) {
-              const pct = total > 0 ? Math.floor((received / total) * 100) : 0;
-              onProgress(pct, received, total);
-            }
-          });
-          res.pipe(out);
-          out.on("finish", () => out.close(() => resolve()));
-          out.on("error", reject);
-        })
-        .on("error", reject);
-    };
-    go(url);
-  });
-}
-
 export class HuggingFaceClient {
   constructor(private readonly store: SettingsStore) {}
 
@@ -327,13 +315,13 @@ export class HuggingFaceClient {
 
   async searchGgufModels(query: string, limit = 25): Promise<HfModelHit[]> {
     const q = encodeURIComponent(query.trim() || "gguf");
-    const url = `https://huggingface.co/api/models?search=${q}&filter=gguf&sort=downloads&direction=-1&limit=${limit}`;
+    const url = huggingfaceUrl(`/api/models?search=${q}&filter=gguf&sort=downloads&direction=-1&limit=${limit}`);
     return requestJson<HfModelHit[]>(url, this.token());
   }
 
   async getModelLicense(modelId: string, tags?: string[]): Promise<ModelLicenseInfo> {
     try {
-      const url = `https://huggingface.co/api/models/${modelId}`;
+      const url = huggingfaceUrl(`/api/models/${modelId}`);
       const detail = await requestJson<{
         id?: string;
         tags?: string[];
@@ -381,7 +369,7 @@ export class HuggingFaceClient {
   ): Promise<Array<{ path: string; type: string; size?: number }>> {
     const suffix = options?.subpath ? `/${options.subpath}` : "";
     const query = options?.recursive ? "?recursive=true" : "";
-    const url = `https://huggingface.co/api/models/${modelId}/tree/main${suffix}${query}`;
+    const url = huggingfaceUrl(`/api/models/${modelId}/tree/main${suffix}${query}`);
     return requestJsonPages(url, this.token());
   }
 
@@ -398,7 +386,8 @@ export class HuggingFaceClient {
   async downloadModelFile(
     modelId: string,
     filePath: string,
-    progress?: ProgressReporter
+    progress?: ProgressReporter,
+    files?: HfFileHit[]
   ): Promise<string> {
     const parts = remoteShardPaths(filePath);
     let primary = "";
@@ -409,7 +398,8 @@ export class HuggingFaceClient {
           message: `Downloading shard ${i + 1}/${parts.length} ${listingBaseName(rel)}…`,
         });
       }
-      const dest = await this.downloadOneFile(modelId, rel, progress);
+      const meta = files?.find((f) => f.path === rel);
+      const dest = await this.downloadOneFile(modelId, rel, progress, meta);
       if (!primary || listingBaseName(rel) === listingBaseName(filePath)) {
         primary = dest;
       }
@@ -417,28 +407,38 @@ export class HuggingFaceClient {
     return primary;
   }
 
+  localDestFor(modelId: string, filePath: string): string {
+    const modelsDir = getModelsDir(this.store.getConfig());
+    const destDir = path.join(modelsDir, modelId.replace(/\//g, "__"));
+    return path.join(destDir, path.basename(filePath));
+  }
+
   private async downloadOneFile(
     modelId: string,
     filePath: string,
-    progress?: ProgressReporter
+    progress?: ProgressReporter,
+    meta?: Pick<HfFileHit, "size" | "sha256">
   ): Promise<string> {
-    const modelsDir = getModelsDir(this.store.getConfig());
-    const destDir = path.join(modelsDir, modelId.replace(/\//g, "__"));
-    const dest = path.join(destDir, path.basename(filePath));
-    if (fs.existsSync(dest) && fs.statSync(dest).size > 0) {
-      return dest;
-    }
-
-    const url = `https://huggingface.co/${modelId}/resolve/main/${filePath}`;
+    const dest = this.localDestFor(modelId, filePath);
+    const url = huggingfaceUrl(`/${modelId}/resolve/main/${filePath}`);
     progress?.report({ message: `Downloading ${filePath}…` });
-    await downloadToFile(url, dest + ".partial", this.token(), (pct, received, total) => {
-      progress?.report({
-        message: `Downloading ${path.basename(filePath)}… ${pct}% (${formatBytes(received)}${
-          total ? " / " + formatBytes(total) : ""
-        })`,
-      });
+    await downloadHttpFile({
+      url,
+      dest,
+      token: this.token(),
+      expectedSize: meta?.size && meta.size > 0 ? meta.size : undefined,
+      expectedSha256: meta?.sha256,
+      gatedPageUrl: huggingfaceModelPage(modelId),
+      onProgress: (info) => {
+        const pct = info.total > 0 ? Math.floor((info.received / info.total) * 100) : 0;
+        progress?.report({
+          message: `Downloading ${path.basename(filePath)}… ${pct}% (${formatBytes(info.received)}${
+            info.total ? " / " + formatBytes(info.total) : ""
+          })`,
+        });
+      },
     });
-    fs.renameSync(dest + ".partial", dest);
+    invalidateModelLibraryCache();
     return dest;
   }
 
@@ -455,7 +455,7 @@ export class HuggingFaceClient {
     if (!file) {
       return undefined;
     }
-    return this.downloadModelFile(modelId, file.path, progress);
+    return this.downloadModelFile(modelId, file.path, progress, files);
   }
 
   /**
@@ -472,7 +472,7 @@ export class HuggingFaceClient {
     if (!file) {
       return undefined;
     }
-    return this.downloadModelFile(modelId, file.path, progress);
+    return this.downloadModelFile(modelId, file.path, progress, files);
   }
 
   /** Paths only — prefer listLocalModelEntries() for source labels. */

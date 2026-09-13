@@ -4,8 +4,11 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { after, before, describe, it } from "node:test";
 import {
+  capsMissDefaultSwaPattern,
   clampLoadSettingsToModel,
+  defaultSwaLayout,
   heuristicPleShare,
+  invalidateModelCapabilitiesCache,
   isLinearRecurrentHybrid,
   isQwen4expArchitecture,
   readModelCapabilities,
@@ -14,7 +17,7 @@ import {
   shouldPinPleToCpu,
   totalModelBytes,
 } from "../src/ggufMetadata";
-import { denseCaps, loadSettings, moeCaps } from "./helpers";
+import { denseCaps, loadSettings, miniGguf, MiniGgufValue, moeCaps } from "./helpers";
 
 describe("shardFileNames", () => {
   it("expands a split-model name into the whole set", () => {
@@ -195,6 +198,105 @@ describe("resolveSlidingWindowPattern", () => {
   });
 });
 
+describe("architecture SWA defaults (llama.cpp set_swa_pattern)", () => {
+  const tmp: string[] = [];
+  after(() => {
+    for (const p of tmp) {
+      fs.rmSync(p, { force: true });
+    }
+  });
+
+  function capsFor(arch: string, extra: Record<string, MiniGgufValue> = {}) {
+    const p = path.join(os.tmpdir(), `llama-aio-swa-${arch}-${process.pid}-${tmp.length}.gguf`);
+    tmp.push(p);
+    fs.writeFileSync(
+      p,
+      miniGguf({
+        "general.architecture": { type: "string", value: arch },
+        "general.name": { type: "string", value: `${arch}-test` },
+        [`${arch}.block_count`]: { type: "u32", value: 12 },
+        [`${arch}.context_length`]: { type: "u32", value: 131072 },
+        [`${arch}.embedding_length`]: { type: "u32", value: 2048 },
+        [`${arch}.attention.head_count`]: { type: "u32", value: 16 },
+        [`${arch}.attention.head_count_kv`]: { type: "u32", value: 4 },
+        ...extra,
+      })
+    );
+    return readModelCapabilities(p);
+  }
+
+  it("lists the families llama.cpp hard-codes", () => {
+    assert.deepEqual(defaultSwaLayout("gemma2"), { period: 2, window: 4096 });
+    assert.deepEqual(defaultSwaLayout("Gemma3"), { period: 6, window: 1024 });
+    assert.deepEqual(defaultSwaLayout("gpt-oss"), { period: 2, window: 128 });
+    assert.deepEqual(defaultSwaLayout("llama4"), { period: 4, window: 8192 });
+    assert.deepEqual(defaultSwaLayout("muse-glimmer"), { period: 4 });
+    assert.equal(defaultSwaLayout("qwen3"), undefined);
+    assert.equal(defaultSwaLayout(undefined), undefined);
+  });
+
+  it("gemma3: 5 of 6 layers slide over the GGUF window when the pattern key is absent", () => {
+    const caps = capsFor("gemma3", {
+      "gemma3.attention.sliding_window": { type: "u32", value: 1024 },
+    });
+    assert.equal(caps.slidingWindow, 1024);
+    assert.equal(caps.slidingWindowPattern?.length, 12);
+    assert.equal(caps.slidingWindowPattern?.filter(Boolean).length, 10);
+    assert.equal(caps.slidingWindowPattern?.[5], false);
+    assert.equal(caps.slidingWindowPattern?.[11], false);
+  });
+
+  it("gemma2 / gpt-oss: alternate SWA and full layers", () => {
+    const g2 = capsFor("gemma2");
+    assert.equal(g2.slidingWindow, 4096, "falls back to llama.cpp's default window");
+    assert.deepEqual(g2.slidingWindowPattern?.slice(0, 4), [true, false, true, false]);
+    const oss = capsFor("gpt-oss", {
+      "gpt-oss.attention.sliding_window": { type: "u32", value: 128 },
+    });
+    assert.deepEqual(oss.slidingWindowPattern?.slice(0, 4), [true, false, true, false]);
+  });
+
+  it("llama4: chunked attention on 3 of 4 layers with the hard-coded 8192 window", () => {
+    const caps = capsFor("llama4");
+    assert.equal(caps.slidingWindow, 8192);
+    assert.deepEqual(caps.slidingWindowPattern?.slice(0, 4), [true, true, true, false]);
+  });
+
+  it("an explicit sliding_window_pattern in the GGUF wins over the table", () => {
+    const caps = capsFor("gemma3", {
+      "gemma3.attention.sliding_window": { type: "u32", value: 512 },
+      "gemma3.attention.sliding_window_pattern": {
+        type: "bool[]",
+        value: [true, false],
+      },
+    });
+    assert.equal(caps.slidingWindow, 512);
+    assert.deepEqual(caps.slidingWindowPattern?.slice(0, 4), [true, false, true, false]);
+  });
+
+  it("leaves architectures without a table entry alone", () => {
+    const caps = capsFor("qwen3");
+    assert.equal(caps.slidingWindow, undefined);
+    assert.equal(caps.slidingWindowPattern, undefined);
+    assert.equal(capsMissDefaultSwaPattern(caps), false);
+  });
+
+  it("flags stale capabilities that predate the table", () => {
+    assert.equal(
+      capsMissDefaultSwaPattern({ architecture: "gemma3", blockCount: 34 }),
+      true
+    );
+    assert.equal(
+      capsMissDefaultSwaPattern({
+        architecture: "gemma3",
+        blockCount: 34,
+        slidingWindowPattern: Array.from({ length: 34 }, () => true),
+      }),
+      false
+    );
+  });
+});
+
 describe("qwen4exp / PLE helpers", () => {
   it("recognizes llama.cpp and HF architecture spellings", () => {
     assert.equal(isQwen4expArchitecture("qwen4exp"), true);
@@ -225,5 +327,59 @@ describe("qwen4exp / PLE helpers", () => {
     assert.equal(isLinearRecurrentHybrid({ architecture: "qwen4_exp" }), false);
     assert.equal(isLinearRecurrentHybrid({ architecture: "qwen3" }), false);
     assert.equal(isLinearRecurrentHybrid(undefined), false);
+  });
+});
+
+describe("readModelCapabilities cache", () => {
+  const tmp: string[] = [];
+  after(() => {
+    invalidateModelCapabilitiesCache();
+    for (const p of tmp) {
+      fs.rmSync(p, { force: true });
+    }
+  });
+
+  function writeCaps(arch: string, name: string, dest: string) {
+    fs.writeFileSync(
+      dest,
+      miniGguf({
+        "general.architecture": { type: "string", value: arch },
+        "general.name": { type: "string", value: name },
+        [`${arch}.block_count`]: { type: "u32", value: 8 },
+        [`${arch}.context_length`]: { type: "u32", value: 8192 },
+        [`${arch}.embedding_length`]: { type: "u32", value: 1024 },
+        [`${arch}.attention.head_count`]: { type: "u32", value: 8 },
+        [`${arch}.attention.head_count_kv`]: { type: "u32", value: 2 },
+      })
+    );
+  }
+
+  it("returns a clone so callers cannot poison the memo", () => {
+    const p = path.join(os.tmpdir(), `llama-aio-caps-clone-${process.pid}.gguf`);
+    tmp.push(p);
+    writeCaps("qwen3", "orig", p);
+    invalidateModelCapabilitiesCache(p);
+    const first = readModelCapabilities(p);
+    first.name = "mutated";
+    const second = readModelCapabilities(p);
+    assert.equal(second.name, "orig");
+    assert.notEqual(first, second);
+  });
+
+  it("re-reads after invalidation even when mtime and size stay the same", () => {
+    const p = path.join(os.tmpdir(), `llama-aio-caps-inv-${process.pid}.gguf`);
+    tmp.push(p);
+    writeCaps("qwen3", "alpha", p);
+    const stamp = Math.floor(Date.now() / 1000) - 90;
+    fs.utimesSync(p, stamp, stamp);
+    invalidateModelCapabilitiesCache(p);
+    assert.equal(readModelCapabilities(p).name, "alpha");
+
+    writeCaps("qwen3", "bravo", p);
+    fs.utimesSync(p, stamp, stamp);
+    assert.equal(readModelCapabilities(p).name, "alpha", "same mtime/size served from cache");
+
+    invalidateModelCapabilitiesCache(p);
+    assert.equal(readModelCapabilities(p).name, "bravo");
   });
 });

@@ -5,10 +5,68 @@ import * as os from "os";
 import * as path from "path";
 import {
   expectedFhsDynamicLinker,
+  invalidateLlamaServerProbeCache,
   looksLikeMissingDynamicLinker,
   nixOsIncompatibilityHint,
+  probeLlamaServerRunnable,
   resolveLaunchPlan,
 } from "../src/nixCompat";
+
+const unixOnly = process.platform === "win32" ? { skip: "needs sh" } : {};
+
+describe("probeLlamaServerRunnable cache", () => {
+  const writeScript = (file: string, body: string) => {
+    fs.writeFileSync(file, body, { mode: 0o755 });
+  };
+
+  it(
+    "remembers a failed probe for the same mtime/size until invalidated",
+    unixOnly,
+    () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "llama-aio-probe-"));
+      const bin = path.join(dir, "llama-server");
+      try {
+        const broken = "#!/bin/sh\nexit 1\n";
+        // Whole-second mtime so it can be restored bit-for-bit after rewriting.
+        const stamp = Math.floor(Date.now() / 1000) - 60;
+        writeScript(bin, broken);
+        fs.utimesSync(bin, stamp, stamp);
+        const first = probeLlamaServerRunnable(bin, { timeoutMs: 5000 });
+        assert.equal(first.ok, false);
+
+        // Same byte length as `broken`, same mtime → looks unchanged on disk.
+        const fixed = "#!/bin/sh\nexit 0\n";
+        assert.equal(fixed.length, broken.length);
+        writeScript(bin, fixed);
+        fs.utimesSync(bin, stamp, stamp);
+
+        const cached = probeLlamaServerRunnable(bin, { timeoutMs: 5000 });
+        assert.equal(cached.ok, false, "negative result served from cache");
+
+        invalidateLlamaServerProbeCache(bin);
+        const fresh = probeLlamaServerRunnable(bin, { timeoutMs: 5000 });
+        assert.equal(fresh.ok, true, "invalidation forces a re-probe");
+      } finally {
+        invalidateLlamaServerProbeCache(bin);
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  );
+
+  it("re-probes when the binary changes on disk", unixOnly, () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "llama-aio-probe-"));
+    const bin = path.join(dir, "llama-server");
+    try {
+      writeScript(bin, "#!/bin/sh\nexit 3\n");
+      assert.equal(probeLlamaServerRunnable(bin, { timeoutMs: 5000 }).ok, false);
+      writeScript(bin, "#!/bin/sh\necho 'version: 1234 (abc)'\nexit 0\n");
+      assert.equal(probeLlamaServerRunnable(bin, { timeoutMs: 5000 }).ok, true);
+    } finally {
+      invalidateLlamaServerProbeCache(bin);
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
 
 describe("expectedFhsDynamicLinker", () => {
   it("points at the usual glibc interpreter path for this arch", () => {

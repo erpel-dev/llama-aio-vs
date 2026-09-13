@@ -61,6 +61,10 @@
         "title": "Llama AIO: Download Model from Hugging Face"
       },
       {
+        "command": "llamaAio.showDownloads",
+        "title": "Llama AIO: Downloads"
+      },
+      {
         "command": "llamaAio.openModelFile",
         "title": "Llama AIO: Open GGUF File…"
       },

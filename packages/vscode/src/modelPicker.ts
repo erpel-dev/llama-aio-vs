@@ -3,9 +3,27 @@ import * as os from "os";
 import * as path from "path";
 import * as vscode from "vscode";
 import { HuggingFaceClient } from "./huggingFace";
-import { formatModelSize, listLocalModelEntries } from "@llama-aio/core";
+import {
+  buildModelPickerHints,
+  displayGgufTitle,
+  formatBytes,
+  formatPickerDetail,
+  invalidateModelLibraryCache,
+  listLocalModelEntries,
+  pickerGpus,
+  readPickerCapabilities,
+  shortHomePath,
+  type LlamaLoadSettings,
+  type LocalModelEntry,
+} from "@llama-aio/core";
 import { getModelsDir } from "@llama-aio/core";
 import { SettingsStore } from "@llama-aio/core";
+
+export interface ModelPickerContext {
+  cpuOnly?: boolean;
+  llamaServerBinary?: string;
+  loadSettings?: LlamaLoadSettings;
+}
 
 /** Open a native file dialog and select an existing .gguf model. */
 export async function openModelFileDialog(
@@ -48,21 +66,99 @@ export async function openModelFileDialog(
   return selected;
 }
 
+type PickAction = "model" | "openFile" | "hfSearch";
+type PickItem = vscode.QuickPickItem & { action: PickAction; modelPath?: string };
+
+function fitIcon(fit: string): string {
+  if (fit === "fits") {
+    return "$(pass)";
+  }
+  if (fit === "tight") {
+    return "$(warning)";
+  }
+  if (fit === "wont-fit") {
+    return "$(error)";
+  }
+  return "";
+}
+
+function fitLabel(fit: string): string {
+  if (fit === "wont-fit") {
+    return "won't fit";
+  }
+  return fit;
+}
+
+function isCurrentPath(current: string, filePath: string): boolean {
+  return !!current && path.resolve(current) === path.resolve(filePath);
+}
+
+function cheapModelItem(entry: LocalModelEntry, current: string): PickItem {
+  const currentMark = isCurrentPath(current, entry.path);
+  const shards = entry.shardCount && entry.shardCount > 1 ? ` · ${entry.shardCount} shards` : "";
+  return {
+    action: "model",
+    modelPath: entry.path,
+    label: (currentMark ? "$(star-full) " : "") + displayGgufTitle(entry.path),
+    description: `${currentMark ? "current · " : ""}${formatBytes(entry.sizeBytes)}${shards}`,
+    detail: `${entry.source} · ${shortHomePath(path.dirname(entry.path))}`,
+    picked: currentMark,
+  };
+}
+
+function richModelItem(entry: LocalModelEntry, current: string, ctx?: ModelPickerContext): PickItem {
+  const caps = readPickerCapabilities(entry.path);
+  const hints = buildModelPickerHints(entry, {
+    caps,
+    settings: ctx?.loadSettings,
+    gpus: pickerGpus(!!ctx?.cpuOnly, ctx?.llamaServerBinary),
+    cpuOnly: ctx?.cpuOnly,
+    ramTotal: os.totalmem(),
+  });
+  const currentMark = isCurrentPath(current, entry.path);
+  const badges: string[] = [];
+  if (currentMark) {
+    badges.push("current");
+  }
+  if (hints.fit !== "unknown") {
+    badges.push(`${fitIcon(hints.fit)} ${fitLabel(hints.fit)}`.trim());
+  }
+  if (hints.shardCount > 1) {
+    badges.push(`${hints.shardCount} shards`);
+  }
+  return {
+    action: "model",
+    modelPath: entry.path,
+    label: (currentMark ? "$(star-full) " : "") + hints.title,
+    description: `${badges.join("  ·  ")}  ·  ${formatBytes(entry.sizeBytes)}`.replace(/^[ ·]+/, ""),
+    detail: formatPickerDetail(hints),
+    picked: currentMark,
+  };
+}
+
+function hfSearchItem(query: string): PickItem {
+  const q = query.trim();
+  return {
+    action: "hfSearch",
+    label: q
+      ? `$(cloud-download) Search Hugging Face for "${q}"…`
+      : "$(cloud-download) Search Hugging Face…",
+    description: "Download a GGUF",
+    alwaysShow: true,
+  };
+}
+
 /** Pick from models in Llama AIO library and common tool download folders. */
 export async function pickDownloadedModel(
   _hf: HuggingFaceClient,
-  store: SettingsStore
+  store: SettingsStore,
+  ctx?: ModelPickerContext
 ): Promise<string | undefined> {
   const config = store.getConfig();
   const modelsDir = getModelsDir(config);
-  const local = await vscode.window.withProgress(
-    {
-      location: vscode.ProgressLocation.Notification,
-      title: "Llama AIO: Scanning local GGUF libraries…",
-      cancellable: false,
-    },
-    async () => listLocalModelEntries(config)
-  );
+  invalidateModelLibraryCache();
+  const local = listLocalModelEntries(config);
+  const current = store.getState().selectedModelPath || "";
 
   if (!local.length) {
     const choice = await vscode.window.showInformationMessage(
@@ -80,47 +176,84 @@ export async function pickDownloadedModel(
     return store.getState().selectedModelPath || undefined;
   }
 
-  const bySource = new Map<string, number>();
+  const qp = vscode.window.createQuickPick<PickItem>();
+  qp.title = "Select model";
+  qp.placeholder = "Filter models, or type to search Hugging Face…";
+  qp.matchOnDescription = true;
+  qp.matchOnDetail = true;
+  qp.ignoreFocusOut = true;
+
+  const openItem: PickItem = {
+    action: "openFile",
+    label: "$(folder-opened) Open GGUF file…",
+    description: "Browse the filesystem for an existing .gguf",
+    alwaysShow: true,
+  };
+
+  const byPath = new Map<string, PickItem>();
   for (const e of local) {
-    bySource.set(e.source, (bySource.get(e.source) || 0) + 1);
+    byPath.set(e.path, cheapModelItem(e, current));
   }
-  const sourceSummary = [...bySource.entries()]
-    .map(([s, n]) => `${s}: ${n}`)
-    .join(" · ");
+  const rebuild = (filter: string) => {
+    qp.items = [openItem, ...local.map((e) => byPath.get(e.path)!), hfSearchItem(filter)];
+  };
+  rebuild("");
 
-  type PickItem = vscode.QuickPickItem & { path?: string; openFile?: boolean };
-  const items: PickItem[] = [
-    {
-      label: "$(folder-opened) Open GGUF file…",
-      description: "Browse the filesystem for an existing .gguf",
-      openFile: true,
-    },
-    ...local.map((e) => ({
-      label: path.basename(e.path),
-      description: e.source,
-      detail: `${formatModelSize(e.sizeBytes)}  ·  ${e.path}`,
-      path: e.path,
-    })),
-  ];
+  // Badges / fit lines are filled after the list is on screen (P-09).
+  void (async () => {
+    qp.busy = true;
+    for (const e of local) {
+      if (qp.items.length === 0) {
+        break;
+      }
+      byPath.set(e.path, richModelItem(e, current, ctx));
+      rebuild(qp.value);
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    qp.busy = false;
+  })();
 
-  const picked = await vscode.window.showQuickPick(items, {
-    title: `Select a GGUF model (${local.length} found)`,
-    placeHolder: sourceSummary || "Pick a model, or open a file…",
-    matchOnDescription: true,
-    matchOnDetail: true,
+  return await new Promise<string | undefined>((resolve) => {
+    let settled = false;
+    const finish = (value: string | undefined) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      qp.dispose();
+      resolve(value);
+    };
+
+    qp.onDidChangeValue((value) => rebuild(value));
+
+    qp.onDidAccept(async () => {
+      const picked = qp.selectedItems[0];
+      if (!picked) {
+        finish(undefined);
+        return;
+      }
+      if (picked.action === "openFile") {
+        finish(await openModelFileDialog(store));
+        return;
+      }
+      if (picked.action === "hfSearch") {
+        const q = qp.value.trim();
+        qp.hide();
+        await vscode.commands.executeCommand("llamaAio.browseModels", q || undefined);
+        finish(store.getState().selectedModelPath || undefined);
+        return;
+      }
+      if (!picked.modelPath) {
+        finish(undefined);
+        return;
+      }
+      await store.applySelectedModel(picked.modelPath);
+      finish(picked.modelPath);
+    });
+
+    qp.onDidHide(() => finish(undefined));
+    qp.show();
   });
-  if (!picked) {
-    return undefined;
-  }
-  if (picked.openFile) {
-    return openModelFileDialog(store);
-  }
-  if (!picked.path) {
-    return undefined;
-  }
-
-  await store.applySelectedModel(picked.path);
-  return picked.path;
 }
 
 /**
@@ -168,6 +301,7 @@ export async function pickDraftModelFromLibrary(
       cancellable: false,
     },
     async (progress) => {
+      invalidateModelLibraryCache();
       const local = [
         ...listLocalModelEntries(config),
         ...listMtpDraftEntries(config),
@@ -222,10 +356,10 @@ export async function pickDraftModelFromLibrary(
     return undefined;
   }
 
-  type PickItem = vscode.QuickPickItem & { path?: string; openFile?: boolean };
+  type DraftPickItem = vscode.QuickPickItem & { path?: string; openFile?: boolean };
   const dflashCount = scored.filter((s) => s.dflash).length;
   const mtpCount = scored.filter((s) => s.mtp).length;
-  const items: PickItem[] = [
+  const items: DraftPickItem[] = [
     {
       label: "$(folder-opened) Open GGUF file…",
       description: "Browse for a DFlash or MTP draft .gguf",
@@ -238,7 +372,7 @@ export async function pickDraftModelFromLibrary(
         : mtp
           ? `MTP drafter · ${e.source}`
           : e.source + (arch ? ` · ${arch}` : ""),
-      detail: `${formatModelSize(e.sizeBytes)}  ·  ${e.path}`,
+      detail: `${formatBytes(e.sizeBytes)}  ·  ${e.path}`,
       path: e.path,
     })),
   ];
@@ -300,6 +434,7 @@ export async function pickMmprojFromLibrary(store: SettingsStore): Promise<strin
       cancellable: false,
     },
     async () => {
+      invalidateModelLibraryCache();
       const entries = listMmprojEntries(config);
       if (!sibling) {
         return entries;
@@ -319,8 +454,8 @@ export async function pickMmprojFromLibrary(store: SettingsStore): Promise<strin
     return undefined;
   }
 
-  type PickItem = vscode.QuickPickItem & { path?: string; openFile?: boolean };
-  const items: PickItem[] = [
+  type MmprojPickItem = vscode.QuickPickItem & { path?: string; openFile?: boolean };
+  const items: MmprojPickItem[] = [
     {
       label: "$(folder-opened) Open GGUF file…",
       description: "Browse for mmproj-F16.gguf (or similar)",
@@ -354,4 +489,3 @@ export async function pickMmprojFromLibrary(store: SettingsStore): Promise<strin
   }
   return picked.path;
 }
-

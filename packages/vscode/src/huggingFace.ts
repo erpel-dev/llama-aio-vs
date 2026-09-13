@@ -2,15 +2,21 @@
  * VS Code UI around the shared HuggingFaceClient (QuickPick / notifications).
  */
 import * as vscode from "vscode";
+import { DownloadPanel } from "./downloadPanel";
 import {
   companionDownloadHint,
   describeLanguageGgufFile,
+  downloadManager,
   formatLicenseQuickPick,
+  huggingfaceModelPage,
+  huggingfaceUrl,
   languageGgufFiles,
   licenseFromTags,
+  listingBaseName,
   preferredMmprojFile,
   preferredMtpDraftFile,
   isMtpSidecarFile,
+  remoteShardPaths,
   resolveLicenseUrl,
   STARTER_MODEL,
   HuggingFaceClient,
@@ -21,6 +27,55 @@ import {
 
 export { HuggingFaceClient, STARTER_MODEL };
 
+function hfToken(store: SettingsStore): string | undefined {
+  const t = (store.getConfig().get<string>("hfToken") || "").trim();
+  return t || undefined;
+}
+
+function enqueueHfFile(
+  hf: HuggingFaceClient,
+  store: SettingsStore,
+  modelId: string,
+  filePath: string,
+  files?: HfFileHit[]
+) {
+  const meta = files?.find((f) => f.path === filePath);
+  return downloadManager.enqueue({
+    label: listingBaseName(filePath),
+    dest: hf.localDestFor(modelId, filePath),
+    url: meta?.url || huggingfaceUrl(`/${modelId}/resolve/main/${filePath}`),
+    token: hfToken(store),
+    expectedSize: meta?.size && meta.size > 0 ? meta.size : undefined,
+    expectedSha256: meta?.sha256,
+    gatedPageUrl: huggingfaceModelPage(modelId),
+    modelId,
+  });
+}
+
+async function enqueueModelAndCompanions(
+  hf: HuggingFaceClient,
+  store: SettingsStore,
+  modelId: string,
+  languagePath: string,
+  files?: HfFileHit[]
+): Promise<string> {
+  DownloadPanel.show(store, downloadManager);
+  const parts = remoteShardPaths(languagePath);
+  const jobs = parts.map((part) => enqueueHfFile(hf, store, modelId, part, files));
+  const listing = files ?? (await hf.listGgufFiles(modelId).catch(() => undefined));
+  const extras = [];
+  const mm = listing ? preferredMmprojFile(listing) : undefined;
+  if (mm) {
+    extras.push(enqueueHfFile(hf, store, modelId, mm.path, listing));
+  }
+  const mtp = listing ? preferredMtpDraftFile(listing, languagePath) : undefined;
+  if (mtp) {
+    extras.push(enqueueHfFile(hf, store, modelId, mtp.path, listing));
+  }
+  const dests = await Promise.all([...jobs, ...extras].map((j) => j.done));
+  return dests[0] || hf.localDestFor(modelId, parts[0]!);
+}
+
 /**
  * One-click download of the curated starter GGUF via the HF resolve URL
  * (no browse/search). Reuses an existing local copy if present.
@@ -29,22 +84,11 @@ export async function downloadStarterModel(
   hf: HuggingFaceClient,
   store: SettingsStore
 ): Promise<string | undefined> {
-  const dest = await vscode.window.withProgress(
-    {
-      location: vscode.ProgressLocation.Notification,
-      title: `Llama AIO: Downloading starter ${STARTER_MODEL.label}`,
-      cancellable: false,
-    },
-    async (progress) => {
-      const modelDest = await hf.downloadModelFile(
-        STARTER_MODEL.repoId,
-        STARTER_MODEL.filePath,
-        progress
-      );
-      await downloadCompanionMmproj(hf, STARTER_MODEL.repoId, progress);
-      await downloadCompanionMtpDraft(hf, STARTER_MODEL.repoId, progress);
-      return modelDest;
-    }
+  const dest = await enqueueModelAndCompanions(
+    hf,
+    store,
+    STARTER_MODEL.repoId,
+    STARTER_MODEL.filePath
   );
 
   await store.applySelectedModel(dest, { attachMmproj: true });
@@ -53,14 +97,18 @@ export async function downloadStarterModel(
 
 export async function browseAndDownloadModel(
   hf: HuggingFaceClient,
-  store: SettingsStore
+  store: SettingsStore,
+  initialQuery?: string
 ): Promise<string | undefined> {
-  const query = await vscode.window.showInputBox({
-    title: "Download a GGUF model from Hugging Face",
-    prompt: "Search Hugging Face (GGUF). Example: qwen2.5-coder, llama-3.2, gpt-oss",
-    placeHolder: "qwen2.5-coder",
-    ignoreFocusOut: true,
-  });
+  const query =
+    initialQuery !== undefined
+      ? initialQuery
+      : await vscode.window.showInputBox({
+          title: "Download a GGUF model from Hugging Face",
+          prompt: "Search Hugging Face (GGUF). Example: qwen2.5-coder, llama-3.2, gpt-oss",
+          placeHolder: "qwen2.5-coder",
+          ignoreFocusOut: true,
+        });
   if (query === undefined) {
     return undefined;
   }
@@ -152,22 +200,12 @@ export async function browseAndDownloadModel(
     return undefined;
   }
 
-  const dest = await vscode.window.withProgress(
-    {
-      location: vscode.ProgressLocation.Notification,
-      title: "Llama AIO: Downloading model",
-      cancellable: false,
-    },
-    async (progress) => {
-      const modelDest = await hf.downloadModelFile(
-        pickedModel.model.id,
-        pickedFile.file.path,
-        progress
-      );
-      await downloadCompanionMmproj(hf, pickedModel.model.id, progress, files);
-      await downloadCompanionMtpDraft(hf, pickedModel.model.id, progress, files, pickedFile.file.path);
-      return modelDest;
-    }
+  const dest = await enqueueModelAndCompanions(
+    hf,
+    store,
+    pickedModel.model.id,
+    pickedFile.file.path,
+    files
   );
 
   const state = await store.applySelectedModel(dest, { attachMmproj: true });
@@ -190,64 +228,6 @@ export async function browseAndDownloadModel(
       ` · ${lic}`
   );
   return dest;
-}
-
-async function downloadCompanionMmproj(
-  hf: HuggingFaceClient,
-  repoId: string,
-  progress: vscode.Progress<{ message?: string; increment?: number }>,
-  files?: HfFileHit[]
-): Promise<string | undefined> {
-  try {
-    const listing = files ?? (await hf.listGgufFiles(repoId));
-    const picked = preferredMmprojFile(listing);
-    if (!picked) {
-      return undefined;
-    }
-    progress.report({ message: `Downloading vision projector ${picked.path}…` });
-    return await hf.downloadPreferredMmproj(repoId, listing, progress);
-  } catch (e) {
-    void vscode.window.showWarningMessage(
-      `Model downloaded, but the vision projector failed: ${e instanceof Error ? e.message : String(e)}`
-    );
-    return undefined;
-  }
-}
-
-async function downloadCompanionMtpDraft(
-  hf: HuggingFaceClient,
-  repoId: string,
-  progress: vscode.Progress<{ message?: string; increment?: number }>,
-  files?: HfFileHit[],
-  languagePath?: string
-): Promise<string | undefined> {
-  try {
-    const listing = files ?? (await hf.listGgufFiles(repoId));
-    const picked = preferredMtpDraftFile(listing, languagePath);
-    if (!picked) {
-      return undefined;
-    }
-    progress.report({ message: `Downloading MTP drafter ${picked.path}…` });
-    return await hf.downloadPreferredMtpDraft(repoId, listing, progress, languagePath);
-  } catch (e) {
-    void vscode.window.showWarningMessage(
-      `Model downloaded, but the MTP drafter failed: ${e instanceof Error ? e.message : String(e)}`
-    );
-    return undefined;
-  }
-}
-
-function formatBytes(n: number): string {
-  if (n < 1024) {
-    return `${n} B`;
-  }
-  if (n < 1024 * 1024) {
-    return `${(n / 1024).toFixed(1)} KB`;
-  }
-  if (n < 1024 * 1024 * 1024) {
-    return `${(n / (1024 * 1024)).toFixed(1)} MB`;
-  }
-  return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
 
 /** Warn before download when the license is limited, custom, or unknown. */

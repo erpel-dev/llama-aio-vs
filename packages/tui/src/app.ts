@@ -32,6 +32,7 @@ import {
   languageGgufFiles,
   licenseFromTags,
   listLocalModelEntries,
+  invalidateModelLibraryCache,
   STARTER_MODEL,
   streamChatCompletion,
   parseTensorSplit,
@@ -2311,6 +2312,7 @@ export async function runApp(services: AppServices): Promise<void> {
         return;
       }
       if (key.name === "g") {
+        invalidateModelLibraryCache();
         refreshModels();
         renderer.requestRender();
         return;
