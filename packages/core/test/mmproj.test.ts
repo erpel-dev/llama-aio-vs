@@ -84,6 +84,11 @@ describe("HF mmproj helpers", () => {
     );
   });
 
+  it("matches mmproj in names like Qwen3.8-27B-mmproj-Q5_K-MIX.gguf", () => {
+    assert.equal(isMmprojFileName("mmproj-Qwen3.8-27B-Q5_K-MIX.gguf"), true);
+    assert.equal(isMmprojFileName("Qwen3.8-27B-mmproj-Q5_K-MIX.gguf"), true);
+  });
+
   it("selects the preferred projector from a repo listing", () => {
     assert.equal(preferredMmprojFile(files)?.path, "mmproj-F16.gguf");
   });

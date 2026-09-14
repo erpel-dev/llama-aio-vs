@@ -37,11 +37,11 @@ async function afterModelSelected(
   processManager: ProcessManager,
   store: SettingsStore
 ): Promise<void> {
+  await settingsView.pushState();
+  chatProvider?.notifyChanged();
   if (!selected) {
     return;
   }
-  await settingsView.pushState();
-  chatProvider?.notifyChanged();
 
   const choice = await vscode.window.showInformationMessage(
     `Model selected:\n${selected}`,

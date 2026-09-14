@@ -1,0 +1,727 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Llama AIO v0.1.17 review — progress (Sep 2026)</title>
+<style>
+  :root {
+    --bg: #ffffff; --fg: #1f2328; --muted: #57606a; --line: #d0d7de; --soft: #f6f8fa;
+    --accent: #0969da; --crit: #a40e26; --high: #cf222e; --med: #bf8700; --low: #1a7f37; --info: #6e7781;
+    --vs-bg: #1e1e1e; --vs-side: #252526; --vs-card: #2d2d30; --vs-line: #3c3c3c; --vs-fg: #cccccc; --vs-dim: #9d9d9d;
+    --vs-blue: #0e639c; --vs-blue-hi: #1177bb; --vs-green: #89d185; --vs-yellow: #cca700; --vs-red: #f14c4c; --vs-input: #3c3c3c;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 15px/1.55 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; color: var(--fg); background: var(--bg); }
+  header.top { background: linear-gradient(135deg, #0b1e3a, #163a6b); color: #fff; padding: 40px 24px 32px; }
+  header.top h1 { margin: 0 0 6px; font-size: 30px; }
+  header.top p { margin: 4px 0; opacity: .9; }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 0 24px 80px; }
+  nav.toc { background: var(--soft); border: 1px solid var(--line); border-radius: 8px; padding: 14px 20px; margin: 28px 0; }
+  nav.toc ol { margin: 6px 0 0; padding-left: 20px; columns: 2; }
+  nav.toc a { color: var(--accent); text-decoration: none; }
+  h2 { font-size: 24px; border-bottom: 2px solid var(--line); padding-bottom: 6px; margin-top: 56px; }
+  h3 { font-size: 19px; margin-top: 36px; }
+  h4 { font-size: 16px; margin: 24px 0 8px; }
+  p.lead { font-size: 17px; color: var(--muted); }
+  code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; }
+  code { background: var(--soft); border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; }
+  pre { background: #0d1117; color: #e6edf3; padding: 14px 16px; border-radius: 8px; overflow-x: auto; line-height: 1.45; }
+  pre code { background: none; border: 0; padding: 0; color: inherit; }
+  table { width: 100%; border-collapse: collapse; margin: 14px 0 28px; font-size: 14px; }
+  th, td { border: 1px solid var(--line); padding: 8px 10px; vertical-align: top; text-align: left; }
+  th { background: var(--soft); }
+  td.id { white-space: nowrap; font-family: ui-monospace, Menlo, monospace; font-size: 12.5px; }
+  td.loc { font-family: ui-monospace, Menlo, monospace; font-size: 12px; color: var(--muted); }
+  .badge { display: inline-block; font-size: 11px; font-weight: 700; letter-spacing: .03em; padding: 2px 8px; border-radius: 999px; color: #fff; white-space: nowrap; }
+  .crit { background: var(--crit); } .high { background: var(--high); } .med { background: var(--med); } .low { background: var(--low); } .info { background: var(--info); }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 14px; margin: 20px 0; }
+  .card { border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; background: var(--soft); }
+  .card .num { font-size: 32px; font-weight: 700; line-height: 1.1; }
+  .card .lbl { color: var(--muted); font-size: 13px; }
+  .score { display: grid; grid-template-columns: 220px 1fr 60px; gap: 8px 14px; align-items: center; margin: 14px 0 26px; }
+  .bar { height: 12px; background: #e6e8eb; border-radius: 6px; overflow: hidden; }
+  .bar > span { display: block; height: 100%; background: linear-gradient(90deg, #2da44e, #0969da); }
+  .callout { border-left: 4px solid var(--accent); background: #f0f6ff; padding: 12px 16px; border-radius: 0 8px 8px 0; margin: 18px 0; }
+  .callout.warn { border-color: var(--med); background: #fff8e5; }
+  .callout.bad { border-color: var(--high); background: #fff1f0; }
+  .two { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; align-items: start; }
+  @media (max-width: 900px) { .two { grid-template-columns: 1fr; } nav.toc ol { columns: 1; } }
+  .mockwrap { display: flex; gap: 28px; flex-wrap: wrap; align-items: flex-start; margin: 18px 0 30px; }
+  .mocklabel { font-size: 12.5px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; margin: 0 0 8px; }
+  /* ---- VS Code look-alike mockups ---- */
+  .vs { width: 340px; background: var(--vs-side); color: var(--vs-fg); border: 1px solid #111; border-radius: 6px; font: 12.5px/1.4 "Segoe UI", -apple-system, sans-serif; box-shadow: 0 10px 30px rgba(0,0,0,.35); overflow: hidden; }
+  .vs.wide { width: 560px; }
+  .vs .titlebar { background: #323233; color: #bbb; font-size: 11px; letter-spacing: .08em; text-transform: uppercase; padding: 8px 14px; border-bottom: 1px solid #111; display: flex; justify-content: space-between; }
+  .vs .body { padding: 10px; display: flex; flex-direction: column; gap: 10px; }
+  .vs .vcard { background: var(--vs-card); border: 1px solid var(--vs-line); border-radius: 5px; padding: 10px 12px; }
+  .vs .vcard h5 { margin: 0 0 8px; font-size: 12px; color: #e0e0e0; font-weight: 600; display: flex; justify-content: space-between; align-items: center; }
+  .vs .row { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 3px 0; }
+  .vs .dim { color: var(--vs-dim); }
+  .vs .btn { display: inline-block; background: var(--vs-blue); color: #fff; border-radius: 3px; padding: 4px 10px; font-size: 12px; border: 0; }
+  .vs .btn.sec { background: #3a3d41; }
+  .vs .btn.small { padding: 2px 8px; font-size: 11px; }
+  .vs .btnrow { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+  .vs .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+  .vs .ok { background: var(--vs-green); } .vs .warn { background: var(--vs-yellow); } .vs .err { background: var(--vs-red); } .vs .off { background: #666; }
+  .vs .input { background: var(--vs-input); border: 1px solid #555; border-radius: 3px; padding: 3px 8px; color: #ddd; min-width: 70px; text-align: right; }
+  .vs .select { background: var(--vs-input); border: 1px solid #555; border-radius: 3px; padding: 3px 8px; color: #ddd; width: 100%; }
+  .vs .select::after { content: " ▾"; color: #999; float: right; }
+  .vs .chip { display: inline-block; background: #3a3d41; border: 1px solid #555; border-radius: 999px; padding: 1px 9px; font-size: 11px; margin: 2px 3px 2px 0; }
+  .vs .chip.on { background: var(--vs-blue); border-color: var(--vs-blue-hi); color: #fff; }
+  .vs .mbar { height: 9px; background: #3c3c3c; border-radius: 4px; overflow: hidden; display: flex; margin: 3px 0 6px; }
+  .vs .mbar span { height: 100%; }
+  .vs .seg-w { background: #4c8ed9; } .vs .seg-k { background: #d9a74c; } .vs .seg-c { background: #6a9955; } .vs .seg-o { background: #7a7a7a; }
+  .vs .acc { border-top: 1px solid var(--vs-line); padding: 7px 4px; display: flex; justify-content: space-between; color: #ddd; }
+  .vs .acc.open { color: #fff; }
+  .vs .acc .tw { color: #999; margin-right: 6px; }
+  .vs .acc-body { padding: 4px 4px 10px 18px; }
+  .vs .verdict { border-radius: 4px; padding: 7px 10px; font-size: 12px; margin: 4px 0 6px; }
+  .vs .verdict.good { background: #1f3b26; border: 1px solid #2f6b3b; color: #cfe9d3; }
+  .vs .verdict.warnv { background: #3b3320; border: 1px solid #7a6a2b; color: #f0e2b0; }
+  .vs .stepper { display: flex; justify-content: space-between; margin: 4px 0 12px; }
+  .vs .step { flex: 1; text-align: center; font-size: 11px; color: #888; position: relative; }
+  .vs .step .n { display: inline-block; width: 20px; height: 20px; line-height: 20px; border-radius: 50%; background: #444; color: #ddd; margin-bottom: 3px; }
+  .vs .step.done .n { background: var(--vs-green); color: #111; } .vs .step.cur .n { background: var(--vs-blue); color: #fff; } .vs .step.cur { color: #fff; }
+  .vs .qp { background: #252526; border: 1px solid #454545; border-radius: 6px; padding: 6px; width: 520px; }
+  .vs .qp .search { background: var(--vs-input); border: 1px solid var(--vs-blue-hi); padding: 4px 8px; color: #ddd; border-radius: 3px; margin-bottom: 6px; }
+  .vs .qp .item { display: grid; grid-template-columns: 1fr auto; gap: 2px 10px; padding: 5px 8px; border-radius: 3px; }
+  .vs .qp .item.sel { background: #04395e; }
+  .vs .qp .item .t { color: #eee; } .vs .qp .item .d { color: #999; font-size: 11.5px; grid-column: 1 / span 2; }
+  .vs .qp .tag { font-size: 10.5px; padding: 0 6px; border-radius: 3px; background: #3a3d41; color: #ddd; margin-left: 4px; }
+  .vs .qp .tag.fit { background: #2f6b3b; } .vs .qp .tag.tight { background: #7a6a2b; } .vs .qp .tag.nofit { background: #7a2b2b; } .vs .qp .tag.cur { background: var(--vs-blue); }
+  .vs .toast { background: #252526; border: 1px solid #454545; border-left: 3px solid var(--vs-blue); padding: 8px 12px; border-radius: 4px; font-size: 12px; }
+  .vs .log { background: #111; color: #ccc; font: 11px/1.45 Menlo, Consolas, monospace; padding: 8px; border-radius: 4px; white-space: pre; overflow: hidden; }
+  .vs .progress { height: 6px; background: #3c3c3c; border-radius: 3px; overflow: hidden; margin: 4px 0; }
+  .vs .progress span { display: block; height: 100%; background: var(--vs-blue-hi); }
+  .vs .tui { background: #000; color: #ddd; font: 11.5px/1.35 Menlo, Consolas, monospace; padding: 10px; white-space: pre; }
+  .vs .tui .k { color: #ffd866; } .vs .tui .h { color: #78dce8; }
+  .flow { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 12px 0 20px; }
+  .flow .node { border: 1px solid var(--line); background: var(--soft); border-radius: 6px; padding: 6px 10px; font-size: 13px; }
+  .flow .node.slow { border-color: var(--high); background: #fff1f0; }
+  .flow .node.warn { border-color: var(--med); background: #fff8e5; }
+  .flow .arrow { color: var(--muted); }
+  .timeline { display: grid; grid-template-columns: 110px 1fr; gap: 6px 12px; align-items: center; margin: 12px 0 24px; font-size: 13px; }
+  .timeline .track { height: 22px; background: #eef1f4; border-radius: 4px; position: relative; overflow: hidden; }
+  .timeline .track span { position: absolute; top: 0; bottom: 0; border-radius: 4px; font-size: 11px; color: #fff; padding: 3px 6px; white-space: nowrap; overflow: hidden; }
+  .timeline .wait { background: #8c959f; } .timeline .tok { background: #2da44e; } .timeline .tool { background: #0969da; }
+  ul.tight li { margin: 3px 0; }
+  .prio { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+  @media (max-width: 900px) { .prio { grid-template-columns: 1fr; } }
+  .prio .col { border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; }
+  .prio h4 { margin-top: 0; }
+  footer { color: var(--muted); font-size: 13px; margin-top: 60px; border-top: 1px solid var(--line); padding-top: 14px; }
+
+  .st { display: inline-block; font-size: 10px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; padding: 2px 7px; border-radius: 999px; margin-left: 6px; vertical-align: middle; }
+  .st.done { background: #1a7f37; color: #fff; }
+  .st.partial { background: #bf8700; color: #fff; }
+  .st.open { background: #6e7781; color: #fff; }
+  .progress-banner { border: 1px solid var(--line); border-radius: 8px; padding: 16px 18px; margin: 24px 0; background: #f0f6ff; }
+  .progress-banner h2 { margin: 0 0 8px; border: 0; padding: 0; font-size: 20px; }
+  .progress-banner .meta { color: var(--muted); font-size: 13.5px; margin: 0 0 12px; }
+  .filter-note { font-size: 13px; color: var(--muted); margin: 8px 0 0; }
+  tr.status-done { background: #f0fff4; }
+  tr.status-partial { background: #fff8e5; }
+  tr.status-open { }
+  .evidence { display: block; font-size: 12px; color: var(--muted); margin-top: 4px; }
+  .extras ul { margin: 6px 0 0; }
+
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="wrap" style="padding-bottom:0">
+    <h1>Llama AIO — Extension Review <span class="st partial">progress update</span></h1>
+    <p>Original review: <strong>v0.1.17</strong> · 12 September 2026 &nbsp;·&nbsp; Status check: working tree <strong>v0.1.18</strong> · 15 September 2026</p>
+    <p>Scope: bugs · GUI improvements &amp; simplifications (with mockups) · performance bottlenecks · feature proposals</p>
+  </div>
+</header>
+
+<div class="wrap">
+
+
+<div class="progress-banner" id="progress">
+  <h2>Progress vs current tree (15 September 2026)</h2>
+  <p class="meta">Original review: Llama AIO <strong>v0.1.17</strong> (12 Sep 2026). Checked against the working tree of <strong>v0.1.18</strong> (includes uncommitted work). Line numbers in the original findings may have drifted — status is from current sources, not those line numbers.</p>
+  <div class="cards">
+    <div class="card"><div class="num" style="color:#1a7f37">31</div><div class="lbl">Done<br>113 findings in the original list</div></div>
+    <div class="card"><div class="num" style="color:#bf8700">21</div><div class="lbl">Partial<br>fix landed, original gap not fully closed</div></div>
+    <div class="card"><div class="num" style="color:#57606a">61</div><div class="lbl">Open<br>still matches the original finding</div></div>
+    <div class="card"><div class="num">37%</div><div class="lbl">Weighted progress<br>done + ½ partial</div></div>
+  </div>
+  <h3 style="margin-top:18px">Landed since the review (also extra work, not in the original IDs)</h3>
+  <ul class="tight">
+    <li><strong>P-01 / F-01</strong> Agent-mode streaming via <code>LiveTextGate</code>.</li>
+    <li><strong>F-03 / P-10 / B-32 / B-33</strong> Download manager (pause/resume/cancel, Range, sha256, gated repos, <code>HF_ENDPOINT</code>).</li>
+    <li><strong>B-01 / B-03 / B-08</strong> PID identity, launch lock, atomic lock file.</li>
+    <li><strong>B-30 / B-31 / B-35 / B-36 / B-38</strong> SWA defaults, partial-offload KV, MoE expert share, unified KV slots, library shard collapse. (B-37 tensor-share across shards is still open.)</li>
+    <li><strong>B-09 / B-10 / P-03 / P-07 / P-13 / P-14</strong> Windows argv launch, missing-terminal fail-fast, CUDA/status-bar cache, stale-lock cleanup, TUI debounce and scoped model scans.</li>
+    <li>Companion-only GGUF downloads (mmproj / MTP) attach as sidecars instead of failing as “no language model”.</li>
+    <li>Performance tab layout: dual-axis gen/prompt chart, compact context bar, collapsed history.</li>
+    <li><code>n-cpu-ffn</code>, Qwen3.8 / qwen4exp PLE, ngram / MTP / DFlash UI (beyond the original review scope).</li>
+  </ul>
+  <h3>Still the highest-value open items</h3>
+  <ul class="tight">
+    <li><strong>B-55 / B-66</strong> TUI <code>runApp()</code> returns immediately; <code>q</code> uses <code>process.exit(0)</code>.</li>
+    <li><strong>B-14 / B-15 / B-25 / B-29</strong> Copilot token count, SSE errors, silent restart, 16k slot hard-fail.</li>
+    <li><strong>B-46 / B-47 / B-48 / F-13</strong> Webview lifecycle, applyState clobber, duplicated estimator.</li>
+    <li><strong>F-02 / G-13</strong> Open log / copy command line / Output channel.</li>
+    <li><strong>G-07 / B-53 / F-16</strong> Copilot prompt every start; no Settings contribution point.</li>
+    <li><strong>F-14</strong> Zero tests in <code>packages/vscode</code> and <code>packages/tui</code>.</li>
+  </ul>
+  <p class="filter-note">Each original ID below has a <span class="st done">Done</span> <span class="st partial">Partial</span> <span class="st open">Open</span> badge. Hover a table row’s ID cell for the verification note. Mockups M1–M8 are marked in section 5.</p>
+</div>
+
+<nav class="toc">
+  <strong>Contents</strong>
+  <ol>
+    <li><a href="#progress">Progress vs current tree</a></li>
+    <li><a href="#summary">Executive summary &amp; scorecard (original)</a></li>
+    <li><a href="#method">Methodology</a></li>
+    <li><a href="#bugs">Bugs (66 findings)</a></li>
+    <li><a href="#perf">Performance bottlenecks (15 findings)</a></li>
+    <li><a href="#gui">GUI review &amp; mockups</a></li>
+    <li><a href="#features">New features &amp; improvements</a></li>
+    <li><a href="#arch">Architecture &amp; maintainability</a></li>
+    <li><a href="#roadmap">Prioritised roadmap</a></li>
+  </ol>
+</nav>
+
+<!-- ============================================================ -->
+<h2 id="summary">1. Executive summary</h2>
+<p class="lead">Llama AIO is a well-scoped, genuinely useful project: it installs and runs <code>llama-server</code>, exposes local models to Copilot Chat, and gives a resource estimate before loading. The core library is solid and well tested (429 passing tests, clean lint). The weaknesses are concentrated in three places: <strong>synchronous I/O and process spawning on the UI thread</strong>, a <strong>4,500-line inline webview</strong> that re-implements core logic, and a handful of <strong>lifecycle/correctness bugs</strong> (process killing, tool-call streaming, memory accounting) that users will hit in ordinary sessions.</p>
+
+<div class="cards">
+  <div class="card"><div class="num">66</div><div class="lbl">Bugs found<br>2 critical · 14 high · 33 medium · 17 low</div></div>
+  <div class="card"><div class="num">15</div><div class="lbl">Performance bottlenecks<br>1 critical · 5 high</div></div>
+  <div class="card"><div class="num">15</div><div class="lbl">GUI issues, 8 mockups</div></div>
+  <div class="card"><div class="num">17</div><div class="lbl">Feature / improvement proposals</div></div>
+</div>
+
+<h3>Scorecard</h3>
+<div class="score">
+  <div>Core correctness (estimate, GGUF, args)</div><div class="bar"><span style="width:72%"></span></div><div>7/10</div>
+  <div>Process lifecycle robustness</div><div class="bar"><span style="width:45%"></span></div><div>4.5/10</div>
+  <div>Copilot Chat provider</div><div class="bar"><span style="width:55%"></span></div><div>5.5/10</div>
+  <div>UI responsiveness</div><div class="bar"><span style="width:40%"></span></div><div>4/10</div>
+  <div>UI clarity / simplicity</div><div class="bar"><span style="width:55%"></span></div><div>5.5/10</div>
+  <div>TUI</div><div class="bar"><span style="width:35%"></span></div><div>3.5/10</div>
+  <div>Test coverage</div><div class="bar"><span style="width:60%"></span></div><div>6/10</div>
+  <div>Maintainability</div><div class="bar"><span style="width:50%"></span></div><div>5/10</div>
+</div>
+
+<h3>The five things to fix first</h3>
+<table>
+  <tr><th style="width:60px">#</th><th>Finding</th><th style="width:110px">Severity</th><th>Why it matters</th></tr>
+  <tr class="status-done"><td class="id" title="LiveTextGate streams with a short look-ahead tail instead of buffering the whole Agent completion.">P-01 <span class="st done" title="Done">Done</span><span class="evidence">LiveTextGate streams with a short look-ahead tail instead of buffering the whole Agent completion.</span></td><td>Agent-mode responses are fully buffered before anything is shown</td><td><span class="badge crit">Critical</span></td><td>Every Copilot Agent request feels frozen for the entire generation (often 20–90 s on local hardware). This is the single largest perceived-performance problem.</td></tr>
+  <tr class="status-open"><td class="id" title="runApp() still shows the first pane and returns; q uses process.exit(0) so finally dispose is skipped.">B-55 <span class="st open" title="Open">Open</span><span class="evidence">runApp() still shows the first pane and returns; q uses process.exit(0) so finally dispose is skipped.</span></td><td>TUI disposes its services immediately after start-up</td><td><span class="badge crit">Critical</span></td><td><code>runApp()</code> resolves right after the first pane is shown, so <code>services.dispose()</code> runs while the UI is still live.</td></tr>
+  <tr class="status-done"><td class="id" title="processIdentity + pidIdentity; skip-kill when the lock PID is no longer llama-server. / core/launchLock.ts (launch.lock.json) around check-and-spawn.">B-01 <span class="st done" title="Done">Done</span> / B-03 <span class="st done" title="Done">Done</span></td><td>Server stop kills whatever PID is in the lock file; no cross-process launch lock</td><td><span class="badge high">High</span></td><td>PID reuse can kill an unrelated process; two VS Code windows (or VS Code + TUI) can both launch servers and truncate each other's logs.</td></tr>
+  <tr class="status-partial"><td class="id" title="Silent slider saves avoid full pushState; many other webview messages still scan/probe. / detectCudaHardware cached 5 min; status bar caches getInstalledInfo for 60 s; tick no longer re-probes CUDA every 5 s.">P-02 <span class="st partial" title="Partial">Partial</span> / P-03 <span class="st done" title="Done">Done</span></td><td>Every sidebar click triggers a synchronous chain of <code>spawnSync</code>, directory walks and GGUF reads; the status bar timer repeats part of it every 5 s</td><td><span class="badge high">High</span></td><td>Extension host stalls of 0.3–10 s per click; on machines without a GPU the <code>nvidia-smi</code>/<code>--list-devices</code> timeouts dominate.</td></tr>
+  <tr class="status-done"><td class="id" title="sliding_window_pattern plus gemma2/gpt-oss/llama4 defaults and tests. / Core splits KV by last-N GPU layers (gpuLayerKvSum). Webview duplicate estimator is still wrong — see B-48.">B-30 <span class="st done" title="Done">Done</span> / B-31 <span class="st done" title="Done">Done</span></td><td>Memory estimate: SWA only recognised for one architecture; partial offload bills 100 % of KV to VRAM</td><td><span class="badge high">High</span></td><td>The headline feature (the estimate) is 2–5× off for Gemma 2/3, gpt-oss, Llama 4, and misleading for every partially-offloaded model.</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2 id="method">2. Methodology</h2>
+<ul class="tight">
+  <li>Full read of <code>packages/vscode/src</code> (extension, settings webview, model picker, HF flow, chat provider) and targeted reads of <code>packages/core/src</code> and <code>packages/tui/src</code> — ~29.5 k lines of TypeScript.</li>
+  <li>Four parallel deep-dives (core process/installer, chat provider &amp; perf stats, memory/model/HF, TUI) with every High/Critical claim re-verified against the source at the quoted <code>file:line</code>.</li>
+  <li>Build check: <code>npm install --ignore-scripts</code>, <code>npm run lint</code> (clean), <code>npm test</code> (429 pass, 0 fail). Node 22 in the review environment; the TUI declares <code>node &gt;= 26.4</code> with <code>--experimental-ffi</code>, so TUI findings are from code reading only.</li>
+  <li>Screenshots in <code>media/</code> were used as the reference for the current GUI.</li>
+  <li>Severity: <span class="badge crit">Critical</span> broken in the normal path · <span class="badge high">High</span> data loss, wrong result, or user-visible stall · <span class="badge med">Medium</span> incorrect in realistic edge cases · <span class="badge low">Low</span> cosmetic / hardening.</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2 id="bugs">3. Bugs</h2>
+
+<h3>3.1 Core — process lifecycle &amp; installer</h3>
+<table>
+  <tr><th style="width:55px">ID</th><th style="width:95px">Sev</th><th>Finding</th><th style="width:230px">Location</th><th>Suggested fix</th></tr>
+  <tr class="status-done"><td class="id" title="processIdentity + pidIdentity; skip-kill when the lock PID is no longer llama-server.">B-01 <span class="st done" title="Done">Done</span><span class="evidence">processIdentity + pidIdentity; skip-kill when the lock PID is no longer llama-server.</span></td><td><span class="badge high">High</span></td><td><code>stop()</code> adds <code>lock.pid</code> to the kill set without checking that the PID still belongs to <code>llama-server</code>. After a crash + PID reuse, an unrelated process is killed.</td><td class="loc">core/processManager.ts:662-688</td><td>Store the process start time (or <code>/proc/&lt;pid&gt;/stat</code> starttime, <code>ps -o lstart</code>, WMI <code>CreationDate</code>) in the lock and verify identity before signalling.</td></tr>
+  <tr class="status-open"><td class="id" title="AppleScript still embeds shQuote(script) in do script.">B-02 <span class="st open" title="Open">Open</span><span class="evidence">AppleScript still embeds shQuote(script) in do script.</span></td><td><span class="badge high">High</span></td><td>macOS external terminal: the shell script is quoted with <code>shQuote()</code> (single quotes) and embedded in an AppleScript <code>do script "…"</code> string. Single quotes are not AppleScript escaping, so scripts containing quotes break and the caller waits the full 180 s timeout.</td><td class="loc">core/externalTerminal.ts:170-199</td><td>Write the script to a temp file and <code>do script "bash /tmp/…"</code>; escape only <code>\</code> and <code>"</code> for AppleScript.</td></tr>
+  <tr class="status-done"><td class="id" title="core/launchLock.ts (launch.lock.json) around check-and-spawn.">B-03 <span class="st done" title="Done">Done</span><span class="evidence">core/launchLock.ts (launch.lock.json) around check-and-spawn.</span></td><td><span class="badge high">High</span></td><td>No cross-process launch lock. Two VS Code windows or VS Code + TUI can both pass the "not running" check, spawn two servers, truncate the shared log (<code>w</code> mode), and the second <code>stop()</code> kills the healthy one.</td><td class="loc">core/processManager.ts:64-75, 394-396, 448</td><td>Take <code>runtime/launch.lock</code> (O_EXCL) around check-and-spawn; open the log in append mode with a session marker.</td></tr>
+  <tr class="status-partial"><td class="id" title="Windows taskkill /T /F is in; POSIX still signals a single PID, not the process group.">B-04 <span class="st partial" title="Partial">Partial</span><span class="evidence">Windows taskkill /T /F is in; POSIX still signals a single PID, not the process group.</span></td><td><span class="badge med">Med</span></td><td><code>stopProcessTree</code> receives a single PID; when the server is launched via a wrapper/terminal the real <code>llama-server</code> can survive.</td><td class="loc">core/processManager.ts</td><td>Kill by process group on POSIX (<code>detached:true</code> + <code>-pid</code>), <code>taskkill /T</code> on Windows.</td></tr>
+  <tr class="status-open"><td class="id" title="No child.on('error') on spawned llama-server / terminal children.">B-05 <span class="st open" title="Open">Open</span><span class="evidence">No child.on('error') on spawned llama-server / terminal children.</span></td><td><span class="badge med">Med</span></td><td>Spawned children have no <code>error</code> listener → an ENOENT/EACCES becomes an unhandled exception in the extension host.</td><td class="loc">core/processManager.ts, externalTerminal.ts</td><td>Attach <code>child.on('error')</code> and surface via the status object.</td></tr>
+  <tr class="status-open"><td class="id" title="compareReleaseTags still calls normalizeReleaseTag, which throws on &quot;local&quot;; peekUpdateCheck is unguarded.">B-06 <span class="st open" title="Open">Open</span><span class="evidence">compareReleaseTags still calls normalizeReleaseTag, which throws on &quot;local&quot;; peekUpdateCheck is unguarded.</span></td><td><span class="badge med">Med</span></td><td><code>compareReleaseTags</code> throws on non-release tags such as <code>"local"</code>; <code>peekUpdateCheck</code> is called inside <code>pushState()</code>, so a locally-built backend makes the sidebar refresh throw.</td><td class="loc">core/llamaInstaller.ts:1557, 450, 1323</td><td>Return <code>undefined</code> for unparsable tags; wrap the update peek in try/catch.</td></tr>
+  <tr class="status-partial"><td class="id" title="Cross-window install lock (wx) exists; in-process lockDepth still lets a second concurrent install skip the file lock.">B-07 <span class="st partial" title="Partial">Partial</span><span class="evidence">Cross-window install lock (wx) exists; in-process lockDepth still lets a second concurrent install skip the file lock.</span></td><td><span class="badge med">Med</span></td><td><code>withInstallLock</code> uses a process-global <code>lockDepth</code>; two concurrent installs in the same process (e.g. install + update prompt) both believe they hold the lock.</td><td class="loc">core/installSwap.ts:116-141</td><td>Use a per-call token or an async mutex.</td></tr>
+  <tr class="status-done"><td class="id" title="Lock file written via tmp + renameSync.">B-08 <span class="st done" title="Done">Done</span><span class="evidence">Lock file written via tmp + renameSync.</span></td><td><span class="badge med">Med</span></td><td>Server lock file is written non-atomically (plain <code>writeFileSync</code>) while other processes poll it.</td><td class="loc">core/processManager.ts:832</td><td>Reuse the tmp+rename pattern already used by <code>ConfigFile</code>.</td></tr>
+  <tr class="status-done"><td class="id" title="Windows launch uses argv arrays (cmd.exe /c start … or Windows Terminal); spawn with shell:false.">B-09 <span class="st done" title="Done">Done</span><span class="evidence">Windows launch uses argv arrays (cmd.exe /c start … or Windows Terminal); spawn with shell:false.</span></td><td><span class="badge med">Med</span></td><td>Windows external terminal builds a <code>cmd.exe</code> line by concatenation; paths containing <code>&amp; ^ % ( )</code> break.</td><td class="loc">core/externalTerminal.ts:47-51, 214</td><td>Write a <code>.cmd</code> file and invoke it; or use PowerShell with argument arrays.</td></tr>
+  <tr class="status-done"><td class="id" title="Missing/unresolved Linux terminal throws missingLinuxTerminalMessage() before the wait loop.">B-10 <span class="st done" title="Done">Done</span><span class="evidence">Missing/unresolved Linux terminal throws missingLinuxTerminalMessage() before the wait loop.</span></td><td><span class="badge med">Med</span></td><td>Launcher failures are undetected: an unknown <code>$TERMINAL</code> or missing emulator fails silently and the code falls into the 180 s wait.</td><td class="loc">core/externalTerminal.ts</td><td>Check exit code of the launcher, verify the marker file appears within ~3 s, fall back to the integrated terminal.</td></tr>
+  <tr class="status-open"><td class="id" title="Installer still uses os.tmpdir()/llama-aio-vs + asset name, not mkdtempSync.">B-11 <span class="st open" title="Open">Open</span><span class="evidence">Installer still uses os.tmpdir()/llama-aio-vs + asset name, not mkdtempSync.</span></td><td><span class="badge low">Low</span></td><td>Predictable temp directory name (TOCTOU) for downloads.</td><td class="loc">core/llamaInstaller.ts:1449</td><td><code>fs.mkdtempSync</code>.</td></tr>
+  <tr class="status-open"><td class="id" title="tee pipeline still lacks set -o pipefail / PIPESTATUS.">B-12 <span class="st open" title="Open">Open</span><span class="evidence">tee pipeline still lacks set -o pipefail / PIPESTATUS.</span></td><td><span class="badge low">Low</span></td><td><code>code=$?</code> captures <code>tee</code>'s exit code, not the server's.</td><td class="loc">core/externalTerminal.ts:152</td><td><code>set -o pipefail</code> or <code>${PIPESTATUS[0]}</code>.</td></tr>
+  <tr class="status-partial"><td class="id" title="isArchive accepts .ZIP; unpack still uses endsWith(&quot;.zip&quot;), so uppercase .ZIP can take the tar path.">B-13 <span class="st partial" title="Partial">Partial</span><span class="evidence">isArchive accepts .ZIP; unpack still uses endsWith(&quot;.zip&quot;), so uppercase .ZIP can take the tar path.</span></td><td><span class="badge low">Low</span></td><td>Archive handling is case-sensitive for <code>.ZIP</code>; missing <code>unzip</code> gives a generic error.</td><td class="loc">core/llamaInstaller.ts</td><td>Lowercase the extension; check <code>commandExists('unzip')</code> up front with a helpful message.</td></tr>
+</table>
+
+<h3>3.2 Copilot Chat provider &amp; performance stats</h3>
+<table>
+  <tr><th style="width:55px">ID</th><th style="width:95px">Sev</th><th>Finding</th><th style="width:230px">Location</th><th>Suggested fix</th></tr>
+  <tr class="status-open"><td class="id" title="provideTokenCount still uses extractTextFromPart and ignores tool parts.">B-14 <span class="st open" title="Open">Open</span><span class="evidence">provideTokenCount still uses extractTextFromPart and ignores tool parts.</span></td><td><span class="badge high">High</span></td><td><code>provideTokenCount</code> uses <code>extractTextFromPart</code>, which ignores <code>ToolCallPart</code>/<code>ToolResultPart</code>, so tool-heavy histories count as ~0 tokens. Copilot then overfills the context and the server returns 400/truncates.</td><td class="loc">vscode/chatProvider.ts:1074-1084</td><td>Serialise tool parts the same way <code>toOpenAiMessages</code> does and count that string.</td></tr>
+  <tr class="status-open"><td class="id" title="SSE loop only handles data: lines; error: events and json.error are skipped.">B-15 <span class="st open" title="Open">Open</span><span class="evidence">SSE loop only handles data: lines; error: events and json.error are skipped.</span></td><td><span class="badge high">High</span></td><td>Mid-stream SSE errors (<code>error:</code> events or <code>json.error</code> objects) are ignored; the user sees "Empty reply" instead of the server's message (e.g. context overflow).</td><td class="loc">vscode/chatProvider.ts:390-654</td><td>Detect <code>error</code> payloads in the SSE loop and throw a <code>LanguageModelError</code> with the message.</td></tr>
+  <tr class="status-open"><td class="id" title="stringifyToolResult still JSON.stringifies non-text items (byte maps).">B-16 <span class="st open" title="Open">Open</span><span class="evidence">stringifyToolResult still JSON.stringifies non-text items (byte maps).</span></td><td><span class="badge med">Med</span></td><td>Tool-result image parts are serialised as JSON byte maps (<code>{"0":137,"1":80…}</code>) — thousands of tokens of noise.</td><td class="loc">vscode/chatProvider.ts:276-281</td><td>Drop binary parts or replace with <code>[image omitted]</code>.</td></tr>
+  <tr class="status-open"><td class="id" title="User text is still emitted before tool results from the same turn.">B-17 <span class="st open" title="Open">Open</span><span class="evidence">User text is still emitted before tool results from the same turn.</span></td><td><span class="badge med">Med</span></td><td><code>toOpenAiMessages</code> emits user text before <code>tool</code> messages from the same turn; strict templates (Llama 3, Qwen) require tool results to directly follow the assistant tool_calls.</td><td class="loc">vscode/chatProvider.ts:283-373</td><td>Emit all <code>tool</code> results first, then remaining text as a user message.</td></tr>
+  <tr class="status-open"><td class="id" title="Wikipedia / duplicate-guard hints are still extra trailing system messages.">B-18 <span class="st open" title="Open">Open</span><span class="evidence">Wikipedia / duplicate-guard hints are still extra trailing system messages.</span></td><td><span class="badge med">Med</span></td><td>Trailing <code>system</code> hint messages are appended after the conversation; many chat templates reject or mis-render a system message that is not first.</td><td class="loc">vscode/chatProvider.ts:847-862</td><td>Merge hints into the first system message or into the last user message.</td></tr>
+  <tr class="status-done"><td class="id" title="Guard fingerprints only since the last user message (same turn); off by default.">B-19 <span class="st done" title="Done">Done</span><span class="evidence">Guard fingerprints only since the last user message (same turn); off by default.</span></td><td><span class="badge med">Med</span></td><td>Duplicate tool-call guard blocks legitimate repeats (e.g. reading the same file after an edit).</td><td class="loc">vscode/toolCallGuard.ts:33-64</td><td>Only block identical calls within the same assistant turn, or after N consecutive identical calls.</td></tr>
+  <tr class="status-open"><td class="id" title="xmlToolCalls does not strip fenced code blocks before matching.">B-20 <span class="st open" title="Open">Open</span><span class="evidence">xmlToolCalls does not strip fenced code blocks before matching.</span></td><td><span class="badge med">Med</span></td><td>XML tool-call extraction matches <code>&lt;tool_call&gt;</code> inside code fences, so a model explaining the format executes a tool.</td><td class="loc">vscode/xmlToolCalls.ts:47-56</td><td>Strip fenced code blocks before matching.</td></tr>
+  <tr class="status-done"><td class="id" title="core/perfStats.ts re-arms alertBand only after context drops below 70%.">B-21 <span class="st done" title="Done">Done</span><span class="evidence">core/perfStats.ts re-arms alertBand only after context drops below 70%.</span></td><td><span class="badge med">Med</span></td><td>Context-usage toasts (80 %/90 %) repeat because the band is reset whenever the estimate drops slightly.</td><td class="loc">vscode/perfStats.ts:482-527</td><td>Only re-arm after the estimate falls below the previous band by a hysteresis margin, or once per conversation.</td></tr>
+  <tr class="status-partial"><td class="id" title="modelConfiguration curated modes are applied; tool_choice is still hardcoded &quot;auto&quot; and Copilot toolMode is ignored.">B-22 <span class="st partial" title="Partial">Partial</span><span class="evidence">modelConfiguration curated modes are applied; tool_choice is still hardcoded &quot;auto&quot; and Copilot toolMode is ignored.</span></td><td><span class="badge med">Med</span></td><td><code>options.toolMode</code> and <code>modelOptions</code> (temperature etc.) from Copilot are ignored; <code>tool_choice</code> is hard-coded to <code>"auto"</code>.</td><td class="loc">vscode/chatProvider.ts</td><td>Map <code>toolMode: Required</code> → <code>tool_choice: "required"</code>; pass through sampling options.</td></tr>
+  <tr class="status-partial"><td class="id" title="reasoning_content can stream as text; no LanguageModelThinkingPart.">B-23 <span class="st partial" title="Partial">Partial</span><span class="evidence">reasoning_content can stream as text; no LanguageModelThinkingPart.</span></td><td><span class="badge med">Med</span></td><td><code>reasoning_content</code> is either streamed as answer text or dropped depending on the model.</td><td class="loc">vscode/chatProvider.ts</td><td>Emit <code>LanguageModelThinkingPart</code> where the API supports it (see F-06).</td></tr>
+  <tr class="status-done"><td class="id" title="wikipedia_lookup is added only when Copilot already sent tools.">B-24 <span class="st done" title="Done">Done</span><span class="evidence">wikipedia_lookup is added only when Copilot already sent tools.</span></td><td><span class="badge med">Med</span></td><td>The <code>wikipedia_lookup</code> tool is injected even when Copilot did not offer it, so the model may call a tool the host cannot execute.</td><td class="loc">vscode/chatProvider.ts</td><td>Only include tools present in <code>options.tools</code>.</td></tr>
+  <tr class="status-open"><td class="id" title="Chat still auto-start() when not ready or configDirty, with no prompt.">B-25 <span class="st open" title="Open">Open</span><span class="evidence">Chat still auto-start() when not ready or configDirty, with no prompt.</span></td><td><span class="badge med">Med</span></td><td>When config is dirty a chat request silently restarts the server (dropping other clients' slots) without any prompt.</td><td class="loc">vscode/chatProvider.ts:803-811</td><td>Ask once ("Settings changed — restart server?") or show a status-bar hint; never restart implicitly from a chat request.</td></tr>
+  <tr class="status-open"><td class="id" title="HTTP timeout: 600000 is set but not wired to AbortSignal.">B-26 <span class="st open" title="Open">Open</span><span class="evidence">HTTP timeout: 600000 is set but not wired to AbortSignal.</span></td><td><span class="badge low">Low</span></td><td>HTTP request timeout is set but is a no-op because the socket timeout is not wired to abort.</td><td class="loc">vscode/chatProvider.ts:412, core/chatClient.ts:99</td><td>Use <code>AbortSignal.timeout</code> combined with the cancellation token.</td></tr>
+  <tr class="status-open"><td class="id" title="onCancellationRequested is registered without dispose in finally.">B-27 <span class="st open" title="Open">Open</span><span class="evidence">onCancellationRequested is registered without dispose in finally.</span></td><td><span class="badge low">Low</span></td><td>Cancellation-token listeners are not disposed after a request completes.</td><td class="loc">vscode/chatProvider.ts</td><td>Dispose in <code>finally</code>.</td></tr>
+  <tr class="status-open"><td class="id" title="finish_reason === length is still not surfaced to the user.">B-28 <span class="st open" title="Open">Open</span><span class="evidence">finish_reason === length is still not surfaced to the user.</span></td><td><span class="badge low">Low</span></td><td><code>finish_reason</code> (<code>length</code>) is not surfaced; truncated answers look complete.</td><td class="loc">vscode/chatProvider.ts</td><td>Append a short notice or set a warning when <code>finish_reason === "length"</code>.</td></tr>
+  <tr class="status-open"><td class="id" title="Hard fail if slotCtx &lt; 16384 even for small prompts.">B-29 <span class="st open" title="Open">Open</span><span class="evidence">Hard fail if slotCtx &lt; 16384 even for small prompts.</span></td><td><span class="badge low">Low</span></td><td>Requests fail hard when the per-slot context is &lt; 16384, even for small prompts.</td><td class="loc">vscode/chatProvider.ts:817</td><td>Warn, and fail only when the actual prompt does not fit.</td></tr>
+</table>
+
+<h3>3.3 Core — memory estimate, model library, Hugging Face</h3>
+<table>
+  <tr><th style="width:55px">ID</th><th style="width:95px">Sev</th><th>Finding</th><th style="width:230px">Location</th><th>Suggested fix</th></tr>
+  <tr class="status-done"><td class="id" title="sliding_window_pattern plus gemma2/gpt-oss/llama4 defaults and tests.">B-30 <span class="st done" title="Done">Done</span><span class="evidence">sliding_window_pattern plus gemma2/gpt-oss/llama4 defaults and tests.</span></td><td><span class="badge high">High</span></td><td>Sliding-window attention is only recognised for one architecture; Gemma 2/3, gpt-oss and Llama 4 (all with SWA layers) have their KV cache over-estimated 2–5×.</td><td class="loc">core/ggufMetadata.ts:607-619</td><td>Read <code>&lt;arch&gt;.attention.sliding_window</code> and the SWA layer pattern per architecture; add fixtures for each.</td></tr>
+  <tr class="status-done"><td class="id" title="Core splits KV by last-N GPU layers (gpuLayerKvSum). Webview duplicate estimator is still wrong — see B-48.">B-31 <span class="st done" title="Done">Done</span><span class="evidence">Core splits KV by last-N GPU layers (gpuLayerKvSum). Webview duplicate estimator is still wrong — see B-48.</span></td><td><span class="badge high">High</span></td><td><code>kvOnGpu = !cpuOnly &amp;&amp; offloadKvCacheToGpu &amp;&amp; onGpu &gt; 0</code> puts 100 % of KV in VRAM as soon as one layer is offloaded. llama.cpp keeps KV of CPU layers in RAM.</td><td class="loc">core/memoryEstimate.ts:993</td><td>Split KV proportionally to offloaded layers (or per SWA/non-SWA layer set).</td></tr>
+  <tr class="status-done"><td class="id" title="httpDownload.ts: stream errors, idle timeout, Range resume, size check.">B-32 <span class="st done" title="Done">Done</span><span class="evidence">httpDownload.ts: stream errors, idle timeout, Range resume, size check.</span></td><td><span class="badge high">High</span></td><td>HF download: no <code>res.on('error')</code>, no idle timeout, no resume. A dropped connection leaves a partial file that the next run treats as complete (any size &gt; 0).</td><td class="loc">core/huggingFace.ts:274-318, 420-443</td><td>Handle stream errors, use <code>Range</code> resume, and validate final length.</td></tr>
+  <tr class="status-done"><td class="id" title="Downloads verify size and optional sha256 (lfs.oid).">B-33 <span class="st done" title="Done">Done</span><span class="evidence">Downloads verify size and optional sha256 (lfs.oid).</span></td><td><span class="badge high">High</span></td><td>No length/sha256 verification although the HF tree API returns <code>lfs.oid</code> and <code>size</code>.</td><td class="loc">core/huggingFace.ts:420-443</td><td>Verify size always, sha256 optionally (streaming hash while downloading).</td></tr>
+  <tr class="status-open"><td class="id" title="--list-devices still only reorders when ≥2 GPUs; single Windows GPU still hits AdapterRAM 4 GiB cap.">B-34 <span class="st open" title="Open">Open</span><span class="evidence">--list-devices still only reorders when ≥2 GPUs; single Windows GPU still hits AdapterRAM 4 GiB cap.</span></td><td><span class="badge high">High</span></td><td>Windows GPU detection uses WMI <code>AdapterRAM</code> (32-bit, capped at 4 GiB); <code>--list-devices</code> is only used when ≥ 2 GPUs are found. Every Windows user with one &gt; 4 GiB GPU gets a wrong VRAM figure.</td><td class="loc">core/gpuInfo.ts:281-324, 500</td><td>Prefer <code>nvidia-smi</code>/<code>--list-devices</code> first; read <code>HardwareInformation.qwMemorySize</code> from the registry as a fallback.</td></tr>
+  <tr class="status-done"><td class="id" title="n-cpu-moe subtracts only moeExpertShare (expert tensors), not whole-layer bytes.">B-35 <span class="st done" title="Done">Done</span><span class="evidence">n-cpu-moe subtracts only moeExpertShare (expert tensors), not whole-layer bytes.</span></td><td><span class="badge med">Med</span></td><td><code>--n-cpu-moe</code> VRAM savings are overstated (dense/attention tensors of those layers are still counted as moved).</td><td class="loc">core/memoryEstimate.ts:955-963</td><td>Move only expert tensors for the affected layers.</td></tr>
+  <tr class="status-done"><td class="id" title="kvSlotMultiplier returns 1 when unifiedKvCache is on.">B-36 <span class="st done" title="Done">Done</span><span class="evidence">kvSlotMultiplier returns 1 when unifiedKvCache is on.</span></td><td><span class="badge med">Med</span></td><td>Non-unified KV is multiplied by slots even when <code>--kv-unified</code> is set.</td><td class="loc">core/memoryEstimate.ts:129-135</td><td>Respect the unified flag.</td></tr>
+  <tr class="status-open"><td class="id" title="totalModelBytes sums shards, but MoE/FFN/PLE tensor shares are still measured from one file's header.">B-37 <span class="st open" title="Open">Open</span><span class="evidence">totalModelBytes sums shards, but MoE/FFN/PLE tensor shares are still measured from one file's header.</span></td><td><span class="badge med">Med</span></td><td>Sharded models: the tensor-share ratio uses whole-model bytes from the first shard only.</td><td class="loc">core/memoryEstimate.ts:655-674</td><td>Sum tensor infos across shards (the header of each shard is cheap to read).</td></tr>
+  <tr class="status-done"><td class="id" title="Model library collapses split GGUFs to the first shard.">B-38 <span class="st done" title="Done">Done</span><span class="evidence">Model library collapses split GGUFs to the first shard.</span></td><td><span class="badge med">Med</span></td><td>Model library lists every split shard (<code>-00002-of-00005</code>) as a separate model.</td><td class="loc">core/modelLibrary.ts:676-693</td><td>Collapse shards into one entry pointing at <code>-00001-of-N</code>.</td></tr>
+  <tr class="status-partial"><td class="id" title="UI shows #kvFlashAttnHint; recommendSettings does not fully reconcile FA vs quantized V.">B-39 <span class="st partial" title="Partial">Partial</span><span class="evidence">UI shows #kvFlashAttnHint; recommendSettings does not fully reconcile FA vs quantized V.</span></td><td><span class="badge med">Med</span></td><td>Quantised V cache with flash-attention off is accepted; llama-server rejects it at start-up.</td><td class="loc">core/serverArgs.ts:160-171</td><td>Reconcile in <code>recommendSettings</code> and show a warning chip in the UI.</td></tr>
+  <tr class="status-partial"><td class="id" title="Some flags are version-gated (FA / n-cpu-*); --kv-unified, --cache-type-*, --load-mode, --reasoning-format are still always emitted.">B-40 <span class="st partial" title="Partial">Partial</span><span class="evidence">Some flags are version-gated (FA / n-cpu-*); --kv-unified, --cache-type-*, --load-mode, --reasoning-format are still always emitted.</span></td><td><span class="badge med">Med</span></td><td>New flags (<code>--kv-unified</code>, <code>--n-cpu-moe</code>, …) are always emitted; a system-PATH backend older than those flags fails to start.</td><td class="loc">core/serverArgs.ts:164, 176, 201, 303</td><td>Gate by probed version, or parse <code>--help</code> once and cache the flag set.</td></tr>
+  <tr class="status-open"><td class="id" title="Little-endian magic only; version &lt;2 or &gt;3 check is a no-op and parse continues.">B-41 <span class="st open" title="Open">Open</span><span class="evidence">Little-endian magic only; version &lt;2 or &gt;3 check is a no-op and parse continues.</span></td><td><span class="badge low">Low</span></td><td>GGUF v1 / big-endian files are misparsed rather than rejected.</td><td class="loc">core/ggufMetadata.ts</td><td>Check magic + version and throw a clear error.</td></tr>
+  <tr class="status-open"><td class="id" title="q8_0 KV still uses 1.0 byte/elt, not 1.0625.">B-42 <span class="st open" title="Open">Open</span><span class="evidence">q8_0 KV still uses 1.0 byte/elt, not 1.0625.</span></td><td><span class="badge low">Low</span></td><td>q8_0 KV cache uses 1.0 byte/elt instead of 1.0625.</td><td class="loc">core/memoryEstimate.ts:478</td><td>Use block-size-aware constants.</td></tr>
+  <tr class="status-done"><td class="id" title="assignLayerDevices uses (k+1)/onGpu cumsum aligned with llama.cpp.">B-43 <span class="st done" title="Done">Done</span><span class="evidence">assignLayerDevices uses (k+1)/onGpu cumsum aligned with llama.cpp.</span></td><td><span class="badge low">Low</span></td><td>GPU layer assignment has an off-by-one in the split boundary.</td><td class="loc">core/gpuSplit.ts:406-418</td><td>Add a test with 2 GPUs and an odd layer count.</td></tr>
+  <tr class="status-open"><td class="id" title="hfLicense.ts is still an if-chain, not a table-driven map.">B-44 <span class="st open" title="Open">Open</span><span class="evidence">hfLicense.ts is still an if-chain, not a table-driven map.</span></td><td><span class="badge low">Low</span></td><td>License bucketing has unreachable branches and mis-buckets some SPDX ids.</td><td class="loc">core/hfLicense.ts:101-114</td><td>Table-driven mapping + tests.</td></tr>
+</table>
+
+<h3>3.4 VS Code extension &amp; sidebar</h3>
+<table>
+  <tr><th style="width:55px">ID</th><th style="width:95px">Sev</th><th>Finding</th><th style="width:230px">Location</th><th>Suggested fix</th></tr>
+  <tr class="status-open"><td class="id" title="5 s status-bar poll does not push the sidebar; crash/TUI stop still stale until a click.">B-45 <span class="st open" title="Open">Open</span><span class="evidence">5 s status-bar poll does not push the sidebar; crash/TUI stop still stale until a click.</span></td><td><span class="badge med">Med</span></td><td>The sidebar never refreshes itself; if the server crashes or is stopped from the TUI it keeps showing "Server ready" until the user clicks something. The 5 s status-bar timer does not push to the sidebar.</td><td class="loc">vscode/extension.ts (setInterval), settingsView.ts</td><td>Share one status poller that emits change events to both status bar and webview.</td></tr>
+  <tr class="status-open"><td class="id" title="resolveWebviewView does not clear this.view on onDidDispose.">B-46 <span class="st open" title="Open">Open</span><span class="evidence">resolveWebviewView does not clear this.view on onDidDispose.</span></td><td><span class="badge med">Med</span></td><td><code>this.view</code> is not cleared on <code>onDidDispose</code>; later <code>postMessage</code> calls hit a disposed webview.</td><td class="loc">vscode/settingsView.ts</td><td>Register <code>webviewView.onDidDispose(() =&gt; this.view = undefined)</code>.</td></tr>
+  <tr class="status-open"><td class="id" title="Silent slider saves avoid some pushState; applyState still overwrites every input with no focus/dirty guard.">B-47 <span class="st open" title="Open">Open</span><span class="evidence">Silent slider saves avoid some pushState; applyState still overwrites every input with no focus/dirty guard.</span></td><td><span class="badge med">Med</span></td><td><code>applyState</code> overwrites every form field on each push, so an in-progress edit is reverted when any background update arrives.</td><td class="loc">vscode/settingsView.ts:3879+</td><td>Skip fields that have focus / dirty flag; diff before writing.</td></tr>
+  <tr class="status-partial"><td class="id" title="confirmIfMemorySpill can use core willSpill; start/reload still prefer the webview live estimator (old kvOnGpu formula).">B-48 <span class="st partial" title="Partial">Partial</span><span class="evidence">confirmIfMemorySpill can use core willSpill; start/reload still prefer the webview live estimator (old kvOnGpu formula).</span></td><td><span class="badge med">Med</span></td><td>The "memory will spill" confirmation trusts <code>willSpill</code> computed by the webview's duplicated estimator, not core. The two estimators already disagree on several inputs (see B-30/31).</td><td class="loc">vscode/settingsView.ts (confirmIfMemorySpill, liveMemoryEstimate 2676-3181)</td><td>Compute on the extension side with core; webview only renders.</td></tr>
+  <tr class="status-open"><td class="id" title="No hash-like general.name fallback to file name.">B-49 <span class="st open" title="Open">Open</span><span class="evidence">No hash-like general.name fallback to file name.</span></td><td><span class="badge low">Low</span></td><td>Model title uses <code>general.name</code> verbatim, which is sometimes a hash ("Dec5630A5621B75…", visible in the shipped screenshot).</td><td class="loc">vscode/settingsView.ts:509</td><td>Fallback to file name when the name looks hash-like (<code>/^[0-9a-f]{12,}$/i</code>).</td></tr>
+  <tr class="status-open"><td class="id" title="afterBackendInstall still calls processManager.start() without claimLaunch().">B-50 <span class="st open" title="Open">Open</span><span class="evidence">afterBackendInstall still calls processManager.start() without claimLaunch().</span></td><td><span class="badge low">Low</span></td><td><code>afterBackendInstall</code> and <code>switchBackend</code> start the server without <code>claimLaunch()</code> or a progress notification.</td><td class="loc">vscode/extension.ts:309, 549-550, 580-581</td><td>Route through the same <code>startServer</code> command.</td></tr>
+  <tr class="status-partial"><td class="id" title="Path links use escAttr/escText; memLines / modelCaps / metrics still assigned via innerHTML.">B-51 <span class="st partial" title="Partial">Partial</span><span class="evidence">Path links use escAttr/escText; memLines / modelCaps / metrics still assigned via innerHTML.</span></td><td><span class="badge low">Low</span></td><td>Warnings/lines and model capabilities are inserted with <code>innerHTML</code> without escaping.</td><td class="loc">vscode/settingsView.ts:3316-3320, 3721</td><td>Use <code>textContent</code> or an <code>esc()</code> helper; add CSP nonce.</td></tr>
+  <tr class="status-done"><td class="id" title="Warm-KV gated with kvBytesWarm &lt; kvBytes; unused _hf / formatBytes leftovers removed.">B-52 <span class="st done" title="Done">Done</span><span class="evidence">Warm-KV gated with kvBytesWarm &lt; kvBytes; unused _hf / formatBytes leftovers removed.</span></td><td><span class="badge low">Low</span></td><td>Dead code: empty <code>if (kvBytesWarm &lt; kvBytes) {}</code> blocks; unused <code>_hf</code> param and <code>formatBytes</code>.</td><td class="loc">settingsView.ts:~3104, ~3120; modelPicker.ts; huggingFace.ts:240</td><td>Remove.</td></tr>
+  <tr class="status-open"><td class="id" title="packages/vscode/package.json has no contributes.configuration.">B-53 <span class="st open" title="Open">Open</span><span class="evidence">packages/vscode/package.json has no contributes.configuration.</span></td><td><span class="badge low">Low</span></td><td>README documents <code>llamaAio.*</code> settings but <code>package.json</code> has no <code>contributes.configuration</code>; the Settings UI shows nothing.</td><td class="loc">README.md, vscode/package.json</td><td>Either add the contribution point or reword the README to point at the sidebar / config.json.</td></tr>
+  <tr class="status-open"><td class="id" title="downloadManager onProgress still emit()s every chunk to the UI.">B-54 <span class="st open" title="Open">Open</span><span class="evidence">downloadManager onProgress still emit()s every chunk to the UI.</span></td><td><span class="badge low">Low</span></td><td>Download progress reports every chunk (tens of thousands of notifications).</td><td class="loc">core/huggingFace.ts:274-318</td><td>Throttle to ~4 Hz or every 1 %.</td></tr>
+</table>
+
+<h3>3.5 TUI</h3>
+<table>
+  <tr><th style="width:55px">ID</th><th style="width:95px">Sev</th><th>Finding</th><th style="width:230px">Location</th><th>Suggested fix</th></tr>
+  <tr class="status-open"><td class="id" title="runApp() still shows the first pane and returns; q uses process.exit(0) so finally dispose is skipped.">B-55 <span class="st open" title="Open">Open</span><span class="evidence">runApp() still shows the first pane and returns; q uses process.exit(0) so finally dispose is skipped.</span></td><td><span class="badge crit">Critical</span></td><td><code>runApp()</code> returns right after <code>showPane("status")</code>; <code>main.ts</code> then calls <code>services.dispose()</code>, tearing down watchers/pollers while the UI is still on screen.</td><td class="loc">tui/main.ts, tui/app.ts:2340-2364</td><td>Return a promise that resolves on quit; dispose in that handler.</td></tr>
+  <tr class="status-open"><td class="id" title="refreshLoad setSelectedIndex still fires SELECTION_CHANGED and clears loadEditing.">B-56 <span class="st open" title="Open">Open</span><span class="evidence">refreshLoad setSelectedIndex still fires SELECTION_CHANGED and clears loadEditing.</span></td><td><span class="badge high">High</span></td><td><code>setSelectedIndex</code> fires <code>selectionChanged</code>, which exits edit mode / drops focus while the user is typing.</td><td class="loc">tui/app.ts:1866-1872, 2195-2202</td><td>Suppress the event for programmatic selection.</td></tr>
+  <tr class="status-open"><td class="id" title="splitGpuCount() is still Math.max(2, gpus.length || 2).">B-57 <span class="st open" title="Open">Open</span><span class="evidence">splitGpuCount() is still Math.max(2, gpus.length || 2).</span></td><td><span class="badge med">Med</span></td><td>Single-GPU systems get a 2-way tensor split and up to 8 phantom GPU rows.</td><td class="loc">tui/app.ts:733-735, 1049-1057</td><td>Use <code>detectGpus().length</code>.</td></tr>
+  <tr class="status-open"><td class="id" title="TUI loadForm bounds are still local, not imported from core.">B-58 <span class="st open" title="Open">Open</span><span class="evidence">TUI loadForm bounds are still local, not imported from core.</span></td><td><span class="badge med">Med</span></td><td>Field bounds in the load form disagree with core's clamping; values are silently changed on save.</td><td class="loc">tui/loadForm.ts:186-207, 364-374, 452-462</td><td>Import bounds from core.</td></tr>
+  <tr class="status-open"><td class="id" title="No shared layout-constant refactor found.">B-59 <span class="st open" title="Open">Open</span><span class="evidence">No shared layout-constant refactor found.</span></td><td><span class="badge med">Med</span></td><td>Detail-bar hit test uses a different width than the render code.</td><td class="loc">tui/app.ts:1252 vs 961</td><td>Single source for layout constants.</td></tr>
+  <tr class="status-open"><td class="id" title="sendChat still refocuses chat input without checking the active pane.">B-60 <span class="st open" title="Open">Open</span><span class="evidence">sendChat still refocuses chat input without checking the active pane.</span></td><td><span class="badge med">Med</span></td><td><code>sendChat</code> refocuses the (hidden) chat input after the pane changed.</td><td class="loc">tui/app.ts:2110-2116</td><td>Check active pane before focusing.</td></tr>
+  <tr class="status-open"><td class="id" title="installBackend still calls setBackend(id) before installOrUpgrade succeeds.">B-61 <span class="st open" title="Open">Open</span><span class="evidence">installBackend still calls setBackend(id) before installOrUpgrade succeeds.</span></td><td><span class="badge med">Med</span></td><td><code>installBackend</code> switches the active backend before the install succeeds.</td><td class="loc">tui/app.ts:1983-1985</td><td>Switch in the success branch.</td></tr>
+  <tr class="status-open"><td class="id" title="No idle header poll / lock-file watcher for TUI status.">B-62 <span class="st open" title="Open">Open</span><span class="evidence">No idle header poll / lock-file watcher for TUI status.</span></td><td><span class="badge med">Med</span></td><td>Header status never refreshes while idle.</td><td class="loc">tui/app.ts:2350-2355</td><td>Poll or subscribe to the lock-file watcher.</td></tr>
+  <tr class="status-partial"><td class="id" title="Esc exits load-edit first; still aborts in-flight chat before HF overlays.">B-63 <span class="st partial" title="Partial">Partial</span><span class="evidence">Esc exits load-edit first; still aborts in-flight chat before HF overlays.</span></td><td><span class="badge low">Low</span></td><td><code>Esc</code> aborts an in-flight chat before closing overlays.</td><td class="loc">tui/app.ts:2237</td><td>Overlay first.</td></tr>
+  <tr class="status-partial"><td class="id" title="Busy-path promises have .catch; not all render-adjacent voids are guarded.">B-64 <span class="st partial" title="Partial">Partial</span><span class="evidence">Busy-path promises have .catch; not all render-adjacent voids are guarded.</span></td><td><span class="badge low">Low</span></td><td>Unhandled promise in the render path.</td><td class="loc">tui/app.ts:808</td><td><code>.catch</code> + status line.</td></tr>
+  <tr class="status-open"><td class="id" title="bin is ./out/main.js; start script still needs node --experimental-ffi; engines node ≥ 26.4.">B-65 <span class="st open" title="Open">Open</span><span class="evidence">bin is ./out/main.js; start script still needs node --experimental-ffi; engines node ≥ 26.4.</span></td><td><span class="badge low">Low</span></td><td>The <code>bin</code> entry is not runnable without <code>--experimental-ffi</code> and Node ≥ 26.4; npm prints EBADENGINE.</td><td class="loc">tui/package.json</td><td>Wrapper script that re-execs node with the flag, and document the requirement.</td></tr>
+  <tr class="status-open"><td class="id" title="q still process.exit(0) without awaiting config flush.">B-66 <span class="st open" title="Open">Open</span><span class="evidence">q still process.exit(0) without awaiting config flush.</span></td><td><span class="badge low">Low</span></td><td><code>q</code> exits before the debounced config write flushes.</td><td class="loc">tui/app.ts:2343</td><td><code>await flush()</code> on quit.</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2 id="perf">4. Performance bottlenecks</h2>
+<p class="lead">Almost all latency in the VS Code extension is <em>self-inflicted</em>: the core API is synchronous, and the extension calls it from event handlers on the extension-host thread. The chat provider adds a separate, much larger problem in Agent mode.</p>
+
+<h3>4.1 What happens when you click a model in the sidebar</h3>
+<div class="flow">
+  <span class="node">webview <code>postMessage</code></span><span class="arrow">→</span>
+  <span class="node">config write (tmp+rename)</span><span class="arrow">→</span>
+  <span class="node slow">pushState()</span><span class="arrow">→</span>
+  <span class="node warn">isHttpReady() ×2 (HTTP)</span><span class="arrow">→</span>
+  <span class="node slow">readGgufMetadata (sync, per-field readSync)</span><span class="arrow">→</span>
+  <span class="node slow">listLocalModelEntries (walk ~25 roots, depth 8)</span><span class="arrow">→</span>
+  <span class="node slow">getInstalledInfo (--version spawnSync)</span><span class="arrow">→</span>
+  <span class="node slow">getUiBackendOptions → detectCudaHardware (sh -c, nvidia-smi 3 s)</span><span class="arrow">→</span>
+  <span class="node slow">detectGpus (spawnSync --list-devices, 8 s timeout)</span><span class="arrow">→</span>
+  <span class="node warn">estimateMemory (re-reads draft GGUF, rescans dir)</span><span class="arrow">→</span>
+  <span class="node warn">findSiblingMtpDraft + mmprojFileSize</span><span class="arrow">→</span>
+  <span class="node">postMessage state</span>
+</div>
+<p>Measured/expected cost per click: <strong>~300 ms warm</strong> on a fast SSD with an NVIDIA GPU; <strong>3–11 s</strong> when the GPU cache is cold, <code>nvidia-smi</code> is missing (waits for the 3 s timeout), or a model root is on a network/slow disk. During this time the whole extension host is blocked — other extensions stall too.</p>
+
+<h3>4.2 Findings</h3>
+<table>
+  <tr><th style="width:55px">ID</th><th style="width:95px">Sev</th><th>Bottleneck</th><th style="width:220px">Location</th><th>Impact</th><th>Fix</th></tr>
+  <tr class="status-done"><td class="id" title="LiveTextGate streams with a short look-ahead tail instead of buffering the whole Agent completion.">P-01 <span class="st done" title="Done">Done</span><span class="evidence">LiveTextGate streams with a short look-ahead tail instead of buffering the whole Agent completion.</span></td><td><span class="badge crit">Critical</span></td><td>When tools are present (Agent mode) the entire completion is buffered to detect <code>&lt;tool_call&gt;</code> XML before any text is emitted.</td><td class="loc">vscode/chatProvider.ts:386-389, 498-512, 625-627</td><td>Zero visible output for the whole generation; 20–90 s "frozen" feel on typical local hardware.</td><td>Stream immediately; hold back only a small tail (length of <code>"&lt;tool_call"</code>) as look-ahead; on detecting the opener, stop emitting text and buffer the block. Native <code>tool_calls</code> deltas already stream — prefer them when the template supports it.</td></tr>
+  <tr class="status-partial"><td class="id" title="Silent slider saves avoid full pushState; many other webview messages still scan/probe.">P-02 <span class="st partial" title="Partial">Partial</span><span class="evidence">Silent slider saves avoid full pushState; many other webview messages still scan/probe.</span></td><td><span class="badge high">High</span></td><td><code>pushState()</code> synchronous chain (above) runs on every message from the webview, including slider drags and toggles.</td><td class="loc">vscode/settingsView.ts:425-585</td><td>0.3–11 s extension-host stall per interaction.</td><td>Make core APIs async (<code>fs.promises</code>, <code>execFile</code>), memoise per-input results (model list by root mtime, GGUF by path+mtime), and split state into independent slices so a slider change only recomputes the estimate.</td></tr>
+  <tr class="status-done"><td class="id" title="detectCudaHardware cached 5 min; status bar caches getInstalledInfo for 60 s; tick no longer re-probes CUDA every 5 s.">P-03 <span class="st done" title="Done">Done</span><span class="evidence">detectCudaHardware cached 5 min; status bar caches getInstalledInfo for 60 s; tick no longer re-probes CUDA every 5 s.</span></td><td><span class="badge high">High</span></td><td>Status-bar <code>setInterval</code> (5 s) calls <code>getInstalledInfo()</code> → <code>resolveActiveUiBackend</code> → <code>detectCudaHardware</code> (<code>sh -c command -v</code>, <code>nvidia-smi -L</code>) uncached, plus <code>getStatus()</code>, in every window.</td><td class="loc">vscode/extension.ts, core/llamaInstaller.ts:588, 602, 1109, 1171</td><td>2–4 process spawns every 5 s per VS Code window, forever; on GPU-less machines a 3 s block every 5 s.</td><td>Cache CUDA/backends detection for the session; poll only <code>isHttpReady</code>; refresh installed info on install/switch events.</td></tr>
+  <tr class="status-open"><td class="id" title="Header is memoised, but first parse still uses per-field readSync via readExact.">P-04 <span class="st open" title="Open">Open</span><span class="evidence">Header is memoised, but first parse still uses per-field readSync via readExact.</span></td><td><span class="badge high">High</span></td><td>GGUF header parsing uses one <code>fs.readSync</code> per field (<code>readExact</code>).</td><td class="loc">core/ggufMetadata.ts:113-140, 179-192</td><td>~750 k syscalls for a large model with many tensors; 100–600 ms per read; done repeatedly (see P-05).</td><td>Read the header in 1 MiB chunks into a buffer and parse from memory; cache by path+mtime+size.</td></tr>
+  <tr class="status-done"><td class="id" title="readModelCapabilities memoised (capsCache); draft caps optional so recommend loops skip re-reads.">P-05 <span class="st done" title="Done">Done</span><span class="evidence">readModelCapabilities memoised (capsCache); draft caps optional so recommend loops skip re-reads.</span></td><td><span class="badge high">High</span></td><td><code>estimateMemory</code> re-reads the draft GGUF and rescans the model directory; <code>recommendSettings</code> calls it 50–150× in its search loops.</td><td class="loc">core/memoryEstimate.ts:709-732, core/recommendSettings.ts:102-113, 310-340, 447-475</td><td>"Recommend" and "Auto" buttons take seconds; combined with P-04 this is the slowest UI path after P-01.</td><td>Pass pre-read metadata into the estimator; memoise the draft lookup; make the search loop analytic (KV is linear in ctx).</td></tr>
+  <tr class="status-open"><td class="id" title="Start wait still sleeps 400 ms and re-runs ss/netstat plus full-file log scans each tick.">P-06 <span class="st open" title="Open">Open</span><span class="evidence">Start wait still sleeps 400 ms and re-runs ss/netstat plus full-file log scans each tick.</span></td><td><span class="badge high">High</span></td><td>Start wait loop (400 ms) runs synchronous <code>ss</code>/<code>netstat</code> and re-reads the whole log file every tick for up to 180 s.</td><td class="loc">core/processManager.ts:517-585</td><td>Extension host blocked in bursts throughout model loading — exactly when the user is watching the progress notification.</td><td>Poll HTTP only; tail the log incrementally from the last offset; async spawn.</td></tr>
+  <tr class="status-done"><td class="id" title="getStatus clears a stale lock when the PID is dead and no launch lock is held.">P-07 <span class="st done" title="Done">Done</span><span class="evidence">getStatus clears a stale lock when the PID is dead and no launch lock is held.</span></td><td><span class="badge med">Med</span></td><td>Stale lock (dead PID) triggers a port scan on every <code>getStatus()</code> until the lock is removed.</td><td class="loc">core/processManager.ts:180-202</td><td>Extra spawn every 5 s after any crash.</td><td>Remove/mark the lock as stale on first detection.</td></tr>
+  <tr class="status-done"><td class="id" title="nixCompat probeCache remembers failed --version probes by mtime/size.">P-08 <span class="st done" title="Done">Done</span><span class="evidence">nixCompat probeCache remembers failed --version probes by mtime/size.</span></td><td><span class="badge med">Med</span></td><td>Failed <code>--version</code> probes are not cached (only successes).</td><td class="loc">core/nixCompat.ts:175-187, llamaInstaller.ts:1171</td><td>Broken binary → 8 s probe on every refresh.</td><td>Negative cache keyed by mtime/size.</td></tr>
+  <tr class="status-open"><td class="id" title="Model picker still wraps synchronous library scans in withProgress (list-then-badges is only a partial paint).">P-09 <span class="st open" title="Open">Open</span><span class="evidence">Model picker still wraps synchronous library scans in withProgress (list-then-badges is only a partial paint).</span></td><td><span class="badge med">Med</span></td><td>Model pickers wrap synchronous work in <code>withProgress</code>; the notification never paints. The draft picker reads every GGUF header.</td><td class="loc">vscode/modelPicker.ts:58-65, 164-212</td><td>Perceived hang with no feedback (1–5 s).</td><td>Async + cached metadata; show the list first and fill details lazily.</td></tr>
+  <tr class="status-done"><td class="id" title="Download manager: pause/resume/cancel, Range, sha256, gated 401/403.">P-10 <span class="st done" title="Done">Done</span><span class="evidence">Download manager: pause/resume/cancel, Range, sha256, gated 401/403.</span></td><td><span class="badge med">Med</span></td><td>Downloads are modal, non-cancellable, without idle timeout or resume.</td><td class="loc">vscode/huggingFace.ts, core/huggingFace.ts</td><td>A 20 GB download blocks the flow; a network hiccup restarts from zero.</td><td>Download manager (F-03).</td></tr>
+  <tr class="status-done"><td class="id" title="License enrichment short-circuits on tags and batches remaining detail fetches at concurrency 6.">P-11 <span class="st done" title="Done">Done</span><span class="evidence">License enrichment short-circuits on tags and batches remaining detail fetches at concurrency 6.</span></td><td><span class="badge med">Med</span></td><td>License enrichment is N+1 (one request per model).</td><td class="loc">core/huggingFace.ts:348-376</td><td>Search results appear late.</td><td>Batch with <code>?expand[]=cardData</code> / limit concurrency and show results before licenses.</td></tr>
+  <tr class="status-open"><td class="id" title="Chat path still does multiple HTTP probes / estimates per request.">P-12 <span class="st open" title="Open">Open</span><span class="evidence">Chat path still does multiple HTTP probes / estimates per request.</span></td><td><span class="badge low">Low</span></td><td>Each chat request performs 3 HTTP probes and estimates tokens 4×.</td><td class="loc">vscode/chatProvider.ts</td><td>+50–150 ms first-token latency.</td><td>One readiness probe with short TTL; compute the estimate once.</td></tr>
+  <tr class="status-done"><td class="id" title="TUI load writes are debounced (~120 ms scheduleLoadPatch) instead of sync work per keypress.">P-13 <span class="st done" title="Done">Done</span><span class="evidence">TUI load writes are debounced (~120 ms scheduleLoadPatch) instead of sync work per keypress.</span></td><td><span class="badge med">Med</span></td><td>TUI runs synchronous spawns (<code>getStatus</code>, GPU detection) per keypress in some panes.</td><td class="loc">tui/app.ts:728-731, 839-841</td><td>Input lag / dropped keys.</td><td>Background refresh with cached snapshot.</td></tr>
+  <tr class="status-done"><td class="id" title="refreshAll walks model roots only when the model pane is active.">P-14 <span class="st done" title="Done">Done</span><span class="evidence">refreshAll walks model roots only when the model pane is active.</span></td><td><span class="badge med">Med</span></td><td>TUI walks all model roots on every pane refresh.</td><td class="loc">tui/app.ts</td><td>Pane switch takes 0.5–3 s.</td><td>Cache + fs watcher.</td></tr>
+  <tr class="status-partial"><td class="id" title="Download panel sets retainContextWhenHidden; settings webview does not.">P-15 <span class="st partial" title="Partial">Partial</span><span class="evidence">Download panel sets retainContextWhenHidden; settings webview does not.</span></td><td><span class="badge low">Low</span></td><td>Webview is torn down when hidden (<code>retainContextWhenHidden</code> off) so every re-show reruns <code>pushState</code>.</td><td class="loc">vscode/settingsView.ts</td><td>Stall when switching sidebars.</td><td>Either retain context or make the initial push cheap (cached slices).</td></tr>
+</table>
+
+<h3>4.3 Agent-mode timeline (P-01)</h3>
+<div class="timeline">
+  <div><strong>Today</strong></div><div class="track"><span class="wait" style="left:0;width:82%">buffering… (nothing shown)</span><span class="tok" style="left:82%;width:14%">all text</span><span class="tool" style="left:96%;width:4%"></span></div>
+  <div><strong>Proposed</strong></div><div class="track"><span class="wait" style="left:0;width:4%"></span><span class="tok" style="left:4%;width:88%">tokens streamed as generated (tail held back: 10 chars)</span><span class="tool" style="left:92%;width:8%">tool call</span></div>
+</div>
+<p>Streaming with a small look-ahead keeps the false-positive protection (the opener is only 10 characters) while restoring time-to-first-token to what Ask mode already has.</p>
+
+<!-- ============================================================ -->
+<h2 id="gui">5. GUI review &amp; mockups</h2>
+<p class="lead">The sidebar is feature-rich but reads like a settings dump: five stacked cards, three memory bars, ~40 controls, and long explanatory text, all visible at once. The recommendations below focus on <strong>progressive disclosure</strong>, one clear answer per question ("does it fit?", "is it running?") and getting rid of modal, non-cancellable flows.</p>
+
+
+<h3 id="mockup-status">5.0 Mockup status</h3>
+<table>
+  <tr><th style="width:70px">ID</th><th style="width:110px">Status</th><th>Note</th></tr>
+  <tr class="status-partial"><td class="id">M1 <span class="st partial" title="Partial">Partial</span></td><td>Partial</td><td>Server card + some &lt;details&gt;; not the accordion header with model·ctx·ngl·port.</td></tr>
+  <tr class="status-open"><td class="id">M2 <span class="st open" title="Open">Open</span></td><td>Open</td><td>No one-sentence fit verdict + one bar + one-click recommend chips.</td></tr>
+  <tr class="status-partial"><td class="id">M3 <span class="st partial" title="Partial">Partial</span></td><td>Partial</td><td>Fit badges on the model picker; shards collapsed (B-38).</td></tr>
+  <tr class="status-open"><td class="id">M4 <span class="st open" title="Open">Open</span></td><td>Open</td><td>No first-run wizard.</td></tr>
+  <tr class="status-done"><td class="id">M5 <span class="st done" title="Done">Done</span></td><td>Done</td><td>Download panel matches the pause/resume/gated/sha256 story.</td></tr>
+  <tr class="status-open"><td class="id">M6 <span class="st open" title="Open">Open</span></td><td>Open</td><td>Status QuickPick not implemented.</td></tr>
+  <tr class="status-done"><td class="id">M7 <span class="st done" title="Done">Done</span></td><td>Done</td><td>Agent-mode streaming shipped (P-01 / F-01).</td></tr>
+  <tr class="status-open"><td class="id">M8 <span class="st open" title="Open">Open</span></td><td>Open</td><td>TUI help overlay not implemented.</td></tr>
+</table>
+
+<h3>5.1 Issues</h3>
+<table>
+  <tr><th style="width:55px">ID</th><th>Issue</th><th>Recommendation</th></tr>
+  <tr class="status-partial"><td class="id" title="Several collapsible details sections exist (advanced, memory, perf history); sidebar is still a long stacked dump.">G-01 <span class="st partial" title="Partial">Partial</span><span class="evidence">Several collapsible details sections exist (advanced, memory, perf history); sidebar is still a long stacked dump.</span></td><td>Endless vertical scroll; everything is always expanded.</td><td>Compact status header + collapsible sections; remember open/closed state (M1).</td></tr>
+  <tr class="status-partial"><td class="id" title="Performance card was compacted (dual-axis chart + collapsed history); Copilot options still live there.">G-02 <span class="st partial" title="Partial">Partial</span><span class="evidence">Performance card was compacted (dual-axis chart + collapsed history); Copilot options still live there.</span></td><td>"Performance" card mixes unrelated items (Copilot stats, slots, context toasts).</td><td>Move Copilot-specific items into a "Copilot Chat" section; keep server stats with the server.</td></tr>
+  <tr class="status-partial"><td class="id" title="#serverCard exists; title is still “Server”, not model · ctx · ngl · port.">G-03 <span class="st partial" title="Partial">Partial</span><span class="evidence">#serverCard exists; title is still “Server”, not model · ctx · ngl · port.</span></td><td>Server card lacks a model summary; you must scroll to see what is loaded.</td><td>Header shows <em>model · ctx · GPU layers · port</em> in one line (M1).</td></tr>
+  <tr class="status-partial"><td class="id" title="Three memory bars remain; spill/fit warnings and a details drawer are improved.">G-04 <span class="st partial" title="Partial">Partial</span><span class="evidence">Three memory bars remain; spill/fit warnings and a details drawer are improved.</span></td><td>Memory section shows three bars, raw byte counts, warm/cold variants and several warnings — information overload.</td><td>One "fit verdict" sentence + one stacked bar per device; details behind a "Show breakdown" link (M2).</td></tr>
+  <tr class="status-partial"><td class="id" title="Backend can be switched from the sidebar; label is still dense (installed / PATH / nix).">G-05 <span class="st partial" title="Partial">Partial</span><span class="evidence">Backend can be switched from the sidebar; label is still dense (installed / PATH / nix).</span></td><td>Backend labels are overloaded ("Installed: cuda (b6120) · PATH · nix …").</td><td>Show active backend + version; move alternatives to a QuickPick.</td></tr>
+  <tr class="status-open"><td class="id" title="Status is still a joined toast / meta line, not a QuickPick with actions.">G-06 <span class="st open" title="Open">Open</span><span class="evidence">Status is still a joined toast / meta line, not a QuickPick with actions.</span></td><td><code>showStatus</code> joins many lines with " | " into a single toast that gets truncated.</td><td>Status QuickPick with actions (M6).</td></tr>
+  <tr class="status-open"><td class="id" title="promptUseInCopilotChat still runs after start/reload; no Don't ask again / globalState.">G-07 <span class="st open" title="Open">Open</span><span class="evidence">promptUseInCopilotChat still runs after start/reload; no Don't ask again / globalState.</span></td><td>"Use in Copilot Chat?" prompt after <em>every</em> start/reload.</td><td>Ask once; remember the answer in <code>globalState</code>; add a "Don't ask again".</td></tr>
+  <tr class="status-partial"><td class="id" title="formatBytes uses GiB; some hash-like names and mixed units remain (B-49).">G-08 <span class="st partial" title="Partial">Partial</span><span class="evidence">formatBytes uses GiB; some hash-like names and mixed units remain (B-49).</span></td><td>Inconsistent units (GiB/GB/MB), emoji indicators, hash-like model names (B-49).</td><td>One formatter (<code>GiB</code>, one decimal), codicons instead of emoji, name fallback.</td></tr>
+  <tr class="status-done"><td class="id" title="Model picker shows size and fit badges (formatBytes + fit icon).">G-09 <span class="st done" title="Done">Done</span><span class="evidence">Model picker shows size and fit badges (formatBytes + fit icon).</span></td><td>Model picker shows plain file names; no size/quant/fit hints.</td><td>QuickPick with badges (M3).</td></tr>
+  <tr class="status-partial"><td class="id" title="Preset chips highlight the active preset; no explicit Custom chip on manual edit.">G-10 <span class="st partial" title="Partial">Partial</span><span class="evidence">Preset chips highlight the active preset; no explicit Custom chip on manual edit.</span></td><td>Presets and sliders interact unpredictably (which preset is "active" after a manual change?).</td><td>Preset chips deselect on manual edit; "Custom" chip appears (M2).</td></tr>
+  <tr class="status-done"><td class="id" title="Advanced and request defaults sit in collapsible details sections.">G-11 <span class="st done" title="Done">Done</span><span class="evidence">Advanced and request defaults sit in collapsible details sections.</span></td><td>Advanced options are a flat list of ~20 controls.</td><td>Group: <em>Context &amp; KV</em>, <em>GPU &amp; offload</em>, <em>Speculative</em>, <em>Multimodal</em>, <em>Server</em>.</td></tr>
+  <tr class="status-partial"><td class="id" title="Download panel has pause/resume/cancel/gated; HF still starts with modal QuickPicks.">G-12 <span class="st partial" title="Partial">Partial</span><span class="evidence">Download panel has pause/resume/cancel/gated; HF still starts with modal QuickPicks.</span></td><td>HF download is a chain of modal QuickPicks and a non-cancellable progress notification.</td><td>Download manager section with cancel/pause/resume (M5).</td></tr>
+  <tr class="status-open"><td class="id" title="No Output channel, Open log, or Copy command line in the UI.">G-13 <span class="st open" title="Open">Open</span><span class="evidence">No Output channel, Open log, or Copy command line in the UI.</span></td><td>No way to see the command line or the log from the UI.</td><td>"Copy command line" and "Open log" buttons; Output channel (M1, F-02).</td></tr>
+  <tr class="status-open"><td class="id" title="TUI has no ? help overlay or persistent key hint bar.">G-14 <span class="st open" title="Open">Open</span><span class="evidence">TUI has no ? help overlay or persistent key hint bar.</span></td><td>TUI shortcuts are undiscoverable.</td><td><code>?</code> help overlay and a persistent key hint bar (M8).</td></tr>
+  <tr class="status-open"><td class="id" title="No webviewState persistence for scroll / expanded sections.">G-15 <span class="st open" title="Open">Open</span><span class="evidence">No webviewState persistence for scroll / expanded sections.</span></td><td>Sidebar loses scroll/expanded state when hidden.</td><td>Persist UI state in <code>webviewState</code>.</td></tr>
+</table>
+
+<h3>5.2 Mockup M1 — Restructured sidebar (current vs proposed)</h3>
+<div class="mockwrap">
+  <div>
+    <p class="mocklabel">Current (schematic of shipped v0.1.17)</p>
+    <div class="vs">
+      <div class="titlebar"><span>Llama AIO</span><span>…</span></div>
+      <div class="body">
+        <div class="vcard"><h5>Server</h5>
+          <div class="row"><span><span class="dot ok"></span>Server ready · 127.0.0.1:8080</span></div>
+          <div class="btnrow"><span class="btn">Start</span><span class="btn sec">Stop</span><span class="btn sec">Reload</span><span class="btn sec">Status</span></div>
+        </div>
+        <div class="vcard"><h5>Performance</h5>
+          <div class="row dim"><span>Prompt tok/s</span><span>412</span></div>
+          <div class="row dim"><span>Gen tok/s</span><span>38.2</span></div>
+          <div class="row dim"><span>Context used</span><span>12 %</span></div>
+          <div class="row dim"><span>Slots</span><span>1 / 4</span></div>
+          <div class="row dim"><span>Copilot requests</span><span>17</span></div>
+        </div>
+        <div class="vcard"><h5>llama.cpp</h5>
+          <div class="row dim"><span>Installed: cuda (b6120) · PATH: b6098 · nix: —</span></div>
+          <div class="btnrow"><span class="btn sec small">Install…</span><span class="btn sec small">Switch…</span><span class="btn sec small">Check updates</span></div>
+        </div>
+        <div class="vcard"><h5>Model</h5>
+          <div class="row"><span style="font-size:13px">Dec5630A5621B75…</span></div>
+          <div class="row dim"><span>Q4_K_M · 32 layers · 8.1 GB</span></div>
+          <div class="btnrow"><span class="btn sec small">Choose…</span><span class="btn sec small">Hugging Face…</span></div>
+        </div>
+        <div class="vcard"><h5>Load settings</h5>
+          <div class="row"><span>Context</span><span class="input">32768</span></div>
+          <div class="row"><span>GPU layers</span><span class="input">99</span></div>
+          <div class="row"><span>Slots</span><span class="input">4</span></div>
+          <div class="row"><span>Flash attention</span><span>☑</span></div>
+          <div class="row"><span>KV type K</span><span class="input">q8_0</span></div>
+          <div class="row"><span>KV type V</span><span class="input">q8_0</span></div>
+          <div><span class="chip on">Balanced</span><span class="chip">Coding</span><span class="chip">Max ctx</span><span class="chip">CPU</span></div>
+          <div class="dim" style="margin-top:6px">GPU 0 VRAM 11.2 / 12.0 GiB</div><div class="mbar"><span class="seg-w" style="width:62%"></span><span class="seg-k" style="width:24%"></span><span class="seg-c" style="width:7%"></span></div>
+          <div class="dim">System RAM 6.4 / 32.0 GiB</div><div class="mbar"><span class="seg-w" style="width:14%"></span><span class="seg-o" style="width:6%"></span></div>
+          <div class="dim">Warm (after 1st request) 11.6 / 12.0 GiB</div><div class="mbar"><span class="seg-w" style="width:62%"></span><span class="seg-k" style="width:24%"></span><span class="seg-c" style="width:11%"></span></div>
+          <div class="dim" style="font-size:11px">⚠ 93 % of VRAM · KV 2.9 GiB · compute 0.8 GiB · mmproj — · draft — · ⚠ q8_0 V needs flash-attn</div>
+          <div class="row"><span>Draft model</span><span class="input">none</span></div>
+          <div class="row"><span>n-cpu-moe</span><span class="input">0</span></div>
+          <div class="row"><span>Tensor split</span><span class="input">auto</span></div>
+          <div class="dim">… 12 more controls …</div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div>
+    <p class="mocklabel">Proposed</p>
+    <div class="vs">
+      <div class="titlebar"><span>Llama AIO</span><span>⟳ ⋯</span></div>
+      <div class="body">
+        <div class="vcard">
+          <div class="row"><span><span class="dot ok"></span><strong>Running</strong> · :8080 · 38 tok/s</span><span class="btn small sec">Stop</span></div>
+          <div class="row dim" style="font-size:11.5px"><span>Qwen3-Coder-30B · Q4_K_M · ctx 32k · 99 GPU layers</span></div>
+          <div class="btnrow"><span class="btn small sec">Reload</span><span class="btn small sec">Open log</span><span class="btn small sec">Copy command</span></div>
+        </div>
+        <div class="acc open"><span><span class="tw">▾</span>Model</span><span class="dim">Qwen3-Coder-30B-A3B</span></div>
+        <div class="acc-body">
+          <div class="select">Qwen3-Coder-30B-A3B-Instruct · Q4_K_M · 17.3 GiB</div>
+          <div class="btnrow"><span class="btn small sec">Browse Hugging Face…</span><span class="btn small sec">Manage roots</span></div>
+        </div>
+        <div class="acc open"><span><span class="tw">▾</span>Memory &amp; load</span><span class="dim">Fits · 93 % VRAM</span></div>
+        <div class="acc-body">
+          <div class="verdict good">✓ Fits on GPU 0 with 0.8 GiB to spare (warm)</div>
+          <div class="mbar"><span class="seg-w" style="width:62%"></span><span class="seg-k" style="width:24%"></span><span class="seg-c" style="width:7%"></span></div>
+          <div class="row dim" style="font-size:11px"><span>■ weights 7.4 · ■ KV 2.9 · ■ compute 0.8 GiB</span><span>details ›</span></div>
+          <div class="row"><span>Context</span><span class="input">32 k</span></div>
+          <div class="row"><span>GPU layers</span><span class="input">all</span></div>
+          <div style="margin-top:4px"><span class="chip on">Balanced</span><span class="chip">Coding</span><span class="chip">Max context</span><span class="chip">Custom</span></div>
+        </div>
+        <div class="acc"><span><span class="tw">▸</span>Advanced</span><span class="dim">KV q8_0 · FA on · 4 slots</span></div>
+        <div class="acc"><span><span class="tw">▸</span>Copilot Chat</span><span class="dim">enabled · 17 requests</span></div>
+        <div class="acc"><span><span class="tw">▸</span>llama.cpp backend</span><span class="dim">cuda b6120 · up to date</span></div>
+        <div class="acc"><span><span class="tw">▸</span>Diagnostics</span><span class="dim">GPU 0 · 12 GiB</span></div>
+      </div>
+    </div>
+  </div>
+</div>
+<p><strong>Rationale.</strong> The header answers "is it running, with what?" without scrolling. Each accordion row carries a one-line summary so collapsed sections still convey state. Presets become a single row of chips with an explicit <em>Custom</em> state (G-10). The three memory bars collapse into one bar plus a verdict (M2).</p>
+
+<h3>5.3 Mockup M2 — Memory "fit verdict"</h3>
+<div class="mockwrap">
+  <div class="vs">
+    <div class="titlebar"><span>Memory &amp; load</span></div>
+    <div class="body">
+      <div class="verdict good">✓ Fits on GPU 0 — 0.8 GiB free after warm-up</div>
+      <div class="dim" style="font-size:11px">GPU 0 · RTX 4070 · 12 GiB</div>
+      <div class="mbar"><span class="seg-w" style="width:62%"></span><span class="seg-k" style="width:24%"></span><span class="seg-c" style="width:7%"></span></div>
+      <div class="dim" style="font-size:11px">RAM · 32 GiB</div>
+      <div class="mbar"><span class="seg-w" style="width:3%"></span><span class="seg-o" style="width:4%"></span></div>
+      <div class="row dim" style="font-size:11px"><span>■ weights ■ KV cache ■ compute ■ other</span><span>Show breakdown ›</span></div>
+    </div>
+  </div>
+  <div class="vs">
+    <div class="titlebar"><span>Memory &amp; load — over budget</span></div>
+    <div class="body">
+      <div class="verdict warnv">⚠ 2.1 GiB over VRAM. Try: <u>ctx 16k</u> · <u>KV q4_0</u> · <u>offload 6 layers</u></div>
+      <div class="dim" style="font-size:11px">GPU 0 · RTX 4070 · 12 GiB</div>
+      <div class="mbar"><span class="seg-w" style="width:70%"></span><span class="seg-k" style="width:30%"></span></div>
+      <div class="row dim" style="font-size:11px"><span>spill → RAM 2.1 GiB</span><span>Show breakdown ›</span></div>
+      <div class="btnrow"><span class="btn small">Apply "ctx 16k"</span><span class="btn small sec">Recommend for me</span></div>
+    </div>
+  </div>
+</div>
+<p>One sentence tells the user whether the configuration works; the suggested fixes are one-click links generated from the same search that <code>recommendSettings</code> already performs. Warm/cold detail moves into the breakdown drawer.</p>
+
+<h3>5.4 Mockup M3 — Model picker with badges</h3>
+<div class="mockwrap">
+  <div class="vs wide">
+    <div class="titlebar"><span>Select model</span></div>
+    <div class="body">
+      <div class="qp" style="width:auto">
+        <div class="search">qwen</div>
+        <div class="item sel"><span class="t">Qwen3-Coder-30B-A3B-Instruct-Q4_K_M<span class="tag cur">current</span><span class="tag fit">fits</span></span><span class="dim">17.3 GiB</span><span class="d">~/models/qwen · MoE 128×3B · ctx 262k · tools ✓ · vision ✗</span></div>
+        <div class="item"><span class="t">Qwen2.5-Coder-14B-Instruct-Q6_K<span class="tag fit">fits</span></span><span class="dim">12.1 GiB</span><span class="d">~/models · dense · ctx 32k · tools ✓</span></div>
+        <div class="item"><span class="t">Qwen3-32B-Q5_K_M<span class="tag tight">tight</span></span><span class="dim">23.2 GiB</span><span class="d">~/.cache/huggingface · dense · needs 9 layers on CPU</span></div>
+        <div class="item"><span class="t">Qwen3-235B-A22B-Q3_K_S<span class="tag nofit">won't fit</span><span class="tag">5 shards</span></span><span class="dim">98.0 GiB</span><span class="d">/mnt/nas/models · MoE · 66 GiB over RAM+VRAM</span></div>
+        <div class="item dim" style="font-size:11.5px">$(cloud-download) Search Hugging Face for "qwen"…</div>
+      </div>
+    </div>
+  </div>
+</div>
+<p>The fit badge is computed from cached metadata against the current load settings; shards are collapsed into one entry (B-38); the last row hands off to the HF flow so the user does not need to know two separate commands.</p>
+
+<h3>5.5 Mockup M4 — First-run wizard</h3>
+<div class="mockwrap">
+  <div class="vs">
+    <div class="titlebar"><span>Llama AIO · Setup</span></div>
+    <div class="body">
+      <div class="stepper"><div class="step done"><div class="n">✓</div>Backend</div><div class="step cur"><div class="n">2</div>Model</div><div class="step"><div class="n">3</div>Copilot</div></div>
+      <div class="vcard"><h5>Pick a model</h5>
+        <div class="dim" style="font-size:11.5px;margin-bottom:8px">Detected: RTX 4070 · 12 GiB VRAM · 32 GiB RAM. Recommended for coding:</div>
+        <div class="row"><span>Qwen3-Coder-30B-A3B · Q4_K_M</span><span class="btn small">Download 17 GiB</span></div>
+        <div class="row"><span>Qwen2.5-Coder-14B · Q5_K_M</span><span class="btn small sec">Download 10 GiB</span></div>
+        <div class="row"><span>gpt-oss-20b · MXFP4</span><span class="btn small sec">Download 12 GiB</span></div>
+        <div class="btnrow"><span class="btn small sec">I already have GGUF files…</span></div>
+      </div>
+      <div class="row dim"><span>Step 2 of 3</span><span>Skip setup</span></div>
+    </div>
+  </div>
+</div>
+<p>Replaces the current sequence of separate commands (install backend → choose model → start → "use in Copilot?") with a guided flow that runs once and can be re-opened from the command palette.</p>
+
+<h3>5.6 Mockup M5 — Download manager</h3>
+<div class="mockwrap">
+  <div class="vs">
+    <div class="titlebar"><span>Downloads</span></div>
+    <div class="body">
+      <div class="vcard">
+        <div class="row"><span>Qwen3-Coder-30B-A3B-Q4_K_M.gguf</span><span class="dim">6.8 / 17.3 GiB</span></div>
+        <div class="progress"><span style="width:39%"></span></div>
+        <div class="row dim" style="font-size:11px"><span>48 MB/s · 3 min left · sha256 verifying on the fly</span><span><span class="btn small sec">Pause</span> <span class="btn small sec">Cancel</span></span></div>
+      </div>
+      <div class="vcard">
+        <div class="row"><span>mmproj-Qwen3-VL-F16.gguf</span><span class="dim">paused</span></div>
+        <div class="progress"><span style="width:71%;background:#777"></span></div>
+        <div class="row dim" style="font-size:11px"><span>1.2 / 1.7 GiB · resumable</span><span><span class="btn small">Resume</span></span></div>
+      </div>
+      <div class="vcard">
+        <div class="row"><span>gemma-3-27b-it-Q4_K_M.gguf</span><span style="color:var(--vs-red)">gated</span></div>
+        <div class="row dim" style="font-size:11px"><span>Accept the licence on huggingface.co and add a token.</span><span><span class="btn small sec">Open page</span> <span class="btn small sec">Set token</span></span></div>
+      </div>
+    </div>
+  </div>
+</div>
+<p>Non-modal, cancellable, resumable (HTTP <code>Range</code>), verified (size + sha256 from <code>lfs.oid</code>), and it explains gated/401 responses instead of failing generically.</p>
+
+<h3>5.7 Mockup M6 — Status QuickPick instead of a toast</h3>
+<div class="mockwrap">
+  <div>
+    <p class="mocklabel">Current</p>
+    <div class="vs" style="width:420px"><div class="body"><div class="toast">Llama AIO: Server ready | PID 48213 | 127.0.0.1:8080 | Model: Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf | ctx 32768 | ngl 99 | backend cuda b6120 | log: ~/.llama-aio-vs/runtime/llama-server.log | slots 1/4 | …</div></div></div>
+  </div>
+  <div>
+    <p class="mocklabel">Proposed</p>
+    <div class="vs wide"><div class="body"><div class="qp" style="width:auto">
+      <div class="search">Llama AIO status</div>
+      <div class="item"><span class="t"><span class="dot ok"></span>Running · PID 48213 · 127.0.0.1:8080 · up 42 min</span><span class="dim">cuda b6120</span></div>
+      <div class="item"><span class="t">Qwen3-Coder-30B-A3B-Instruct · Q4_K_M</span><span class="dim">ctx 32k · ngl 99 · 4 slots</span></div>
+      <div class="item sel"><span class="t">$(output) Open server log</span></div>
+      <div class="item"><span class="t">$(clippy) Copy command line</span></div>
+      <div class="item"><span class="t">$(debug-restart) Reload</span><span class="dim">apply pending changes</span></div>
+      <div class="item"><span class="t">$(debug-stop) Stop</span></div>
+    </div></div></div>
+  </div>
+</div>
+
+<h3>5.8 Mockup M7 — Agent-mode streaming (see P-01)</h3>
+<p>Covered by the timeline in section 4.3; the user-visible change is that Copilot Agent shows tokens as they are generated instead of a spinner for the whole generation.</p>
+
+<h3>5.9 Mockup M8 — TUI help overlay and key bar</h3>
+<div class="mockwrap">
+  <div class="vs" style="width:520px"><div class="tui">┌─ Llama AIO ────────────────────── <span class="h">● running</span> · Qwen3-Coder-30B · 38 tok/s ─┐
+│ <span class="k">1</span> Status  <span class="k">2</span> Models  <span class="k">3</span> Load  <span class="k">4</span> Chat  <span class="k">5</span> Backend  <span class="k">6</span> Log       │
+│                                                                    │
+│   ╭─ Keys ───────────────────────────────────────────────╮         │
+│   │  <span class="k">s</span> start/stop server     <span class="k">r</span> reload with new settings  │         │
+│   │  <span class="k">Enter</span> edit field        <span class="k">Esc</span> cancel edit / close      │         │
+│   │  <span class="k">Tab</span> next field          <span class="k">/</span> filter models             │         │
+│   │  <span class="k">a</span> auto-recommend        <span class="k">p</span> presets                    │         │
+│   │  <span class="k">?</span> this help             <span class="k">q</span> quit (saves settings)     │         │
+│   ╰──────────────────────────────────────────────────────╯         │
+│                                                                    │
+└─ <span class="k">?</span> help · <span class="k">s</span> start · <span class="k">r</span> reload · <span class="k">q</span> quit ─────────────────────────────┘</div></div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="features">6. New features &amp; improvements</h2>
+<table>
+  <tr><th style="width:55px">ID</th><th style="width:90px">Effort</th><th>Proposal</th><th>Value</th></tr>
+  <tr class="status-done"><td class="id" title="Shipped as LiveTextGate (P-01).">F-01 <span class="st done" title="Done">Done</span><span class="evidence">Shipped as LiveTextGate (P-01).</span></td><td><span class="badge info">Small</span></td><td><strong>Stream in Agent mode</strong> with look-ahead tail (P-01).</td><td>Biggest perceived-performance win; no new UI.</td></tr>
+  <tr class="status-open"><td class="id" title="No Output channel / Open log / Copy command line.">F-02 <span class="st open" title="Open">Open</span><span class="evidence">No Output channel / Open log / Copy command line.</span></td><td><span class="badge info">Small</span></td><td><strong>Output channel + "Open log" + "Copy command line"</strong>; surface the last 20 log lines when start fails.</td><td>Turns "server failed to start (180 s)" into an actionable error.</td></tr>
+  <tr class="status-done"><td class="id" title="downloadManager + downloadPanel: pause/resume/cancel, sha256, gated guidance, HF_ENDPOINT.">F-03 <span class="st done" title="Done">Done</span><span class="evidence">downloadManager + downloadPanel: pause/resume/cancel, sha256, gated guidance, HF_ENDPOINT.</span></td><td><span class="badge med">Medium</span></td><td><strong>Download manager</strong>: cancel, pause/resume, size+sha256 check, gated-repo guidance, proxy/<code>HF_ENDPOINT</code> support (M5).</td><td>Fixes B-32/33, P-10, G-12.</td></tr>
+  <tr class="status-open"><td class="id" title="Core APIs are still largely synchronous; caching is incremental only.">F-04 <span class="st open" title="Open">Open</span><span class="evidence">Core APIs are still largely synchronous; caching is incremental only.</span></td><td><span class="badge high">Large</span></td><td><strong>Async core API</strong> (<code>fs.promises</code>, <code>execFile</code>) with memoisation (model list by root mtime, GGUF by path+mtime, GPU/backends per session).</td><td>Removes nearly all UI stalls (P-02…P-09, P-13, P-14). Can be done incrementally behind <code>*Async</code> variants.</td></tr>
+  <tr class="status-open"><td class="id" title="No per-model load profiles.">F-05 <span class="st open" title="Open">Open</span><span class="evidence">No per-model load profiles.</span></td><td><span class="badge med">Medium</span></td><td><strong>Per-model profiles</strong>: remember load settings per model path; presets become named profiles; "last known good" auto-restore after a failed start.</td><td>Users switch between a coding model and a vision model without re-tuning each time.</td></tr>
+  <tr class="status-open"><td class="id" title="No LanguageModelThinkingPart; finish_reason is unused (reasoning may still stream as text).">F-06 <span class="st open" title="Open">Open</span><span class="evidence">No LanguageModelThinkingPart; finish_reason is unused (reasoning may still stream as text).</span></td><td><span class="badge info">Small</span></td><td><strong>Reasoning as <code>LanguageModelThinkingPart</code></strong> (B-23) and surface <code>finish_reason</code> (B-28).</td><td>Correct display of Qwen3/DeepSeek-R1/gpt-oss thinking.</td></tr>
+  <tr class="status-open"><td class="id" title="Copilot model id still tied to general.name / path display, not a stable hash.">F-07 <span class="st open" title="Open">Open</span><span class="evidence">Copilot model id still tied to general.name / path display, not a stable hash.</span></td><td><span class="badge info">Small</span></td><td><strong>Stable model id</strong> for Copilot (hash of path + quant) instead of <code>general.name</code>, with a readable display name fallback (B-49).</td><td>Chat history keeps working across renames; no hash titles.</td></tr>
+  <tr class="status-open"><td class="id" title="No estimate ± band or post-load estimated-vs-actual.">F-08 <span class="st open" title="Open">Open</span><span class="evidence">No estimate ± band or post-load estimated-vs-actual.</span></td><td><span class="badge med">Medium</span></td><td><strong>Estimate confidence band</strong> ("11.2 ± 0.6 GiB") and post-load reconciliation: read <code>/metrics</code> or <code>nvidia-smi</code> after start and show "estimated vs actual".</td><td>Builds trust in the estimate and gives calibration data for B-30/31/35.</td></tr>
+  <tr class="status-open"><td class="id" title="No crash auto-restart / idle auto-stop health monitor.">F-09 <span class="st open" title="Open">Open</span><span class="evidence">No crash auto-restart / idle auto-stop health monitor.</span></td><td><span class="badge med">Medium</span></td><td><strong>Health monitor</strong>: detect crash/exit, optional auto-restart with back-off, idle auto-stop after N minutes to free VRAM.</td><td>Fixes B-45 and keeps GPU free for other work.</td></tr>
+  <tr class="status-open"><td class="id" title="No llama-bench / benchmark button.">F-10 <span class="st open" title="Open">Open</span><span class="evidence">No llama-bench / benchmark button.</span></td><td><span class="badge med">Medium</span></td><td><strong>Benchmark button</strong>: run <code>llama-bench</code> (or a fixed prompt) for the current settings; show pp/tg tok/s and compare presets.</td><td>Answers "which preset is faster on my machine?".</td></tr>
+  <tr class="status-done"><td class="id" title="Library scan includes LM Studio and Ollama roots (and other common tool folders).">F-11 <span class="st done" title="Done">Done</span><span class="evidence">Library scan includes LM Studio and Ollama roots (and other common tool folders).</span></td><td><span class="badge info">Small</span></td><td><strong>Import from Ollama / LM Studio</strong> (follow symlinks in <code>~/.ollama/models/blobs</code>, read manifests for names).</td><td>Many users already have GGUFs on disk.</td></tr>
+  <tr class="status-open"><td class="id" title="No macOS Metal / unified-memory path in the estimator.">F-12 <span class="st open" title="Open">Open</span><span class="evidence">No macOS Metal / unified-memory path in the estimator.</span></td><td><span class="badge info">Small</span></td><td><strong>macOS Metal detection</strong> (<code>system_profiler SPDisplaysDataType -json</code>) with unified memory handling in the estimator.</td><td>Apple Silicon currently falls into the generic path.</td></tr>
+  <tr class="status-open"><td class="id" title="settingsView.ts is still one giant getHtml() template (~4.7k lines).">F-13 <span class="st open" title="Open">Open</span><span class="evidence">settingsView.ts is still one giant getHtml() template (~4.7k lines).</span></td><td><span class="badge high">Large</span></td><td><strong>Bundle the webview from TypeScript</strong> (second esbuild entry) and import the estimator, presets and formatters from <code>core</code>.</td><td>Deletes ~1,500 duplicated lines; fixes B-48; enables unit tests for the UI logic.</td></tr>
+  <tr class="status-open"><td class="id" title="packages/vscode and packages/tui still have zero *.test.ts files.">F-14 <span class="st open" title="Open">Open</span><span class="evidence">packages/vscode and packages/tui still have zero *.test.ts files.</span></td><td><span class="badge med">Medium</span></td><td><strong>Tests</strong> for <code>ProcessManager</code> (fake spawn), <code>toOpenAiMessages</code> mapping, token counting, XML tool-call extraction, TUI form bounds.</td><td>The two packages with zero tests are where most bugs were found.</td></tr>
+  <tr class="status-open"><td class="id" title="HF token still lives in config.json, not SecretStorage.">F-15 <span class="st open" title="Open">Open</span><span class="evidence">HF token still lives in config.json, not SecretStorage.</span></td><td><span class="badge info">Small</span></td><td><strong>SecretStorage for the HF token</strong> instead of plain <code>config.json</code>.</td><td>Security hygiene; config.json is shared with the TUI and often committed to dotfiles.</td></tr>
+  <tr class="status-open"><td class="id" title="No contributes.configuration (same as B-53).">F-16 <span class="st open" title="Open">Open</span><span class="evidence">No contributes.configuration (same as B-53).</span></td><td><span class="badge info">Small</span></td><td><strong>README / settings alignment</strong> (B-53) and a <code>contributes.configuration</code> for the few global toggles (auto-start, Copilot prompt, status-bar).</td><td>Discoverability in the Settings UI.</td></tr>
+  <tr class="status-open"><td class="id" title="No /slots occupancy view.">F-17 <span class="st open" title="Open">Open</span><span class="evidence">No /slots occupancy view.</span></td><td><span class="badge info">Small</span></td><td><strong>Slots / KV view</strong> from <code>/slots</code>: show which Copilot conversations occupy slots and their cached prefix length.</td><td>Explains "why is my request queued?".</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2 id="arch">7. Architecture &amp; maintainability notes</h2>
+<div class="two">
+  <div>
+    <h4>Strengths</h4>
+    <ul class="tight">
+      <li>Clear monorepo split; <code>core</code> is UI-agnostic and reused by both front-ends.</li>
+      <li>Atomic config writes with external-change detection; install swap with rollback.</li>
+      <li>429 unit tests around the hard parts (GGUF parsing, estimate, args, HF parsing).</li>
+      <li>Pragmatic GPU detection with multiple fallbacks and a cache.</li>
+    </ul>
+  </div>
+  <div>
+    <h4>Risks</h4>
+    <ul class="tight">
+      <li><code>settingsView.ts</code>: 4,569 lines, HTML/CSS/JS in one template string; no bundling, no type-checking, no tests for the webview logic.</li>
+      <li><strong>Three estimators</strong> (core, webview <code>liveMemoryEstimate</code>, TUI) and <strong>three preset tables</strong> that already diverge.</li>
+      <li>Synchronous core API forces every consumer onto the UI thread.</li>
+      <li>Zero tests in <code>packages/vscode</code> and <code>packages/tui</code>.</li>
+      <li>No Output channel or structured logging in the extension; failures surface only as toasts.</li>
+      <li><s>Process lifecycle relies on a PID in a JSON file with no identity check and no inter-process lock.</s> <span class="st done">Done</span> B-01 / B-03 / B-08 — identity check, launch lock, atomic write. Remaining: B-04 process-group kill on POSIX, B-55 TUI dispose.</li>
+    </ul>
+  </div>
+</div>
+<div class="callout">
+  <strong>Suggested structural change.</strong> Introduce a small <em>state service</em> in the extension (one poller, one cache, event emitter) that both the status bar and the webview subscribe to; move all computation to <code>core</code> async functions; bundle the webview as a TypeScript entry that imports display-only helpers from <code>core</code>. Most of the bug list in 3.4 and half of the performance list disappear as a side effect.
+<div class="callout" style="margin-top:18px">
+  <strong>Architecture risks — what changed.</strong>
+  Process identity and an inter-process launch lock now exist (B-01, B-03, B-08). Agent-mode buffering is gone (P-01). Downloads are a real manager (F-03). Remaining structural risks are unchanged: the ~4.7k-line inline webview and duplicate estimator (F-13 / B-48), synchronous core on the UI thread (F-04), and zero tests in <code>vscode</code> / <code>tui</code> (F-14).
+</div>
+
+</div>
+
+<!-- ============================================================ -->
+<h2 id="roadmap">8. Prioritised roadmap</h2>
+<div class="prio">
+  <div class="col">
+    <h4>Now — correctness &amp; perceived speed</h4>
+    <ul class="tight">
+      <li>P-01 <span class="st done" title="Done">Done</span> / F-01 <span class="st done" title="Done">Done</span> stream in Agent mode</li>
+      <li>B-55 <span class="st open" title="Open">Open</span>, B-56 <span class="st open" title="Open">Open</span> TUI lifecycle &amp; focus</li>
+      <li>B-01 <span class="st done" title="Done">Done</span>, B-03 <span class="st done" title="Done">Done</span>, B-08 <span class="st done" title="Done">Done</span> process identity, launch lock, atomic lock</li>
+      <li>B-14 <span class="st open" title="Open">Open</span>, B-15 <span class="st open" title="Open">Open</span> token count &amp; SSE errors</li>
+      <li>B-30 <span class="st done" title="Done">Done</span>, B-31 <span class="st done" title="Done">Done</span> SWA &amp; partial-offload KV</li>
+      <li>B-34 <span class="st open" title="Open">Open</span> Windows VRAM cap</li>
+      <li>P-03 <span class="st done" title="Done">Done</span> stop spawning per 5 s tick</li>
+      <li>B-06 <span class="st open" title="Open">Open</span>, B-46 <span class="st open" title="Open">Open</span>, B-47 <span class="st open" title="Open">Open</span> sidebar robustness</li>
+      <li>F-02 <span class="st open" title="Open">Open</span> Output channel / open log</li>
+    </ul>
+  </div>
+  <div class="col">
+    <h4>Next — responsiveness &amp; simplification</h4>
+    <ul class="tight">
+      <li>F-04 <span class="st open" title="Open">Open</span> async core + caching (P-02 <span class="st partial" title="Partial">Partial</span>, P-04 <span class="st open" title="Open">Open</span>…P-09 <span class="st open" title="Open">Open</span>)</li>
+      <li>P-06 <span class="st open" title="Open">Open</span> async start-wait loop</li>
+      <li>M1/M2 sidebar restructure with fit verdict</li>
+      <li>M3 model picker badges; B-38 <span class="st done" title="Done">Done</span> shard collapse</li>
+      <li>M6 status QuickPick; G-07 <span class="st open" title="Open">Open</span> ask once</li>
+      <li>F-03 <span class="st done" title="Done">Done</span> / M5 download manager (B-32 <span class="st done" title="Done">Done</span>, B-33 <span class="st done" title="Done">Done</span>)</li>
+      <li>B-17 <span class="st open" title="Open">Open</span>, B-18 <span class="st open" title="Open">Open</span>, B-19 <span class="st done" title="Done">Done</span>, B-20 <span class="st open" title="Open">Open</span>, B-22 <span class="st partial" title="Partial">Partial</span>, B-24 <span class="st done" title="Done">Done</span> chat mapping fixes</li>
+      <li>F-06 <span class="st open" title="Open">Open</span> thinking parts; F-07 <span class="st open" title="Open">Open</span> stable ids</li>
+      <li>F-14 <span class="st open" title="Open">Open</span> tests for vscode &amp; tui</li>
+    </ul>
+  </div>
+  <div class="col">
+    <h4>Later — new capabilities</h4>
+    <ul class="tight">
+      <li>F-13 <span class="st open" title="Open">Open</span> bundled TS webview sharing core (retire duplicate estimators)</li>
+      <li>M4 first-run wizard</li>
+      <li>F-05 <span class="st open" title="Open">Open</span> per-model profiles</li>
+      <li>F-08 <span class="st open" title="Open">Open</span> estimate reconciliation; F-09 <span class="st open" title="Open">Open</span> health monitor</li>
+      <li>F-10 <span class="st open" title="Open">Open</span> benchmark; F-11 <span class="st done" title="Done">Done</span> Ollama import; F-12 <span class="st open" title="Open">Open</span> Metal</li>
+      <li>F-15 <span class="st open" title="Open">Open</span> SecretStorage; F-16 <span class="st open" title="Open">Open</span> settings; F-17 <span class="st open" title="Open">Open</span> slots view</li>
+      <li>M8 TUI help overlay; TUI cached refresh (P-13 <span class="st done" title="Done">Done</span>, P-14 <span class="st done" title="Done">Done</span>)</li>
+    </ul>
+  </div>
+</div>
+
+<footer>
+  Original review of Llama AIO v0.1.17 (12 Sep 2026). Progress overlay 31 done / 21 partial / 61 open against the v0.1.18 working tree (15 Sep 2026). Line numbers in findings may have drifted.
+</footer>
+
+</div>
+</body>
+</html>

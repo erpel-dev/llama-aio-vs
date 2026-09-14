@@ -27,7 +27,12 @@ import {
 } from "./modelLibrary";
 import { getModelsDir } from "./paths";
 import type { SettingsStore } from "./settings";
-import type { HfFileHit, HfModelHit } from "./types";
+import {
+  recommendedMaxDraftTokens,
+  speculativeUsesNgram,
+  type HfFileHit,
+  type HfModelHit,
+} from "./types";
 
 function fileRole(file: HfFileHit, files: HfFileHit[]): GgufFileRole {
   return classifyGgufFile(file, files);
@@ -40,6 +45,49 @@ export function languageGgufFiles(files: HfFileHit[]): HfFileHit[] {
     return role === "language" || role === "mtp-baked";
   });
   return collapseSplitGgufFiles(language);
+}
+
+/** Vision projectors and sidecar MTP drafters — offered when a repo has no language GGUF. */
+export function companionGgufFiles(files: HfFileHit[]): HfFileHit[] {
+  const companions = files.filter((f) => {
+    const role = fileRole(f, files);
+    return role === "mmproj" || role === "mtp-sidecar";
+  });
+  return collapseSplitGgufFiles(companions);
+}
+
+export function downloadPickerFiles(files: HfFileHit[]): {
+  files: HfFileHit[];
+  companionOnly: boolean;
+} {
+  const language = languageGgufFiles(files);
+  if (language.length) {
+    return { files: language, companionOnly: false };
+  }
+  return { files: companionGgufFiles(files), companionOnly: true };
+}
+
+/** Attach a downloaded mmproj / MTP sidecar without replacing the selected language model. */
+export async function attachDownloadedCompanion(
+  store: SettingsStore,
+  dest: string,
+  remotePath: string,
+  files: HfFileHit[]
+): Promise<"mmproj" | "mtp-sidecar"> {
+  const hit = files.find((f) => f.path === remotePath) || { path: remotePath, size: 0, url: "" };
+  const role = fileRole(hit, files);
+  if (role === "mtp-sidecar") {
+    const cur = store.getState().loadSettings;
+    const mode = speculativeUsesNgram(cur.speculativeMode) ? "ngram-mtp" : "mtp";
+    await store.updateLoadSettings({
+      draftModelPath: dest,
+      speculativeMode: mode,
+      maxDraftTokens: recommendedMaxDraftTokens(mode, cur.maxDraftTokens, true),
+    });
+    return "mtp-sidecar";
+  }
+  await store.updateLoadSettings({ mmprojPath: dest });
+  return "mmproj";
 }
 
 /**
@@ -154,6 +202,12 @@ export function describeLanguageGgufFile(file: HfFileHit, all: HfFileHit[]): str
   }
   if (role === "mtp-baked") {
     bits.push("MTP head included");
+  }
+  if (role === "mmproj") {
+    bits.push("vision projector");
+  }
+  if (role === "mtp-sidecar") {
+    bits.push("MTP draft");
   }
   return bits.join(" · ");
 }

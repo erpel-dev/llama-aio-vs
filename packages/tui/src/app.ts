@@ -27,9 +27,10 @@ import {
   formatGpuDeviceLabel,
   formatLicenseQuickPick,
   formatModelSize,
+  attachDownloadedCompanion,
   companionDownloadHint,
   describeLanguageGgufFile,
-  languageGgufFiles,
+  downloadPickerFiles,
   licenseFromTags,
   listLocalModelEntries,
   invalidateModelLibraryCache,
@@ -472,6 +473,7 @@ export async function runApp(services: AppServices): Promise<void> {
   let hfPickedLicense: ModelLicenseInfo | undefined;
   let hfFiles: HfFileHit[] = [];
   let hfAllFiles: HfFileHit[] = [];
+  let hfCompanionOnly = false;
 
   const modelHint = mount(
     Text({
@@ -1527,6 +1529,7 @@ export async function runApp(services: AppServices): Promise<void> {
       hfPickedLicense = undefined;
       hfFiles = [];
       hfAllFiles = [];
+      hfCompanionOnly = false;
       modelSearch.value = "";
       refreshModels();
       modelSelect.focus();
@@ -1609,10 +1612,12 @@ export async function runApp(services: AppServices): Promise<void> {
       description: describeLanguageGgufFile(f, hfAllFiles),
       value: f.path,
     }));
-    const extras = companionDownloadHint(hfAllFiles);
-    modelHint.content = extras
-      ? `${hfPickedRepo?.id} · ${hfFiles.length} GGUF · also fetches ${extras} · Enter download · Esc back`
-      : `${hfPickedRepo?.id} · ${hfFiles.length} GGUF file(s) · Enter download · Esc back`;
+    const extras = hfCompanionOnly ? "" : companionDownloadHint(hfAllFiles);
+    modelHint.content = hfCompanionOnly
+      ? `${hfPickedRepo?.id} · companion GGUF (vision projector / MTP draft) · Enter download · Esc back`
+      : extras
+        ? `${hfPickedRepo?.id} · ${hfFiles.length} GGUF · also fetches ${extras} · Enter download · Esc back`
+        : `${hfPickedRepo?.id} · ${hfFiles.length} GGUF file(s) · Enter download · Esc back`;
     modelSelect.focus();
     renderer.requestRender();
   }
@@ -1653,10 +1658,12 @@ export async function runApp(services: AppServices): Promise<void> {
     }
     await withBusy("Listing GGUF files…", async () => {
       const all = await services.hf.listGgufFiles(hfPickedRepo!.id);
-      hfFiles = languageGgufFiles(all);
+      const picker = downloadPickerFiles(all);
       hfAllFiles = all;
+      hfFiles = picker.files;
+      hfCompanionOnly = picker.companionOnly;
       if (!hfFiles.length) {
-        setStatusMessage("No language GGUF files in that repo.");
+        setStatusMessage("No language model or companion GGUF in that repo.");
         showHfRepos();
         return;
       }
@@ -1677,6 +1684,16 @@ export async function runApp(services: AppServices): Promise<void> {
           renderer.requestRender();
         },
       });
+      if (hfCompanionOnly) {
+        const role = await attachDownloadedCompanion(services.store, dest, filePath, hfAllFiles);
+        setStatusMessage(
+          role === "mtp-sidecar"
+            ? `MTP drafter ready: ${path.basename(dest)}.`
+            : `Vision projector ready: ${path.basename(dest)}.`
+        );
+        setModelBrowse("local");
+        return;
+      }
       try {
         await services.hf.downloadPreferredMmproj(repoId, hfAllFiles, {
           report: (v: { message?: string; increment?: number }) => {

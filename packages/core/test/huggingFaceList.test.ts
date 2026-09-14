@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
   collapseSplitGgufFiles,
+  companionGgufFiles,
   describeLanguageGgufFile,
+  downloadPickerFiles,
   ggufHitsFromTree,
   languageGgufFiles,
   parseNextLink,
@@ -124,5 +126,49 @@ describe("split GGUF picker collapse", () => {
       "UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00004-of-00004.gguf",
     ]);
     assert.deepEqual(remoteShardPaths("mmproj-F16.gguf"), ["mmproj-F16.gguf"]);
+  });
+});
+
+describe("companion-only download picker", () => {
+  const hermihg = [{ path: "mmproj-Qwen3.8-27B-Q5_K-MIX.gguf", size: 347213792, url: "" }];
+
+  it("offers mmproj files when a repo has no language GGUF", () => {
+    assert.deepEqual(languageGgufFiles(hermihg).map((f) => f.path), []);
+    assert.deepEqual(
+      companionGgufFiles(hermihg).map((f) => f.path),
+      ["mmproj-Qwen3.8-27B-Q5_K-MIX.gguf"]
+    );
+    const picker = downloadPickerFiles(hermihg);
+    assert.equal(picker.companionOnly, true);
+    assert.deepEqual(
+      picker.files.map((f) => f.path),
+      ["mmproj-Qwen3.8-27B-Q5_K-MIX.gguf"]
+    );
+    assert.match(describeLanguageGgufFile(hermihg[0]!, hermihg), /vision projector/);
+  });
+
+  it("still prefers language files when a repo has both", () => {
+    const mixed = [
+      { path: "Qwen3.8-27B-Q4_K_M.gguf", size: 17e9, url: "" },
+      { path: "mmproj-F16.gguf", size: 9e8, url: "" },
+      { path: "mtp-gemma-4-12B-it.gguf", size: 8e8, url: "" },
+    ];
+    const picker = downloadPickerFiles(mixed);
+    assert.equal(picker.companionOnly, false);
+    assert.deepEqual(
+      picker.files.map((f) => f.path),
+      ["Qwen3.8-27B-Q4_K_M.gguf"]
+    );
+    assert.deepEqual(
+      companionGgufFiles(mixed).map((f) => f.path).sort(),
+      ["mmproj-F16.gguf", "mtp-gemma-4-12B-it.gguf"].sort()
+    );
+  });
+
+  it("does not offer imatrix dumps as companions", () => {
+    const onlyImatrix = [{ path: "imatrix-qwen3.8-27b.gguf", size: 13642624, url: "" }];
+    const picker = downloadPickerFiles(onlyImatrix);
+    assert.equal(picker.companionOnly, true);
+    assert.deepEqual(picker.files, []);
   });
 });

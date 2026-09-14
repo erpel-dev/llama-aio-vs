@@ -4,13 +4,14 @@
 import * as vscode from "vscode";
 import { DownloadPanel } from "./downloadPanel";
 import {
+  attachDownloadedCompanion,
   companionDownloadHint,
   describeLanguageGgufFile,
   downloadManager,
+  downloadPickerFiles,
   formatLicenseQuickPick,
   huggingfaceModelPage,
   huggingfaceUrl,
-  languageGgufFiles,
   licenseFromTags,
   listingBaseName,
   preferredMmprojFile,
@@ -176,27 +177,53 @@ export async function browseAndDownloadModel(
     return undefined;
   }
 
-  const languageFiles = languageGgufFiles(files);
-  if (!languageFiles.length) {
-    vscode.window.showWarningMessage("That repo only has companion GGUFs (mmproj / MTP draft), not a language model.");
+  const picker = downloadPickerFiles(files);
+  if (!picker.files.length) {
+    vscode.window.showWarningMessage("That repo has no language model or companion GGUF (mmproj / MTP draft).");
     return undefined;
   }
 
-  const extras = companionDownloadHint(files);
+  const extras = picker.companionOnly ? "" : companionDownloadHint(files);
   const pickedFile = await vscode.window.showQuickPick(
-    languageFiles.map((f) => ({
+    picker.files.map((f) => ({
       label: f.path,
       description: describeLanguageGgufFile(f, files),
       file: f,
     })),
     {
-      title: extras
-        ? `Select a GGUF to download  ·  will also fetch ${extras}`
-        : "Select a GGUF file to download",
+      title: picker.companionOnly
+        ? "Companion-only repo — select a vision projector or MTP draft to download"
+        : extras
+          ? `Select a GGUF to download  ·  will also fetch ${extras}`
+          : "Select a GGUF file to download",
       matchOnDescription: true,
     }
   );
   if (!pickedFile) {
+    return undefined;
+  }
+
+  if (picker.companionOnly) {
+    DownloadPanel.show(store, downloadManager);
+    const dest = await enqueueHfFile(
+      hf,
+      store,
+      pickedModel.model.id,
+      pickedFile.file.path,
+      files
+    ).done;
+    const role = await attachDownloadedCompanion(store, dest, pickedFile.file.path, files);
+    const name = listingBaseName(dest);
+    if (role === "mtp-sidecar") {
+      vscode.window.showInformationMessage(`MTP drafter ready: ${name}`);
+    } else {
+      const hasModel = !!store.getState().selectedModelPath;
+      vscode.window.showInformationMessage(
+        hasModel
+          ? `Vision projector ready: ${name}. Reload the server to use it.`
+          : `Vision projector downloaded: ${name}. Select a language model to use it.`
+      );
+    }
     return undefined;
   }
 

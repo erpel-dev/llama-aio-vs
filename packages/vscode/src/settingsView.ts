@@ -918,6 +918,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       font-size: 10px;
       color: var(--muted);
     }
+    .ctx-legend.tight { gap: 6px 8px; font-size: 9.5px; margin-top: 4px; }
     .ctx-legend i {
       display: inline-block;
       width: 8px;
@@ -931,82 +932,43 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     .ctx-legend .seg-history { background: #22c55e; }
     .ctx-legend .seg-toolResults { background: #a855f7; }
     .ctx-legend .seg-request { background: #f59e0b; }
-    .stat-grid {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 6px;
-      margin-top: 10px;
-    }
-    .stat {
-      border: 1px solid var(--border);
-      border-radius: 5px;
-      padding: 6px 8px;
-      background: color-mix(in srgb, var(--fg) 4%, transparent);
-      min-width: 0;
-    }
-    .stat .k {
-      font-size: 9.5px;
-      letter-spacing: 0.05em;
-      text-transform: uppercase;
-      color: var(--muted);
-    }
-    .stat .v {
-      font-size: 13px;
-      font-weight: 650;
-      margin-top: 1px;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-    .stat .s {
-      font-size: 10px;
-      color: var(--muted);
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-    .stat.empty .v { color: var(--muted); font-weight: 500; }
-    .stat.stale .v { color: var(--muted); font-weight: 600; }
-    .stat.good .v { color: var(--ok); }
-    .perf-session { margin-top: 8px; }
-    .perf-session .spark-head {
-      display: flex;
-      justify-content: space-between;
-      align-items: baseline;
-      gap: 8px;
-      font-size: 10px;
-      color: var(--muted);
-      margin-bottom: 2px;
-    }
-    .perf-session .spark-head .avg {
-      color: var(--fg);
-      font-weight: 650;
-      font-size: 11px;
-    }
-    .perf-spark {
-      display: block;
-      width: 100%;
-      height: 28px;
-    }
-    .perf-spark polyline {
-      fill: none;
-      stroke: var(--starting);
-      stroke-width: 1.5;
-    }
-    .perf-spark circle { fill: var(--starting); }
-    .perf-pills {
+    .chart-legend {
       display: flex;
       flex-wrap: wrap;
-      gap: 4px;
-      margin-top: 6px;
-    }
-    .perf-pills span {
+      gap: 8px 12px;
       font-size: 10px;
       color: var(--muted);
-      border: 1px solid var(--border);
-      border-radius: 999px;
-      padding: 1px 7px;
+      margin: 8px 0 4px;
     }
+    .chart-legend i {
+      display: inline-block;
+      width: 12px;
+      height: 2px;
+      border-radius: 1px;
+      margin-right: 5px;
+      vertical-align: middle;
+    }
+    .chart-legend .gen { background: var(--starting); }
+    .chart-legend .prompt { background: var(--warn); }
+    .perf-session { margin-top: 0; width: 100%; }
+    .perf-chart {
+      display: block;
+      width: 100%;
+      height: 96px;
+      color: var(--muted);
+    }
+    .metric-line {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 2px 10px;
+      margin-top: 6px;
+      font-size: 11px;
+      color: var(--fg);
+    }
+    .metric-line .muted { color: var(--muted); }
+    .metric-line .ok { font-weight: 650; }
+    .metric-line .gen { color: var(--starting); font-weight: 650; }
+    .metric-line .prompt { color: var(--warn); font-weight: 650; }
     .perf-history {
       margin-top: 8px;
       border: 1px solid var(--border);
@@ -1023,6 +985,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       font-size: 11px;
       cursor: pointer;
       user-select: none;
+      color: var(--muted);
     }
     .perf-history summary::-webkit-details-marker { display: none; }
     .perf-history summary::before {
@@ -1056,7 +1019,35 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       background: color-mix(in srgb, var(--fg) 3%, transparent);
     }
     .perf-history .muted { color: var(--muted); }
-    .stat.warn .v { color: var(--warn); }
+    .perf-history #perfHistoryTable { overflow-x: auto; }
+    .perf-history .opt-list { padding: 0 8px 8px; }
+    .perf-history .opt-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+      padding: 4px 0;
+      border-top: 1px solid var(--border);
+      color: var(--fg);
+      font-size: 11px;
+    }
+    .perf-history .opt-row .hint {
+      font-size: 10px;
+      color: var(--muted);
+      font-weight: 400;
+      margin: 0;
+    }
+    .perf-history .btn-row {
+      display: flex;
+      gap: 6px;
+      margin-top: 6px;
+    }
+    .perf-history .btn-row button {
+      flex: 1;
+      padding: 6px 8px;
+      font-size: 11px;
+      text-align: center;
+    }
     .presets {
       display: flex;
       flex-wrap: wrap;
@@ -1385,37 +1376,42 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       <span id="ctxLabel">Context</span>
       <span class="sub" id="ctxSub">— (send a chat to measure)</span>
     </div>
-    <div class="ctx-stack" id="ctxStack"></div>
-    <div class="ctx-legend" id="ctxLegend">
+    <div class="ctx-stack" id="ctxStack" role="img" aria-label="Context"></div>
+    <div class="ctx-legend tight" id="ctxLegend">
       <span><i class="seg-tools"></i>Tools</span>
-      <span><i class="seg-system"></i>System</span>
-      <span><i class="seg-history"></i>History</span>
-      <span><i class="seg-toolResults"></i>Tool results</span>
-      <span><i class="seg-request"></i>Request</span>
+      <span><i class="seg-system"></i>Sys</span>
+      <span><i class="seg-history"></i>Hist</span>
+      <span><i class="seg-toolResults"></i>Results</span>
+      <span><i class="seg-request"></i>Req</span>
     </div>
-    <div class="stat-grid" id="perfStats"></div>
-    <div class="meta" id="perfFoot" style="margin-top:6px">No generation yet</div>
+    <div class="chart-legend hidden" id="perfChartLegend">
+      <span><i class="gen"></i>Generation</span>
+      <span><i class="prompt"></i>Prompt processing</span>
+    </div>
     <div class="perf-session hidden" id="perfSession"></div>
-    <details class="perf-history hidden" id="perfHistory"></details>
-    <div class="toggle" style="margin-top:10px">
-      <span>Prompt replacements</span>
-      <input type="checkbox" id="promptReplacementsEnabled" title="Strip Copilot system-prompt boilerplate before llama.cpp" />
-    </div>
-    <div class="meta" id="replacementStats" style="margin-top:4px">Last call: —</div>
-    <div class="toggle" style="margin-top:8px">
-      <span>Wikipedia lookup</span>
-      <input type="checkbox" id="wikipediaLookupEnabled" title="Let the model call wikipedia_lookup for encyclopedic facts. Off by default." />
-    </div>
-    <div class="meta" style="margin-top:4px">Off by default. When on, the model can fetch a Wikipedia lead section before answering facts it may not know.</div>
-    <div class="toggle" style="margin-top:8px">
-      <span>Skip repeating tool calls</span>
-      <input type="checkbox" id="duplicateToolCallGuardEnabled" title="Skip a tool that already ran with the same arguments in this turn. Off by default — can block a legitimate retry." />
-    </div>
-    <div class="meta" style="margin-top:4px">Off by default. When on, skip a tool that already ran with the same arguments this turn.</div>
-    <div class="btn-col" style="margin-top:8px">
-      <button class="secondary" id="viewContextBtn" disabled title="Open the last Copilot → llama.cpp request (messages + tools) in an editor">View last call</button>
-      <button class="secondary" id="viewResponseBtn" disabled title="Open the last llama.cpp assistant stream (helps debug empty Chat replies)">View last response</button>
-    </div>
+    <div class="metric-line" id="perfMetrics">No generation yet</div>
+    <details class="perf-history" id="perfMore">
+      <summary>History, options &amp; debug</summary>
+      <div id="perfHistoryTable"></div>
+      <div class="opt-list">
+        <div class="opt-row">
+          <span>Prompt replacements <span class="hint" id="replacementStats">—</span></span>
+          <input type="checkbox" id="promptReplacementsEnabled" title="Strip Copilot system-prompt boilerplate before llama.cpp" />
+        </div>
+        <div class="opt-row">
+          <span>Wikipedia lookup</span>
+          <input type="checkbox" id="wikipediaLookupEnabled" title="Let the model call wikipedia_lookup for encyclopedic facts. Off by default." />
+        </div>
+        <div class="opt-row">
+          <span>Skip duplicate tools</span>
+          <input type="checkbox" id="duplicateToolCallGuardEnabled" title="Skip a tool that already ran with the same arguments in this turn. Off by default — can block a legitimate retry." />
+        </div>
+        <div class="btn-row">
+          <button class="secondary" id="viewContextBtn" disabled title="Open the last Copilot → llama.cpp request (messages + tools) in an editor">Last call</button>
+          <button class="secondary" id="viewResponseBtn" disabled title="Open the last llama.cpp assistant stream (helps debug empty Chat replies)">Last response</button>
+        </div>
+      </div>
+    </details>
   </div>
 
   <div class="setup hidden" id="setupBox">
@@ -1828,6 +1824,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     let lastEndpoint = '';
     let lastPid;
     let saveLoadTimer = null;
+    let lastChartGen = [];
+    let lastChartPrompt = [];
+    let perfChartRO = null;
     let updateCheck = { latestTag: undefined, installedTag: undefined, updateAvailable: false, checkFailed: false, pending: true };
 
     function setServerCardKind(kind) {
@@ -2423,6 +2422,58 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       return true;
     }
 
+    function fmtNum(n) {
+      return typeof n === 'number' && isFinite(n) ? Number(n).toLocaleString() : '—';
+    }
+
+    function fmtTokK(n) {
+      if (typeof n !== 'number' || !isFinite(n)) return '—';
+      const abs = Math.abs(n);
+      if (abs >= 1000) {
+        const digits = abs >= 10000 ? 0 : 1;
+        const s = (n / 1000).toFixed(digits);
+        return (s.endsWith('.0') ? s.slice(0, -2) : s) + 'k';
+      }
+      return Math.round(n).toLocaleString();
+    }
+
+    function fmtRate(n) {
+      if (typeof n !== 'number' || !isFinite(n) || n <= 0) return undefined;
+      return n >= 100 ? n.toFixed(0) : n.toFixed(1);
+    }
+
+    function niceCeil(n) {
+      if (!(n > 0)) return 20;
+      if (n <= 20) return 20;
+      if (n <= 100) return Math.ceil(n / 10) * 10;
+      return Math.ceil(n / 100) * 100;
+    }
+
+    function maxPositive(values) {
+      let m = 0;
+      for (let i = 0; i < values.length; i++) {
+        const v = values[i];
+        if (typeof v === 'number' && isFinite(v) && v > m) m = v;
+      }
+      return m;
+    }
+
+    function pickNum() {
+      for (let i = 0; i < arguments.length; i++) {
+        const n = arguments[i];
+        if (typeof n === 'number' && isFinite(n)) return n;
+      }
+      return undefined;
+    }
+
+    function specAcceptLabel(mode) {
+      if (mode === 'dflash') return 'DFlash';
+      if (mode === 'ngram-dflash') return 'N-gram+DFlash';
+      if (mode === 'ngram') return 'N-gram';
+      if (mode === 'ngram-mtp') return 'N-gram+MTP';
+      return 'MTP';
+    }
+
     function renderContextStack(perf) {
       const stack = $('ctxStack');
       const label = $('ctxLabel');
@@ -2446,13 +2497,17 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
 
       if (typeof promptTokens === 'number' && typeof contextLimit === 'number' && typeof ctxPct === 'number') {
         label.textContent = 'Context';
+        const pct = Math.round(ctxPct * 10) / 10;
         sub.textContent =
-          approx + promptTokens.toLocaleString() + ' / ' +
-          contextLimit.toLocaleString() + ' (' + ctxPct + '%)' +
+          approx + fmtTokK(promptTokens) + ' / ' +
+          fmtTokK(contextLimit) + ' · ' + pct + '%' +
           (ctxLevel === 'critical' ? ' · nearly full' : ctxLevel === 'warn' ? ' · running low' : '');
+        stack.setAttribute('aria-label',
+          'Context used: ' + approx + fmtTokK(promptTokens) + ' of ' + fmtTokK(contextLimit) + ' tokens');
       } else {
         label.textContent = 'Context';
         sub.textContent = '— (send a chat to measure)';
+        stack.setAttribute('aria-label', 'Context');
       }
 
       stack.innerHTML = '';
@@ -2471,197 +2526,220 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       }
     }
 
-    function fmtNum(n) {
-      return typeof n === 'number' && isFinite(n) ? Number(n).toLocaleString() : '—';
-    }
-
-    function fmtRate(n) {
-      if (typeof n !== 'number' || !isFinite(n) || n <= 0) return undefined;
-      return n >= 100 ? n.toFixed(0) : n.toFixed(1);
-    }
-
-    function meanField(rows, key, allowZero) {
-      const xs = [];
-      for (let i = 0; i < rows.length; i++) {
-        const n = rows[i][key];
-        if (typeof n !== 'number' || !isFinite(n)) continue;
-        if (!allowZero && n <= 0) continue;
-        xs.push(n);
+    function chartWidth(el) {
+      let w = el ? el.getBoundingClientRect().width : 0;
+      if (!(w > 0)) {
+        const card = $('perfCard');
+        w = card ? card.getBoundingClientRect().width - 20 : 0;
       }
-      if (!xs.length) return undefined;
-      let sum = 0;
-      for (let i = 0; i < xs.length; i++) sum += xs[i];
-      return sum / xs.length;
+      return Math.max(200, Math.round(w) || 240);
     }
 
-    function sparklineSvg(values) {
-      if (!values.length) return '';
-      const w = 240, h = 28, pad = 2.5;
-      let min = values[0], max = values[0];
-      for (let i = 1; i < values.length; i++) {
-        if (values[i] < min) min = values[i];
-        if (values[i] > max) max = values[i];
+    function dualAxisSvg(genValues, promptValues, widthPx) {
+      const n = Math.max(genValues.length, promptValues.length);
+      if (!n) return '';
+      const hasGen = maxPositive(genValues) > 0;
+      const hasPrompt = maxPositive(promptValues) > 0;
+      if (!hasGen && !hasPrompt) return '';
+
+      const W = Math.max(200, Math.round(widthPx) || 240);
+      const H = 96;
+      const left = 28, right = 44, top = 12, bottom = 14;
+      const x0 = left, y0 = top, plotW = W - left - right, plotH = H - top - bottom;
+      const GEN = '#58a6ff';
+      const PROMPT = '#d29922';
+      const genMax = niceCeil(maxPositive(genValues));
+      const promptMax = niceCeil(maxPositive(promptValues));
+
+      function ptsOf(values, yMax) {
+        const pts = [];
+        for (let i = 0; i < n; i++) {
+          const v = values[i];
+          if (typeof v !== 'number' || !isFinite(v) || v <= 0) continue;
+          const x = n === 1 ? x0 + plotW / 2 : x0 + (i / (n - 1)) * plotW;
+          const y = y0 + plotH - (v / yMax) * plotH;
+          pts.push({ x: x, y: y, v: v });
+        }
+        return pts;
       }
-      const span = max - min || 1;
-      const pts = values.map(function (v, i) {
-        const x = values.length === 1 ? w / 2 : (i / (values.length - 1)) * w;
-        const y = h - pad - ((v - min) / span) * (h - pad * 2);
-        return x.toFixed(1) + ',' + y.toFixed(1);
-      }).join(' ');
-      const last = values[values.length - 1];
-      const lastX = values.length === 1 ? w / 2 : w;
-      const lastY = h - pad - ((last - min) / span) * (h - pad * 2);
-      return '<svg class="perf-spark" viewBox="0 0 ' + w + ' ' + h + '" preserveAspectRatio="none" role="img" aria-label="Generation tok/s over recent calls">' +
-        '<polyline points="' + pts + '"/>' +
-        '<circle cx="' + lastX.toFixed(1) + '" cy="' + lastY.toFixed(1) + '" r="2.2"/>' +
-        '</svg>';
-    }
 
-    function statTile(key, value, sub, kind) {
-      return '<div class="stat' + (kind ? ' ' + kind : '') + '">' +
-        '<div class="k">' + key + '</div>' +
-        '<div class="v">' + value + '</div>' +
-        (sub ? '<div class="s">' + sub + '</div>' : '<div class="s">&nbsp;</div>') +
-        '</div>';
+      function poly(pts) {
+        return pts.map(function (p) { return p.x.toFixed(1) + ',' + p.y.toFixed(1); }).join(' ');
+      }
+
+      function fmtAxis(v) {
+        if (v === 0) return '0';
+        return v >= 100 || Math.round(v) === v ? String(Math.round(v)) : v.toFixed(1);
+      }
+
+      const genPts = hasGen ? ptsOf(genValues, genMax) : [];
+      const promptPts = hasPrompt ? ptsOf(promptValues, promptMax) : [];
+      const parts = [];
+      const fracs = [0, 0.5, 1];
+      for (let i = 0; i < fracs.length; i++) {
+        const t = fracs[i];
+        const y = y0 + plotH - t * plotH;
+        parts.push('<line x1="' + x0 + '" x2="' + (x0 + plotW) + '" y1="' + y.toFixed(1) +
+          '" y2="' + y.toFixed(1) + '" stroke="rgba(128,128,128,0.18)" stroke-width="1"/>');
+        if (hasGen) {
+          parts.push('<text x="' + (x0 - 4) + '" y="' + (y + 3).toFixed(1) +
+            '" text-anchor="end" fill="' + GEN + '" font-size="8">' + fmtAxis(t * genMax) + '</text>');
+        }
+        if (hasPrompt) {
+          parts.push('<text x="' + (x0 + plotW + 4) + '" y="' + (y + 3).toFixed(1) +
+            '" fill="' + PROMPT + '" font-size="8">' + fmtAxis(t * promptMax) + '</text>');
+        }
+      }
+      if (promptPts.length > 1) {
+        parts.push('<polyline points="' + poly(promptPts) + '" fill="none" stroke="' + PROMPT + '" stroke-width="1.5"/>');
+      }
+      if (genPts.length > 1) {
+        parts.push('<polyline points="' + poly(genPts) + '" fill="none" stroke="' + GEN + '" stroke-width="1.7"/>');
+      }
+      if (promptPts.length) {
+        const last = promptPts[promptPts.length - 1];
+        const label = fmtRate(last.v) || fmtAxis(last.v);
+        parts.push('<circle cx="' + last.x.toFixed(1) + '" cy="' + last.y.toFixed(1) + '" r="2.3" fill="' + PROMPT + '"/>');
+        parts.push('<text x="' + (last.x - 4).toFixed(1) + '" y="' + (last.y - 5).toFixed(1) +
+          '" text-anchor="end" fill="' + PROMPT + '" font-size="9" font-weight="650">' + label + '</text>');
+      }
+      if (genPts.length) {
+        const last = genPts[genPts.length - 1];
+        const label = fmtRate(last.v) || fmtAxis(last.v);
+        parts.push('<circle cx="' + last.x.toFixed(1) + '" cy="' + last.y.toFixed(1) + '" r="2.5" fill="' + GEN + '"/>');
+        parts.push('<text x="' + (last.x + 5).toFixed(1) + '" y="' + (last.y + 12).toFixed(1) +
+          '" fill="' + GEN + '" font-size="9" font-weight="650">' + label + '</text>');
+      }
+      parts.push('<text x="' + x0 + '" y="' + (H - 2) + '" fill="currentColor" font-size="8">oldest</text>');
+      parts.push('<text x="' + (x0 + plotW) + '" y="' + (H - 2) +
+        '" text-anchor="end" fill="currentColor" font-size="8">latest</text>');
+
+      return '<svg xmlns="http://www.w3.org/2000/svg" class="perf-chart dual" viewBox="0 0 ' + W + ' ' + H +
+        '" role="img" aria-label="Generation tok/s left axis, prompt tok/s right axis, oldest left">' +
+        parts.join('') + '<' + '/svg>';
     }
 
     function renderPerfStats(perf, perfLines) {
-      const grid = $('perfStats');
-      const foot = $('perfFoot');
       const sessEl = $('perfSession');
-      const histEl = $('perfHistory');
-      if (!grid) return;
+      const legendEl = $('perfChartLegend');
+      const metricsEl = $('perfMetrics');
+      const tableEl = $('perfHistoryTable');
       const p = perf || {};
       const stale = !!(p.generating && p.showingPreviousCall);
-      const tiles = [];
+      const rows = Array.isArray(p.history) ? p.history.filter(function (h) { return h && typeof h === 'object'; }) : [];
+      const last = rows[0] || {};
 
-      const gen = fmtRate(p.genTokPerSec);
-      tiles.push(gen
-        ? statTile(
-          'Generation',
-          gen + ' tok/s',
-          stale ? 'last call' : (p.estimated ? 'live estimate' : 'from server timings'),
-          stale ? 'stale' : undefined
-        )
-        : statTile('Generation', '—', p.generating ? 'measuring…' : 'no generation yet', 'empty'));
-
-      const prompt = fmtRate(p.promptTokPerSec);
-      tiles.push(prompt
-        ? statTile('Prompt', prompt + ' tok/s', stale ? 'last call' : 'prompt processing', stale ? 'stale' : undefined)
-        : statTile('Prompt', '—', 'prompt processing', 'empty'));
-
-      if (typeof p.cacheHitPct === 'number') {
-        tiles.push(statTile(
-          'Prompt reuse',
-          p.cacheHitPct + '%',
-          (stale ? 'last call · ' : '') + fmtNum(p.cachedPromptTokens) + ' cached · ' + fmtNum(p.processedPromptTokens) + ' new',
-          stale ? 'stale' : (p.cacheHitPct >= 50 ? 'good' : undefined)
-        ));
-      } else {
-        tiles.push(statTile('Prompt reuse', '—', 'KV prefix cache (cache_n)', 'empty'));
-      }
-
-      if (p.speculativeMode && p.speculativeMode !== 'off') {
-        const label = p.speculativeMode === 'dflash'
-          ? 'DFlash accepted'
-          : p.speculativeMode === 'ngram-dflash'
-            ? 'N-gram+DFlash accepted'
-            : p.speculativeMode === 'ngram'
-              ? 'N-gram accepted'
-              : p.speculativeMode === 'ngram-mtp'
-                ? 'N-gram+MTP accepted'
-                : 'MTP accepted';
-        if (typeof p.draftAcceptancePct === 'number') {
-          tiles.push(statTile(
-            label,
-            p.draftAcceptancePct.toFixed(1) + '%',
-            (stale ? 'last call · ' : '') + fmtNum(p.draftTokensAccepted) + ' / ' + fmtNum(p.draftTokens) + ' drafted',
-            stale ? 'stale' : (p.draftAcceptancePct >= 50 ? 'good' : undefined)
-          ));
-        } else {
-          tiles.push(statTile(label, '—', p.generating ? 'drafts arrive at end of call' : 'no draft tokens yet', 'empty'));
-        }
-      } else {
-        tiles.push(statTile('Spec accepted', '—', 'speculative off', 'empty'));
-      }
-
-      grid.innerHTML = tiles.join('');
-      grid.title = Array.isArray(perfLines) ? perfLines.join('\\n') : '';
-
-      if (foot) {
-        const parts = [];
-        if (p.generating) parts.push('<span class="ok">● Generating…</span>');
-        if (typeof p.completionTokens === 'number') {
-          parts.push(fmtNum(p.completionTokens) + ' completion tokens');
-        }
-        if (!p.generating && p.finishedAt && p.startedAt) {
-          parts.push(((p.finishedAt - p.startedAt) / 1000).toFixed(1) + 's');
-        }
-        foot.innerHTML = parts.length ? parts.join(' · ') : 'No generation yet';
-      }
-
-      if (sessEl || histEl) {
-        const rows = Array.isArray(p.history) ? p.history : [];
+      if (tableEl) {
         if (!rows.length) {
-          if (sessEl) {
-            sessEl.classList.add('hidden');
-            sessEl.innerHTML = '';
-          }
-          if (histEl) {
-            histEl.classList.add('hidden');
-            histEl.innerHTML = '';
-          }
+          tableEl.innerHTML = '<div class="muted" style="padding:6px 8px">No completed calls yet</div>';
         } else {
-          const genAvg = meanField(rows, 'genTokPerSec', false);
-          const promptAvg = meanField(rows, 'promptTokPerSec', false);
-          const reuseAvg = meanField(rows, 'cacheHitPct', true);
-          const mtpAvg = meanField(rows, 'draftAcceptancePct', true);
-          const genSeries = [];
-          for (let i = rows.length - 1; i >= 0; i--) {
-            const n = rows[i].genTokPerSec;
-            if (typeof n === 'number' && isFinite(n) && n > 0) genSeries.push(n);
-          }
+          const body = rows.map(function (h, i) {
+            const when = h.finishedAt ? new Date(h.finishedAt).toLocaleTimeString() : '';
+            const genH = fmtRate(h.genTokPerSec);
+            const promptH = fmtRate(h.promptTokPerSec);
+            const reuse = typeof h.cacheHitPct === 'number' ? h.cacheHitPct.toFixed(0) + '%' : '—';
+            return '<tr><td>' + (i === 0 ? when + ' <span class="muted">latest</span>' : when) +
+              '</td><td>' + (genH || '—') +
+              '</td><td>' + (promptH || '—') +
+              '</td><td>' + reuse + '</td></tr>';
+          }).join('');
+          tableEl.innerHTML = '<table><thead><tr><th>Call</th><th>Gen</th><th>Prompt</th><th>Reuse</th></tr></thead><tbody>' +
+            body + '</tbody></table>';
+        }
+      }
 
-          if (sessEl) {
+      const cacheHitPct = pickNum(p.cacheHitPct, last.cacheHitPct);
+      const completionTokens = pickNum(p.completionTokens, last.completionTokens);
+      const draftAcceptancePct = pickNum(p.draftAcceptancePct, last.draftAcceptancePct);
+      const durationMs = (!p.generating && p.finishedAt && p.startedAt)
+        ? (p.finishedAt - p.startedAt)
+        : last.durationMs;
+      const genNow = p.generating ? p.genTokPerSec : pickNum(p.genTokPerSec, last.genTokPerSec);
+      const promptNow = pickNum(p.promptTokPerSec, last.promptTokPerSec);
+
+      let svg = '';
+      try {
+        const chrono = rows.slice().reverse();
+        const genValues = [];
+        const promptValues = [];
+        for (let i = 0; i < chrono.length; i++) {
+          genValues.push(chrono[i].genTokPerSec);
+          promptValues.push(chrono[i].promptTokPerSec);
+        }
+        lastChartGen = genValues;
+        lastChartPrompt = promptValues;
+        if (sessEl) {
+          const empty = !maxPositive(genValues) && !maxPositive(promptValues);
+          if (empty) {
+            sessEl.classList.add('hidden');
+            sessEl.textContent = '';
+            svg = '';
+          } else {
             sessEl.classList.remove('hidden');
-            const pills = [];
-            const promptLabel = fmtRate(promptAvg);
-            if (promptLabel) pills.push('<span>Prompt ' + promptLabel + ' avg</span>');
-            if (typeof reuseAvg === 'number') pills.push('<span>Reuse ' + reuseAvg.toFixed(0) + '%</span>');
-            if (typeof mtpAvg === 'number') pills.push('<span>MTP ' + mtpAvg.toFixed(0) + '%</span>');
-            const avgLabel = fmtRate(genAvg);
-            sessEl.innerHTML =
-              '<div class="spark-head"><span>Gen tok/s · last ' + rows.length +
-              ' call' + (rows.length === 1 ? '' : 's') + '</span>' +
-              (avgLabel ? '<span class="avg">' + avgLabel + ' avg</span>' : '') +
-              '</div>' +
-              sparklineSvg(genSeries) +
-              (pills.length ? '<div class="perf-pills">' + pills.join('') + '</div>' : '');
-          }
-
-          if (histEl) {
-            const wasOpen = !!histEl.open;
-            histEl.classList.remove('hidden');
-            const body = rows.map((h, i) => {
-              const when = h.finishedAt ? new Date(h.finishedAt).toLocaleTimeString() : '';
-              const genH = fmtRate(h.genTokPerSec);
-              const reuse = typeof h.cacheHitPct === 'number' ? h.cacheHitPct.toFixed(0) + '%' : '—';
-              const tok = typeof h.completionTokens === 'number' ? fmtNum(h.completionTokens) : '—';
-              const dur = typeof h.durationMs === 'number' ? (h.durationMs / 1000).toFixed(1) + 's' : '—';
-              return '<tr><td>' + (i === 0 ? when + ' <span class="muted">latest</span>' : when) +
-                '</td><td>' + (genH || '—') +
-                '</td><td>' + reuse +
-                '</td><td>' + tok +
-                '</td><td>' + dur + '</td></tr>';
-            }).join('');
-            const avgBit = fmtRate(genAvg) ? '<span class="muted">avg ' + fmtRate(genAvg) + ' gen</span>' : '';
-            histEl.innerHTML = '<summary><span>Recent calls · ' + rows.length + '</span>' + avgBit + '</summary>' +
-              '<table><thead><tr>' +
-              '<th>Call</th><th>Gen</th><th>Reuse</th><th>Out</th><th>Time</th>' +
-              '</tr></thead><tbody>' + body + '</tbody></table>';
-            histEl.open = wasOpen;
+            svg = dualAxisSvg(genValues, promptValues, chartWidth(sessEl)) || '';
+            if (svg) {
+              sessEl.innerHTML = svg;
+              if (!perfChartRO && typeof ResizeObserver !== 'undefined') {
+                let raf = 0;
+                perfChartRO = new ResizeObserver(function () {
+                  if (raf) return;
+                  raf = requestAnimationFrame(function () {
+                    raf = 0;
+                    if (!lastChartGen.length && !lastChartPrompt.length) return;
+                    const next = dualAxisSvg(lastChartGen, lastChartPrompt, chartWidth(sessEl));
+                    if (next) sessEl.innerHTML = next;
+                  });
+                });
+                perfChartRO.observe(sessEl);
+              }
+            } else {
+              sessEl.classList.add('hidden');
+              sessEl.textContent = '';
+            }
           }
         }
+        if (legendEl) legendEl.classList.toggle('hidden', !svg);
+      } catch (err) {
+        svg = '';
+        if (sessEl) {
+          sessEl.classList.add('hidden');
+          sessEl.textContent = '';
+        }
+        if (legendEl) legendEl.classList.add('hidden');
+      }
+
+      const bits = [];
+      if (p.generating) {
+        const live = fmtRate(p.genTokPerSec);
+        bits.push('<span class="ok">● Generating…' + (live ? ' ' + live + ' tok/s' : '') + '</span>');
+      } else if (!svg) {
+        const genLabel = fmtRate(genNow);
+        const promptLabel = fmtRate(promptNow);
+        if (genLabel) bits.push('<span class="gen">' + genLabel + ' gen</span>');
+        if (promptLabel) bits.push('<span class="prompt">' + promptLabel + ' prompt</span>');
+      }
+      if (typeof cacheHitPct === 'number') {
+        bits.push('<span' + (stale ? ' class="muted"' : '') + '>' + cacheHitPct + '% reuse</span>');
+      }
+      if (p.speculativeMode && p.speculativeMode !== 'off') {
+        const specName = specAcceptLabel(p.speculativeMode);
+        if (typeof draftAcceptancePct === 'number') {
+          const cls = stale ? 'muted' : (draftAcceptancePct >= 50 ? 'ok' : '');
+          bits.push('<span' + (cls ? ' class="' + cls + '"' : '') + '>' +
+            draftAcceptancePct.toFixed(1) + '% ' + specName + '</span>');
+        } else if (!p.generating) {
+          bits.push('<span class="muted">' + specName + ' —</span>');
+        }
+      }
+      if (typeof completionTokens === 'number') {
+        const dur = typeof durationMs === 'number' && durationMs > 0 && !p.generating
+          ? ' · ' + (durationMs / 1000).toFixed(1) + 's'
+          : '';
+        bits.push('<span class="muted">' + fmtNum(completionTokens) + ' tok' + dur + '</span>');
+      }
+      if (metricsEl) {
+        metricsEl.innerHTML = bits.length ? bits.join('') : (rows.length ? 'Last ' + rows.length + ' call' + (rows.length === 1 ? '' : 's') : 'No generation yet');
+        metricsEl.title = Array.isArray(perfLines) ? perfLines.join('\\n') : '';
       }
     }
 
@@ -4042,21 +4120,27 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         const sessionSaved = hist.reduce(function (sum, h) {
           return sum + (typeof h.tokensSaved === 'number' ? h.tokensSaved : 0);
         }, 0);
-        const sessionBit = sessionSaved > 0
-          ? 'Session: ≈' + Number(sessionSaved).toLocaleString() + ' tok across ' + hist.length + ' call' + (hist.length === 1 ? '' : 's') + '. '
+        const sessionTitle = sessionSaved > 0
+          ? 'Session: ≈' + Number(sessionSaved).toLocaleString() + ' tok across ' + hist.length + ' call' + (hist.length === 1 ? '' : 's')
           : '';
         if (!payload.promptReplacementsEnabled) {
-          prStats.textContent = sessionBit + 'Last call: replacements off';
+          prStats.textContent = sessionSaved > 0 ? '−' + fmtTokK(sessionSaved) + ' session' : 'off';
+          prStats.title = 'Prompt replacements are off' + (sessionTitle ? '. ' + sessionTitle : '');
         } else if (!pr) {
-          prStats.textContent = sessionBit + 'Last call: — (send a chat to measure)';
+          prStats.textContent = sessionSaved > 0 ? '−' + fmtTokK(sessionSaved) + ' session' : '—';
+          prStats.title = (sessionTitle ? sessionTitle + '. ' : '') + 'Send a chat to measure';
         } else if (!pr.enabled) {
-          prStats.textContent = sessionBit + 'Last call: replacements were off';
+          prStats.textContent = 'off last call';
+          prStats.title = (sessionTitle ? sessionTitle + '. ' : '') + 'Last call: replacements were off';
         } else if (pr.tokensSaved > 0) {
-          prStats.textContent = sessionBit +
+          prStats.textContent = '−' + fmtTokK(pr.tokensSaved) + ' last call';
+          prStats.title = (sessionTitle ? sessionTitle + '. ' : '') +
             'Last call: saved ≈' + Number(pr.tokensSaved).toLocaleString() +
             ' tokens (' + pr.pctSaved + '% of request)';
         } else {
-          prStats.textContent = sessionBit + 'Last call: no matching boilerplate (' +
+          prStats.textContent = sessionSaved > 0 ? '−' + fmtTokK(sessionSaved) + ' session' : 'no match';
+          prStats.title = (sessionTitle ? sessionTitle + '. ' : '') +
+            'Last call: no matching boilerplate (' +
             Number(pr.tokensBefore || 0).toLocaleString() + ' tok request)';
         }
       }
