@@ -2,16 +2,19 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
   computeOverheadBytes,
+  deviceWouldSpill,
   estimateKvBytes,
   estimateMemory,
   estimateRecurrentStateBytesPerLayer,
   hostFallbackWarning,
   inferComputeBackend,
+  integratedGpuNotes,
   kvSlotMultiplier,
   peerGpuOverheadBytes,
   vulkanDeviceReservedBytes,
   vulkanDriverBytes,
 } from "../src/memoryEstimate";
+import { isIntegratedGpu } from "../src/gpuInfo";
 import { ModelCapabilities } from "../src/ggufMetadata";
 import { denseCaps, GiB, loadSettings, moeCaps } from "./helpers";
 
@@ -273,9 +276,10 @@ describe("hostFallbackWarning", () => {
     const msg = hostFallbackWarning(idleInGtt, 1);
     assert.ok(msg, "expected a warning");
     assert.ok(msg!.includes("Vulkan1"), msg!);
-    assert.ok(/system RAM, not VRAM/.test(msg!), msg!);
-    assert.ok(/14.2 GiB in GTT/.test(msg!), msg!);
-    assert.ok(/Resizable BAR/.test(msg!), msg!);
+    assert.ok(/in GTT/.test(msg!), msg!);
+    assert.ok(/14.2 GiB/.test(msg!), msg!);
+    assert.ok(/ReBAR/.test(msg!), msg!);
+    assert.equal(/PCIe|split-mode none/.test(msg!), false, msg!);
   });
 
   it("stays quiet for a card that is genuinely using its VRAM", () => {
@@ -295,7 +299,22 @@ describe("hostFallbackWarning", () => {
       { totalBytes: 16 * GiB, usedBytes: 0, gttUsedBytes: 9 * GiB, source: "test" },
       1
     );
-    assert.ok(msg && /with ~0 VRAM/.test(msg), msg ?? "expected a warning");
+    assert.ok(msg && /in GTT/.test(msg), msg ?? "expected a warning");
+  });
+
+  it("stays quiet for an APU whose GTT is the normal path", () => {
+    const apu = {
+      totalBytes: 512 * MiB,
+      usedBytes: 431 * MiB,
+      gttUsedBytes: 1.24 * GiB,
+      gttTotalBytes: 15.3 * GiB,
+      visVramTotalBytes: 512 * MiB,
+      name: "Cezanne [Radeon Vega Series / Radeon Vega Mobile Series]",
+      source: "test",
+      llamaDeviceId: "Vulkan0",
+    };
+    assert.equal(isIntegratedGpu(apu), true);
+    assert.equal(hostFallbackWarning(apu, 0), undefined);
   });
 
   it("is surfaced by estimateMemory when the collector reports GTT", () => {
@@ -306,11 +325,99 @@ describe("hostFallbackWarning", () => {
     });
     assert.ok(est);
     assert.ok(
-      est.warnings.some((w) => /system RAM, not VRAM/.test(w)),
+      est.warnings.some((w) => /in GTT/.test(w)),
       `warnings: ${est.warnings.join(" | ")}`
     );
     // A runtime observation must not feed the predictive spill search.
     assert.ok(est.lines.some((l) => /GTT now/.test(l)));
+  });
+});
+
+describe("iGPU / APU guidance", () => {
+  const MiB = 1024 ** 2;
+  const apu = {
+    totalBytes: 512 * MiB,
+    usedBytes: 431 * MiB,
+    gttUsedBytes: 1.24 * GiB,
+    gttTotalBytes: 15.3 * GiB,
+    visVramTotalBytes: 512 * MiB,
+    name: "Onboard IGD",
+    source: "test",
+    llamaDeviceId: "Vulkan0",
+  };
+
+  it("does not treat a 512 MiB carve-out as already spilling", () => {
+    assert.equal(deviceWouldSpill(0, 512 * MiB), false);
+    assert.equal(deviceWouldSpill(512 * MiB + 1, 512 * MiB), true);
+    assert.equal(deviceWouldSpill(11 * GiB, 12 * GiB), true);
+    assert.equal(deviceWouldSpill(9 * GiB, 12 * GiB), false);
+  });
+
+  it("classifies APU names and UMA+GTT, but not a discrete RX card", () => {
+    assert.equal(isIntegratedGpu(apu), true);
+    assert.equal(
+      isIntegratedGpu({
+        totalBytes: 512 * MiB,
+        gttTotalBytes: 15 * GiB,
+        name: "amdgpu",
+      }),
+      true
+    );
+    assert.equal(
+      isIntegratedGpu({
+        totalBytes: 16 * GiB,
+        gttTotalBytes: 16 * GiB,
+        name: "Radeon RX 9070 XT",
+      }),
+      false
+    );
+  });
+
+  it("replaces Tight/ReBAR banners when offload is 0", () => {
+    const notes = integratedGpuNotes({
+      gpu: apu,
+      onGpu: 0,
+      nLayers: 30,
+      usedBytes: 0,
+      gpuWeightsBytes: 0,
+    });
+    assert.equal(notes.willSpill, false);
+    assert.match(notes.warnings[0] || "", /CPU only/);
+    assert.match(notes.warnings[1] || "", /offload to 30/);
+    const est = estimateMemory(
+      denseCaps({ fileSizeBytes: 2.7 * GiB, blockCount: 30 }),
+      loadSettings({ gpuOffload: 0, contextLength: 16384 }),
+      apu,
+      { gpus: [apu] }
+    );
+    assert.ok(est);
+    assert.equal(est.willSpill, false);
+    assert.ok(est.warnings.some((w) => /CPU only/.test(w)), est.warnings.join(" | "));
+    assert.ok(est.warnings.some((w) => /GTT/.test(w)), est.warnings.join(" | "));
+    assert.ok(!est.warnings.some((w) => /Tight on|PCIe|ReBAR|2.00 GiB/.test(w)), est.warnings.join(" | "));
+    assert.ok(est.charts.vram.capacityBytes && est.charts.vram.capacityBytes > 10 * GiB);
+  });
+
+  it("uses GTT as the budget when layers are offloaded", () => {
+    const fits = estimateMemory(
+      denseCaps({ fileSizeBytes: 2.7 * GiB, blockCount: 30 }),
+      loadSettings({ gpuOffload: 30, contextLength: 8192 }),
+      apu,
+      { gpus: [apu] }
+    );
+    assert.ok(fits);
+    assert.equal(fits.willSpill, false);
+    assert.ok(fits.warnings.some((w) => /iGPU via GTT/.test(w)), fits.warnings.join(" | "));
+
+    const tinyGtt = { ...apu, gttTotalBytes: 512 * MiB };
+    const over = estimateMemory(
+      denseCaps({ fileSizeBytes: 2.7 * GiB, blockCount: 30 }),
+      loadSettings({ gpuOffload: 30, contextLength: 8192 }),
+      tinyGtt,
+      { gpus: [tinyGtt] }
+    );
+    assert.ok(over?.willSpill);
+    assert.ok(over!.warnings.some((w) => /Too big for GTT/.test(w)), over!.warnings.join(" | "));
   });
 });
 

@@ -1,5 +1,5 @@
 import * as os from "os";
-import { formatGpuDeviceLabel, GpuMemoryInfo } from "./gpuInfo";
+import { formatGpuDeviceLabel, GpuMemoryInfo, isIntegratedGpu } from "./gpuInfo";
 import {
   assignLayerDevices,
   gpuDisplayOrder,
@@ -124,9 +124,37 @@ export const VRAM_HEADROOM_BYTES = 2 * GiB;
 /** Soft “getting full” warning once remaining VRAM drops below this. */
 export const VRAM_SOFT_HEADROOM_BYTES = 4 * GiB;
 
-/** True when `used` leaves less than {@link VRAM_HEADROOM_BYTES} free on `cap`. */
-export function deviceWouldSpill(used: number, cap: number): boolean {
-  return cap > 0 && used > cap - VRAM_HEADROOM_BYTES;
+/** True when `used` leaves less than `headroom` free on `cap`. */
+export function deviceWouldSpill(
+  used: number,
+  cap: number,
+  headroom: number = VRAM_HEADROOM_BYTES
+): boolean {
+  if (!(cap > 0)) {
+    return false;
+  }
+  // A 512 MiB iGPU can never keep 2 GiB free — only count real overflow.
+  const reserve = cap > headroom ? headroom : 0;
+  return used > cap - reserve;
+}
+
+/** VRAM, or GTT on an APU — the number the bars and spill check should use. */
+export function gpuBarCapacityBytes(gpu: GpuMemoryInfo | undefined): number | undefined {
+  if (!gpu || !(gpu.totalBytes > 0)) {
+    return undefined;
+  }
+  if (isIntegratedGpu(gpu) && (gpu.gttTotalBytes || 0) > gpu.totalBytes) {
+    return gpu.gttTotalBytes;
+  }
+  return gpu.totalBytes;
+}
+
+export function gpuWouldSpill(used: number, gpu: GpuMemoryInfo | undefined): boolean {
+  const cap = gpuBarCapacityBytes(gpu);
+  if (!cap || !gpu) {
+    return false;
+  }
+  return deviceWouldSpill(used, cap, isIntegratedGpu(gpu) ? 0 : VRAM_HEADROOM_BYTES);
 }
 
 /**
@@ -193,22 +221,55 @@ export function hostFallbackWarning(
   const gttHeavy =
     gttUsed >= GTT_HEAVY_MIN_BYTES &&
     gttUsed > Math.max(vramUsed * 2, cap * 0.25);
+  if (isIntegratedGpu(gpu)) {
+    return undefined;
+  }
   if (!gttHeavy && !(smallBar && gttUsed >= GTT_HEAVY_MIN_BYTES)) {
     return undefined;
   }
   const label = gpuLabel(gpu, index);
-  const barBit = smallBar
-    ? ` Its visible-VRAM window is only ~${formatBytes(visTotal)} of ${formatBytes(cap)} ` +
-      `(Resizable BAR / Above 4G off)`
-    : "";
+  const rebar = smallBar ? " Likely ReBAR off." : "";
   return (
-    `${label} is using system RAM, not VRAM: ~${formatBytes(gttUsed)} in GTT` +
-    (vramUsed > 0 ? ` vs ~${formatBytes(vramUsed)} VRAM` : " with ~0 VRAM") +
-    `.${barBit}` +
-    ` Layers placed on this card read weights over PCIe, so they run at host-memory speed and the ` +
-    `rest of the model only gets one card's bandwidth. Either enable Resizable BAR, drop to one GPU ` +
-    `(--split-mode none), or size the split so this card is not asked to hold layers.`
+    `${label} is in GTT (~${formatBytes(gttUsed)}), not VRAM.${rebar} ` +
+    `That card will be slow. Use one GPU, or fix ReBAR.`
   );
+}
+
+/** Short APU/iGPU guidance — replaces the 2 GiB “tight” + ReBAR banners. */
+export function integratedGpuNotes(opts: {
+  gpu: GpuMemoryInfo;
+  onGpu: number;
+  nLayers: number;
+  usedBytes: number;
+  gpuWeightsBytes: number;
+}): { warnings: string[]; willSpill: boolean } {
+  const { gpu, onGpu, nLayers, usedBytes, gpuWeightsBytes } = opts;
+  const vram = formatBytes(gpu.totalBytes);
+  const gttCap = gpu.gttTotalBytes || 0;
+  const gttLabel = gttCap > 0 ? `~${formatBytes(gttCap)}` : "system RAM";
+  if (onGpu <= 0) {
+    return {
+      willSpill: false,
+      warnings: [
+        `CPU only — iGPU unused. The ${vram} VRAM bar is the carve-out, not your budget.`,
+        `To try the iGPU, set GPU offload to ${nLayers}. Weights go to GTT (${gttLabel}), not that ${vram}.`,
+      ],
+    };
+  }
+  if (gttCap > 0 && usedBytes > gttCap) {
+    return {
+      willSpill: true,
+      warnings: [
+        `Too big for GTT (~${formatBytes(usedBytes)} of ${formatBytes(gttCap)}). Lower context or keep offload at 0.`,
+      ],
+    };
+  }
+  return {
+    willSpill: false,
+    warnings: [
+      `iGPU via GTT — ~${formatBytes(gpuWeightsBytes)} weights in system RAM. Dedicated ${vram} VRAM is unused; that is normal.`,
+    ],
+  };
 }
 
 function buildGpuBarChart(
@@ -223,9 +284,12 @@ function buildGpuBarChart(
   vision = 0
 ): MemoryBarChart {
   const totalBytes = weights + kv + overhead + spec + vision;
+  const igpu = isIntegratedGpu(gpu);
   const title = labeled && gpu
-    ? `VRAM · ${gpuLabel(gpu, index)} · est. at full context`
-    : "VRAM · est. at full context";
+    ? `${igpu ? "iGPU GTT" : "VRAM"} · ${gpuLabel(gpu, index)} · est. at full context`
+    : igpu
+      ? "iGPU GTT · est. at full context"
+      : "VRAM · est. at full context";
   return {
     title,
     segments: [
@@ -236,7 +300,7 @@ function buildGpuBarChart(
       { key: "overhead" as const, label: "Overhead", bytes: overhead },
     ],
     totalBytes,
-    capacityBytes: gpu?.totalBytes,
+    capacityBytes: gpuBarCapacityBytes(gpu),
   };
 }
 
@@ -1192,7 +1256,8 @@ export function estimateMemory(
       `Partial GPU offload: ${nLayers - onGpu}/${nLayers} layers (~${formatBytes(cpuWeights)}) stay in system RAM (slower).`
     );
   }
-  if (!cpuOnly && onGpu === 0) {
+  const singleIgpu = !cpuOnly && gpus.length === 1 && isIntegratedGpu(gpus[0]);
+  if (!cpuOnly && onGpu === 0 && !singleIgpu) {
     warnings.push("GPU offload is 0 — model weights run from system RAM (CPU).");
   }
   if (!cpuOnly && !settings.offloadKvCacheToGpu) {
@@ -1303,40 +1368,54 @@ export function estimateMemory(
   }
 
   if (!cpuOnly && gpus.length) {
-    for (let i = 0; i < gpus.length; i++) {
-      const used = perGpuParts[i]!.used;
-      const cap = gpus[i]!.totalBytes;
-      if (!(cap > 0)) {
-        continue;
-      }
-      if (deviceWouldSpill(used, cap)) {
+    if (singleIgpu) {
+      const igpu = integratedGpuNotes({
+        gpu: gpus[0]!,
+        onGpu,
+        nLayers,
+        usedBytes: perGpuParts[0]?.used || 0,
+        gpuWeightsBytes: gpuWeights,
+      });
+      warnings.unshift(...igpu.warnings);
+      if (igpu.willSpill) {
         willSpill = true;
-        const pct = Math.round((used / cap) * 100);
-        const label = gpuLabel(gpus[i]!, i);
-        if (used > cap) {
-          warnings.unshift(
-            `Estimated ${label} at full context ~${formatBytes(used)} is over the full ${formatBytes(cap)} (${pct}%). Expect spill to system RAM (much slower). Lower Context Length, GPU Offload, or use a smaller quant.`
-          );
-        } else {
-          warnings.unshift(
-            `Tight on ${label} at full context: ~${formatBytes(used)} of ${formatBytes(cap)} (${pct}%). Only ~${formatBytes(cap - used)} left — target is ${formatBytes(VRAM_HEADROOM_BYTES)} free. Lower Context Length or GPU Offload.`
+      }
+    } else {
+      for (let i = 0; i < gpus.length; i++) {
+        const used = perGpuParts[i]!.used;
+        const cap = gpus[i]!.totalBytes;
+        if (!(cap > 0)) {
+          continue;
+        }
+        if (deviceWouldSpill(used, cap)) {
+          willSpill = true;
+          const pct = Math.round((used / cap) * 100);
+          const label = gpuLabel(gpus[i]!, i);
+          if (used > cap) {
+            warnings.unshift(
+              `Estimated ${label} at full context ~${formatBytes(used)} is over the full ${formatBytes(cap)} (${pct}%). Expect spill to system RAM (much slower). Lower Context Length, GPU Offload, or use a smaller quant.`
+            );
+          } else {
+            warnings.unshift(
+              `Tight on ${label} at full context: ~${formatBytes(used)} of ${formatBytes(cap)} (${pct}%). Only ~${formatBytes(cap - used)} left — target is ${formatBytes(VRAM_HEADROOM_BYTES)} free. Lower Context Length or GPU Offload.`
+            );
+          }
+        } else if (cap > VRAM_SOFT_HEADROOM_BYTES && cap - used < VRAM_SOFT_HEADROOM_BYTES) {
+          const pct = Math.round((used / cap) * 100);
+          const label = gpuLabel(gpus[i]!, i);
+          warnings.push(
+            `Getting full on ${label} at full context: ~${formatBytes(used)} of ${formatBytes(cap)} VRAM (${pct}%). Leave some free for the display driver.`
           );
         }
-      } else if (cap - used < VRAM_SOFT_HEADROOM_BYTES) {
-        const pct = Math.round((used / cap) * 100);
-        const label = gpuLabel(gpus[i]!, i);
-        warnings.push(
-          `Getting full on ${label} at full context: ~${formatBytes(used)} of ${formatBytes(cap)} VRAM (${pct}%). Leave some free for the display driver.`
-        );
       }
-    }
-    // Runtime observation, not a prediction — deliberately does not set
-    // `willSpill` (that drives the Recommend search, which can only change
-    // settings, not the card's BAR window).
-    for (let i = 0; i < gpus.length; i++) {
-      const hint = hostFallbackWarning(gpus[i], i);
-      if (hint) {
-        warnings.unshift(hint);
+      // Runtime observation, not a prediction — deliberately does not set
+      // `willSpill` (that drives the Recommend search, which can only change
+      // settings, not the card's BAR window).
+      for (let i = 0; i < gpus.length; i++) {
+        const hint = hostFallbackWarning(gpus[i], i);
+        if (hint) {
+          warnings.unshift(hint);
+        }
       }
     }
     if (
@@ -1526,9 +1605,11 @@ export function estimateMemory(
       });
       return `VRAM ${parts.join(" · ")}${kvBit}${specBit}${visionBit}`;
     }
-    const cap = gpus[0]?.totalBytes ?? gpu?.totalBytes;
+    const capGpu = gpus[0] || gpu;
+    const cap = gpuBarCapacityBytes(capGpu) ?? capGpu?.totalBytes;
+    const kind = isIntegratedGpu(capGpu) ? "iGPU GTT" : "VRAM";
     return (
-      `VRAM ~${formatBytes(totalGpuBytes)}` +
+      `${kind} ~${formatBytes(totalGpuBytes)}` +
       (cap ? ` of ${formatBytes(cap)} (${Math.round((totalGpuBytes / cap) * 100)}%)` : "") +
       kvBit +
       specBit +

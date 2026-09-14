@@ -2081,6 +2081,22 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       return pretty ? (id + ' · ' + pretty) : id;
     }
 
+    // Mirrors isIntegratedGpu() / gpuBarCapacityBytes() in core.
+    function isIntegratedGpu(gpu) {
+      if (!gpu || !(gpu.totalBytes > 0)) return false;
+      const name = String(gpu.name || '') + ' ' + String(gpu.llamaDeviceId || '');
+      if (/onboard|\bigd\b|integrated|iris|uhd graphics|hd graphics|radeon graphics|vega mobile|cezanne|renoir|lucienne|barcelo|mendocino|rembrandt|raphael|phoenix|hawk.?point|strix|gfx[0-9]+c\b/i.test(name)) {
+        return true;
+      }
+      const gtt = gpu.gttTotalBytes || 0;
+      return gpu.totalBytes <= 2 * 1024 ** 3 && gtt >= 4 * 1024 ** 3 && gtt >= gpu.totalBytes * 4;
+    }
+    function gpuBarCapacityBytes(gpu) {
+      if (!gpu || !(gpu.totalBytes > 0)) return undefined;
+      if (isIntegratedGpu(gpu) && (gpu.gttTotalBytes || 0) > gpu.totalBytes) return gpu.gttTotalBytes;
+      return gpu.totalBytes;
+    }
+
     function parseTensorSplit(raw) {
       const s = String(raw || '').trim();
       if (!s) return [];
@@ -2269,8 +2285,8 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     function buildGpuChart(index, gpu, weights, kv, overhead, spec, specLabel, labeled, vision) {
       return {
         title: labeled && gpu
-          ? ('VRAM · ' + gpuLabel(gpu, index) + ' · est. at full context')
-          : 'VRAM · est. at full context',
+          ? ((isIntegratedGpu(gpu) ? 'iGPU GTT' : 'VRAM') + ' · ' + gpuLabel(gpu, index) + ' · est. at full context')
+          : (isIntegratedGpu(gpu) ? 'iGPU GTT · est. at full context' : 'VRAM · est. at full context'),
         segments: [
           { key: 'weights', label: 'Weights', bytes: weights },
           { key: 'vision', label: 'Vision (CLIP)', bytes: vision || 0 },
@@ -2279,7 +2295,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           { key: 'overhead', label: 'Overhead', bytes: overhead },
         ],
         totalBytes: weights + kv + overhead + (spec || 0) + (vision || 0),
-        capacityBytes: gpu && gpu.totalBytes ? gpu.totalBytes : undefined,
+        capacityBytes: gpuBarCapacityBytes(gpu),
       };
     }
 
@@ -2325,7 +2341,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               { key: 'overhead', label: 'Overhead', bytes: gpuOverhead },
             ],
             totalBytes: totalGpu,
-            capacityBytes: gpuInfo && gpuInfo.totalBytes ? gpuInfo.totalBytes : undefined,
+            capacityBytes: gpuBarCapacityBytes(gpuInfo),
           };
       const vram2 = i1 !== undefined && gpus[i1]
         ? buildGpuChart(
@@ -2673,10 +2689,11 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       const pct = chart.capacityBytes
         ? Math.round((chart.totalBytes / chart.capacityBytes) * 100)
         : undefined;
-      // 2 GiB free is the usable ceiling used by the spill warnings.
+      // 2 / 4 GiB free only apply when the bar is big enough to leave that much.
       const remaining = chart.capacityBytes != null ? chart.capacityBytes - chart.totalBytes : undefined;
-      const over = remaining !== undefined && remaining < 2 * 1024 ** 3;
-      const warn = !over && remaining !== undefined && remaining < 4 * 1024 ** 3;
+      const cap = chart.capacityBytes || 0;
+      const over = remaining !== undefined && (remaining < 0 || (cap > 2 * 1024 ** 3 && remaining < 2 * 1024 ** 3));
+      const warn = !over && remaining !== undefined && cap > 4 * 1024 ** 3 && remaining < 4 * 1024 ** 3;
       stack.classList.toggle('over', over);
       stack.classList.toggle('warn', warn);
       sub.className = 'sub' + (over ? ' over' : warn ? ' warn' : '');
@@ -3014,7 +3031,8 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       if (!cpuOnly && onGpu > 0 && onGpu < nLayers) {
         warnings.push('Partial GPU offload: ' + (nLayers - onGpu) + '/' + nLayers + ' layers (~' + fmtBytes(cpuWeights) + ') stay in system RAM.');
       }
-      if (!cpuOnly && onGpu === 0) warnings.push('GPU offload is 0 — weights run from system RAM.');
+      const singleIgpu = !cpuOnly && gpuInfos && gpuInfos.length === 1 && isIntegratedGpu(gpuInfos[0]);
+      if (!cpuOnly && onGpu === 0 && !singleIgpu) warnings.push('GPU offload is 0 — weights run from system RAM.');
       if (!cpuOnly && !L.offloadKvCacheToGpu) warnings.push('KV cache (~' + fmtBytes(kvBytes) + ' at full context) is in system RAM.');
       else if (kvSplit) warnings.push('KV cache follows the layers: ~' + fmtBytes(gpuKv) + ' in VRAM for the ' + onGpu + ' offloaded layers, ~' + fmtBytes(cpuKv) + ' in system RAM for the ' + (nLayers - onGpu) + ' CPU layers (at full context).');
       if (!cpuOnly && memInputs.isMoe && L.nCpuMoe > 0) {
@@ -3033,6 +3051,22 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       if (!cpuOnly && gpuInfos && gpuInfos.length) {
         const shares = liveShares;
         const mainIdx = liveMainIdx;
+        if (singleIgpu) {
+          const g = gpuInfos[0];
+          const used = gpuWeights * (liveWeightShares[0] || 0) + (liveKvPerGpu[0] || 0) + overheadForGpu(0, mainIdx, shares[0] || 0, gpuOverhead, peerOverhead) + (draftGpuBundle * (liveWeightShares[0] || 0)) + gpuVisionBytes;
+          const vram = fmtBytes(g.totalBytes);
+          const gttCap = g.gttTotalBytes || 0;
+          const gttLabel = gttCap > 0 ? '~' + fmtBytes(gttCap) : 'system RAM';
+          if (onGpu <= 0) {
+            warnings.unshift('CPU only — iGPU unused. The ' + vram + ' VRAM bar is the carve-out, not your budget.');
+            warnings.push('To try the iGPU, set GPU offload to ' + nLayers + '. Weights go to GTT (' + gttLabel + '), not that ' + vram + '.');
+          } else if (gttCap > 0 && used > gttCap) {
+            willSpill = true;
+            warnings.unshift('Too big for GTT (~' + fmtBytes(used) + ' of ' + fmtBytes(gttCap) + '). Lower context or keep offload at 0.');
+          } else {
+            warnings.unshift('iGPU via GTT — ~' + fmtBytes(gpuWeights) + ' weights in system RAM. Dedicated ' + vram + ' VRAM is unused; that is normal.');
+          }
+        } else {
         for (let i = 0; i < gpuInfos.length; i++) {
           const g = gpuInfos[i];
           const share = shares[i] || 0;
@@ -3044,19 +3078,17 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           if (used > cap) {
             willSpill = true;
             warnings.unshift('Estimated ' + label + ' at full context ~' + fmtBytes(used) + ' is over the full ' + fmtBytes(cap) + ' (' + pct + '%). Expect spill to system RAM. Lower Context or GPU Offload.');
-          } else if (used > cap - 2 * 1024 ** 3) {
+          } else if (cap > 2 * 1024 ** 3 && used > cap - 2 * 1024 ** 3) {
             willSpill = true;
             warnings.unshift('Tight on ' + label + ' at full context: ~' + fmtBytes(used) + ' of ' + fmtBytes(cap) + ' (' + pct + '%). Only ~' + fmtBytes(cap - used) + ' left — target is 2 GiB free. Lower Context or GPU Offload.');
-          } else if (cap - used < 4 * 1024 ** 3) {
+          } else if (cap > 4 * 1024 ** 3 && cap - used < 4 * 1024 ** 3) {
             warnings.push('Getting full on ' + label + ' at full context: ~' + fmtBytes(used) + ' of ' + fmtBytes(cap) + ' VRAM (' + pct + '%).');
           }
         }
-        // Mirrors hostFallbackWarning() in core/memoryEstimate.ts: a card whose
-        // GTT dwarfs its VRAM use is holding its share in system RAM (RADV does
-        // this when the BAR window is small), so the VRAM bars above overstate
-        // what that card actually contributes.
+        // Mirrors hostFallbackWarning() — skip APUs; only discrete GTT fallback.
         for (let i = 0; i < gpuInfos.length; i++) {
           const g = gpuInfos[i];
+          if (isIntegratedGpu(g)) continue;
           const cap = g.totalBytes || 0;
           if (!cap) continue;
           const vramUsed = g.usedBytes || 0;
@@ -3066,27 +3098,41 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           const gttHeavy = gttUsed >= 1024 ** 3 && gttUsed > Math.max(vramUsed * 2, cap * 0.25);
           if (!gttHeavy && !(smallBar && gttUsed >= 1024 ** 3)) continue;
           warnings.unshift(
-            gpuLabel(g, i) + ' is using system RAM, not VRAM: ~' + fmtBytes(gttUsed) + ' in GTT' +
-            (vramUsed > 0 ? ' vs ~' + fmtBytes(vramUsed) + ' VRAM' : ' with ~0 VRAM') + '.' +
-            (smallBar ? ' Its visible-VRAM window is only ~' + fmtBytes(visTotal) + ' of ' + fmtBytes(cap) + ' (Resizable BAR / Above 4G off).' : '') +
-            ' Layers on this card read weights over PCIe, so they run at host-memory speed. ' +
-            'Enable Resizable BAR, drop to one GPU (--split-mode none), or resize the split.'
+            gpuLabel(g, i) + ' is in GTT (~' + fmtBytes(gttUsed) + '), not VRAM.' +
+            (smallBar ? ' Likely ReBAR off.' : '') +
+            ' That card will be slow. Use one GPU, or fix ReBAR.'
           );
+        }
         }
         if (gpuInfos.length >= 2 && L.splitMode !== 'none' && parseTensorSplit(L.tensorSplit).length < 2) {
           warnings.push('Tensor split is empty — llama.cpp will split by VRAM size (often 1:1). Pick the faster card as Main GPU and raise Weights on main GPU so that card gets more of the model.');
         }
       } else if (!cpuOnly && gpuInfo && gpuInfo.totalBytes) {
-        const headroom = 2 * 1024 ** 3;
-        const pct = Math.round((totalGpu / gpuInfo.totalBytes) * 100);
-        if (totalGpu > gpuInfo.totalBytes) {
+        if (isIntegratedGpu(gpuInfo)) {
+          const vram = fmtBytes(gpuInfo.totalBytes);
+          const gttCap = gpuInfo.gttTotalBytes || 0;
+          const gttLabel = gttCap > 0 ? '~' + fmtBytes(gttCap) : 'system RAM';
+          if (onGpu <= 0) {
+            warnings.unshift('CPU only — iGPU unused. The ' + vram + ' VRAM bar is the carve-out, not your budget.');
+            warnings.push('To try the iGPU, set GPU offload to ' + nLayers + '. Weights go to GTT (' + gttLabel + '), not that ' + vram + '.');
+          } else if (gttCap > 0 && totalGpu > gttCap) {
+            willSpill = true;
+            warnings.unshift('Too big for GTT (~' + fmtBytes(totalGpu) + ' of ' + fmtBytes(gttCap) + '). Lower context or keep offload at 0.');
+          } else {
+            warnings.unshift('iGPU via GTT — ~' + fmtBytes(gpuWeights) + ' weights in system RAM. Dedicated ' + vram + ' VRAM is unused; that is normal.');
+          }
+        } else {
+        const cap = gpuInfo.totalBytes;
+        const pct = Math.round((totalGpu / cap) * 100);
+        if (totalGpu > cap) {
           willSpill = true;
-          warnings.unshift('Estimated VRAM at full context ~' + fmtBytes(totalGpu) + ' is over the full ' + fmtBytes(gpuInfo.totalBytes) + ' GPU (' + pct + '%). Expect spill to system RAM. Lower Context or GPU Offload.');
-        } else if (totalGpu > gpuInfo.totalBytes - headroom) {
+          warnings.unshift('Estimated VRAM at full context ~' + fmtBytes(totalGpu) + ' is over the full ' + fmtBytes(cap) + ' GPU (' + pct + '%). Expect spill to system RAM. Lower Context or GPU Offload.');
+        } else if (cap > 2 * 1024 ** 3 && totalGpu > cap - 2 * 1024 ** 3) {
           willSpill = true;
-          warnings.unshift('Tight on VRAM at full context: ~' + fmtBytes(totalGpu) + ' of ' + fmtBytes(gpuInfo.totalBytes) + ' (' + pct + '%). Only ~' + fmtBytes(gpuInfo.totalBytes - totalGpu) + ' left — target is 2 GiB free. Lower Context or GPU Offload.');
-        } else if (gpuInfo.totalBytes - totalGpu < 4 * 1024 ** 3) {
-          warnings.push('Getting full at full context: ~' + fmtBytes(totalGpu) + ' of ' + fmtBytes(gpuInfo.totalBytes) + ' VRAM (' + pct + '%).');
+          warnings.unshift('Tight on VRAM at full context: ~' + fmtBytes(totalGpu) + ' of ' + fmtBytes(cap) + ' (' + pct + '%). Only ~' + fmtBytes(cap - totalGpu) + ' left — target is 2 GiB free. Lower Context or GPU Offload.');
+        } else if (cap > 4 * 1024 ** 3 && cap - totalGpu < 4 * 1024 ** 3) {
+          warnings.push('Getting full at full context: ~' + fmtBytes(totalGpu) + ' of ' + fmtBytes(cap) + ' VRAM (' + pct + '%).');
+        }
         }
       }
       if (cpuOnly && systemRamTotalBytes && totalCpu > systemRamTotalBytes * 0.9) {
@@ -3196,11 +3242,11 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           ' · KV ~' + fmtBytes(kvBytes) + (kvSplit ? ' (~' + fmtBytes(gpuKv) + ' on GPU)' : (kvOnGpu ? ' on GPU' : ' in RAM')) +
           ' · ' + onGpu + '/' + nLayers + ' layers offloaded' + specSuffix;
       } else {
-        const pct = gpuInfo && gpuInfo.totalBytes
-          ? Math.round((totalGpu / gpuInfo.totalBytes) * 100)
-          : undefined;
-        summary = 'VRAM ~' + fmtBytes(totalGpu) +
-          (gpuInfo && gpuInfo.totalBytes ? ' of ' + fmtBytes(gpuInfo.totalBytes) + (pct !== undefined ? ' (' + pct + '%)' : '') : '') +
+        const cap = gpuBarCapacityBytes(gpuInfo) || (gpuInfo && gpuInfo.totalBytes);
+        const pct = cap ? Math.round((totalGpu / cap) * 100) : undefined;
+        const kind = isIntegratedGpu(gpuInfo) ? 'iGPU GTT' : 'VRAM';
+        summary = kind + ' ~' + fmtBytes(totalGpu) +
+          (cap ? ' of ' + fmtBytes(cap) + (pct !== undefined ? ' (' + pct + '%)' : '') : '') +
           ' · KV ~' + fmtBytes(kvBytes) + (kvSplit ? ' (~' + fmtBytes(gpuKv) + ' on GPU)' : (kvOnGpu ? ' on GPU' : ' in RAM')) +
           ' · ' + onGpu + '/' + nLayers + ' layers offloaded' + specSuffix;
       }

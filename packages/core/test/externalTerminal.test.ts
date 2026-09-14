@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
 import path from "node:path";
 import { describe, it } from "node:test";
-import { buildWindowsExternalLaunch, withLogFileArg } from "../src/externalTerminal";
+import {
+  buildWindowsExternalLaunch,
+  linuxTerminalArgsPrefix,
+  missingLinuxTerminalMessage,
+  resolveLinuxTerminalLauncher,
+  withLogFileArg,
+} from "../src/externalTerminal";
 
 describe("withLogFileArg", () => {
   it("prepends --log-file when missing", () => {
@@ -59,5 +65,60 @@ describe("buildWindowsExternalLaunch", () => {
       binary,
     ]);
     assert.equal(plan.argv.includes("powershell.exe"), false);
+  });
+});
+
+describe("resolveLinuxTerminalLauncher", () => {
+  it("uses a PATH hit with the matching argv prefix", () => {
+    const plan = resolveLinuxTerminalLauncher({
+      isFlatpak: false,
+      env: {},
+      lookup: (name) => (name === "konsole" ? "/usr/bin/konsole" : undefined),
+    });
+    assert.ok(plan);
+    assert.equal(plan.viaFlatpakHost, false);
+    assert.equal(plan.command, "/usr/bin/konsole");
+    assert.deepEqual(plan.prefix, linuxTerminalArgsPrefix("/usr/bin/konsole"));
+  });
+
+  it("honors $TERMINAL before the built-in list", () => {
+    const plan = resolveLinuxTerminalLauncher({
+      isFlatpak: false,
+      env: { TERMINAL: "alacritty" },
+      lookup: (name) => (name === "alacritty" ? "/usr/bin/alacritty" : undefined),
+    });
+    assert.ok(plan);
+    assert.equal(plan.terminal, "/usr/bin/alacritty");
+    assert.deepEqual(plan.prefix, ["-e"]);
+  });
+
+  it("wraps the host terminal in flatpak-spawn --host inside a Flatpak", () => {
+    const plan = resolveLinuxTerminalLauncher({
+      isFlatpak: true,
+      env: { FLATPAK_ID: "com.visualstudio.code" },
+      lookup: (name) => (name === "flatpak-spawn" ? "/usr/bin/flatpak-spawn" : undefined),
+      hostLookup: (name) => (name === "konsole" ? "/usr/bin/konsole" : undefined),
+    });
+    assert.ok(plan);
+    assert.equal(plan.viaFlatpakHost, true);
+    assert.equal(plan.command, "/usr/bin/flatpak-spawn");
+    assert.equal(plan.terminal, "/usr/bin/konsole");
+    assert.deepEqual(plan.prefix, [
+      "--host",
+      "/usr/bin/konsole",
+      "--title",
+      "Llama AIO · llama-server",
+      "-e",
+    ]);
+  });
+
+  it("returns undefined in Flatpak when the host portal cannot see a terminal", () => {
+    const plan = resolveLinuxTerminalLauncher({
+      isFlatpak: true,
+      lookup: (name) => (name === "flatpak-spawn" ? "/usr/bin/flatpak-spawn" : undefined),
+      hostLookup: () => undefined,
+    });
+    assert.equal(plan, undefined);
+    assert.match(missingLinuxTerminalMessage({ flatpak: true, flatpakId: "com.visualstudio.code" }), /Flatpak/);
   });
 });

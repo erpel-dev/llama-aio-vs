@@ -511,6 +511,32 @@ export function detectGpus(force = false, llamaServerBinary?: string): GpuMemory
   return gpus;
 }
 
+/** Dedicated VRAM this small is usually a UMA carve-out, not a discrete card. */
+const INTEGRATED_VRAM_MAX_BYTES = 2 * 1024 ** 3;
+
+/**
+ * True for APUs / iGPUs (Vega/Rembrandt/Intel UHD, “Onboard IGD”, or a tiny
+ * VRAM bar next to a large GTT aperture). Discrete cards — even with ReBAR
+ * off and a big GTT figure — stay false.
+ */
+export function isIntegratedGpu(
+  gpu: Pick<GpuMemoryInfo, "name" | "llamaDeviceId" | "totalBytes" | "gttTotalBytes"> | undefined
+): boolean {
+  if (!gpu || !(gpu.totalBytes > 0)) {
+    return false;
+  }
+  const name = `${gpu.name || ""} ${gpu.llamaDeviceId || ""}`.toLowerCase();
+  if (
+    /onboard|\bigd\b|integrated|iris|uhd graphics|hd graphics|radeon graphics|vega mobile|cezanne|renoir|lucienne|barcelo|mendocino|rembrandt|raphael|phoenix|hawk.?point|strix|gfx[0-9]+c\b/.test(
+      name
+    )
+  ) {
+    return true;
+  }
+  const gtt = gpu.gttTotalBytes || 0;
+  return gpu.totalBytes <= INTEGRATED_VRAM_MAX_BYTES && gtt >= 4 * 1024 ** 3 && gtt >= gpu.totalBytes * 4;
+}
+
 /** `Vulkan0 · Radeon RX 9070 XT` when llama.cpp id is known; else `GPU 0 · …`. */
 export function formatGpuDeviceLabel(
   gpu: { name?: string; llamaDeviceId?: string } | undefined,
