@@ -47,6 +47,26 @@ export interface LlamaListedDevice {
 }
 
 const MIN_VRAM = 512 * 1024 * 1024;
+/**
+ * `Win32_VideoController.AdapterRAM` is a uint32. Cards larger than 4 GiB
+ * saturate here (often `0xFFF00000` or `0xFFFFFFFF`), so that reading is not
+ * the device size.
+ */
+export const ADAPTER_RAM_UINT32_CAP = 0x1_0000_0000;
+/** Lower edge of the saturation band. A genuine 2–3 GiB card stays below it. */
+const ADAPTER_RAM_CAP_FLOOR = 0xe000_0000;
+const MAX_PLAUSIBLE_VRAM = 512 * 1024 ** 3;
+
+/** True when a WMI `AdapterRAM` value is the uint32 ceiling, not a measured size. */
+export function adapterRamLooksCapped(totalBytes: number): boolean {
+  return totalBytes >= ADAPTER_RAM_CAP_FLOOR && totalBytes <= 0xffff_ffff;
+}
+
+function isIgnoredDisplayName(name: string): boolean {
+  return /microsoft basic|basic display|basic render|remote display|virtual display|indirect display|hyper-v|parsec|iddcx|idd sample|virtual monitor|meta virtual/i.test(
+    name
+  );
+}
 
 function pciSortKey(slot?: string): string {
   return (slot || "zzzz").toLowerCase();
@@ -279,8 +299,8 @@ function readRocmSmi(): GpuMemoryInfo | undefined {
 }
 
 /**
- * Windows fallback for AMD/Intel when nvidia-smi is absent.
- * Note: AdapterRAM is often a uint32 and can under-report >4 GiB cards.
+ * Windows WMI fallback. `AdapterRAM` saturates at 4 GiB; callers replace that
+ * with `--list-devices` or `HardwareInformation.qwMemorySize` when they can.
  */
 function readWindowsWmiGpus(): GpuMemoryInfo[] | undefined {
   if (process.platform !== "win32") {
@@ -299,29 +319,169 @@ function readWindowsWmiGpus(): GpuMemoryInfo[] | undefined {
     if (!out) {
       return undefined;
     }
-    const parsed = JSON.parse(out) as
-      | { Name?: string; AdapterRAM?: number }
-      | Array<{ Name?: string; AdapterRAM?: number }>;
-    const items = Array.isArray(parsed) ? parsed : [parsed];
-    const found: GpuMemoryInfo[] = [];
-    for (const item of items) {
-      const name = String(item.Name || "");
-      if (!name || /Microsoft Basic/i.test(name)) {
-        continue;
-      }
-      const totalBytes = Number(item.AdapterRAM);
-      if (!Number.isFinite(totalBytes) || totalBytes < MIN_VRAM) {
-        continue;
-      }
-      found.push({ totalBytes, name, source: "wmi" });
-    }
-    if (!found.length) {
-      return undefined;
-    }
-    return sortAndIndex(found);
+    const found = parseWindowsWmiVideoControllers(out);
+    return found.length ? sortAndIndex(found) : undefined;
   } catch {
     return undefined;
   }
+}
+
+/**
+ * `reg query` text. Windows may emit UTF-16LE (with or without a BOM) when
+ * the console code page is Unicode; treating that as UTF-8 drops every line.
+ */
+export function decodeRegistryQueryOutput(buf: Buffer): string {
+  if (buf.length >= 2 && buf[0] === 0xff && buf[1] === 0xfe) {
+    return buf.subarray(2).toString("utf16le");
+  }
+  if (buf.length >= 4 && buf[1] === 0 && buf[3] === 0) {
+    return buf.toString("utf16le").replace(/^\uFEFF/, "");
+  }
+  return buf.toString("utf8");
+}
+
+function parseRegBinaryQword(hex: string): number | undefined {
+  const clean = hex.replace(/[^0-9a-fA-F]/g, "");
+  if (!clean || clean.length % 2 !== 0 || clean.length > 16) {
+    return undefined;
+  }
+  const bytes: number[] = [];
+  for (let i = 0; i < clean.length; i += 2) {
+    bytes.push(Number.parseInt(clean.slice(i, i + 2), 16));
+  }
+  const fromEndian = (little: boolean): number => {
+    let n = 0n;
+    for (let i = 0; i < bytes.length; i++) {
+      const shift = little ? i : bytes.length - 1 - i;
+      n += BigInt(bytes[i]!) << BigInt(8 * shift);
+    }
+    return Number(n);
+  };
+  const plausible = (n: number) =>
+    Number.isSafeInteger(n) && n >= MIN_VRAM && n <= MAX_PLAUSIBLE_VRAM;
+  const le = fromEndian(true);
+  if (plausible(le)) {
+    return le;
+  }
+  const be = fromEndian(false);
+  return plausible(be) ? be : undefined;
+}
+
+/** Parse one `HardwareInformation.qwMemorySize` data cell from `reg query`. */
+export function parseQwMemorySizeField(type: string, data: string): number | undefined {
+  const kind = type.toUpperCase();
+  const raw = data.trim();
+  if (kind === "REG_QWORD" || kind === "REG_DWORD") {
+    const n = /^0x/i.test(raw) ? Number.parseInt(raw, 16) : Number(raw);
+    if (!Number.isSafeInteger(n) || n <= 0) {
+      return undefined;
+    }
+    return n;
+  }
+  if (kind === "REG_BINARY") {
+    return parseRegBinaryQword(raw);
+  }
+  return undefined;
+}
+
+export interface WindowsRegistryGpu {
+  name: string;
+  totalBytes: number;
+}
+
+const DISPLAY_CLASS_GUID = "{4d36e968-e325-11ce-bfc1-08002be10318}";
+
+/**
+ * Parse `reg query HKLM\...\Class\{4d36e968-...} /s`.
+ * Only `HardwareInformation.qwMemorySize` counts — `MemorySize` is the same
+ * uint32 cap as WMI `AdapterRAM`.
+ */
+export function parseWindowsGpuRegistry(text: string): WindowsRegistryGpu[] {
+  const blocks = new Map<string, { name?: string; totalBytes?: number }>();
+  let current: string | undefined;
+  for (const line of text.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (/^HKEY_/i.test(trimmed) && trimmed.toLowerCase().includes(DISPLAY_CLASS_GUID.toLowerCase())) {
+      const key = /\\(\d{4})$/.exec(trimmed);
+      current = key?.[1];
+      if (current && !blocks.has(current)) {
+        blocks.set(current, {});
+      }
+      if (!key) {
+        current = undefined;
+      }
+      continue;
+    }
+    if (!current) {
+      continue;
+    }
+    const field = /^\s*(DriverDesc|HardwareInformation\.qwMemorySize)\s+(REG_\w+)\s+(.+)$/i.exec(line);
+    if (!field) {
+      continue;
+    }
+    const rec = blocks.get(current);
+    if (!rec) {
+      continue;
+    }
+    if (/^DriverDesc$/i.test(field[1] || "")) {
+      rec.name = (field[3] || "").trim();
+    } else {
+      const bytes = parseQwMemorySizeField(field[2] || "", field[3] || "");
+      if (bytes && bytes >= MIN_VRAM && bytes <= MAX_PLAUSIBLE_VRAM) {
+        rec.totalBytes = bytes;
+      }
+    }
+  }
+  const out: WindowsRegistryGpu[] = [];
+  for (const rec of blocks.values()) {
+    if (!rec.name || !rec.totalBytes || isIgnoredDisplayName(rec.name)) {
+      continue;
+    }
+    out.push({ name: rec.name, totalBytes: rec.totalBytes });
+  }
+  return out;
+}
+
+function readWindowsRegistryGpus(): WindowsRegistryGpu[] | undefined {
+  if (process.platform !== "win32") {
+    return undefined;
+  }
+  try {
+    const buf = execFileSync(
+      "reg.exe",
+      [
+        "query",
+        `HKLM\\SYSTEM\\CurrentControlSet\\Control\\Class\\${DISPLAY_CLASS_GUID}`,
+        "/s",
+      ],
+      { timeout: 6000, windowsHide: true }
+    );
+    const found = parseWindowsGpuRegistry(decodeRegistryQueryOutput(buf));
+    return found.length ? found : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** CIM JSON from `Win32_VideoController`. `AdapterRAM` may arrive as a string. */
+export function parseWindowsWmiVideoControllers(json: string): GpuMemoryInfo[] {
+  const parsed = JSON.parse(json) as
+    | { Name?: string; AdapterRAM?: number | string }
+    | Array<{ Name?: string; AdapterRAM?: number | string }>;
+  const items = Array.isArray(parsed) ? parsed : [parsed];
+  const found: GpuMemoryInfo[] = [];
+  for (const item of items) {
+    const name = String(item.Name || "");
+    if (!name || isIgnoredDisplayName(name)) {
+      continue;
+    }
+    const totalBytes = Number(item.AdapterRAM);
+    if (!Number.isFinite(totalBytes) || totalBytes < MIN_VRAM) {
+      continue;
+    }
+    found.push({ totalBytes, name, source: "wmi" });
+  }
+  return found;
 }
 
 /** Detected GPUs, cached briefly because sysfs/nvidia-smi are stable. */
@@ -349,6 +509,13 @@ export function preferStableGpuList(
     previous.length === next.length &&
     previous.some((g) => g.llamaDeviceId) &&
     !next.some((g) => g.llamaDeviceId)
+  ) {
+    return previous;
+  }
+  // A later WMI probe can fall back to the 4 GiB cap after a good reading.
+  if (
+    previous.length === next.length &&
+    next.some((g, i) => adapterRamLooksCapped(g.totalBytes) && (previous[i]?.totalBytes || 0) > ADAPTER_RAM_UINT32_CAP)
   ) {
     return previous;
   }
@@ -441,20 +608,134 @@ export function orderGpusLikeLlama(
     }
     const sysfsTotal = g.totalBytes > 0 ? g.totalBytes : 0;
     const listedTotal = dev.totalBytes && dev.totalBytes > 0 ? dev.totalBytes : 0;
+    // WMI AdapterRAM saturates at 4 GiB. A larger --list-devices size is real.
+    // Linux sysfs totals are left alone (source is not "wmi").
+    const upgradeCapped =
+      g.source === "wmi" && listedTotal > sysfsTotal && adapterRamLooksCapped(sysfsTotal);
     ordered.push({
       ...g,
       name: g.name && !/^(amdgpu|nvidia|i915|xe)$/i.test(g.name.trim()) ? g.name : dev.name,
       // `||` would take a 0 MiB `--list-devices` reading over a good sysfs total.
-      totalBytes: sysfsTotal || listedTotal,
+      totalBytes: upgradeCapped ? listedTotal : sysfsTotal || listedTotal,
       usedBytes: dev.usedBytes ?? g.usedBytes,
       index: ordered.length,
       llamaDeviceId: dev.id,
+      source: upgradeCapped ? "wmi+list-devices" : g.source,
     });
   }
   for (const g of unused) {
     ordered.push({ ...g, index: ordered.length });
   }
   return ordered;
+}
+
+/** Pair a WMI name with a registry `DriverDesc` or a `--list-devices` name. */
+export function windowsGpuNamesMatch(a: string, b: string): boolean {
+  const ta = gpuModelTokens(a);
+  const tb = gpuModelTokens(b);
+  if (ta.length && tb.length) {
+    return ta.some((t) => tb.includes(t));
+  }
+  const norm = (s: string) =>
+    s
+      .toLowerCase()
+      .replace(/\(r\)|\(tm\)/gi, "")
+      .replace(/[^a-z0-9]+/g, " ")
+      .trim();
+  const na = norm(a);
+  const nb = norm(b);
+  if (!na || !nb) {
+    return false;
+  }
+  return na === nb || na.includes(nb) || nb.includes(na);
+}
+
+/**
+ * True when WMI is missing or still sitting on the 4 GiB cap, and
+ * `--list-devices` did not already report a larger card.
+ */
+export function windowsVramNeedsRegistry(
+  gpus: GpuMemoryInfo[],
+  listed: LlamaListedDevice[] | undefined
+): boolean {
+  const capped = gpus.length === 0 || gpus.some((g) => adapterRamLooksCapped(g.totalBytes));
+  if (!capped) {
+    return false;
+  }
+  if (!listed?.length) {
+    return true;
+  }
+  return !listed.some((d) => (d.totalBytes || 0) > ADAPTER_RAM_UINT32_CAP);
+}
+
+/**
+ * Windows VRAM: `--list-devices` replaces a capped `AdapterRAM`, then
+ * `HardwareInformation.qwMemorySize` if the device list is missing or 0 MiB.
+ * An empty WMI list becomes the device list, or the registry entries.
+ */
+export function resolveWindowsGpuList(
+  wmi: GpuMemoryInfo[],
+  listed: LlamaListedDevice[] | undefined,
+  registry: WindowsRegistryGpu[] | undefined
+): GpuMemoryInfo[] {
+  let gpus = wmi.filter((g) => !isIgnoredDisplayName(g.name || ""));
+  if (listed?.length) {
+    if (gpus.length) {
+      gpus = orderGpusLikeLlama(gpus, listed);
+    } else {
+      gpus = [];
+      for (const dev of listed) {
+        if (!dev.totalBytes || dev.totalBytes < MIN_VRAM) {
+          continue;
+        }
+        gpus.push({
+          totalBytes: dev.totalBytes,
+          usedBytes: dev.usedBytes,
+          name: dev.name,
+          source: "llama-list-devices",
+          index: gpus.length,
+          llamaDeviceId: dev.id,
+        });
+      }
+    }
+  }
+  const reg = (registry || []).filter(
+    (r) => r.name && r.totalBytes >= MIN_VRAM && !isIgnoredDisplayName(r.name)
+  );
+  if (!reg.length) {
+    return gpus;
+  }
+  if (!gpus.length) {
+    return sortAndIndex(
+      reg.map((r) => ({ totalBytes: r.totalBytes, name: r.name, source: "registry" }))
+    );
+  }
+  const used = new Set<number>();
+  return gpus.map((g) => {
+    if (!adapterRamLooksCapped(g.totalBytes)) {
+      return g;
+    }
+    let matchAt = reg.findIndex((r, i) => !used.has(i) && windowsGpuNamesMatch(r.name, g.name || ""));
+    if (matchAt < 0 && gpus.length === 1 && reg.length === 1 && !used.has(0)) {
+      const only = reg[0];
+      const gpuTokens = gpuModelTokens(g.name || "");
+      const regTokens = gpuModelTokens(only?.name || "");
+      // A single unnamed adapter can take the only registry qword.
+      // A named model must not inherit a different card's size.
+      if (only && gpuTokens.length === 0 && regTokens.length === 0) {
+        matchAt = 0;
+      }
+    }
+    if (matchAt < 0) {
+      return g;
+    }
+    const match = reg[matchAt];
+    if (!match || match.totalBytes <= g.totalBytes) {
+      return g;
+    }
+    used.add(matchAt);
+    return { ...g, totalBytes: match.totalBytes, source: "registry" };
+  });
 }
 
 function readLlamaListDevices(binary: string): LlamaListedDevice[] | undefined {
@@ -496,15 +777,35 @@ export function detectGpus(force = false, llamaServerBinary?: string): GpuMemory
   const wmi = nvidia || sysfs ? undefined : readWindowsWmiGpus();
   const rocm = nvidia || sysfs || wmi ? undefined : readRocmSmi();
   let gpus = nvidia || sysfs || wmi || (rocm ? [rocm] : []);
+  const windowsVram =
+    process.platform === "win32" && !nvidia && !sysfs;
+  const windowsNeedsList =
+    windowsVram &&
+    ((wmi || []).length === 0 ||
+      (wmi || []).length >= 2 ||
+      (wmi || []).some((g) => adapterRamLooksCapped(g.totalBytes)));
   // `--list-devices` maps the vulkan\bin exe; skip while an install holds it.
-  if (binKey && gpus.length >= 2 && !activeInstallLock()) {
-    const listed = readLlamaListDevices(binKey);
-    if (listed?.length) {
-      gpus = orderGpusLikeLlama(gpus, listed);
-    }
+  // One Windows GPU still needs it: WMI AdapterRAM cannot report past 4 GiB.
+  let listed: LlamaListedDevice[] | undefined;
+  if (binKey && !activeInstallLock() && (gpus.length >= 2 || windowsNeedsList)) {
+    listed = readLlamaListDevices(binKey);
+  }
+  if (windowsVram) {
+    const registry = windowsVramNeedsRegistry(wmi || [], listed)
+      ? readWindowsRegistryGpus()
+      : undefined;
+    gpus = resolveWindowsGpuList(wmi || [], listed, registry);
+  } else if (listed?.length && gpus.length >= 2) {
+    gpus = orderGpusLikeLlama(gpus, listed);
   }
   gpus = preferStableGpuList(gpus, force ? undefined : lastGoodGpus);
   if (gpus.length >= 2) {
+    lastGoodGpus = gpus;
+  } else if (
+    gpus.length === 1 &&
+    (gpus[0]?.totalBytes || 0) > ADAPTER_RAM_UINT32_CAP &&
+    (lastGoodGpus?.length || 0) <= 1
+  ) {
     lastGoodGpus = gpus;
   }
   cached = { at: now, binKey, gpus };

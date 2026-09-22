@@ -3,6 +3,7 @@ import * as os from "os";
 import * as path from "path";
 import * as vscode from "vscode";
 import { promptUseInCopilotChat } from "./copilotChatPrompt";
+import { copyServerCommandLine, openServerLog, reportLaunchFailure } from "./serverDiagnostics";
 import { detectGpus, activeInstallLock, type GpuMemoryInfo } from "@llama-aio/core";
 import { LlamaInstaller, UiBackend } from "@llama-aio/core";
 import { estimateMemory, memoryEstimateInputs, mmprojFileSize, resolveDraftCapabilities } from "@llama-aio/core";
@@ -21,18 +22,6 @@ import { SettingsStore } from "@llama-aio/core";
 import { resolveLaunchMode } from "@llama-aio/core";
 import { capsMissDefaultSwaPattern, DEFAULT_LOAD_SETTINGS, DEFAULT_REQUEST_SETTINGS, effectiveServerUiState, isQwen4expArchitecture, LlamaLoadSettings, normalizeSpeculativeMode, RequestSettings } from "@llama-aio/core";
 import { STARTER_MODEL } from "./huggingFace";
-
-function uiSpillFromMessage(msg: { willSpill?: unknown; spillWarning?: unknown }):
-  | { willSpill: boolean; warning?: string }
-  | undefined {
-  if (typeof msg.willSpill !== "boolean") {
-    return undefined;
-  }
-  return {
-    willSpill: msg.willSpill,
-    warning: typeof msg.spillWarning === "string" ? msg.spillWarning : undefined,
-  };
-}
 
 export type ModelActions = {
   downloadFromHuggingFace: () => Promise<void>;
@@ -86,7 +75,8 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     private readonly perf: PerfStats,
     private readonly onReload: (token?: LaunchToken) => Promise<void>,
     private readonly modelActions: ModelActions,
-    private readonly notifyChatModels: () => void = () => undefined
+    private readonly notifyChatModels: () => void = () => undefined,
+    private readonly globalState?: vscode.Memento
   ) {}
 
   resolveWebviewView(
@@ -95,6 +85,11 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     _token: vscode.CancellationToken
   ): void {
     this.view = webviewView;
+    webviewView.onDidDispose(() => {
+      if (this.view === webviewView) {
+        this.view = undefined;
+      }
+    });
     webviewView.webview.options = {
       enableScripts: true,
       localResourceRoots: [this.extensionUri],
@@ -172,7 +167,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             try {
               await this.store.updateLoadSettings(msg.payload as Partial<LlamaLoadSettings>);
               this.syncSpeculativeMode();
-              if (!(await this.confirmIfMemorySpill(uiSpillFromMessage(msg)))) {
+              if (!(await this.confirmIfMemorySpill())) {
                 break;
               }
               await this.onReload(token);
@@ -183,7 +178,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               await this.pushState();
             }
             if (readyMessage) {
-              void promptUseInCopilotChat(this.store, readyMessage);
+              void promptUseInCopilotChat(this.store, readyMessage, this.globalState);
             }
             break;
           }
@@ -200,7 +195,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                 await this.store.updateLoadSettings(msg.payload as Partial<LlamaLoadSettings>);
                 this.syncSpeculativeMode();
               }
-              if (!(await this.confirmIfMemorySpill(uiSpillFromMessage(msg)))) {
+              if (!(await this.confirmIfMemorySpill())) {
                 break;
               }
               const status = await vscode.window.withProgress(
@@ -227,13 +222,19 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               await this.pushState();
             }
             if (readyMessage) {
-              void promptUseInCopilotChat(this.store, readyMessage);
+              void promptUseInCopilotChat(this.store, readyMessage, this.globalState);
             }
             break;
           }
           case "stop":
             await this.processManager.stop(true);
             await this.pushState();
+            break;
+          case "openLog":
+            await openServerLog();
+            break;
+          case "copyCommandLine":
+            await copyServerCommandLine();
             break;
           case "refresh":
             invalidateModelLibraryCache();
@@ -379,9 +380,13 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           }
         }
       } catch (e) {
-        vscode.window.showErrorMessage(
-          `Llama AIO: ${e instanceof Error ? e.message : String(e)}`
-        );
+        if (msg.type === "start" || msg.type === "reload") {
+          await reportLaunchFailure(msg.type === "reload" ? "Reload failed" : "Start failed", e);
+        } else {
+          vscode.window.showErrorMessage(
+            `Llama AIO: ${e instanceof Error ? e.message : String(e)}`
+          );
+        }
         await this.pushState();
       }
     });
@@ -403,7 +408,11 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       state.modelCapabilities,
       state.loadSettings,
       cpuOnly ? undefined : gpus[0],
-      { cpuOnly, gpus: cpuOnly ? undefined : gpus }
+      {
+        cpuOnly,
+        draftCaps: resolveDraftCapabilities(state.loadSettings),
+        gpus: cpuOnly ? undefined : gpus,
+      }
     );
   }
 
@@ -413,16 +422,17 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     this.perf.setSpeculativeMode(normalizeSpeculativeMode(mode));
   }
 
-  /** Ask before start/reload when estimated memory is likely to spill (VRAM or RAM). */
-  async confirmIfMemorySpill(fromUi?: { willSpill?: boolean; warning?: string }): Promise<boolean> {
-    const est = fromUi?.willSpill !== undefined ? undefined : this.currentMemoryEstimate();
-    const willSpill = fromUi?.willSpill !== undefined ? fromUi.willSpill : !!est?.willSpill;
-    if (!willSpill) {
+  /**
+   * Ask before start/reload when core's memory estimate says the load will spill.
+   * The webview's live chart is display-only and is not consulted here.
+   */
+  async confirmIfMemorySpill(): Promise<boolean> {
+    const est = this.currentMemoryEstimate();
+    if (!est?.willSpill) {
       return true;
     }
     const warning =
-      fromUi?.warning ||
-      est?.warnings[0] ||
+      est.warnings[0] ||
       "These settings leave too little memory headroom and may spill or thrash (much slower).";
     // Modal dialogs already include a localized Cancel — passing "Cancel" too
     // shows two Abbrechen buttons.
@@ -461,7 +471,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           !state.modelCapabilities.fullAttentionInterval) ||
         (isQwen4expArchitecture(state.modelCapabilities.architecture) &&
           (state.modelCapabilities.pleShare === undefined ||
-            !Number.isFinite(state.modelCapabilities.pleShare))))
+            !Number.isFinite(state.modelCapabilities.pleShare) ||
+            // Stale 40% heuristic from scanning only shard 1 (PLE often lives in shard 2).
+            ((state.modelCapabilities.shardCount ?? 1) > 1 &&
+              state.modelCapabilities.pleShare === 0.4))))
     ) {
       try {
         state = await this.store.applySelectedModel(state.selectedModelPath);
@@ -858,6 +871,13 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       flex: 0 0 auto;
       min-width: 72px;
       text-align: center;
+    }
+    .actions-row.diag-row { margin-top: 6px; }
+    .actions-row.diag-row button.secondary {
+      flex: 1;
+      text-align: center;
+      font-weight: 550;
+      padding: 5px 8px;
     }
     .launch-row { margin-top: 8px; }
     .launch-row label {
@@ -1361,6 +1381,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       <button class="primary" id="primaryBtn" data-action="start">Start</button>
       <button class="secondary" id="stopBtn" disabled>Stop</button>
     </div>
+    <div class="actions-row diag-row">
+      <button class="secondary" id="openLogBtn" type="button">Open log</button>
+      <button class="secondary" id="copyCmdBtn" type="button">Copy command</button>
+    </div>
     <div class="launch-row">
       <label for="launchMode">Launch mode</label>
       <select id="launchMode" class="wide" title="How llama-server is started">
@@ -1537,8 +1561,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
   <div class="row hidden" id="dualGpuRow">
     <div class="label"><span class="name tip" data-flag="-mg, --main-gpu" data-help="GPU that holds the compute graph, scratch buffers, and the slider’s share of weights + KV. Index matches llama.cpp --list-devices (Vulkan0, Vulkan1, …), which is often not PCI / btop order.">Main GPU</span></div>
       <select id="mainGpu" class="wide"></select>
-    <div class="label" style="margin-top:6px"><span class="name tip" data-flag="-ts, --tensor-split" data-help="Percent of model weights and KV cache on the Main GPU. The rest is split evenly across the other cards. llama.cpp receives this as --tensor-split in --list-devices order. Disabled when Split mode is None (the whole model stays on the Main GPU).">Weights on main GPU</span><span id="tensorSplitPct">75%</span></div>
+    <div class="label" style="margin-top:6px"><span class="name tip" data-flag="-ts, --tensor-split" data-help="Percent of GPU-resident weights on the Main GPU after CPU MoE/FFN. llama.cpp --tensor-split still fills by layer count, so the emitted fractions can differ (cheap first layers get more of Main). The rest is split evenly across the other cards. Disabled when Split mode is None.">Weights on main GPU</span><span id="tensorSplitPct">75%</span></div>
     <input type="range" id="tensorSplitRange" min="10" max="90" step="1" />
+    <div class="hint" id="tensorSplitHint"></div>
     <div class="label" style="margin-top:6px"><span class="name tip" data-flag="-sm, --split-mode" data-help="How tensors are split. Layer (default) shares the model across cards. Row needs a fast x16 link. Tensor splits every weight matrix across cards (experimental, fastest for multi-GPU inference). None keeps every GPU layer on the Main GPU and leaves the other cards free (--device).">Split mode</span></div>
       <select id="splitMode" class="wide">
         <option value="layer">Layer (default)</option>
@@ -2179,6 +2204,73 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       return mass.map((x) => x / tot);
     }
 
+    function needsWeightAwareTensorSplitLive(splitMode, opts) {
+      if (splitMode === 'row' || splitMode === 'tensor' || splitMode === 'none') return false;
+      if (opts && opts.isMoe) return (opts.nCpuMoe || 0) > 0 && (opts.moeExpertShare || 0) > 0;
+      return !!(opts && (opts.nCpuFfn || 0) > 0 && (opts.denseFfnShare || 0) > 0);
+    }
+
+    function liveLayersOnGpu(L) {
+      const nLayers = Math.max(1, (memInputs && memInputs.blockCount) || 1);
+      const ngl = L && Number.isFinite(Number(L.gpuOffload)) ? Number(L.gpuOffload) : Number($('gpuOffload') && $('gpuOffload').value);
+      if (!Number.isFinite(ngl) || ngl >= 99) return nLayers;
+      return Math.min(nLayers, Math.max(0, Math.round(ngl)));
+    }
+
+    function liveMassOpts(L) {
+      const nCpuMoe = L && Number.isFinite(Number(L.nCpuMoe)) ? Number(L.nCpuMoe) : Number($('nCpuMoe') && $('nCpuMoe').value) || 0;
+      const nCpuFfn = L && Number.isFinite(Number(L.nCpuFfn)) ? Number(L.nCpuFfn) : Number($('nCpuFfn') && $('nCpuFfn').value) || 0;
+      return {
+        isMoe: !!(memInputs && memInputs.isMoe),
+        nCpuMoe: nCpuMoe,
+        moeExpertShare: memInputs ? moeExpertShareOf(memInputs) : 0,
+        nCpuFfn: nCpuFfn,
+        denseFfnShare: memInputs ? denseFfnShareOf(memInputs) : 0,
+      };
+    }
+
+    function mainWeightShareFromSplitLive(raw, mainGpu, gpus, splitMode, opts, nLayers, onGpu) {
+      const shares = effectiveTensorSplitShares(raw, gpus, splitMode, mainGpu);
+      const n = (gpus && gpus.length) || 1;
+      const main = clampMainGpu(mainGpu, n);
+      if (n < 2 || !needsWeightAwareTensorSplitLive(splitMode, opts)) return shares[main] || 1;
+      const weight = layerAwareWeightSharesLive(nLayers, onGpu, shares, splitMode, mainGpu, opts);
+      return weight[main] || shares[main] || 1;
+    }
+
+    function tensorSplitForTargetWeightShareLive(targetShare, mainGpu, n, nLayers, onGpu, splitMode, opts) {
+      n = Math.max(1, Math.round(n) || 1);
+      if (n < 2) return '';
+      const target = Math.min(0.9, Math.max(0.1, Number(targetShare) || 0.5));
+      if (nLayers < 1 || !needsWeightAwareTensorSplitLive(splitMode, opts)) {
+        return tensorSplitForMainShare(target, mainGpu, n);
+      }
+      const main = clampMainGpu(mainGpu, n);
+      const targetPct = Math.round(target * 100);
+      let best = tensorSplitForMainShare(target, mainGpu, n);
+      let bestErr = Infinity;
+      let bestPct = targetPct;
+      for (let pct = 10; pct <= 90; pct++) {
+        const candidate = tensorSplitForMainShare(pct / 100, mainGpu, n);
+        const shares = tensorSplitShares(candidate, gpuInfos);
+        const weight = layerAwareWeightSharesLive(nLayers, onGpu, shares, splitMode || 'layer', mainGpu, opts);
+        const err = Math.abs((weight[main] || 0) - target);
+        if (err < bestErr - 1e-12) {
+          best = candidate;
+          bestErr = err;
+          bestPct = pct;
+        } else if (err <= bestErr + 1e-12) {
+          const closer = Math.abs(pct - targetPct) < Math.abs(bestPct - targetPct);
+          if (closer || (pct < bestPct && Math.abs(pct - targetPct) === Math.abs(bestPct - targetPct))) {
+            best = candidate;
+            bestErr = err;
+            bestPct = pct;
+          }
+        }
+      }
+      return best;
+    }
+
     function gpuDisplayOrder(gpus, mainGpu) {
       const n = (gpus && gpus.length) || 0;
       const order = [];
@@ -2237,18 +2329,35 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       const raw = $('tensorSplitRange') && $('tensorSplitRange').value;
       const pct = Number(raw);
       const share = (Number.isFinite(pct) ? pct : 50) / 100;
-      return tensorSplitForMainShare(share, readMainGpuIndex(), n);
+      const splitMode = ($('splitMode') && $('splitMode').value) || 'layer';
+      const nLayers = Math.max(1, (memInputs && memInputs.blockCount) || 1);
+      return tensorSplitForTargetWeightShareLive(
+        share,
+        readMainGpuIndex(),
+        n,
+        nLayers,
+        liveLayersOnGpu(),
+        splitMode,
+        liveMassOpts()
+      );
     }
 
     function syncTensorSplitPctLabel() {
       const range = $('tensorSplitRange');
       const lbl = $('tensorSplitPct');
+      const hint = $('tensorSplitHint');
       if (!range || !lbl) return;
       if ($('splitMode') && $('splitMode').value === 'none') {
         lbl.textContent = '100%';
+        if (hint) hint.textContent = '';
         return;
       }
       lbl.textContent = String(range.value) + '%';
+      if (hint) {
+        const n = (gpuInfos && gpuInfos.length) || 1;
+        const emitted = n >= 2 ? readTensorSplitFromUi() : '';
+        hint.textContent = emitted ? ('GPU-resident weights · --tensor-split ' + emitted) : '';
+      }
     }
 
     function syncTensorSplitEnabled() {
@@ -2264,7 +2373,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
 
     function fillMainGpuSelect(selected) {
       const sel = $('mainGpu');
-      if (!sel) return;
+      if (!sel || document.activeElement === sel) return;
       const gpus = gpuInfos || [];
       const n = Math.max(gpus.length, 1);
       const want = clampMainGpu(selected, n);
@@ -2913,14 +3022,15 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         : 0;
       // Mirrors vulkanDeviceReservedBytes() / vulkanDriverBytes(): 384 MiB
       // driver + 256 MiB slop on one Vulkan device. Split Flash-Next keeps
-      // 768 MiB driver + 2.5 GiB reserve; Qwen3.5 RCO keeps the 256 MiB
-      // slop even when split (that 2.5 GiB/card was the 13.9 vs 11.4 gap).
-      // Linear-recurrent hybrids (Qwen3.5 RCO) also run a smaller graph;
-      // full/SWA interleaves such as Flash-Next keep the dense graph.
+      // 768 MiB driver + 2.5 GiB reserve; Qwen3.5 RCO (and qwen4exp with
+      // SSM geometry) keeps the 256 MiB slop even when split.
+      // Linear-recurrent hybrids also run a smaller graph; full/SWA
+      // Flash-Next without ssm.* keeps the dense graph.
       // Inline isLinearRecurrentHybrid(): this is webview JS, the TS import
       // above is not in scope here.
       const archNorm = String((memInputs && memInputs.architecture) || '').toLowerCase().replace(/[._-]/g, '');
-      const discountRecurrent = archNorm !== 'qwen4exp' && archNorm.indexOf('qwen35') === 0;
+      const ssmState = Number(memInputs && memInputs.ssmStateSize) || 0;
+      const discountRecurrent = archNorm.indexOf('qwen35') === 0 || (ssmState > 0 && ssmState <= 4096);
       const ohTax = {
         vulkan: { driver: 768 * 1024 * 1024, peer: 512 * 1024 * 1024, graph: 12, reserved: 2.5 * 1024 ** 3 },
         cuda: { driver: 384 * 1024 * 1024, peer: 256 * 1024 * 1024, graph: 8, reserved: 0 },
@@ -3409,7 +3519,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           const names = gpuInfos.map((g, i) => gpuLabel(g, i) + ' · ' + fmtBytes(g.totalBytes)).join('  ·  ');
           hint.textContent = splitModeIsNone()
             ? names + '. Split mode None keeps every GPU layer on Main GPU and leaves the other cards free. Reload to apply.'
-            : names + '. Pick the faster card as Main GPU (Vulkan/CUDA order from llama.cpp, which may differ from btop). Then use the slider for how much of the model that card holds.';
+            : names + '. Pick the faster card as Main GPU (Vulkan/CUDA order from llama.cpp, which may differ from btop). The slider is GPU-resident weight share on that card after CPU MoE/FFN.';
         }
       }
     }
@@ -3430,10 +3540,19 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         const shares = tensorSplitShares(split, gpuInfos);
         split = tensorSplitForMainShare(Math.max.apply(null, shares), L.mainGpu ?? 0, n);
       }
-      const share = mainShareFromSplit(split, L.mainGpu ?? 0, gpuInfos);
+      const nLayers = Math.max(1, (memInputs && memInputs.blockCount) || 1);
+      const share = mainWeightShareFromSplitLive(
+        split,
+        L.mainGpu ?? 0,
+        gpuInfos,
+        L.splitMode,
+        liveMassOpts(L),
+        nLayers,
+        liveLayersOnGpu(L)
+      );
       const pct = Math.min(90, Math.max(10, Math.round(share * 100)));
       const range = $('tensorSplitRange');
-      if (range) range.value = String(pct);
+      if (range && document.activeElement !== range) range.value = String(pct);
       syncTensorSplitEnabled();
       return isLegacyGpu0FirstSplit(L.tensorSplit) && clampMainGpu(L.mainGpu ?? 0, n) > 0;
     }
@@ -3726,7 +3845,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       const el = $(id);
       if (!el) continue;
       el.addEventListener('change', () => { scheduleSaveLoad(); refreshMemoryLive(); });
-      el.addEventListener('input', () => { scheduleSaveLoad(); scheduleLiveMemory(); });
+      el.addEventListener('input', () => { scheduleSaveLoad(); scheduleLiveMemory(); syncTensorSplitPctLabel(); });
     }
 
     // Request defaults apply to the next chat call (no server reload). Persist on edit.
@@ -4035,6 +4154,33 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       }
     }
 
+    function fieldFocused(id) {
+      const el = $(id);
+      return !!(el && document.activeElement === el);
+    }
+    /** Leave the control the user is editing alone. Background pushes must not revert it. */
+    function setField(id, value) {
+      const el = $(id);
+      if (!el || document.activeElement === el) return;
+      const next = value == null ? '' : String(value);
+      if (el.value !== next) el.value = next;
+    }
+    function setPair(id, rangeId, value) {
+      if (fieldFocused(id) || fieldFocused(rangeId)) return;
+      setField(id, value);
+      setField(rangeId, value);
+    }
+    function setChecked(id, on) {
+      const el = $(id);
+      if (!el || document.activeElement === el) return;
+      el.checked = !!on;
+    }
+    function setDisabled(id, disabled) {
+      const el = $(id);
+      if (!el || document.activeElement === el) return;
+      el.disabled = !!disabled;
+    }
+
     function applyState(payload) {
       const s = payload.state;
       const L = s.loadSettings;
@@ -4077,7 +4223,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         message: starting ? startMessage : (status.message || ''),
       });
       const lm = $('launchMode');
-      if (lm && payload.launchMode) {
+      if (lm && payload.launchMode && document.activeElement !== lm) {
         lm.value = payload.launchMode === 'background' ? 'background' : 'externalTerminal';
       }
       updatePrimaryAction();
@@ -4101,18 +4247,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           : 'Send a Copilot Chat message first';
       }
 
-      const prToggle = $('promptReplacementsEnabled');
-      if (prToggle) {
-        prToggle.checked = !!payload.promptReplacementsEnabled;
-      }
-      const wikiToggle = $('wikipediaLookupEnabled');
-      if (wikiToggle) {
-        wikiToggle.checked = !!payload.wikipediaLookupEnabled;
-      }
-      const dupToggle = $('duplicateToolCallGuardEnabled');
-      if (dupToggle) {
-        dupToggle.checked = !!payload.duplicateToolCallGuardEnabled;
-      }
+      setChecked('promptReplacementsEnabled', !!payload.promptReplacementsEnabled);
+      setChecked('wikipediaLookupEnabled', !!payload.wikipediaLookupEnabled);
+      setChecked('duplicateToolCallGuardEnabled', !!payload.duplicateToolCallGuardEnabled);
       const prStats = $('replacementStats');
       if (prStats) {
         const pr = perf.promptReplacements;
@@ -4187,46 +4324,49 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       backendOptionsCache = options;
       activeBackendId = payload.selectedUiBackend || (options.find((o) => o.active) || {}).id || '';
       const prev = sel.value;
+      const backendFocused = document.activeElement === sel;
       suppressBackendChange = true;
-      sel.innerHTML = '';
-      for (const opt of options) {
-        const o = document.createElement('option');
-        o.value = opt.id;
-        let text = opt.label;
-        if (!opt.available) {
-          text += ' (unavailable)';
-        } else if (opt.id === 'path') {
-          text += opt.installed
-            ? (opt.installedTag ? (' · ' + opt.installedTag) : ' · found')
-            : ' · not on PATH';
-          if (opt.active) text += ' ●';
-        } else if (opt.installed) {
-          text += opt.installedTag
-            ? (' · installed ' + opt.installedTag)
-            : ' · installed';
-          if (opt.active) text += ' ●';
+      if (!backendFocused) {
+        sel.innerHTML = '';
+        for (const opt of options) {
+          const o = document.createElement('option');
+          o.value = opt.id;
+          let text = opt.label;
+          if (!opt.available) {
+            text += ' (unavailable)';
+          } else if (opt.id === 'path') {
+            text += opt.installed
+              ? (opt.installedTag ? (' · ' + opt.installedTag) : ' · found')
+              : ' · not on PATH';
+            if (opt.active) text += ' ●';
+          } else if (opt.installed) {
+            text += opt.installedTag
+              ? (' · installed ' + opt.installedTag)
+              : ' · installed';
+            if (opt.active) text += ' ●';
+          } else {
+            text += ' · not installed';
+          }
+          o.textContent = text;
+          // PATH stays selectable even when missing so the user can switch to it
+          // and see the install hint; download backends disable when unavailable.
+          o.disabled = opt.id === 'path' ? false : !opt.available;
+          if (opt.reason && (opt.id === 'path' ? !opt.installed : !opt.available)) {
+            o.title = opt.reason;
+          } else if (opt.id === 'path' && opt.installed && opt.installedTag) {
+            o.title = 'llama-server on PATH';
+          } else if (opt.installed && opt.installedTag) {
+            o.title = 'Cached locally: ' + opt.installedTag;
+          }
+          sel.appendChild(o);
+        }
+        const want = activeBackendId || prev || 'vulkan';
+        if ([...sel.options].some((o) => o.value === want && !o.disabled)) {
+          sel.value = want;
         } else {
-          text += ' · not installed';
+          const first = [...sel.options].find((o) => !o.disabled);
+          if (first) sel.value = first.value;
         }
-        o.textContent = text;
-        // PATH stays selectable even when missing so the user can switch to it
-        // and see the install hint; download backends disable when unavailable.
-        o.disabled = opt.id === 'path' ? false : !opt.available;
-        if (opt.reason && (opt.id === 'path' ? !opt.installed : !opt.available)) {
-          o.title = opt.reason;
-        } else if (opt.id === 'path' && opt.installed && opt.installedTag) {
-          o.title = 'llama-server on PATH';
-        } else if (opt.installed && opt.installedTag) {
-          o.title = 'Cached locally: ' + opt.installedTag;
-        }
-        sel.appendChild(o);
-      }
-      const want = activeBackendId || prev || 'vulkan';
-      if ([...sel.options].some((o) => o.value === want && !o.disabled)) {
-        sel.value = want;
-      } else {
-        const first = [...sel.options].find((o) => !o.disabled);
-        if (first) sel.value = first.value;
       }
       suppressBackendChange = false;
       updateBackendUi();
@@ -4306,74 +4446,85 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       const ffn = (caps && caps.isMoe) ? 0 : Math.min(L.nCpuFfn ?? 0, blocks);
       const threads = Math.min(Math.max(1, L.cpuThreads || 1), cpuLogicalCores);
 
-      $('contextLength').value = ctx;
-      $('contextLengthRange').value = ctx;
-      $('gpuOffload').value = ngl;
-      $('gpuOffloadRange').value = ngl;
-      $('cpuThreads').value = threads;
-      $('cpuThreadsRange').value = threads;
-      $('evalBatchSize').value = L.evalBatchSize;
-      $('physicalBatchSize').value = L.physicalBatchSize;
-      $('maxConcurrentPredictions').value = L.maxConcurrentPredictions;
-      $('nCpuMoe').value = moe;
-      $('nCpuMoeRange').value = moe;
-      $('nCpuFfn').value = ffn;
-      $('nCpuFfnRange').value = ffn;
-      $('offloadKvCacheToGpu').checked = !!L.offloadKvCacheToGpu;
-      if ($('mmprojOffloadToGpu')) $('mmprojOffloadToGpu').checked = L.mmprojOffloadToGpu !== false;
-      $('cacheTypeK').value = L.cacheTypeK || 'q8_0';
-      $('cacheTypeV').value = L.cacheTypeV || 'q8_0';
-      $('kvTypesLinked').checked = (L.cacheTypeK || 'q8_0') === (L.cacheTypeV || 'q8_0');
-      syncKvLink(false);
-      $('keepModelInMemory').checked = !!L.keepModelInMemory;
+      setPair('contextLength', 'contextLengthRange', ctx);
+      setPair('gpuOffload', 'gpuOffloadRange', ngl);
+      setPair('cpuThreads', 'cpuThreadsRange', threads);
+      setField('evalBatchSize', L.evalBatchSize);
+      setField('physicalBatchSize', L.physicalBatchSize);
+      setField('maxConcurrentPredictions', L.maxConcurrentPredictions);
+      setPair('nCpuMoe', 'nCpuMoeRange', moe);
+      setPair('nCpuFfn', 'nCpuFfnRange', ffn);
+      setChecked('offloadKvCacheToGpu', !!L.offloadKvCacheToGpu);
+      setChecked('mmprojOffloadToGpu', L.mmprojOffloadToGpu !== false);
+      if (!fieldFocused('cacheTypeK') && !fieldFocused('cacheTypeV') && !fieldFocused('kvTypesLinked')) {
+        setField('cacheTypeK', L.cacheTypeK || 'q8_0');
+        setField('cacheTypeV', L.cacheTypeV || 'q8_0');
+        setChecked('kvTypesLinked', (L.cacheTypeK || 'q8_0') === (L.cacheTypeV || 'q8_0'));
+        syncKvLink(false);
+      }
+      setChecked('keepModelInMemory', !!L.keepModelInMemory);
       if (payload.isWindows) {
         const label = $('keepModelLabel');
         if (label) label.textContent = 'Keep Model in Memory (mmap on Windows)';
         const hint = $('keepModelHint');
         if (hint) hint.style.display = 'block';
       }
-      $('tryMmap').checked = !!L.tryMmap;
-      if ($('lazyMode')) $('lazyMode').value = L.lazyMode || 'auto';
-      $('unifiedKvCache').checked = !!L.unifiedKvCache;
-      $('flashAttention').value = L.flashAttention || 'auto';
-      $('contextCheckpoints').value = L.contextCheckpoints;
-      $('cacheReuse').value = L.cacheReuse ?? 0;
-      $('reasoningFormat').value = L.reasoningFormat || 'deepseek-legacy';
+      setChecked('tryMmap', !!L.tryMmap);
+      setField('lazyMode', L.lazyMode || 'auto');
+      setChecked('unifiedKvCache', !!L.unifiedKvCache);
+      setField('flashAttention', L.flashAttention || 'auto');
+      setField('contextCheckpoints', L.contextCheckpoints);
+      setField('cacheReuse', L.cacheReuse ?? 0);
+      setField('reasoningFormat', L.reasoningFormat || 'deepseek-legacy');
       const budget = L.reasoningBudget ?? -1;
-      $('reasoningBudgetUnlimited').checked = budget < 0;
-      $('reasoningBudget').value = budget < 0 ? 2048 : budget;
-      $('reasoningBudget').disabled = budget < 0;
-      $('ropeBaseAuto').checked = L.ropeFreqBase == null;
-      $('ropeFreqBase').value = L.ropeFreqBase ?? 10000;
-      $('ropeFreqBase').disabled = L.ropeFreqBase == null;
-      $('ropeScaleAuto').checked = L.ropeFreqScale == null;
-      $('ropeFreqScale').value = L.ropeFreqScale ?? 1;
-      $('ropeFreqScale').disabled = L.ropeFreqScale == null;
-      $('seedRandom').checked = L.seed == null;
-      $('seed').value = L.seed ?? 0;
-      $('seed').disabled = L.seed == null;
-      $('speculativeMode').value = L.speculativeMode || 'off';
-      $('maxDraftTokens').value = L.maxDraftTokens;
-      $('minDraftTokens').value = L.minDraftTokens;
-      $('draftProbability').value = L.draftProbability;
-      if ($('ngramVariant')) $('ngramVariant').value = L.ngramVariant || 'simple';
-      if ($('ngramSizeN')) $('ngramSizeN').value = L.ngramSizeN ?? 12;
-      if ($('ngramSizeNRange')) $('ngramSizeNRange').value = Math.min(64, L.ngramSizeN ?? 12);
-      if ($('ngramSizeM')) $('ngramSizeM').value = L.ngramSizeM ?? 48;
-      if ($('ngramMinHits')) $('ngramMinHits').value = L.ngramMinHits ?? 1;
-      if ($('draftGpuOffload')) $('draftGpuOffload').value = L.draftGpuOffload ?? 99;
-      if ($('splitMode')) $('splitMode').value = L.splitMode || 'layer';
+      const budgetFocused = fieldFocused('reasoningBudget') || fieldFocused('reasoningBudgetUnlimited');
+      if (!budgetFocused) {
+        setChecked('reasoningBudgetUnlimited', budget < 0);
+        setField('reasoningBudget', budget < 0 ? 2048 : budget);
+        setDisabled('reasoningBudget', budget < 0);
+      }
+      const ropeBaseFocused = fieldFocused('ropeFreqBase') || fieldFocused('ropeBaseAuto');
+      if (!ropeBaseFocused) {
+        setChecked('ropeBaseAuto', L.ropeFreqBase == null);
+        setField('ropeFreqBase', L.ropeFreqBase ?? 10000);
+        setDisabled('ropeFreqBase', L.ropeFreqBase == null);
+      }
+      const ropeScaleFocused = fieldFocused('ropeFreqScale') || fieldFocused('ropeScaleAuto');
+      if (!ropeScaleFocused) {
+        setChecked('ropeScaleAuto', L.ropeFreqScale == null);
+        setField('ropeFreqScale', L.ropeFreqScale ?? 1);
+        setDisabled('ropeFreqScale', L.ropeFreqScale == null);
+      }
+      const seedFocused = fieldFocused('seed') || fieldFocused('seedRandom');
+      if (!seedFocused) {
+        setChecked('seedRandom', L.seed == null);
+        setField('seed', L.seed ?? 0);
+        setDisabled('seed', L.seed == null);
+      }
+      setField('speculativeMode', L.speculativeMode || 'off');
+      setField('maxDraftTokens', L.maxDraftTokens);
+      setField('minDraftTokens', L.minDraftTokens);
+      setField('draftProbability', L.draftProbability);
+      setField('ngramVariant', L.ngramVariant || 'simple');
+      if (!fieldFocused('ngramSizeN') && !fieldFocused('ngramSizeNRange')) {
+        setField('ngramSizeN', L.ngramSizeN ?? 12);
+        setField('ngramSizeNRange', Math.min(64, L.ngramSizeN ?? 12));
+      }
+      setField('ngramSizeM', L.ngramSizeM ?? 48);
+      setField('ngramMinHits', L.ngramMinHits ?? 1);
+      setField('draftGpuOffload', L.draftGpuOffload ?? 99);
+      setField('splitMode', L.splitMode || 'layer');
       setDraftModelHint(L.draftModelPath || '');
       setMmprojHint(L.mmprojPath || '');
       applySpecUi(!!(caps && caps.nextnPredictLayers > 0), sidecarMtpAvailable());
-      $('temperature').value = R.temperature;
-      $('topP').value = R.topP;
-      $('topK').value = R.topK;
-      $('maxTokens').value = R.maxTokens;
-      if ($('minP')) $('minP').value = R.minP ?? 0;
-      if ($('repeatPenalty')) $('repeatPenalty').value = R.repeatPenalty ?? 1;
-      if ($('presencePenalty')) $('presencePenalty').value = R.presencePenalty ?? 0;
-      if ($('frequencyPenalty')) $('frequencyPenalty').value = R.frequencyPenalty ?? 0;
+      setField('temperature', R.temperature);
+      setField('topP', R.topP);
+      setField('topK', R.topK);
+      setField('maxTokens', R.maxTokens);
+      setField('minP', R.minP ?? 0);
+      setField('repeatPenalty', R.repeatPenalty ?? 1);
+      setField('presencePenalty', R.presencePenalty ?? 0);
+      setField('frequencyPenalty', R.frequencyPenalty ?? 0);
       renderModeOverrideHint(payload.modeSampling);
       syncFlashAttentionWarning();
 
@@ -4594,12 +4745,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           endpoint: '',
           message: '',
         });
-        const live = liveMemoryEstimate();
         vscode.postMessage({
           type: 'reload',
           payload: readLoad(),
-          willSpill: !!(live && live.willSpill),
-          spillWarning: live && live.warnings && live.warnings[0] ? live.warnings[0] : undefined,
         });
         vscode.postMessage({ type: 'saveRequest', payload: readRequest() });
       } else if (action === 'start') {
@@ -4612,17 +4760,16 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           endpoint: '',
           message: '',
         });
-        const live = liveMemoryEstimate();
         vscode.postMessage({
           type: 'start',
           payload: readLoad(),
-          willSpill: !!(live && live.willSpill),
-          spillWarning: live && live.warnings && live.warnings[0] ? live.warnings[0] : undefined,
         });
         vscode.postMessage({ type: 'saveRequest', payload: readRequest() });
       }
     });
     $('stopBtn').addEventListener('click', () => vscode.postMessage({ type: 'stop' }));
+    $('openLogBtn').addEventListener('click', () => vscode.postMessage({ type: 'openLog' }));
+    $('copyCmdBtn').addEventListener('click', () => vscode.postMessage({ type: 'copyCommandLine' }));
     $('launchMode').addEventListener('change', () => {
       const mode = $('launchMode').value === 'background' ? 'background' : 'externalTerminal';
       if (serverRunning) {

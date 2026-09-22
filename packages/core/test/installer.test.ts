@@ -144,9 +144,16 @@ describe("describeMissingAsset", () => {
 
 describe("compareReleaseTags", () => {
   it("treats a higher b-number as newer", () => {
-    assert.ok(compareReleaseTags("b10375", "b10344") > 0);
-    assert.ok(compareReleaseTags("b10344", "b10375") < 0);
+    assert.ok((compareReleaseTags("b10375", "b10344") ?? 0) > 0);
+    assert.ok((compareReleaseTags("b10344", "b10375") ?? 0) < 0);
     assert.equal(compareReleaseTags("b10344", "b10344"), 0);
+  });
+
+  it("returns undefined for tags that are not llama.cpp build tags", () => {
+    assert.equal(compareReleaseTags("b10375", "local"), undefined);
+    assert.equal(compareReleaseTags("local", "b10375"), undefined);
+    assert.equal(compareReleaseTags("PATH", "b1"), undefined);
+    assert.equal(compareReleaseTags("", "b10375"), undefined);
   });
 });
 

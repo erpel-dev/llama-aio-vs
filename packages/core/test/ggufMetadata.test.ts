@@ -17,7 +17,7 @@ import {
   shouldPinPleToCpu,
   totalModelBytes,
 } from "../src/ggufMetadata";
-import { denseCaps, loadSettings, miniGguf, MiniGgufValue, moeCaps } from "./helpers";
+import { denseCaps, loadSettings, miniGguf, miniGgufWithTensors, MiniGgufValue, moeCaps } from "./helpers";
 
 describe("shardFileNames", () => {
   it("expands a split-model name into the whole set", () => {
@@ -318,15 +318,79 @@ describe("qwen4exp / PLE helpers", () => {
     assert.equal(shouldPinPleToCpu(undefined), false);
   });
 
-  it("gates the RCO graph discount on qwen35 only, never qwen4exp", () => {
+  it("gates the RCO graph discount on qwen35, and on qwen4exp only when SSM is present", () => {
     assert.equal(isLinearRecurrentHybrid({ architecture: "qwen35" }), true);
     assert.equal(isLinearRecurrentHybrid({ architecture: "qwen35moe" }), true);
     assert.equal(isLinearRecurrentHybrid({ architecture: "qwen3.5" }), true);
     assert.equal(isLinearRecurrentHybrid({ architecture: "QWEN35" }), true);
     assert.equal(isLinearRecurrentHybrid({ architecture: "qwen4exp" }), false);
     assert.equal(isLinearRecurrentHybrid({ architecture: "qwen4_exp" }), false);
+    assert.equal(
+      isLinearRecurrentHybrid({ architecture: "qwen4exp", ssmStateSize: 128 }),
+      true
+    );
+    assert.equal(
+      isLinearRecurrentHybrid({ architecture: "qwen4exp", ssmStateSize: 0 }),
+      false
+    );
+    assert.equal(
+      isLinearRecurrentHybrid({ architecture: "qwen4exp", ssmStateSize: 99999 }),
+      false
+    );
     assert.equal(isLinearRecurrentHybrid({ architecture: "qwen3" }), false);
+    assert.equal(isLinearRecurrentHybrid({ ssmStateSize: 128 }), true);
     assert.equal(isLinearRecurrentHybrid(undefined), false);
+  });
+});
+
+describe("split GGUF PLE scan", () => {
+  let dir: string;
+
+  before(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "llama-aio-ple-shards-"));
+    const kv = {
+      "general.architecture": { type: "string" as const, value: "qwen4exp" },
+      "general.name": { type: "string" as const, value: "split-ple" },
+      "qwen4exp.block_count": { type: "u32" as const, value: 4 },
+      "qwen4exp.context_length": { type: "u32" as const, value: 8192 },
+      "qwen4exp.embedding_length": { type: "u32" as const, value: 2560 },
+      "qwen4exp.attention.head_count": { type: "u32" as const, value: 8 },
+      "qwen4exp.attention.head_count_kv": { type: "u32" as const, value: 2 },
+      "qwen4exp.expert_count": { type: "u32" as const, value: 16 },
+    };
+    fs.writeFileSync(
+      path.join(dir, "model-00001-of-00002.gguf"),
+      miniGgufWithTensors(kv, [{ name: "blk.0.ffn_down_exps.weight", bytes: 3000 }])
+    );
+    fs.writeFileSync(
+      path.join(dir, "model-00002-of-00002.gguf"),
+      miniGgufWithTensors(kv, [{ name: "per_layer_token_embd.weight", bytes: 7000 }])
+    );
+  });
+
+  after(() => {
+    invalidateModelCapabilitiesCache();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("measures PLE in shard 2 instead of falling back to the 40% heuristic", () => {
+    const p = path.join(dir, "model-00001-of-00002.gguf");
+    invalidateModelCapabilitiesCache(p);
+    const caps = readModelCapabilities(p);
+    assert.ok(caps.pleShare);
+    assert.ok(
+      Math.abs((caps.pleShare || 0) - 0.7) < 0.02,
+      `pleShare ${caps.pleShare} should be ~0.7 (7000/10000), not the 0.4 heuristic`
+    );
+    assert.equal(caps.shardCount, 2);
+    assert.equal(caps.shardsFound, 2);
+  });
+
+  it("finds the same PLE share when the later shard is selected", () => {
+    const p = path.join(dir, "model-00002-of-00002.gguf");
+    invalidateModelCapabilitiesCache(p);
+    const caps = readModelCapabilities(p);
+    assert.ok(Math.abs((caps.pleShare || 0) - 0.7) < 0.02, `pleShare ${caps.pleShare}`);
   });
 });
 

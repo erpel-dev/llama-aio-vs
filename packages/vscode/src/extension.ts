@@ -26,6 +26,13 @@ import * as path from "path";
 import * as vscode from "vscode";
 import { LlamaAioChatProvider } from "./chatProvider";
 import { promptUseInCopilotChat } from "./copilotChatPrompt";
+import {
+  copyServerCommandLine,
+  initServerDiagnostics,
+  openServerLog,
+  reportLaunchFailure,
+  showServerOutput,
+} from "./serverDiagnostics";
 import { browseAndDownloadModel, downloadStarterModel, HuggingFaceClient } from "./huggingFace";
 import { WikipediaLookupTool, syncWikipediaLookupContext, WIKIPEDIA_LOOKUP_TOOL_NAME } from "./wikipediaTool";
 
@@ -35,7 +42,8 @@ async function afterModelSelected(
   selected: string | undefined,
   settingsView: SettingsViewProvider,
   processManager: ProcessManager,
-  store: SettingsStore
+  store: SettingsStore,
+  globalState: vscode.Memento
 ): Promise<void> {
   await settingsView.pushState();
   chatProvider?.notifyChanged();
@@ -79,11 +87,9 @@ async function afterModelSelected(
       );
       chatProvider?.notifyChanged();
       await settingsView.pushState();
-      await promptUseInCopilotChat(store, status.message);
+      await promptUseInCopilotChat(store, status.message, globalState);
     } catch (e) {
-      vscode.window.showErrorMessage(
-        `Start failed: ${e instanceof Error ? e.message : String(e)}`
-      );
+      await reportLaunchFailure(kind === "reload" ? "Reload failed" : "Start failed", e);
     } finally {
       processManager.releaseLaunch(token);
     }
@@ -101,6 +107,7 @@ export function activate(context: vscode.ExtensionContext): void {
   ensureDirs(getInstallDir(config), getModelsDir(config), getLockDir());
 
   const processManager = new ProcessManager(store);
+  context.subscriptions.push(initServerDiagnostics(processManager));
   const perf = new PerfStats();
   perf.setSpeculativeMode(
     (() => {
@@ -126,7 +133,7 @@ export function activate(context: vscode.ExtensionContext): void {
   const downloadFromHuggingFace = async (query?: string) => {
     try {
       const selected = await browseAndDownloadModel(hf, store, query);
-      await afterModelSelected(selected, settingsView, processManager, store);
+      await afterModelSelected(selected, settingsView, processManager, store, context.globalState);
     } catch (e) {
       if (e instanceof DownloadAbortError) {
         return;
@@ -140,7 +147,7 @@ export function activate(context: vscode.ExtensionContext): void {
   const downloadStarter = async () => {
     try {
       const selected = await downloadStarterModel(hf, store);
-      await afterModelSelected(selected, settingsView, processManager, store);
+      await afterModelSelected(selected, settingsView, processManager, store, context.globalState);
     } catch (e) {
       if (e instanceof DownloadAbortError) {
         return;
@@ -155,7 +162,7 @@ export function activate(context: vscode.ExtensionContext): void {
   const openGgufFile = async () => {
     try {
       const selected = await openModelFileDialog(store);
-      await afterModelSelected(selected, settingsView, processManager, store);
+      await afterModelSelected(selected, settingsView, processManager, store, context.globalState);
     } catch (e) {
       vscode.window.showErrorMessage(
         `Open file failed: ${e instanceof Error ? e.message : String(e)}`
@@ -170,7 +177,7 @@ export function activate(context: vscode.ExtensionContext): void {
         llamaServerBinary: processManager.resolveBinary(),
         loadSettings: store.getState().loadSettings,
       });
-      await afterModelSelected(selected, settingsView, processManager, store);
+      await afterModelSelected(selected, settingsView, processManager, store, context.globalState);
     } catch (e) {
       vscode.window.showErrorMessage(
         `Select model failed: ${e instanceof Error ? e.message : String(e)}`
@@ -324,10 +331,14 @@ export function activate(context: vscode.ExtensionContext): void {
         "Later"
       );
       if (restart === "Start server") {
-        const status = await processManager.start();
-        chatProvider?.notifyChanged();
-        await settingsView.pushState();
-        await promptUseInCopilotChat(store, status.message);
+        try {
+          const status = await processManager.start();
+          chatProvider?.notifyChanged();
+          await settingsView.pushState();
+          await promptUseInCopilotChat(store, status.message, context.globalState);
+        } catch (e) {
+          await reportLaunchFailure("Start failed", e);
+        }
       }
     }
   };
@@ -569,11 +580,9 @@ export function activate(context: vscode.ExtensionContext): void {
             const status = await processManager.start();
             chatProvider?.notifyChanged();
             await settingsView.pushState();
-            await promptUseInCopilotChat(store, status.message);
+            await promptUseInCopilotChat(store, status.message, context.globalState);
           } catch (e) {
-            vscode.window.showErrorMessage(
-              `Restart failed: ${e instanceof Error ? e.message : String(e)}`
-            );
+            await reportLaunchFailure("Restart failed", e);
           }
         }
       } else {
@@ -600,11 +609,9 @@ export function activate(context: vscode.ExtensionContext): void {
             const status = await processManager.start();
             chatProvider?.notifyChanged();
             await settingsView.pushState();
-            await promptUseInCopilotChat(store, status.message);
+            await promptUseInCopilotChat(store, status.message, context.globalState);
           } catch (e) {
-            vscode.window.showErrorMessage(
-              `Restart failed: ${e instanceof Error ? e.message : String(e)}`
-            );
+            await reportLaunchFailure("Restart failed", e);
           }
         }
       } else {
@@ -653,7 +660,8 @@ export function activate(context: vscode.ExtensionContext): void {
       switchBackend,
       showDownloads,
     },
-    () => chatProvider?.notifyChanged()
+    () => chatProvider?.notifyChanged(),
+    context.globalState
   );
 
   context.subscriptions.push(
@@ -838,11 +846,9 @@ export function activate(context: vscode.ExtensionContext): void {
         chatProvider?.notifyChanged();
         await settingsView.pushState();
         await refreshStatusBar();
-        await promptUseInCopilotChat(store, status.message);
+        await promptUseInCopilotChat(store, status.message, context.globalState);
       } catch (e) {
-        vscode.window.showErrorMessage(
-          `Start failed: ${e instanceof Error ? e.message : String(e)}`
-        );
+        await reportLaunchFailure("Start failed", e);
       } finally {
         processManager.releaseLaunch(token);
       }
@@ -878,14 +884,18 @@ export function activate(context: vscode.ExtensionContext): void {
         chatProvider?.notifyChanged();
         await settingsView.pushState();
         await refreshStatusBar();
-        await promptUseInCopilotChat(store, status.message);
+        await promptUseInCopilotChat(store, status.message, context.globalState);
       } catch (e) {
-        vscode.window.showErrorMessage(
-          `Reload failed: ${e instanceof Error ? e.message : String(e)}`
-        );
+        await reportLaunchFailure("Reload failed", e);
       } finally {
         processManager.releaseLaunch(token);
       }
+    }),
+
+    vscode.commands.registerCommand("llamaAio.openServerLog", () => openServerLog()),
+    vscode.commands.registerCommand("llamaAio.copyServerCommand", () => copyServerCommandLine()),
+    vscode.commands.registerCommand("llamaAio.showServerOutput", () => {
+      showServerOutput();
     }),
 
     vscode.commands.registerCommand("llamaAio.showStatus", async () => {
@@ -931,13 +941,11 @@ export function activate(context: vscode.ExtensionContext): void {
       .then(async (status) => {
         chatProvider?.notifyChanged();
         void refreshStatusBar();
-        await promptUseInCopilotChat(store, status.message);
+        await promptUseInCopilotChat(store, status.message, context.globalState);
       })
       .catch((err) => {
         void refreshStatusBar();
-        void vscode.window.showErrorMessage(
-          `Llama AIO could not auto-start llama-server: ${err instanceof Error ? err.message : String(err)}`
-        );
+        void reportLaunchFailure("Auto-start failed", err);
       });
   }
 }

@@ -1,10 +1,12 @@
 import { detectGpuMemory, detectGpus, GpuMemoryInfo } from "./gpuInfo";
 import {
   capacityAwareTensorSplit,
+  type LayerWeightMassOptions,
   mainShareFromSplit,
   parseTensorSplit,
   retargetTensorSplitMainShare,
   tensorSplitForMainShare,
+  tensorSplitForTargetWeightShare,
 } from "./gpuSplit";
 import { isQwen4expArchitecture, ModelCapabilities } from "./ggufMetadata";
 import { estimateMemory, MemoryEstimate, VRAM_HEADROOM_BYTES } from "./memoryEstimate";
@@ -270,6 +272,43 @@ function uniqueSplits(splits: string[]): string[] {
   return out;
 }
 
+function weightMassOptions(caps: ModelCapabilities, settings: LlamaLoadSettings): LayerWeightMassOptions {
+  return {
+    isMoe: caps.isMoe,
+    nCpuMoe: settings.nCpuMoe,
+    moeExpertShare: caps.moeExpertShare,
+    nCpuFfn: settings.nCpuFfn,
+    denseFfnShare: caps.denseFfnShare,
+  };
+}
+
+function layersOnGpuForSplit(caps: ModelCapabilities, settings: LlamaLoadSettings): number {
+  const nLayers = Math.max(1, caps.blockCount || 1);
+  return settings.gpuOffload >= 99 ? nLayers : Math.min(nLayers, Math.max(0, settings.gpuOffload));
+}
+
+/** Hold a weight-share target while `--n-cpu-moe` / `--n-cpu-ffn` changes layer mass. */
+function retargetTensorSplitToWeightShare(
+  settings: LlamaLoadSettings,
+  caps: ModelCapabilities,
+  gpus: GpuMemoryInfo[],
+  targetShare: number
+): LlamaLoadSettings {
+  if (gpus.length < 2 || parseTensorSplit(settings.tensorSplit).length < 2) {
+    return settings;
+  }
+  const next = tensorSplitForTargetWeightShare(
+    targetShare,
+    settings.mainGpu,
+    gpus.length,
+    Math.max(1, caps.blockCount || 1),
+    layersOnGpuForSplit(caps, settings),
+    settings.splitMode,
+    weightMassOptions(caps, settings)
+  );
+  return next ? { ...settings, tensorSplit: next } : settings;
+}
+
 /**
  * Full GPU offload with a tensor split that fills Main first (CLIP / MTP / compute
  * already live there), then remaining cards back-to-front. Neighborhood-walks
@@ -440,18 +479,29 @@ function fitOffload(
     };
   }
 
+  const splitWeightTarget =
+    gpus.length >= 2 && parseTensorSplit(base.tensorSplit).length >= 2
+      ? mainShareFromSplit(base.tensorSplit, base.mainGpu, gpus.length, vramTotals(gpus))
+      : undefined;
+
   if (caps.isMoe) {
     // Max GPU offload; raise CPU MoE only as needed for headroom.
     const withAllGpu: LlamaLoadSettings = { ...base, gpuOffload: 99, nCpuMoe: 0 };
-    let nCpuMoe = nLayers; // worst case if nothing fits
+    let best: LlamaLoadSettings = { ...withAllGpu, nCpuMoe: nLayers };
+    if (splitWeightTarget != null) {
+      best = retargetTensorSplitToWeightShare(best, caps, gpus, splitWeightTarget);
+    }
     for (let n = 0; n <= nLayers; n++) {
-      const candidate = { ...withAllGpu, nCpuMoe: n };
+      let candidate: LlamaLoadSettings = { ...withAllGpu, nCpuMoe: n };
+      if (splitWeightTarget != null) {
+        candidate = retargetTensorSplitToWeightShare(candidate, caps, gpus, splitWeightTarget);
+      }
       if (fitsHeadroom(caps, candidate, gpu, false, headroom, gpus)) {
-        nCpuMoe = n;
+        best = candidate;
         break;
       }
     }
-    return { ...withAllGpu, nCpuMoe };
+    return best;
   }
 
   // Dense: prefer keeping every layer on the GPU and moving dense FFN tensors
@@ -459,7 +509,10 @@ function fitOffload(
   // path, where experts spill to RAM first.
   const withAllDense: LlamaLoadSettings = { ...base, gpuOffload: 99, nCpuMoe: 0, nCpuFfn: 0 };
   for (let n = 0; n <= nLayers; n++) {
-    const candidate = { ...withAllDense, nCpuFfn: n };
+    let candidate: LlamaLoadSettings = { ...withAllDense, nCpuFfn: n };
+    if (splitWeightTarget != null) {
+      candidate = retargetTensorSplitToWeightShare(candidate, caps, gpus, splitWeightTarget);
+    }
     if (fitsHeadroom(caps, candidate, gpu, false, headroom, gpus)) {
       return candidate;
     }

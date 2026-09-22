@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { decodeSseLines, toolCallSlot } from "../src/sseStream";
+import {
+  decodeSseLines,
+  errorMessageFromSseJson,
+  messageFromSseErrorLine,
+  toolCallSlot,
+} from "../src/sseStream";
 
 async function* feed(chunks: Array<Uint8Array | string>): AsyncGenerator<Uint8Array | string> {
   for (const c of chunks) {
@@ -95,5 +100,28 @@ describe("toolCallSlot", () => {
     assert.equal(toolCallSlot(calls, {}), 0);
     calls.push({ id: "call_b", name: "write", arguments: "{" });
     assert.equal(toolCallSlot(calls, {}), 1);
+  });
+});
+
+describe("SSE error payloads", () => {
+  it("reads an error: event", () => {
+    assert.equal(messageFromSseErrorLine("error: context size exceeded"), "context size exceeded");
+    assert.equal(
+      messageFromSseErrorLine('error: {"error":{"message":"slot context exceeded"}}'),
+      "slot context exceeded"
+    );
+  });
+
+  it("ignores ordinary data lines", () => {
+    assert.equal(messageFromSseErrorLine('data: {"choices":[]}'), undefined);
+    assert.equal(errorMessageFromSseJson({ choices: [{ delta: { content: "hi" } }] }), undefined);
+  });
+
+  it("reads a JSON error object on a data line", () => {
+    assert.equal(
+      errorMessageFromSseJson({ error: { message: "request exceeds context size", type: "server_error" } }),
+      "request exceeds context size"
+    );
+    assert.equal(errorMessageFromSseJson({ error: "overloaded" }), "overloaded");
   });
 });

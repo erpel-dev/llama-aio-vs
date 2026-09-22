@@ -21,6 +21,7 @@ import {
   type SelectOption,
 } from "@opentui/core";
 import {
+  clampLoadSettingsToModel,
   estimateMemory,
   fittingContextLength,
   formatBytes,
@@ -37,8 +38,8 @@ import {
   STARTER_MODEL,
   streamChatCompletion,
   parseTensorSplit,
-  tensorSplitForMainShare,
-  mainShareFromSplit,
+  tensorSplitForTargetWeightShare,
+  mainWeightShareFromSplit,
   isLegacyGpu0FirstSplit,
   alignTensorSplitToMainGpu,
   isMtpSidecarFile,
@@ -74,9 +75,8 @@ import {
 type PaneId = "status" | "backend" | "model" | "load" | "chat";
 
 const PANE_TABS: Array<{ name: string; description: string; value: PaneId }> = [
-  { name: "Status", description: "Server start / stop / reload", value: "status" },
-  { name: "Backend", description: "llama.cpp binary", value: "backend" },
-  { name: "Model", description: "Local GGUF library", value: "model" },
+  { name: "Home", description: "Running, fit, and the next action", value: "status" },
+  { name: "Models", description: "Local GGUF library", value: "model" },
   { name: "Load", description: "Context, offload, KV cache", value: "load" },
   { name: "Chat", description: "Talk to the running model", value: "chat" },
 ];
@@ -218,13 +218,13 @@ function statusLabel(running: boolean, starting: boolean, dirty: boolean): strin
     return "starting…";
   }
   if (running && dirty) {
-    return "running · settings changed — F12 reload";
+    return "running · settings changed";
   }
   if (running) {
     return "running";
   }
   if (dirty) {
-    return "stopped · settings changed — F12 reload";
+    return "stopped · settings changed";
   }
   return "stopped";
 }
@@ -321,8 +321,7 @@ export async function runApp(services: AppServices): Promise<void> {
 
   const footer = mount(
     Text({
-      content:
-        "Tab/F1-F5 · Load: ↑↓ Enter ←→ Esc · F12 reload · s/x/r · q",
+      content: "s start · x stop · r reload · ? help · q quit",
       fg: theme.muted,
       height: 1,
     })
@@ -349,8 +348,7 @@ export async function runApp(services: AppServices): Promise<void> {
     Text({
       content: "",
       fg: theme.text,
-      flexGrow: 1,
-      minHeight: 6,
+      flexShrink: 0,
       wrapMode: "word",
     })
   ) as TextRenderable;
@@ -364,9 +362,9 @@ export async function runApp(services: AppServices): Promise<void> {
   const statusActions = mount(
     Select({
       width: "100%",
-      height: selectHeight(statusActionsOpts.length),
-      showDescription: true,
-      showScrollIndicator: false,
+      flexGrow: 1,
+      showDescription: false,
+      showScrollIndicator: true,
       backgroundColor: theme.panel,
       focusedBackgroundColor: theme.panel,
       selectedBackgroundColor: theme.selectedBg,
@@ -389,7 +387,7 @@ export async function runApp(services: AppServices): Promise<void> {
       borderColor: theme.border,
       backgroundColor: theme.panel,
       padding: 1,
-      title: " Server ",
+      title: " Home ",
       titleColor: theme.accent,
     })
   ) as BoxRenderable;
@@ -724,7 +722,23 @@ export async function runApp(services: AppServices): Promise<void> {
 
   // Field list navigation: ↑↓ select · Enter edit/activate · ←→ adjust · Esc done
   let loadEditing = false;
+  let loadDigitBuf = "";
+  let paintedDetailWidth = 40;
+  let cover: "none" | "help" | "log" = "none";
+  let homeFitText = "Select a model to see if it fits.";
+  let homeFitKey = "";
+  let lastGenRate = "";
+  const sectionOpen: Record<"fit" | "gpu" | "spec" | "sampling" | "advanced", boolean> = {
+    fit: true,
+    gpu: false,
+    spec: false,
+    sampling: false,
+    advanced: false,
+  };
   let loadSaveTimer: ReturnType<typeof setTimeout> | undefined;
+  let pendingLoadPatch: (() => Promise<void>) | undefined;
+  /** Programmatic selection restore must not kick the user out of edit mode. */
+  let ignoreLoadSelectionEvent = false;
 
   type LoadBounds = { min: number; max: number };
 
@@ -734,7 +748,7 @@ export async function runApp(services: AppServices): Promise<void> {
   }
 
   function splitGpuCount(): number {
-    return Math.max(2, splitGpuInfos().length || 2);
+    return Math.max(1, splitGpuInfos().length);
   }
 
   function syncMainGpuOptions(): void {
@@ -748,15 +762,72 @@ export async function runApp(services: AppServices): Promise<void> {
           value: String(i),
           name: `${formatGpuDeviceLabel(g, i)} · ${formatBytes(g.totalBytes)}`,
         }))
-      : Array.from({ length: 8 }, (_, i) => ({ value: String(i), name: `GPU ${i}` }));
+      : [{ value: "0", name: "GPU 0" }];
+  }
+
+  function tensorSplitMassArgs(load: LlamaLoadSettings): {
+    nLayers: number;
+    layersOnGpu: number;
+    mass: {
+      isMoe: boolean;
+      nCpuMoe: number;
+      moeExpertShare: number | undefined;
+      nCpuFfn: number;
+      denseFfnShare: number | undefined;
+    };
+  } {
+    const caps = services.store.getState().modelCapabilities;
+    const nLayers = Math.max(1, caps?.blockCount || 1);
+    const onGpu =
+      load.gpuOffload >= 99 ? nLayers : Math.min(nLayers, Math.max(0, load.gpuOffload));
+    return {
+      nLayers,
+      layersOnGpu: onGpu,
+      mass: {
+        isMoe: !!caps?.isMoe,
+        nCpuMoe: load.nCpuMoe,
+        moeExpertShare: caps?.moeExpertShare,
+        nCpuFfn: load.nCpuFfn,
+        denseFfnShare: caps?.denseFfnShare,
+      },
+    };
+  }
+
+  function emitTensorSplitForWeightShare(share: number, load: LlamaLoadSettings): string {
+    const n = splitGpuCount();
+    const args = tensorSplitMassArgs(load);
+    return tensorSplitForTargetWeightShare(
+      share,
+      load.mainGpu,
+      n,
+      args.nLayers,
+      args.layersOnGpu,
+      load.splitMode,
+      args.mass
+    );
   }
 
   function tensorSplitPercent(load: LlamaLoadSettings): number {
     const gpus = splitGpuInfos();
     const n = splitGpuCount();
     const vram = gpus.length ? gpus.map((g) => g.totalBytes) : Array.from({ length: n }, () => 1);
-    const share = mainShareFromSplit(load.tensorSplit, load.mainGpu, n, vram);
+    const args = tensorSplitMassArgs(load);
+    const share = mainWeightShareFromSplit(
+      load.tensorSplit,
+      load.mainGpu,
+      n,
+      vram,
+      args.nLayers,
+      args.layersOnGpu,
+      load.splitMode,
+      args.mass
+    );
     return Math.min(90, Math.max(10, Math.round(share * 100)));
+  }
+
+  function tensorSplitValueSuffix(pct: number, load: LlamaLoadSettings): string {
+    const emitted = emitTensorSplitForWeightShare(pct / 100, load);
+    return parseTensorSplit(emitted).length >= 2 ? `% · ${emitted}` : "%";
   }
 
   function visibleLoadFields(): typeof LOAD_FIELD_DEFS {
@@ -764,6 +835,9 @@ export async function runApp(services: AppServices): Promise<void> {
     const splitMode = load.splitMode || "layer";
     const spec = load.speculativeMode || "off";
     return LOAD_FIELD_DEFS.filter((f) => {
+      if ((f.id === "tensorSplit" || f.id === "splitMode" || f.id === "mainGpu") && splitGpuInfos().length < 2) {
+        return false;
+      }
       if (f.id === "tensorSplit" && splitMode === "none") {
         return false;
       }
@@ -788,6 +862,161 @@ export async function runApp(services: AppServices): Promise<void> {
       }
       return true;
     });
+  }
+
+  const LOAD_SECTIONS: Array<{
+    id: "fit" | "gpu" | "spec" | "sampling" | "advanced";
+    title: string;
+    fields: string[];
+  }> = [
+    {
+      id: "fit",
+      title: "Fit",
+      fields: ["contextLength", "gpuOffload", "maxConcurrentPredictions", "cacheTypeK", "cacheTypeV"],
+    },
+    { id: "gpu", title: "GPU split", fields: ["tensorSplit", "splitMode", "mainGpu"] },
+    {
+      id: "spec",
+      title: "Speculative",
+      fields: [
+        "speculativeMode",
+        "ngramVariant",
+        "ngramSizeN",
+        "ngramSizeM",
+        "ngramMinHits",
+        "maxDraftTokens",
+        "draftGpuOffload",
+      ],
+    },
+    {
+      id: "sampling",
+      title: "Sampling",
+      fields: [
+        "temperature",
+        "topP",
+        "topK",
+        "minP",
+        "repeatPenalty",
+        "presencePenalty",
+        "frequencyPenalty",
+        "maxTokens",
+      ],
+    },
+    {
+      id: "advanced",
+      title: "Advanced",
+      fields: [
+        "cpuThreads",
+        "nCpuMoe",
+        "nCpuFfn",
+        "flashAttention",
+        "lazyMode",
+        "offloadKvCacheToGpu",
+        "mmprojOffloadToGpu",
+        "evalBatchSize",
+        "physicalBatchSize",
+      ],
+    },
+  ];
+
+  function sectionSummary(id: (typeof LOAD_SECTIONS)[number]["id"]): string {
+    const load = services.store.getState().loadSettings;
+    if (id === "fit") {
+      return `ctx ${load.contextLength} · ngl ${load.gpuOffload} · slots ${load.maxConcurrentPredictions} · KV ${load.cacheTypeK}/${load.cacheTypeV}`;
+    }
+    if (id === "gpu") {
+      if (splitGpuInfos().length < 2) {
+        return "1 GPU — hidden";
+      }
+      if ((load.splitMode || "layer") === "none") {
+        return "split off";
+      }
+      return `${tensorSplitPercent(load)}% on main GPU · ${load.splitMode || "layer"}`;
+    }
+    if (id === "spec") {
+      return load.speculativeMode || "off";
+    }
+    if (id === "sampling") {
+      const req = services.store.getState().requestSettings;
+      return `temp ${req.temperature} · top_p ${req.topP} · max ${req.maxTokens}`;
+    }
+    return "threads · flash · batches";
+  }
+
+  function matchingPresetLabel(): string {
+    const load = services.store.getState().loadSettings;
+    if (load.maxConcurrentPredictions !== 1) {
+      return "Custom";
+    }
+    for (const preset of Object.values(LOAD_PRESETS)) {
+      if (preset.cacheTypeK !== load.cacheTypeK || preset.cacheTypeV !== load.cacheTypeV) {
+        continue;
+      }
+      if (preset.contextLength === "fit") {
+        continue;
+      }
+      if (preset.contextLength === load.contextLength) {
+        return preset.label;
+      }
+    }
+    return "Custom";
+  }
+
+  function loadListOptions(override?: { id: string; name: string; description?: string }): SelectOption[] {
+    const fields = visibleLoadFields().filter((f) => f.kind !== "action");
+    const opts: SelectOption[] = fields.filter((f) => f.kind === "preset").map((f) => formatLoadOption(f));
+    const byId = new Map(fields.map((f) => [f.id, f]));
+    for (const section of LOAD_SECTIONS) {
+      if (section.id === "gpu" && splitGpuInfos().length < 2) {
+        opts.push({
+          name: "▸ GPU split",
+          description: splitGpuInfos().length === 0 ? "CPU backend — hidden" : "1 GPU — hidden",
+          value: "section:gpu-hidden",
+        });
+        continue;
+      }
+      const open = sectionOpen[section.id];
+      opts.push({
+        name: `${open ? "▾" : "▸"} ${section.title}`,
+        description: sectionSummary(section.id),
+        value: `section:${section.id}`,
+      });
+      if (!open) {
+        continue;
+      }
+      for (const id of section.fields) {
+        const field = byId.get(id);
+        if (field) {
+          opts.push(formatLoadOption(field));
+        }
+      }
+    }
+    if (override) {
+      const idx = opts.findIndex((o) => o.value === override.id);
+      if (idx >= 0) {
+        opts[idx] = {
+          ...opts[idx],
+          name: override.name,
+          description: override.description ?? opts[idx]!.description,
+        };
+      }
+    }
+    return opts;
+  }
+
+  function restoreLoadSelection(selectedId: string | undefined): void {
+    if (!selectedId) {
+      return;
+    }
+    const idx = loadFieldSelect.options.findIndex((o) => o.value === selectedId);
+    if (idx >= 0 && idx !== loadFieldSelect.getSelectedIndex()) {
+      ignoreLoadSelectionEvent = true;
+      try {
+        loadFieldSelect.setSelectedIndex(idx);
+      } finally {
+        ignoreLoadSelectionEvent = false;
+      }
+    }
   }
 
   function maybeMigrateLegacySplit(): void {
@@ -925,7 +1154,7 @@ export async function runApp(services: AppServices): Promise<void> {
     const label = loadFieldLabel(field);
     if (field.kind === "number") {
       const shown = formatFieldValue(raw as number, field.step);
-      const suffix = field.key === "tensorSplit" ? "%" : "";
+      const suffix = field.key === "tensorSplit" ? tensorSplitValueSuffix(raw as number, services.store.getState().loadSettings) : "";
       return {
         name: `${label}  ·  ${shown}${suffix}`,
         description: field.help,
@@ -961,8 +1190,25 @@ export async function runApp(services: AppServices): Promise<void> {
     return LOAD_FIELD_DEFS.find((f) => f.id === id);
   }
 
+  function coreStoredNumber(
+    field: Extract<(typeof LOAD_FIELD_DEFS)[number], { kind: "number" }>,
+    raw: number
+  ): number {
+    const { min, max } = loadBounds(field);
+    const stepped = roundToStep(raw, field.step, min, max);
+    const caps = services.store.getState().modelCapabilities;
+    if (!caps || field.store !== "load" || field.key === "tensorSplit") {
+      return stepped;
+    }
+    const load = services.store.getState().loadSettings;
+    const clamped = clampLoadSettingsToModel({ ...load, [field.key]: stepped } as LlamaLoadSettings, caps);
+    const stored = clamped[field.key as keyof LlamaLoadSettings];
+    return typeof stored === "number" ? stored : stepped;
+  }
+
   function paintLoadDetailBar(min: number, max: number, value: number): void {
-    const width = Math.max(24, Math.min(56, (renderer.width || 80) - 8));
+    paintedDetailWidth = Math.max(24, Math.min(56, (renderer.width || 80) - 8));
+    const width = paintedDetailWidth;
     const range = max - min;
     const ratio = range <= 0 ? 0 : (value - min) / range;
     const fillCols = Math.max(0, Math.min(width, Math.round(ratio * width)));
@@ -974,18 +1220,23 @@ export async function runApp(services: AppServices): Promise<void> {
   function refreshLoadDetail(): void {
     const field = currentLoadField();
     if (!field) {
-      loadDetailHelp.content = "";
+      const selected = loadFieldSelect.getSelectedOption();
+      loadDetailHelp.content = selected?.description || "";
       loadDetailFilled.content = "";
       loadDetailEmpty.content = "";
-      loadEditHint.content = "↑↓ settings · Enter edit/apply · F12 reload dirty";
+      loadEditHint.content = "↑↓ move · Enter edit or expand";
       loadEditHint.fg = theme.muted as never;
       return;
     }
     loadDetailHelp.content = field.help;
     if (field.kind === "number") {
       const { min, max } = loadBounds(field);
-      const value = Number(readFieldRaw(field));
-      paintLoadDetailBar(min, max, value);
+      const typed = loadDigitBuf !== "" ? Number(loadDigitBuf) : Number(readFieldRaw(field));
+      const value = Number.isFinite(typed) ? typed : Number(readFieldRaw(field));
+      const stored = coreStoredNumber(field, value);
+      paintLoadDetailBar(min, max, stored);
+      const shown = formatFieldValue(stored, field.step);
+      loadDetailHelp.content = `${field.help}\nCore will store ${shown}.`;
     } else if (field.kind === "enum") {
       const cur = String(readFieldRaw(field));
       const labels = field.options.map((o) => {
@@ -999,14 +1250,17 @@ export async function runApp(services: AppServices): Promise<void> {
       loadDetailEmpty.content = "";
     }
     if (loadEditing && (field.kind === "number" || field.kind === "enum")) {
-      loadEditHint.content = "Editing — ←→ change · Enter/Esc done · F12 reload";
+      loadEditHint.content =
+        field.kind === "number" && loadDigitBuf
+          ? `Typing ${loadDigitBuf} — core will store ${formatFieldValue(coreStoredNumber(field, Number(loadDigitBuf)), field.step)}`
+          : "Editing — ←→ step · digits type · Enter/Esc done";
       loadEditHint.fg = theme.warn as never;
       loadFieldSelect.selectedBackgroundColor = theme.warn;
     } else {
       loadEditHint.content =
         field.kind === "preset" || field.kind === "action"
-          ? "Enter to run · ↑↓ move · F12 reload dirty settings"
-          : "Enter to edit · ↑↓ move · ←→ after Enter · F12 reload";
+          ? "Enter applies the preset"
+          : "Enter to edit · ↑↓ move";
       loadEditHint.fg = theme.muted as never;
       if (!loadFieldSelect.focused) {
         loadFieldSelect.selectedBackgroundColor = SELECTED_MUTED_BG;
@@ -1018,6 +1272,9 @@ export async function runApp(services: AppServices): Promise<void> {
 
   function setLoadEditing(on: boolean): void {
     loadEditing = on;
+    if (!on) {
+      loadDigitBuf = "";
+    }
     if (on) {
       // Blur so OpenTUI Select doesn't eat ↑↓ while we adjust the value.
       if (loadFieldSelect.focused) {
@@ -1027,21 +1284,37 @@ export async function runApp(services: AppServices): Promise<void> {
       loadFieldSelect.focus();
     }
     refreshLoadDetail();
+    refreshFooter();
     renderer.requestRender();
   }
 
   function scheduleLoadPatch(apply: () => Promise<void>): void {
+    pendingLoadPatch = apply;
     if (loadSaveTimer) {
       clearTimeout(loadSaveTimer);
     }
     loadSaveTimer = setTimeout(() => {
+      const run = pendingLoadPatch;
+      pendingLoadPatch = undefined;
       loadSaveTimer = undefined;
-      void apply().catch((err) => {
+      void run?.().catch((err) => {
         statusMessage = err instanceof Error ? err.message : String(err);
         refreshStatus();
         renderer.requestRender();
       });
     }, 120);
+  }
+
+  async function flushPendingLoadPatch(): Promise<void> {
+    if (loadSaveTimer) {
+      clearTimeout(loadSaveTimer);
+      loadSaveTimer = undefined;
+    }
+    const run = pendingLoadPatch;
+    pendingLoadPatch = undefined;
+    if (run) {
+      await run();
+    }
   }
 
   async function commitLoadNumber(field: Extract<(typeof LOAD_FIELD_DEFS)[number], { kind: "number" }>, value: number): Promise<void> {
@@ -1055,8 +1328,18 @@ export async function runApp(services: AppServices): Promise<void> {
         return;
       }
       await services.store.updateLoadSettings({
-        tensorSplit: tensorSplitForMainShare(value / 100, load.mainGpu, splitGpuCount()),
+        tensorSplit: emitTensorSplitForWeightShare(value / 100, load),
       });
+      return;
+    }
+    if (field.key === "nCpuMoe" || field.key === "nCpuFfn" || field.key === "gpuOffload") {
+      const load = services.store.getState().loadSettings;
+      const patch: Partial<LlamaLoadSettings> = { [field.key]: value };
+      if (parseTensorSplit(load.tensorSplit).length >= 2 && load.splitMode !== "none") {
+        const want = tensorSplitPercent(load) / 100;
+        patch.tensorSplit = emitTensorSplitForWeightShare(want, { ...load, [field.key]: value });
+      }
+      await services.store.updateLoadSettings(patch);
       return;
     }
     await services.store.updateLoadSettings({ [field.key]: value });
@@ -1106,10 +1389,9 @@ export async function runApp(services: AppServices): Promise<void> {
       const load = services.store.getState().loadSettings;
       const patch: Partial<LlamaLoadSettings> = { mainGpu };
       if (parseTensorSplit(load.tensorSplit).length >= 2) {
-        patch.tensorSplit = tensorSplitForMainShare(
+        patch.tensorSplit = emitTensorSplitForWeightShare(
           tensorSplitPercent(load) / 100,
-          mainGpu,
-          splitGpuCount()
+          { ...load, mainGpu }
         );
       }
       await services.store.updateLoadSettings(patch);
@@ -1123,25 +1405,22 @@ export async function runApp(services: AppServices): Promise<void> {
     if (!field || (field.kind !== "number" && field.kind !== "enum")) {
       return false;
     }
+    loadDigitBuf = "";
     if (field.kind === "number") {
       const { min, max } = loadBounds(field);
       const cur = Number(readFieldRaw(field));
-      const next = roundToStep(cur + dir * field.step, field.step, min, max);
+      const next = coreStoredNumber(field, cur + dir * field.step);
       if (next === cur) {
         refreshLoadDetail();
         return true;
       }
-      // Optimistic UI while debounce writes.
       paintLoadDetailBar(min, max, next);
-      const opts = loadFieldSelect.options.map((o) =>
-        o.value === field.id
-          ? {
-              ...o,
-              name: `${field.label}  ·  ${formatFieldValue(next, field.step)}${field.key === "tensorSplit" ? "%" : ""}`,
-            }
-          : o
-      );
-      loadFieldSelect.options = opts;
+      const selectedId = field.id;
+      loadFieldSelect.options = loadListOptions({
+        id: field.id,
+        name: `${loadFieldLabel(field)}  ·  ${formatFieldValue(next, field.step)}${field.key === "tensorSplit" ? tensorSplitValueSuffix(next, services.store.getState().loadSettings) : ""}`,
+      });
+      restoreLoadSelection(selectedId);
       scheduleLoadPatch(() => commitLoadNumber(field, next));
       refreshLoadDetail();
       renderer.requestRender();
@@ -1155,23 +1434,68 @@ export async function runApp(services: AppServices): Promise<void> {
       return true;
     }
     scheduleLoadPatch(() => commitLoadEnum(field, next));
-    // refresh via store onDidChange; optimistic option text:
     const nextName = field.options.find((o) => o.value === next)?.name || next;
-    loadFieldSelect.options = visibleLoadFields().map((f) =>
-      f.id === field.id
-        ? {
-            name: `${field.label}  ·  ${nextName}`,
-            description: field.options.find((o) => o.value === next)?.name || field.help,
-            value: field.id,
-          }
-        : formatLoadOption(f)
-    );
+    const selectedId = field.id;
+    loadFieldSelect.options = loadListOptions({
+      id: field.id,
+      name: `${loadFieldLabel(field)}  ·  ${nextName}`,
+      description: nextName,
+    });
+    restoreLoadSelection(selectedId);
     refreshLoadDetail();
     renderer.requestRender();
     return true;
   }
 
+  function applyLoadDigit(ch: string): void {
+    const field = currentLoadField();
+    if (!field || field.kind !== "number") {
+      return;
+    }
+    if (ch === "." && (field.step >= 1 || loadDigitBuf.includes("."))) {
+      return;
+    }
+    if (ch === "backspace") {
+      loadDigitBuf = loadDigitBuf.slice(0, -1);
+    } else {
+      loadDigitBuf += ch;
+    }
+    const raw = loadDigitBuf === "" || loadDigitBuf === "." ? Number(readFieldRaw(field)) : Number(loadDigitBuf);
+    if (!Number.isFinite(raw)) {
+      return;
+    }
+    const stored = coreStoredNumber(field, raw);
+    const { min, max } = loadBounds(field);
+    paintLoadDetailBar(min, max, stored);
+    const selectedId = field.id;
+    const shown = loadDigitBuf === "" ? formatFieldValue(stored, field.step) : loadDigitBuf;
+    loadFieldSelect.options = loadListOptions({
+      id: field.id,
+      name: `${loadFieldLabel(field)}  ·  ${shown}`,
+    });
+    restoreLoadSelection(selectedId);
+    scheduleLoadPatch(() => commitLoadNumber(field, stored));
+    refreshLoadDetail();
+    renderer.requestRender();
+  }
+
   function activateLoadField(): void {
+    const selected = loadFieldSelect.getSelectedOption()?.value as string | undefined;
+    if (selected === "section:gpu-hidden") {
+      return;
+    }
+    if (selected?.startsWith("section:")) {
+      const id = selected.slice("section:".length) as keyof typeof sectionOpen;
+      if (id in sectionOpen) {
+        sectionOpen[id] = !sectionOpen[id];
+        loadFieldSelect.options = loadListOptions();
+        restoreLoadSelection(selected);
+        refreshLoadDetail();
+        refreshFooter();
+        renderer.requestRender();
+      }
+      return;
+    }
     const field = currentLoadField();
     if (!field) {
       return;
@@ -1202,10 +1526,11 @@ export async function runApp(services: AppServices): Promise<void> {
       selectedTextColor: theme.selectedFg,
       textColor: theme.text,
       descriptionColor: theme.muted,
-      options: visibleLoadFields().map((f) => formatLoadOption(f)),
+      options: [],
     })
   ) as SelectRenderable;
   wireSelect(loadFieldSelect, true);
+  loadFieldSelect.options = loadListOptions();
 
   const loadDetailHelp = mount(
     Text({
@@ -1235,7 +1560,7 @@ export async function runApp(services: AppServices): Promise<void> {
 
   const loadEditHint = mount(
     Text({
-      content: "↑↓ settings · Enter edit/apply · F12 reload dirty",
+      content: "↑↓ move · Enter edit",
       fg: theme.muted,
       height: 1,
       flexShrink: 0,
@@ -1251,21 +1576,20 @@ export async function runApp(services: AppServices): Promise<void> {
     if (!loadEditing) {
       loadEditing = true;
     }
+    loadDigitBuf = "";
     const { min, max } = loadBounds(field);
-    const width = Math.max(1, loadDetailBar.width || 40);
+    const width = Math.max(24, Math.min(56, (renderer.width || 80) - 8));
+    paintedDetailWidth = width;
     const local = Math.max(0, Math.min(width, absX - loadDetailBar.x));
     const raw = min + (local / width) * (max - min);
-    const next = roundToStep(raw, field.step, min, max);
+    const next = coreStoredNumber(field, raw);
     paintLoadDetailBar(min, max, next);
-    loadFieldSelect.options = visibleLoadFields().map((f) =>
-      f.id === field.id
-        ? {
-            name: `${field.label}  ·  ${formatFieldValue(next, field.step)}${field.key === "tensorSplit" ? "%" : ""}`,
-            description: field.help,
-            value: field.id,
-          }
-        : formatLoadOption(f)
-    );
+    const selectedId = field.id;
+    loadFieldSelect.options = loadListOptions({
+      id: field.id,
+      name: `${loadFieldLabel(field)}  ·  ${formatFieldValue(next, field.step)}${field.key === "tensorSplit" ? tensorSplitValueSuffix(next, services.store.getState().loadSettings) : ""}`,
+    });
+    restoreLoadSelection(selectedId);
     scheduleLoadPatch(() => commitLoadNumber(field, next));
     refreshLoadDetail();
     renderer.requestRender();
@@ -1296,7 +1620,6 @@ export async function runApp(services: AppServices): Promise<void> {
       titleColor: theme.accent,
     })
   ) as BoxRenderable;
-  loadPane.add(loadMemPanel);
   loadPane.add(loadHint);
   loadPane.add(loadFieldSelect);
   loadPane.add(loadDetailHelp);
@@ -1326,7 +1649,7 @@ export async function runApp(services: AppServices): Promise<void> {
   const chatInput = mount(
     Input({
       width: "100%",
-      placeholder: "Message · Enter send · Esc cancel generation",
+      placeholder: "Message · Enter send · Esc stops generation",
       backgroundColor: theme.inputBg,
       focusedBackgroundColor: theme.inputBg,
       textColor: theme.text,
@@ -1365,6 +1688,101 @@ export async function runApp(services: AppServices): Promise<void> {
     body.add(pane);
   }
 
+  const HELP_TEXT = [
+    "Tab  F1–F4     Home, Models, Load, Chat",
+    "s  x  r        start, stop, reload",
+    "c  m  e  b     chat, models, load, backend",
+    "l              command line and last 20 log lines",
+    "Enter          edit a field, expand a section, send chat",
+    "Esc            close help, then log, then edit, then model browser, then stop chat",
+    "/              search models on Hugging Face",
+    "q              quit and save the load edit",
+  ].join("\n");
+
+  const coverText = mount(
+    Text({
+      content: "",
+      fg: theme.text,
+      flexGrow: 1,
+      wrapMode: "word",
+    })
+  ) as TextRenderable;
+  const coverPane = mount(
+    Box({
+      width: "100%",
+      height: "100%",
+      flexDirection: "column",
+      gap: 1,
+      border: true,
+      borderStyle: "rounded",
+      borderColor: theme.border,
+      backgroundColor: theme.panel,
+      padding: 1,
+      title: " Keys ",
+      titleColor: theme.accent,
+    })
+  ) as BoxRenderable;
+  coverPane.add(coverText);
+  coverPane.visible = false;
+  body.add(coverPane);
+
+  function logBody(): string {
+    let cmd: string;
+    try {
+      cmd = services.processManager.describeCommandLine();
+    } catch (err) {
+      cmd = err instanceof Error ? err.message : String(err);
+    }
+    const tail = services.processManager.readRecentLogLines(20);
+    return `Command\n${cmd}\n\nLast 20 log lines\n${tail || "(log is empty)"}`;
+  }
+
+  function refreshFooter(): void {
+    if (cover === "help" || cover === "log") {
+      footer.content = "Esc close · q quit";
+      return;
+    }
+    if (activePane === "backend") {
+      footer.content = "Enter use or install · Esc Home · ? help · q quit";
+      return;
+    }
+    if (activePane === "status") {
+      footer.content = "s start · x stop · r reload · c chat · m models · e load · l log · ? help · q quit";
+      return;
+    }
+    if (activePane === "model") {
+      footer.content =
+        modelBrowse === "local"
+          ? "Enter select · / search · g rescan · ? help · q quit"
+          : "Enter select · Esc back · ? help · q quit";
+      return;
+    }
+    if (activePane === "load") {
+      footer.content = loadEditing
+        ? "←→ step · digits type · Enter done · Esc cancel · ? help"
+        : "↑↓ move · Enter edit or expand · ? help · q quit";
+      return;
+    }
+    footer.content = "Enter send · Esc stop · ? help · q quit";
+  }
+
+  function hideCover(): void {
+    cover = "none";
+    coverPane.visible = false;
+  }
+
+  function showCover(next: "help" | "log"): void {
+    cover = next;
+    for (const pane of Object.values(panes)) {
+      pane.visible = false;
+    }
+    coverPane.title = next === "help" ? " Keys " : " Log ";
+    coverText.content = next === "help" ? HELP_TEXT : logBody();
+    coverPane.visible = true;
+    refreshFooter();
+    renderer.requestRender();
+  }
+
   function focusPrimary(): void {
     if (activePane === "status") {
       statusActions.focus();
@@ -1384,8 +1802,9 @@ export async function runApp(services: AppServices): Promise<void> {
   }
 
   function cyclePane(delta: number): void {
-    const i = PANE_ORDER.indexOf(activePane);
-    const next = PANE_ORDER[(i + delta + PANE_ORDER.length) % PANE_ORDER.length];
+    const current = (PANE_ORDER as readonly string[]).includes(activePane) ? activePane : "status";
+    const i = PANE_ORDER.indexOf(current);
+    const next = PANE_ORDER[(i + delta + PANE_ORDER.length) % PANE_ORDER.length]!;
     showPane(next);
   }
 
@@ -1418,18 +1837,20 @@ export async function runApp(services: AppServices): Promise<void> {
   function showPane(id: PaneId): void {
     if (loadEditing) {
       loadEditing = false;
+      loadDigitBuf = "";
     }
+    hideCover();
     activePane = id;
     for (const [key, pane] of Object.entries(panes) as Array<[PaneId, BoxRenderable]>) {
       pane.visible = key === id;
     }
     const idx = PANE_TABS.findIndex((t) => t.value === id);
-    // Avoid setSelectedIndex → SELECTION_CHANGED → showPane recursion.
     if (idx >= 0 && tabs.getSelectedIndex() !== idx) {
       tabs.setSelectedIndex(idx);
     }
     refreshAll();
     focusPrimary();
+    refreshFooter();
     renderer.requestRender();
   }
 
@@ -1452,34 +1873,75 @@ export async function runApp(services: AppServices): Promise<void> {
       .join("\n");
   }
 
+  function ensureHomeFit(): void {
+    const state = services.store.getState();
+    const load = state.loadSettings;
+    const key = `${state.selectedModelPath}|${load.contextLength}|${load.gpuOffload}|${load.cacheTypeK}|${load.maxConcurrentPredictions}`;
+    if (key === homeFitKey && homeFitText) {
+      return;
+    }
+    refreshMemoryCharts();
+  }
+
+  function homeActionOptions(running: boolean, dirty: boolean): SelectOption[] {
+    const opts: SelectOption[] = [];
+    if (!running) {
+      opts.push({ name: "Start server", description: "Launch llama-server with the current model", value: "start" });
+    } else {
+      opts.push({ name: "Stop server", description: "Stop the shared llama-server", value: "stop" });
+    }
+    if (dirty || running) {
+      opts.push({ name: "Reload", description: "Apply load settings", value: "reload" });
+    }
+    opts.push(
+      { name: "Chat", description: "Talk to the running model", value: "chat" },
+      { name: "Models", description: "Local GGUF library", value: "models" },
+      { name: "Edit load", description: "Context, offload, sampling", value: "load" },
+      { name: "Change backend", description: "llama.cpp binary", value: "backend" },
+      { name: "Show log", description: "Command line and the last 20 log lines", value: "log" }
+    );
+    return opts;
+  }
+
   function refreshStatus(): void {
     const st = services.processManager.getStatus();
     const state = services.store.getState();
     const color = statusColor(st.running, !!st.starting, !!st.configDirty);
-    headerStatus.content = `${statusLabel(st.running, !!st.starting, !!st.configDirty)} · ${st.endpoint}`;
+    const modelName = path.basename(st.modelPath || state.selectedModelPath || "") || "no model";
+    const endpoint = st.endpoint.replace(/^https?:\/\//, "");
+    headerStatus.content = `${statusLabel(st.running, !!st.starting, !!st.configDirty)} · ${endpoint} · ${modelName}${lastGenRate ? ` · ${lastGenRate}` : ""}`;
     headerStatus.fg = color as never;
 
+    if (activePane === "status" || activePane === "load") {
+      ensureHomeFit();
+    }
+    const load = state.loadSettings;
+    const info = services.installer.resolveActiveUiBackend();
     const lines = [
-      `Endpoint:  ${st.endpoint}`,
-      `PID:       ${st.pid ?? "—"}`,
-      `Model:     ${shortPath(st.modelPath || state.selectedModelPath || "")}`,
-      `Vision:    ${
-        state.loadSettings.mmprojPath
-          ? `${path.basename(state.loadSettings.mmprojPath)}${
-              state.loadSettings.mmprojOffloadToGpu === false ? " · CPU" : " · GPU"
-            }`
-          : "off"
-      }`,
-      `Config:    ${services.config.path}`,
-      `Dirty:     ${st.configDirty ? "yes — reload to apply" : "no"}`,
-      `Owned:     ${st.ownedByThisExtension ? "yes" : "no / foreign"}`,
-      "",
+      homeFitText,
+      st.configDirty ? "Settings changed. Reload before the next request." : "",
+      `Context ${load.contextLength} · layers ${load.gpuOffload} · ${load.maxConcurrentPredictions} slot · KV ${load.cacheTypeK}/${load.cacheTypeV} · ${load.speculativeMode || "off"}`,
+      `Backend ${info}`,
       bootMessage ? `Progress:  ${bootMessage}` : "",
       statusMessage ? `Note:      ${statusMessage}` : "",
-      st.message ? `Server:    ${st.message}` : "",
-    ].filter((l) => l !== undefined);
+      st.message && !st.running ? `Server:    ${st.message}` : "",
+    ].filter((l) => l !== "");
+    statusInfo.content = lines.join("\n");
 
-    statusInfo.content = lines.filter((l, i, a) => !(l === "" && a[i - 1] === "")).join("\n");
+    const nextActions = homeActionOptions(!!st.running, !!st.configDirty);
+    const selected = statusActions.getSelectedOption()?.value;
+    const same =
+      nextActions.length === statusActions.options.length &&
+      nextActions.every((o, i) => o.value === statusActions.options[i]?.value);
+    if (!same) {
+      statusActions.options = nextActions;
+      if (selected) {
+        const idx = nextActions.findIndex((o) => o.value === selected);
+        if (idx >= 0) {
+          statusActions.setSelectedIndex(idx);
+        }
+      }
+    }
   }
 
   function refreshBackend(): void {
@@ -1509,7 +1971,11 @@ export async function runApp(services: AppServices): Promise<void> {
 
     const bits = [
       `Active: ${info.activeBackend}`,
-      info.binaryVersion ? `Version: ${info.binaryVersion}` : "",
+      info.tag
+        ? `Build: ${info.tag}`
+        : info.binaryVersion && !/llama_server|initializing/.test(info.binaryVersion)
+          ? `Version: ${info.binaryVersion.split("\n")[0]!.slice(0, 80)}`
+          : "",
       info.binaryRunnable === false
         ? `Not runnable${info.nixOs ? " (NixOS / FHS)" : ""}${info.binaryRunError ? `: ${info.binaryRunError.slice(0, 80)}` : ""}`
         : "",
@@ -1522,6 +1988,7 @@ export async function runApp(services: AppServices): Promise<void> {
   function setModelBrowse(mode: ModelBrowseMode): void {
     modelBrowse = mode;
     modelSearch.visible = mode === "hf-query";
+    refreshFooter();
     if (mode === "local") {
       hfRepos = [];
       hfLicenses = new Map();
@@ -1810,6 +2277,8 @@ export async function runApp(services: AppServices): Promise<void> {
       loadMemSummary.content = "Select a model to estimate VRAM / RAM use.";
       loadMemSummary.fg = theme.muted as never;
       loadMemWarn.content = "";
+      homeFitText = "Select a model to see if it fits.";
+      homeFitKey = `${state.selectedModelPath}|none`;
       return;
     }
 
@@ -1826,6 +2295,8 @@ export async function runApp(services: AppServices): Promise<void> {
       paintMemBar(loadVramBar, null, barWidth);
       paintMemBar(loadRamBar, null, barWidth);
       setVram2Visible(false);
+      homeFitText = "Memory estimate unavailable.";
+      homeFitKey = `${state.selectedModelPath}|${state.loadSettings.contextLength}|unavailable`;
       return;
     }
 
@@ -1861,6 +2332,13 @@ export async function runApp(services: AppServices): Promise<void> {
 
     loadMemSummary.content = est.summary;
     loadMemSummary.fg = (est.willSpill ? theme.bad : theme.text) as never;
+    const chart = cpuOnly ? est.charts.ram : est.charts.vram;
+    const sub = chartSubtitle(chart);
+    const bar = barParts(chart, 24)
+      .map((p) => (p.key === "free" ? "░".repeat(p.cols) : "█".repeat(p.cols)))
+      .join("");
+    homeFitText = `${est.willSpill ? "Does not fit." : "Fits."}  ${sub.text}\n${bar}`;
+    homeFitKey = `${state.selectedModelPath}|${state.loadSettings.contextLength}|${state.loadSettings.gpuOffload}|${state.loadSettings.cacheTypeK}|${state.loadSettings.maxConcurrentPredictions}`;
 
     const warnLine = est.warnings[0] || "";
     loadMemWarn.content = warnLine;
@@ -1870,24 +2348,18 @@ export async function runApp(services: AppServices): Promise<void> {
   function refreshLoad(): void {
     const state = services.store.getState();
     const load = state.loadSettings;
-    const req = state.requestSettings;
     const selectedId = loadFieldSelect.getSelectedOption()?.value as string | undefined;
 
     syncMainGpuOptions();
     maybeMigrateLegacySplit();
     refreshMemoryCharts();
     loadHint.content = [
-      `ctx ${load.contextLength} · ngl ${load.gpuOffload} · KV ${load.cacheTypeK}/${load.cacheTypeV} · slots ${load.maxConcurrentPredictions}`,
-      `sampling T=${req.temperature} top_p=${req.topP} top_k=${req.topK} max_tokens=${req.maxTokens}`,
+      homeFitText.split("\n")[0] || "",
+      `Preset ${matchingPresetLabel()} · ctx ${load.contextLength} · ngl ${load.gpuOffload} · KV ${load.cacheTypeK}/${load.cacheTypeV} · slots ${load.maxConcurrentPredictions}`,
     ].join("\n");
 
-    loadFieldSelect.options = visibleLoadFields().map((f) => formatLoadOption(f));
-    if (selectedId) {
-      const idx = loadFieldSelect.options.findIndex((o) => o.value === selectedId);
-      if (idx >= 0) {
-        loadFieldSelect.setSelectedIndex(idx);
-      }
-    }
+    loadFieldSelect.options = loadListOptions();
+    restoreLoadSelection(selectedId);
     refreshLoadDetail();
   }
 
@@ -1999,7 +2471,6 @@ export async function runApp(services: AppServices): Promise<void> {
       return;
     }
     await withBusy(`Installing ${id}…`, async () => {
-      await services.installer.setBackend(id);
       await services.installer.installOrUpgrade(
         {
           report: (v: { message?: string; increment?: number }) => {
@@ -2067,7 +2538,7 @@ export async function runApp(services: AppServices): Promise<void> {
     }
     const ready = await services.processManager.isHttpReady();
     if (!ready) {
-      setStatusMessage("Server is not ready — start it on the Status pane.");
+      setStatusMessage("Server is not ready. Start it from Home.");
       showPane("status");
       return;
     }
@@ -2102,8 +2573,11 @@ export async function runApp(services: AppServices): Promise<void> {
             renderer.requestRender();
           }
         } else if (ev.kind === "stats") {
+          if (ev.genTokPerSec) {
+            lastGenRate = `${ev.genTokPerSec.toFixed(1)} tok/s`;
+          }
           const bits = [
-            ev.genTokPerSec ? `${ev.genTokPerSec.toFixed(1)} tok/s` : "",
+            lastGenRate,
             ev.promptTokens != null ? `prompt ${ev.promptTokens}` : "",
             ev.cachedPromptTokens != null && ev.processedPromptTokens != null
               ? `cache ${ev.cachedPromptTokens}/${ev.cachedPromptTokens + ev.processedPromptTokens}`
@@ -2129,10 +2603,17 @@ export async function runApp(services: AppServices): Promise<void> {
       chatBusy = false;
       chatAbort = undefined;
       renderChatLog();
-      chatInput.focus();
+      if (activePane === "chat" && cover === "none") {
+        chatInput.focus();
+      }
       renderer.requestRender();
     }
   }
+
+  // Replaced once the status timer exists so quit can flush and then resolve runApp.
+  let requestQuit: () => void = () => {
+    renderer.destroy();
+  };
 
   // ─── events ────────────────────────────────────────────────────────────
   tabs.on(TabSelectRenderableEvents.SELECTION_CHANGED, () => {
@@ -2150,9 +2631,16 @@ export async function runApp(services: AppServices): Promise<void> {
       void stopServer();
     } else if (v === "reload") {
       void reloadServer();
-    } else if (v === "refresh") {
-      refreshAll();
-      renderer.requestRender();
+    } else if (v === "chat") {
+      showPane("chat");
+    } else if (v === "models") {
+      showPane("model");
+    } else if (v === "load") {
+      showPane("load");
+    } else if (v === "backend") {
+      showPane("backend");
+    } else if (v === "log") {
+      showCover("log");
     }
   });
 
@@ -2211,9 +2699,14 @@ export async function runApp(services: AppServices): Promise<void> {
   });
 
   loadFieldSelect.on(SelectRenderableEvents.SELECTION_CHANGED, () => {
-    // Navigating the list always leaves edit mode.
+    if (ignoreLoadSelectionEvent) {
+      return;
+    }
+    // User navigation leaves edit mode. Programmatic restores do not.
     if (loadEditing) {
       loadEditing = false;
+      loadDigitBuf = "";
+      refreshFooter();
     }
     refreshLoadDetail();
     renderer.requestRender();
@@ -2246,24 +2739,59 @@ export async function runApp(services: AppServices): Promise<void> {
       return;
     }
 
-    if (key.name === "escape") {
-      if (activePane === "load" && loadEditing) {
+    const helpKey = key.name === "?" || key.sequence === "?";
+    if (cover !== "none") {
+      if (key.name === "escape" || (helpKey && cover === "help")) {
         key.preventDefault();
-        setLoadEditing(false);
+        hideCover();
+        for (const [id, pane] of Object.entries(panes) as Array<[PaneId, BoxRenderable]>) {
+          pane.visible = id === activePane;
+        }
+        refreshFooter();
+        focusPrimary();
+        renderer.requestRender();
         return;
       }
-      if (chatBusy) {
-        chatAbort?.abort();
+      if (helpKey) {
+        key.preventDefault();
+        showCover("help");
+        return;
+      }
+      if (key.name === "q" && !key.ctrl) {
+        key.preventDefault();
+        requestQuit();
+      }
+      return;
+    }
+
+    if (key.name === "escape") {
+      key.preventDefault();
+      if (activePane === "backend") {
+        showPane("status");
+        return;
+      }
+      if (activePane === "load" && loadEditing) {
+        setLoadEditing(false);
         return;
       }
       if (activePane === "model" && modelBrowse !== "local") {
         modelBrowseBack();
         return;
       }
+      if (chatBusy) {
+        chatAbort?.abort();
+        return;
+      }
+      return;
     }
 
-    // Load edit mode: ←→/↑↓ adjust, Enter/Esc done (list is blurred while editing).
     if (activePane === "load" && loadEditing && !key.ctrl) {
+      const seq = key.sequence || "";
+      if (key.name === "backspace" || /^[0-9.]$/.test(seq)) {
+        key.preventDefault();
+        applyLoadDigit(key.name === "backspace" ? "backspace" : seq);
+        return;
+      }
       if (key.name === "left" || key.name === "right") {
         key.preventDefault();
         adjustLoadField(key.name === "right" ? 1 : -1);
@@ -2281,13 +2809,11 @@ export async function runApp(services: AppServices): Promise<void> {
       }
     }
 
-    // Panel navigation works everywhere — including while typing in Chat.
     const fMap: Record<string, PaneId> = {
       f1: "status",
-      f2: "backend",
-      f3: "model",
-      f4: "load",
-      f5: "chat",
+      f2: "model",
+      f3: "load",
+      f4: "chat",
     };
     if (key.name && fMap[key.name]) {
       showPane(fMap[key.name]);
@@ -2298,7 +2824,6 @@ export async function runApp(services: AppServices): Promise<void> {
       return;
     }
 
-    // ←→ moves focus between list and action sections (not while editing text / load values).
     if (
       (key.name === "left" || key.name === "right") &&
       !(activePane === "chat" && chatInput.focused) &&
@@ -2310,7 +2835,6 @@ export async function runApp(services: AppServices): Promise<void> {
       }
     }
 
-    // While typing in chat or HF search, don't steal digits / letters.
     if (activePane === "chat" && chatInput.focused) {
       return;
     }
@@ -2318,7 +2842,17 @@ export async function runApp(services: AppServices): Promise<void> {
       return;
     }
 
-    // Model pane shortcuts
+    if (helpKey) {
+      key.preventDefault();
+      showCover("help");
+      return;
+    }
+    if (key.name === "l" && !key.ctrl) {
+      key.preventDefault();
+      showCover("log");
+      return;
+    }
+
     if (activePane === "model" && modelBrowse === "local" && !key.ctrl) {
       if (key.name === "/" || key.sequence === "/") {
         setModelBrowse("hf-query");
@@ -2336,15 +2870,20 @@ export async function runApp(services: AppServices): Promise<void> {
       }
     }
 
-    const digitMap: Record<string, PaneId> = {
-      "1": "status",
-      "2": "backend",
-      "3": "model",
-      "4": "load",
-      "5": "chat",
-    };
-    if (key.name && digitMap[key.name]) {
-      showPane(digitMap[key.name]);
+    if (key.name === "c" && !key.ctrl) {
+      showPane("chat");
+      return;
+    }
+    if (key.name === "m" && !key.ctrl) {
+      showPane("model");
+      return;
+    }
+    if (key.name === "e" && !key.ctrl) {
+      showPane("load");
+      return;
+    }
+    if (key.name === "b" && !key.ctrl) {
+      showPane("backend");
       return;
     }
     if (key.name === "s" && !key.ctrl) {
@@ -2360,24 +2899,61 @@ export async function runApp(services: AppServices): Promise<void> {
       return;
     }
     if (key.name === "q" && !key.ctrl) {
-      renderer.destroy();
-      process.exit(0);
+      key.preventDefault();
+      requestQuit();
+      return;
     }
   });
 
-  // Keep header fresh while starting
   const timer = setInterval(() => {
-    if (busy || services.processManager.getStatus().starting) {
-      refreshStatus();
-      renderer.requestRender();
+    refreshStatus();
+    renderer.requestRender();
+  }, 2000);
+
+  let quitting = false;
+  let settled = false;
+  let resolveQuit: () => void = () => undefined;
+  const untilQuit = new Promise<void>((resolve) => {
+    resolveQuit = () => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      resolve();
+    };
+  });
+
+  requestQuit = () => {
+    if (quitting) {
+      return;
     }
-  }, 500);
+    quitting = true;
+    void (async () => {
+      try {
+        await flushPendingLoadPatch();
+      } catch {
+        // The last keystroke may fail to persist; still leave the UI.
+      }
+      try {
+        renderer.destroy();
+      } finally {
+        resolveQuit();
+      }
+    })();
+  };
 
   renderer.on("destroy", () => {
     clearInterval(timer);
     chatAbort?.abort();
+    if (quitting) {
+      return;
+    }
+    // Ctrl+C destroys the renderer directly. Flush, then let main() dispose.
+    quitting = true;
+    void flushPendingLoadPatch().finally(() => resolveQuit());
   });
 
   showPane("status");
   void chatDraft;
+  await untilQuit;
 }

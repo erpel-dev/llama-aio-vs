@@ -4,7 +4,12 @@
  */
 import * as http from "http";
 import { ratesFromTimings, type LlamaTimings } from "./llamaTimings";
-import { decodeSseLines } from "./sseStream";
+import {
+  decodeSseLines,
+  errorMessageFromSseJson,
+  messageFromSseErrorLine,
+  SseStreamError,
+} from "./sseStream";
 
 export type ChatRole = "system" | "user" | "assistant";
 
@@ -141,6 +146,10 @@ export async function* streamChatCompletion(
         return;
       }
       const trimmed = line.trim();
+      const errorLine = messageFromSseErrorLine(trimmed);
+      if (errorLine) {
+        throw new SseStreamError(errorLine);
+      }
       if (!trimmed.startsWith("data:")) {
         continue;
       }
@@ -150,6 +159,7 @@ export async function* streamChatCompletion(
       }
       try {
         const json = JSON.parse(data) as {
+          error?: { message?: string } | string;
           choices?: Array<{
             delta?: {
               content?: string | null;
@@ -159,6 +169,10 @@ export async function* streamChatCompletion(
           timings?: LlamaTimings;
           usage?: LlamaUsage;
         };
+        const streamError = errorMessageFromSseJson(json);
+        if (streamError) {
+          throw new SseStreamError(streamError);
+        }
         if (json.timings) {
           lastTimings = json.timings;
         }
@@ -178,6 +192,9 @@ export async function* streamChatCompletion(
           yield { kind: "text", text: reasoning };
         }
       } catch (err) {
+        if (err instanceof SseStreamError) {
+          throw err;
+        }
         console.warn(
           "Llama AIO chat: could not parse SSE event:",
           data.slice(0, 200),

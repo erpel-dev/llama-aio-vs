@@ -32,6 +32,7 @@ export * from "./recommendSettings";
 export * from "./serverArgs";
 export * from "./settings";
 export * from "./sseStream";
+export * from "./toolResultText";
 export * from "./streamTextGate";
 export * from "./toolCallGuard";
 export * from "./types";

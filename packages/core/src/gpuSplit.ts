@@ -205,6 +205,110 @@ export function tensorSplitForMainShare(
 }
 
 /**
+ * True when `--n-cpu-moe` / `--n-cpu-ffn` makes later GPU layers heavier than
+ * the first ones, so a layer-count `--tensor-split` is not a weight split.
+ * Row / tensor / none keep uniform (or Main-only) mass — no inverse needed.
+ */
+export function needsWeightAwareTensorSplit(
+  splitMode: GpuSplitMode | undefined,
+  options: LayerWeightMassOptions = {}
+): boolean {
+  if (splitMode === "row" || splitMode === "tensor" || splitMode === "none") {
+    return false;
+  }
+  if (options.isMoe) {
+    return (options.nCpuMoe || 0) > 0 && (options.moeExpertShare || 0) > 0;
+  }
+  return (options.nCpuFfn || 0) > 0 && (options.denseFfnShare || 0) > 0;
+}
+
+/**
+ * Fraction of GPU-resident weights on `--main-gpu` after layer assignment and
+ * CPU MoE / FFN. Falls back to the raw `--tensor-split` share when mass is uniform.
+ */
+export function mainWeightShareFromSplit(
+  tensorSplit: string | undefined,
+  mainGpu: number,
+  gpuCount: number,
+  vramBytes: number[],
+  nLayers: number,
+  layersOnGpu: number,
+  splitMode: GpuSplitMode | undefined,
+  options: LayerWeightMassOptions = {}
+): number {
+  const n = clampGpuCount(gpuCount);
+  const shares = effectiveTensorSplitShares(tensorSplit, splitMode, mainGpu, n, vramBytes);
+  const main = clampMainGpuIndex(mainGpu, n);
+  if (n < 2 || nLayers < 1 || !needsWeightAwareTensorSplit(splitMode, options)) {
+    return shares[main] ?? 1;
+  }
+  const weight = layerAwareWeightShares(nLayers, layersOnGpu, shares, splitMode, mainGpu, options);
+  return weight[main] ?? shares[main] ?? 1;
+}
+
+/**
+ * `--tensor-split` (device-index order) whose GPU-resident weight share on
+ * `--main-gpu` is as close as possible to `targetMainWeightShare`.
+ *
+ * llama.cpp still fills by layer count, so this inverts
+ * {@link layerAwareWeightShares}: 50% with `--n-cpu-moe` on the cheap first
+ * layers typically emits more than 50% of layers onto Main. Falls back to
+ * {@link tensorSplitForMainShare} when every GPU layer has the same mass.
+ */
+export function tensorSplitForTargetWeightShare(
+  targetMainWeightShare: number,
+  mainGpu: number,
+  gpuCount: number,
+  nLayers: number,
+  layersOnGpu: number,
+  splitMode: GpuSplitMode | undefined,
+  options: LayerWeightMassOptions = {}
+): string {
+  const n = clampGpuCount(gpuCount);
+  const target = clampMainShare(targetMainWeightShare);
+  if (n < 2) {
+    return "";
+  }
+  if (nLayers < 1 || !needsWeightAwareTensorSplit(splitMode, options)) {
+    return tensorSplitForMainShare(target, mainGpu, n);
+  }
+  const main = clampMainGpuIndex(mainGpu, n);
+  const targetPct = Math.round(target * 100);
+  let best = tensorSplitForMainShare(target, mainGpu, n);
+  let bestErr = Infinity;
+  let bestPct = targetPct;
+  for (let pct = 10; pct <= 90; pct++) {
+    const candidate = tensorSplitForMainShare(pct / 100, mainGpu, n);
+    const shares = tensorSplitShares(candidate, n, []);
+    const weight = layerAwareWeightShares(
+      nLayers,
+      layersOnGpu,
+      shares,
+      splitMode || "layer",
+      mainGpu,
+      options
+    );
+    const err = Math.abs((weight[main] ?? 0) - target);
+    if (err < bestErr - 1e-12) {
+      best = candidate;
+      bestErr = err;
+      bestPct = pct;
+      continue;
+    }
+    if (err > bestErr + 1e-12) {
+      continue;
+    }
+    const closerToTarget = Math.abs(pct - targetPct) < Math.abs(bestPct - targetPct);
+    if (closerToTarget || (pct < bestPct && Math.abs(pct - targetPct) === Math.abs(bestPct - targetPct))) {
+      best = candidate;
+      bestErr = err;
+      bestPct = pct;
+    }
+  }
+  return best;
+}
+
+/**
  * Canonical `--tensor-split` from per-device fractions (device order).
  * Zeros are kept so a 3-GPU "70,0,30" does not collapse to two parts.
  */

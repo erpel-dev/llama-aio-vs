@@ -88,6 +88,61 @@ export function miniGguf(kv: Record<string, MiniGgufValue>): Buffer {
   return Buffer.concat(parts);
 }
 
+/**
+ * Header + dummy tensor payloads. Offsets chain so `readModelCapabilities`
+ * can infer per-tensor byte sizes from this file's length (not a split total).
+ */
+export function miniGgufWithTensors(
+  kv: Record<string, MiniGgufValue>,
+  tensors: Array<{ name: string; bytes: number }>
+): Buffer {
+  const parts: Buffer[] = [];
+  const u32 = (n: number) => {
+    const b = Buffer.alloc(4);
+    b.writeUInt32LE(n, 0);
+    return b;
+  };
+  const u64 = (n: number) => {
+    const b = Buffer.alloc(8);
+    b.writeBigUInt64LE(BigInt(n), 0);
+    return b;
+  };
+  const str = (s: string) => Buffer.concat([u64(Buffer.byteLength(s)), Buffer.from(s, "utf8")]);
+  parts.push(u32(0x46554747), u32(3), u64(tensors.length), u64(Object.keys(kv).length));
+  for (const [key, entry] of Object.entries(kv)) {
+    parts.push(str(key));
+    switch (entry.type) {
+      case "string":
+        parts.push(u32(8), str(entry.value));
+        break;
+      case "u32":
+        parts.push(u32(4), u32(entry.value));
+        break;
+      case "u32[]":
+        parts.push(u32(9), u32(4), u64(entry.value.length), ...entry.value.map(u32));
+        break;
+      case "bool[]":
+        parts.push(
+          u32(9),
+          u32(7),
+          u64(entry.value.length),
+          ...entry.value.map((v) => Buffer.from([v ? 1 : 0]))
+        );
+        break;
+    }
+  }
+  let offset = 0;
+  for (const t of tensors) {
+    const bytes = Math.max(0, Math.floor(t.bytes));
+    parts.push(str(t.name), u32(1), u64(Math.max(1, bytes)), u32(0), u64(offset));
+    offset += bytes;
+  }
+  const preamble = Buffer.concat(parts);
+  const alignment = 32;
+  const dataStart = Math.ceil(preamble.length / alignment) * alignment;
+  return Buffer.concat([preamble, Buffer.alloc(dataStart - preamble.length + offset)]);
+}
+
 /** Value that follows `flag` in an argv array, or undefined when absent. */
 export function argValue(args: string[], flag: string): string | undefined {
   const i = args.indexOf(flag);

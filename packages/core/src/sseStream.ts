@@ -8,6 +8,65 @@
 /** Refuse to buffer more than this without seeing a newline (runaway stream). */
 export const MAX_SSE_LINE_CHARS = 8 * 1024 * 1024;
 
+/** Mid-stream llama-server failure (`error:` event or a JSON `error` object). */
+export class SseStreamError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SseStreamError";
+  }
+}
+
+/**
+ * Message from an SSE `error:` line, or undefined when the line is not an error event.
+ * Plain text and `{"error":{"message":"..."}}` payloads are both accepted.
+ */
+export function messageFromSseErrorLine(line: string): string | undefined {
+  const trimmed = line.trim();
+  if (!/^error:/i.test(trimmed)) {
+    return undefined;
+  }
+  const payload = trimmed.replace(/^error:\s*/i, "").trim();
+  if (!payload) {
+    return "llama-server stream error";
+  }
+  return errorMessageFromSseJson(tryParseJson(payload)) || payload.slice(0, 500);
+}
+
+/**
+ * Message from a parsed SSE JSON object that carries `error`, or undefined for a normal chunk.
+ * llama-server reports context overflow this way on an otherwise 200 stream.
+ */
+export function errorMessageFromSseJson(json: unknown): string | undefined {
+  if (!json || typeof json !== "object") {
+    return undefined;
+  }
+  const error = (json as { error?: unknown }).error;
+  if (error == null) {
+    return undefined;
+  }
+  if (typeof error === "string" && error.trim()) {
+    return error.trim();
+  }
+  if (typeof error === "object") {
+    const message = (error as { message?: unknown }).message;
+    if (typeof message === "string" && message.trim()) {
+      return message.trim();
+    }
+  }
+  return "llama-server stream error";
+}
+
+function tryParseJson(payload: string): unknown {
+  if (!payload.startsWith("{") && !payload.startsWith("[")) {
+    return undefined;
+  }
+  try {
+    return JSON.parse(payload);
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * Split a byte stream into complete lines.
  *

@@ -8,6 +8,7 @@ import {
   buildReplacementStats,
   estimateRequestTokens,
   loadPromptReplacements,
+  messageContentChars,
   type PromptReplacement,
   type PromptReplacementStats,
 } from "@llama-aio/core";
@@ -24,8 +25,12 @@ import {
 } from "@llama-aio/core";
 import {
   decodeSseLines,
+  errorMessageFromSseJson,
+  formatToolResultContent,
   LiveTextGate,
+  messageFromSseErrorLine,
   parseXmlToolCalls,
+  SseStreamError,
   stripXmlToolCalls,
   toolCallSlot,
 } from "@llama-aio/core";
@@ -280,10 +285,7 @@ function extractTextFromPart(part: unknown): string {
 }
 
 function stringifyToolResult(content: readonly unknown[]): string {
-  return content
-    .map((item) => extractTextFromPart(item) || JSON.stringify(item))
-    .filter((item) => item && item !== "null" && item !== "undefined")
-    .join("\n");
+  return formatToolResultContent(content);
 }
 
 function toOpenAiMessages(
@@ -353,7 +355,15 @@ function toOpenAiMessages(
       continue;
     }
 
-    // user
+    // Tool results must follow the assistant tool_calls immediately. Copilot
+    // puts the follow-up user text in the same turn, so emit tools first.
+    for (const toolResult of toolResults) {
+      out.push({
+        role: "tool",
+        tool_call_id: toolResult.callId,
+        content: toolResult.content,
+      });
+    }
     if (imageParts.length > 0) {
       const content: OpenAiContentPart[] = [];
       if (textContent) {
@@ -365,13 +375,6 @@ function toOpenAiMessages(
       out.push({ role: "user", content });
     } else if (textContent) {
       out.push({ role: "user", content: textContent });
-    }
-    for (const toolResult of toolResults) {
-      out.push({
-        role: "tool",
-        tool_call_id: toolResult.callId,
-        content: toolResult.content,
-      });
     }
   }
 
@@ -457,6 +460,10 @@ async function* streamChatCompletions(
       return;
     }
     const trimmed = line.trim();
+    const errorLine = messageFromSseErrorLine(trimmed);
+    if (errorLine) {
+      throw new vscode.LanguageModelError(errorLine);
+    }
     if (!trimmed.startsWith("data:")) {
       continue;
     }
@@ -489,6 +496,10 @@ async function* streamChatCompletions(
         timings?: LlamaTimings;
         usage?: LlamaUsage;
       };
+      const streamError = errorMessageFromSseJson(json);
+      if (streamError) {
+        throw new SseStreamError(streamError);
+      }
       if (json.timings) {
         lastTimings = json.timings;
       }
@@ -585,6 +596,9 @@ async function* streamChatCompletions(
         }
       }
     } catch (err) {
+      if (err instanceof SseStreamError) {
+        throw new vscode.LanguageModelError(err.message);
+      }
       // A truncated line can no longer happen here (decodeSseLines only yields
       // complete lines), so this is a real protocol problem worth surfacing.
       console.warn(
@@ -690,6 +704,8 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
 
   private cachedRules: PromptReplacement[] | undefined;
   private cachedRulesKey: string | undefined;
+  /** One toast per session when the slot is under 16k but the prompt still fits. */
+  private warnedSmallSlot = false;
 
   private async getReplacementRules(): Promise<PromptReplacement[]> {
     const custom = this.store.getPromptReplacementsFile();
@@ -824,26 +840,24 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
     progress: vscode.Progress<vscode.LanguageModelResponsePart>,
     token: vscode.CancellationToken
   ): Promise<void> {
-    if (!(await this.processManager.isHttpReady()) || this.processManager.getStatus().configDirty) {
-      try {
-        await this.processManager.start();
-      } catch (e) {
-        throw new Error(
-          `Llama AIO server is not running: ${e instanceof Error ? e.message : String(e)}`
-        );
-      }
+    if (!(await this.processManager.isHttpReady())) {
+      const starting = this.processManager.getStatus().starting;
+      throw new vscode.LanguageModelError(
+        starting
+          ? "Llama AIO server is still starting. Wait until it is ready, then send the chat again."
+          : "Llama AIO server is not running. Start it from the Llama AIO sidebar, then send the chat again."
+      );
+    }
+    if (this.processManager.getStatus().configDirty) {
+      throw new vscode.LanguageModelError(
+        "Llama AIO load settings changed. Reload the server from the sidebar before chatting. A chat request will not restart it."
+      );
     }
 
     const state = this.store.getState();
     const props = await this.fetchServerProps();
     const slotCtx =
       props?.default_generation_settings?.n_ctx || this.store.getSlotContextSize(state.loadSettings);
-    if (slotCtx < 16384) {
-      throw new Error(
-        `Llama-server slot context is only ${slotCtx} tokens — too small for Copilot Chat/agent.\n` +
-          `In Llama AIO: set Context Length ≥ 65536, Max Concurrent Predictions = 1, then Reload.`
-      );
-    }
 
     const convertedRaw = toOpenAiMessages(messages);
     let tools =
@@ -917,6 +931,19 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
     }
 
     const estimatedPromptTokens = estimateRequestTokens(converted, tools);
+    if (estimatedPromptTokens >= slotCtx) {
+      throw new vscode.LanguageModelError(
+        `This prompt is about ${estimatedPromptTokens} tokens and the server slot is ${slotCtx}. ` +
+          `It does not fit. Raise Context Length or set Max Concurrent Predictions to 1, then Reload.`
+      );
+    }
+    if (slotCtx < 16384 && !this.warnedSmallSlot) {
+      this.warnedSmallSlot = true;
+      void vscode.window.showWarningMessage(
+        `Llama AIO slot context is ${slotCtx} tokens (under 16k). This prompt fits, but Copilot agent turns often need more. ` +
+          `Set Context Length ≥ 65536 and Max Concurrent Predictions = 1, then Reload.`
+      );
+    }
     const contextBreakdown = estimateContextBreakdown(
       converted,
       tools ?? [],
@@ -1103,7 +1130,7 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
     if (typeof text === "string") {
       return Math.ceil(text.length / 4);
     }
-    const joined = text.content.map((p) => extractTextFromPart(p)).join("");
-    return Math.ceil(joined.length / 4);
+    // Same serialization the request uses, so tool calls and tool results count.
+    return Math.ceil(messageContentChars(toOpenAiMessages([text])) / 4);
   }
 }

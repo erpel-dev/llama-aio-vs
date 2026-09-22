@@ -89,6 +89,21 @@ export function normalizeLoadSettingsForCpuBackend(
   };
 }
 
+/** Shell-ish display form of an argv list (clipboard / log), not a spawn argv. */
+export function formatCommandDisplay(argv: readonly string[]): string {
+  return argv.map(quoteCommandArg).join(" ");
+}
+
+function quoteCommandArg(value: string): string {
+  if (value.length === 0) {
+    return '""';
+  }
+  if (!/[\s"]/.test(value)) {
+    return value;
+  }
+  return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+
 /**
  * Build llama-server CLI args from load settings + model path.
  * Settings are normalized here as well as in the store, so no caller can put a

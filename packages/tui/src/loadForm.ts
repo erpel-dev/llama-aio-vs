@@ -126,7 +126,7 @@ export const LOAD_FIELD_DEFS: LoadFieldDef[] = [
     id: "tensorSplit",
     kind: "number",
     label: "Weights on main GPU",
-    help: "Percent of weights + KV on the Main GPU (--tensor-split). The rest is split evenly across the other cards. llama.cpp still receives device-index order (GPU 0, GPU 1, …).",
+    help: "Percent of GPU-resident weights on the Main GPU after CPU MoE/FFN (--tensor-split). llama.cpp still fills by layer count, so cheap first layers can get more of Main. The rest is split evenly across the other cards.",
     step: 1,
     store: "load",
     key: "tensorSplit",

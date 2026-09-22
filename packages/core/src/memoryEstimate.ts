@@ -313,9 +313,8 @@ export interface ComputeOverheadOptions {
   flashAttention?: string;
   /** Share of layers that carry context-scaled attention state (0..1), used
    * only when `discountRecurrentGraph` is set. Linear-recurrent hybrids
-   * (Qwen3.5 RCO: fixed SSM state, KV billed only on full-attn layers) run
-   * smaller graphs; plain full/SWA interleaves (e.g. Flash-Next) do not.
-   * Defaults to 1 (dense) when omitted. */
+   * (Qwen3.5 RCO, or qwen4exp with SSM geometry) run smaller graphs; plain
+   * full/SWA Flash-Next interleaves do not. Defaults to 1 (dense) when omitted. */
   fullAttentionFraction?: number;
   /** Opt-in: scale the graph workspace by `fullAttentionFraction`. Only the
    * caller that proved the model is linear-recurrent sets this. */
@@ -329,7 +328,8 @@ export interface ComputeOverheadOptions {
   /**
    * Skip the 2.5 GiB Flash-Next dual-GPU RADV reserve. Defaults to true when
    * `discountRecurrentGraph` is set (Qwen3.5 RCO measured ~2.5 GiB over LACT
-   * per card at 60k on two 16 GB cards). Flash-Next keeps the fat heap.
+   * per card at 60k on two 16 GB cards). Plain full/SWA Flash-Next keeps the
+   * fat heap; qwen4exp + SSM uses the compact one.
    */
   compactVulkanHeap?: boolean;
 }
@@ -461,12 +461,13 @@ export function computeOverheadBytes(
   // Several f32 residual / FFN streams (old *24 was ~4× too small).
   const activations = ubatch * embed * 96;
   const batchBuf = batch * 8 * 1024;
-  // Linear-recurrent hybrids (Qwen3.5 RCO) keep a fixed SSM state off the
-  // full-attn layers, so only the full-attention share bills the graph term.
-  // Plain full/SWA interleaves (e.g. Flash-Next qwen4exp) still run dense
-  // graphs: GGUF gives them the same interval marker but every layer keeps
-  // context-scaled KV, so the discount stays opt-in (clamped to 0.05 so a
-  // degenerate value cannot zero the graph entirely).
+  // Linear-recurrent hybrids (Qwen3.5 RCO, qwen4exp with ssm.*) keep a
+  // fixed SSM state off the full-attn layers, so only the full-attention
+  // share bills the graph term. Plain full/SWA interleaves (Flash-Next
+  // without SSM) still run dense graphs: GGUF may give them the same
+  // interval marker but every layer keeps context-scaled KV, so the
+  // discount stays opt-in (clamped to 0.05 so a degenerate value cannot
+  // zero the graph entirely).
   const rawFraction = options?.discountRecurrentGraph ? options?.fullAttentionFraction : undefined;
   const fullFraction =
     rawFraction === undefined || !Number.isFinite(rawFraction)

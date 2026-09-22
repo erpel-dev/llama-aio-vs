@@ -567,6 +567,62 @@ describe("computeOverheadBytes", () => {
     );
   });
 
+  it("applies the compact heap to qwen4exp when SSM geometry is present", () => {
+    const base = {
+      blockCount: 48,
+      embeddingLength: 2560,
+      attentionHeadCount: 24,
+      attentionHeadCountKv: 2,
+      keyLength: 256,
+      valueLength: 256,
+      fullAttentionInterval: 4,
+      fileSizeBytes: 10 * GiB,
+    };
+    const g0 = {
+      totalBytes: 16 * GiB,
+      usedBytes: 0,
+      name: "RX 9070 XT",
+      source: "test",
+      llamaDeviceId: "Vulkan0",
+    };
+    const g1 = {
+      totalBytes: 16 * GiB,
+      usedBytes: 0,
+      name: "RX 9060 XT",
+      source: "test",
+      llamaDeviceId: "Vulkan1",
+    };
+    const settings = loadSettings({
+      contextLength: 65536,
+      gpuOffload: 48,
+      physicalBatchSize: 256,
+      evalBatchSize: 512,
+      tensorSplit: "62,38",
+    });
+    const swa = estimateMemory(
+      denseCaps({ architecture: "qwen4exp", ...base }),
+      settings,
+      g0,
+      { gpus: [g0, g1] }
+    );
+    const ssm = estimateMemory(
+      denseCaps({ architecture: "qwen4exp", ssmStateSize: 128, ssmInnerSize: 6144, ...base }),
+      settings,
+      g0,
+      { gpus: [g0, g1] }
+    );
+    assert.ok(swa && ssm);
+    assert.ok(
+      ssm.overheadBytes < swa.overheadBytes,
+      `qwen4exp+SSM overhead ${ssm.overheadBytes} should drop the Flash-Next heap (${swa.overheadBytes})`
+    );
+    const oh0 = ssm.charts.vram.segments.find((s) => s.key === "overhead")!.bytes;
+    const oh1 = ssm.charts.vram2!.segments.find((s) => s.key === "overhead")!.bytes;
+    assert.ok(oh0 < 2.3 * GiB, `main overhead ${oh0} still has the 2.5 GiB Flash-Next heap`);
+    assert.ok(oh1 < 1.1 * GiB, `peer overhead ${oh1} still has the 2.5 GiB Flash-Next heap`);
+    assert.ok(oh0 > 0.9 * GiB, `main overhead ${oh0} dropped driver/graph`);
+  });
+
   it("prices a single-Vulkan 27B RCO near LACT, not the dual-GPU 2.5 GiB heap", () => {
     const g0 = {
       totalBytes: 16 * GiB,

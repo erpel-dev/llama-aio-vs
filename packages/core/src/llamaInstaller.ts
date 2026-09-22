@@ -447,17 +447,33 @@ export async function resolveLatestReleaseTag(): Promise<string> {
 const LATEST_TAG_CACHE_MS = 45 * 60 * 1000;
 let latestTagCache: { tag: string; fetchedAt: number } | undefined;
 
-/** Compare release tags (`b10173`). Positive if `a` is newer than `b`. */
-export function compareReleaseTags(a: string, b: string): number {
-  const na = Number.parseInt(normalizeReleaseTag(a).replace(/^b/i, ""), 10);
-  const nb = Number.parseInt(normalizeReleaseTag(b).replace(/^b/i, ""), 10);
+/**
+ * Compare release tags (`b10173`). Positive if `a` is newer than `b`.
+ * Returns undefined when either tag is not a llama.cpp build tag (`local`, `PATH`, empty).
+ */
+export function compareReleaseTags(a: string, b: string): number | undefined {
+  const naTag = tryNormalizeReleaseTag(a);
+  const nbTag = tryNormalizeReleaseTag(b);
+  if (!naTag || !nbTag) {
+    return undefined;
+  }
+  const na = Number.parseInt(naTag.replace(/^b/i, ""), 10);
+  const nb = Number.parseInt(nbTag.replace(/^b/i, ""), 10);
   if (Number.isFinite(na) && Number.isFinite(nb)) {
     return na - nb;
   }
-  return normalizeReleaseTag(a).localeCompare(normalizeReleaseTag(b), undefined, {
+  return naTag.localeCompare(nbTag, undefined, {
     numeric: true,
     sensitivity: "base",
   });
+}
+
+function tryNormalizeReleaseTag(input: string): string | undefined {
+  try {
+    return normalizeReleaseTag(input);
+  } catch {
+    return undefined;
+  }
 }
 
 export function peekCachedLatestReleaseTag(): string | undefined {
@@ -1296,7 +1312,7 @@ export class LlamaInstaller {
       return {
         latestTag: cached,
         installedTag,
-        updateAvailable: !installedTag || compareReleaseTags(cached, installedTag) > 0,
+        updateAvailable: !installedTag || (compareReleaseTags(cached, installedTag) ?? 0) > 0,
         checkFailed: false,
         pending: false,
       };
@@ -1307,7 +1323,7 @@ export class LlamaInstaller {
       return {
         latestTag,
         installedTag,
-        updateAvailable: !installedTag || compareReleaseTags(latestTag, installedTag) > 0,
+        updateAvailable: !installedTag || (compareReleaseTags(latestTag, installedTag) ?? 0) > 0,
         checkFailed: false,
         pending: false,
       };
@@ -1321,33 +1337,45 @@ export class LlamaInstaller {
     }
   }
 
-  /** Sync snapshot using cache only (no network). */
+  /**
+   * Sync snapshot using cache only (no network).
+   * Never throws: a local or unparsable VERSION tag must not break sidebar refresh.
+   */
   peekUpdateCheck(): UpdateCheckInfo {
-    if (this.resolveActiveUiBackend() === "path") {
+    try {
+      if (this.resolveActiveUiBackend() === "path") {
+        return {
+          installedTag: findLlamaServerOnPath() ? "PATH" : undefined,
+          updateAvailable: false,
+          checkFailed: false,
+          pending: false,
+        };
+      }
+      const installedTag = this.readBackendVersion().tag;
+      const cached = peekCachedLatestReleaseTag();
+      if (!cached) {
+        return {
+          installedTag,
+          updateAvailable: false,
+          checkFailed: false,
+          pending: true,
+        };
+      }
+      const cmp = installedTag ? compareReleaseTags(cached, installedTag) : undefined;
       return {
-        installedTag: findLlamaServerOnPath() ? "PATH" : undefined,
-        updateAvailable: false,
+        latestTag: cached,
+        installedTag,
+        updateAvailable: !installedTag || (cmp !== undefined && cmp > 0),
         checkFailed: false,
         pending: false,
       };
-    }
-    const installedTag = this.readBackendVersion().tag;
-    const cached = peekCachedLatestReleaseTag();
-    if (!cached) {
+    } catch {
       return {
-        installedTag,
         updateAvailable: false,
-        checkFailed: false,
-        pending: true,
+        checkFailed: true,
+        pending: false,
       };
     }
-    return {
-      latestTag: cached,
-      installedTag,
-      updateAvailable: !installedTag || compareReleaseTags(cached, installedTag) > 0,
-      checkFailed: false,
-      pending: false,
-    };
   }
 
   async installOrUpgrade(
@@ -1381,7 +1409,8 @@ export class LlamaInstaller {
         ? backendSetting
         : this.resolveActiveUiBackend(backendSetting);
     const current = this.readBackendVersion(uiBackend).tag;
-    if (!options?.force && current && compareReleaseTags(tag, current) <= 0) {
+    const cmp = current ? compareReleaseTags(tag, current) : undefined;
+    if (!options?.force && current && cmp !== undefined && cmp <= 0) {
       progress?.report({ message: `Already on ${current}` });
       return current;
     }
@@ -1693,7 +1722,8 @@ export class LlamaInstaller {
     // Keep update UI in sync when we just installed this tag.
     if (tag && tag !== "local") {
       const cached = peekCachedLatestReleaseTag();
-      if (!cached || compareReleaseTags(tag, cached) >= 0) {
+      const cmp = cached ? compareReleaseTags(tag, cached) : undefined;
+      if (!cached || (cmp !== undefined && cmp >= 0)) {
         latestTagCache = { tag, fetchedAt: Date.now() };
       }
     }

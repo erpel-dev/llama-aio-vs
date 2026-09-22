@@ -29,7 +29,7 @@ import {
   uniquePids,
 } from "./processIdentity";
 import { buildServerArgs, serverConfigFingerprint, SettingsStore } from "./settings";
-import { normalizeLoadSettingsForCpuBackend } from "./serverArgs";
+import { formatCommandDisplay, normalizeLoadSettingsForCpuBackend } from "./serverArgs";
 import { ServerStatus } from "./types";
 import { activeInstallLock } from "./installSwap";
 import { acquireLaunchLock, activeLaunchLock, LaunchLockHandle } from "./launchLock";
@@ -336,6 +336,47 @@ export class ProcessManager {
       ? undefined
       : getLlamaServerBinary(installer.getActiveInstallDir());
     return resolveLaunchPlan({ installedBinary: installed, usePath });
+  }
+
+  /**
+   * Command line the next start would run, for the sidebar “Copy command” button.
+   * Does not launch anything and does not write the log.
+   */
+  describeCommandLine(): string {
+    const launch = this.resolveLaunch();
+    const state = this.store.getState();
+    const model = (state.selectedModelPath || "").trim();
+    if (!model) {
+      throw new Error("No model selected. Choose a GGUF before copying the command line.");
+    }
+    let loadSettings = state.loadSettings;
+    const caps = state.modelCapabilities;
+    if (caps) {
+      loadSettings = clampLoadSettingsToModel(loadSettings, caps);
+    }
+    if (this.isCpuBackend()) {
+      loadSettings = normalizeLoadSettingsForCpuBackend(loadSettings);
+    }
+    const gpus = this.isCpuBackend() ? [] : detectGpus(false, launch.binary);
+    const args = buildServerArgs(model, this.store.getHost(), this.store.getPort(), loadSettings, {
+      gpus,
+      requestSampling: state.requestSettings,
+      caps,
+    });
+    return formatCommandDisplay([launch.command, ...launch.prefixArgs, ...args]);
+  }
+
+  /** Raw tail of the server log (unfiltered), for the Output channel after a failed start. */
+  readRecentLogLines(maxLines = 20): string {
+    try {
+      const lines = fs
+        .readFileSync(getLogPath(), "utf8")
+        .split(/\r?\n/)
+        .filter((line) => line.length > 0);
+      return lines.slice(-maxLines).join("\n");
+    } catch {
+      return "";
+    }
   }
 
   resolveBinary(): string {
@@ -667,7 +708,7 @@ export class ProcessManager {
 
   private formatStartFailure(prefix: string, fatalLine?: string): string {
     const logPath = getLogPath();
-    const snippet = this.readLogSnippet(logPath);
+    const snippet = this.readLogSnippet(logPath, 20);
     const blob = `${fatalLine || ""}\n${snippet}`;
     let hint = "";
     if (/ErrorDeviceLost|VK_ERROR_DEVICE_LOST|vk::Queue::submit/i.test(blob)) {

@@ -13,11 +13,13 @@ import {
   retargetTensorSplitMainShare,
   tensorSplitFromFractions,
   tensorSplitForMainShare,
+  tensorSplitForTargetWeightShare,
   tensorSplitShares,
   tensorSplitSharesEqual,
   effectiveTensorSplitShares,
   assignLayerDevices,
   layerAwareWeightShares,
+  mainWeightShareFromSplit,
 } from "../src/gpuSplit";
 
 describe("parseTensorSplit", () => {
@@ -222,5 +224,57 @@ describe("layerAwareWeightShares", () => {
     });
     assert.ok(shares[1]! > 0.7, `expected GPU1 to hold most remaining experts, got ${shares[1]}`);
     assert.ok(shares[0]! < 0.3, `expected GPU0 to be cheap after CPU-MoE, got ${shares[0]}`);
+  });
+});
+
+describe("tensorSplitForTargetWeightShare", () => {
+  const flashNextMass = {
+    isMoe: true,
+    nCpuMoe: 23,
+    moeExpertShare: 0.5116,
+  };
+
+  it("matches layer percent when every GPU layer has the same mass", () => {
+    assert.equal(tensorSplitForTargetWeightShare(0.5, 0, 2, 48, 48, "layer", {}), "50,50");
+    assert.equal(tensorSplitForTargetWeightShare(0.75, 1, 2, 48, 48, "layer", {}), "25,75");
+  });
+
+  it("leaves row/tensor splits as layer percents", () => {
+    assert.equal(
+      tensorSplitForTargetWeightShare(0.5, 0, 2, 48, 48, "row", flashNextMass),
+      "50,50"
+    );
+  });
+
+  it("puts extra cheap layers on Main so 50% is GPU-resident weights after --n-cpu-moe", () => {
+    const split = tensorSplitForTargetWeightShare(0.5, 0, 2, 48, 48, "layer", flashNextMass);
+    assert.equal(split, "63,37");
+    const shares = tensorSplitShares(split, 2, [16, 16]);
+    const weight = layerAwareWeightShares(48, 48, shares, "layer", 0, flashNextMass);
+    assert.ok(Math.abs(weight[0]! - 0.5) < 0.03, `expected ~50% weights on GPU0, got ${weight[0]} (${split})`);
+  });
+
+  it("inverts the same way when Main is GPU 1", () => {
+    const split = tensorSplitForTargetWeightShare(0.5, 1, 2, 48, 48, "layer", flashNextMass);
+    assert.equal(split, "63,37");
+    const shares = tensorSplitShares(split, 2, [16, 16]);
+    const weight = layerAwareWeightShares(48, 48, shares, "layer", 1, flashNextMass);
+    assert.ok(Math.abs(weight[1]! - 0.5) < 0.03, `expected ~50% weights on GPU1, got ${weight[1]} (${split})`);
+  });
+});
+
+describe("mainWeightShareFromSplit", () => {
+  it("reports GPU-resident weight share, not layer percent, after --n-cpu-moe", () => {
+    const share = mainWeightShareFromSplit(
+      "50,50",
+      0,
+      2,
+      [16, 16],
+      48,
+      48,
+      "layer",
+      { isMoe: true, nCpuMoe: 23, moeExpertShare: 0.5116 }
+    );
+    assert.ok(share < 0.4, `50/50 layers should be well under 50% weights, got ${share}`);
   });
 });

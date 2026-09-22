@@ -13,10 +13,13 @@ export {
   gpuDisplayOrder,
   mainShareForUi,
   mainShareFromSplit,
+  mainWeightShareFromSplit,
+  needsWeightAwareTensorSplit,
   normalizeGpuSplitMode,
   normalizeTensorSplit,
   parseTensorSplit,
   tensorSplitForMainShare,
+  tensorSplitForTargetWeightShare,
   tensorSplitShares,
   effectiveTensorSplitShares,
   tensorSplitSharesEqual,
@@ -316,8 +319,9 @@ export interface LlamaLoadSettings {
   /**
    * How to split tensors across GPUs (`--tensor-split`). Empty = omit
    * (llama.cpp splits by VRAM, often 1:1). Stored in **device-index order**
-   * (`75,25` = 75% on GPU 0). The UI slider is “% on Main GPU” and is mapped
-   * with {@link tensorSplitForMainShare}.
+   * (`75,25` = 75% of *layers* on GPU 0). The UI slider is “% of GPU-resident
+   * weights on Main GPU” after `--n-cpu-moe` / `--n-cpu-ffn`, mapped with
+   * {@link tensorSplitForTargetWeightShare}.
    */
   tensorSplit: string;
   /** How layers/rows are split (`--split-mode`). Default layer. */

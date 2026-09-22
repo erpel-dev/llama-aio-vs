@@ -489,44 +489,121 @@ export function isQwen4expArchitecture(architecture?: string): boolean {
 
 /**
  * True for linear-recurrent hybrids whose non-full layers carry a fixed SSM
- * state instead of context-scaled attention (Qwen3.5 RCO: arch `qwen35` /
- * `qwen35moe`). qwen4exp (Flash-Next) is a full/SWA interleave, not RCO —
- * its GGUF reuses the interval marker but every layer keeps context-scaled
- * KV, so the graph discount must not apply there.
+ * state instead of context-scaled attention.
+ *
+ * qwen35 / qwen35moe (Qwen3.5 RCO) always qualify. qwen4exp is a full/SWA
+ * interleave **unless** the GGUF actually stores SSM geometry — Flash-Next
+ * GSQ-RCO reuses the `qwen4exp` tag with 36/48 recurrent layers and
+ * `ssm.state_size`. Those must take the compact graph/heap, or dual-GPU
+ * VRAM bars keep the 2.5 GiB Flash-Next reserve. A qwen4exp file with no
+ * `ssm.*` keys stays dense.
  */
 export function isLinearRecurrentHybrid(caps?: {
   architecture?: string;
+  ssmStateSize?: number;
 }): boolean {
-  const arch = (caps?.architecture || "").toLowerCase().replace(/[._-]/g, "");
-  if (isQwen4expArchitecture(arch)) {
+  if (!caps) {
     return false;
   }
-  return arch.startsWith("qwen35");
+  const arch = (caps.architecture || "").toLowerCase().replace(/[._-]/g, "");
+  if (arch.startsWith("qwen35")) {
+    return true;
+  }
+  const ssm = caps.ssmStateSize;
+  return typeof ssm === "number" && Number.isFinite(ssm) && ssm > 0 && ssm <= 4096;
 }
 
-/**
- * Share of GGUF tensor bytes belonging to the PLE / engram lookup table.
- * Matches llama.cpp `per_layer_token_embd` (not the small `*.ple.*` projections).
- */
-function computePleShare(
+/** llama.cpp `per_layer_token_embd` / `ple_ngram` — not the small `*.ple.*` projections. */
+function isPleTensorName(name: string): boolean {
+  return /per_layer_token_embd/i.test(name) || /ple_ngram/i.test(name);
+}
+
+function tensorByteTotals(
   tensors: Array<{ name: string; offset: number }>,
   dataStart: number,
-  fileSize: number
-): number | undefined {
+  fileSize: number,
+  match: (name: string) => boolean
+): { total: number; matched: number } | undefined {
   if (!tensors.length || fileSize <= dataStart) {
     return undefined;
   }
   const sorted = [...tensors].sort((a, b) => a.offset - b.offset);
   let total = 0;
-  let ple = 0;
+  let matched = 0;
   for (let i = 0; i < sorted.length; i++) {
     const off = sorted[i].offset;
     const next = i + 1 < sorted.length ? sorted[i + 1].offset : Math.max(off, fileSize - dataStart);
     const size = Math.max(0, next - off);
     total += size;
-    if (/per_layer_token_embd/i.test(sorted[i].name) || /ple_ngram/i.test(sorted[i].name)) {
-      ple += size;
+    if (match(sorted[i].name)) {
+      matched += size;
     }
+  }
+  if (total <= 0) {
+    return undefined;
+  }
+  return { total, matched };
+}
+
+/** Header-scan one GGUF and return tensor-byte totals, using that file's size. */
+function measureTensorClassInFile(
+  filePath: string,
+  match: (name: string) => boolean
+): { total: number; matched: number } | undefined {
+  const fd = fs.openSync(filePath, "r");
+  try {
+    const { dataStart, tensors } = readGgufHeader(fd);
+    const fileSize = fs.fstatSync(fd).size;
+    return tensorByteTotals(tensors, dataStart, fileSize, match);
+  } catch {
+    return undefined;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/**
+ * PLE share across every shard of a split GGUF. The n-gram table often lives
+ * alone in a later shard (`*-00002-of-00002.gguf`); scanning only the opened
+ * file missed it and fell back to the 40% qwen4exp heuristic.
+ */
+function measurePleShareForModel(
+  filePath: string,
+  selected?: { tensors: Array<{ name: string; offset: number }>; dataStart: number }
+): number | undefined {
+  const names = shardFileNames(path.basename(filePath));
+  const dir = path.dirname(filePath);
+  const selectedName = path.basename(filePath);
+  const files = names || [selectedName];
+  let total = 0;
+  let ple = 0;
+  for (const name of files) {
+    const p = names ? path.join(dir, name) : filePath;
+    const reuse = selected && name === selectedName ? selected : undefined;
+    let part: { total: number; matched: number } | undefined;
+    if (reuse) {
+      let fileSize = 0;
+      try {
+        fileSize = fs.statSync(p).size;
+      } catch {
+        continue;
+      }
+      part = tensorByteTotals(reuse.tensors, reuse.dataStart, fileSize, isPleTensorName);
+    } else {
+      try {
+        if (!fs.existsSync(p)) {
+          continue;
+        }
+      } catch {
+        continue;
+      }
+      part = measureTensorClassInFile(p, isPleTensorName);
+    }
+    if (!part) {
+      continue;
+    }
+    total += part.total;
+    ple += part.matched;
   }
   if (total <= 0 || ple <= 0) {
     return undefined;
@@ -775,7 +852,7 @@ function readModelCapabilitiesUncached(filePath: string): ModelCapabilities {
     : undefined;
 
   const pleShare =
-    computePleShare(tensors, dataStart, fileSizeBytes || 0) ??
+    measurePleShareForModel(filePath, { tensors, dataStart }) ??
     (isQwen4expArchitecture(arch) ? heuristicPleShare(arch) : undefined);
 
   return {

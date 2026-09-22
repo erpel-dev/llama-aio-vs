@@ -1,11 +1,25 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { buildServerArgs, normalizeLoadSettingsForCpuBackend, serverConfigFingerprint } from "../src/serverArgs";
+import {
+  buildServerArgs,
+  formatCommandDisplay,
+  normalizeLoadSettingsForCpuBackend,
+  serverConfigFingerprint,
+} from "../src/serverArgs";
 import { DEFAULT_LOAD_SETTINGS } from "../src/types";
 import { argValue, argValues, denseCaps, loadSettings, moeCaps } from "./helpers";
 
 const MODEL = "/models/test.gguf";
 const build = (over = {}) => buildServerArgs(MODEL, "127.0.0.1", 8742, loadSettings(over));
+
+describe("formatCommandDisplay", () => {
+  it("quotes arguments that contain spaces", () => {
+    assert.equal(
+      formatCommandDisplay(["llama-server", "-m", "/models/my model.gguf", "--port", "8742"]),
+      'llama-server -m "/models/my model.gguf" --port 8742'
+    );
+  });
+});
 
 describe("buildServerArgs", () => {
   it("emits the core flags from defaults", () => {
