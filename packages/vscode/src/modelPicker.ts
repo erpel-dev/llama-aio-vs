@@ -6,11 +6,18 @@ import { HuggingFaceClient } from "./huggingFace";
 import {
   buildModelPickerHints,
   displayGgufTitle,
+  findSiblingMmproj,
   formatBytes,
+  formatModelSize,
   formatPickerDetail,
-  invalidateModelLibraryCache,
+  isDflashDraftArchitecture,
+  isMtpDraftArchitecture,
+  isMtpSidecarFile,
   listLocalModelEntries,
+  listMmprojEntries,
+  listMtpDraftEntries,
   pickerGpus,
+  readModelCapabilities,
   readPickerCapabilities,
   shortHomePath,
   type LlamaLoadSettings,
@@ -93,6 +100,10 @@ function isCurrentPath(current: string, filePath: string): boolean {
   return !!current && path.resolve(current) === path.resolve(filePath);
 }
 
+function yieldToUi(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
 function cheapModelItem(entry: LocalModelEntry, current: string): PickItem {
   const currentMark = isCurrentPath(current, entry.path);
   const shards = entry.shardCount && entry.shardCount > 1 ? ` · ${entry.shardCount} shards` : "";
@@ -156,11 +167,38 @@ export async function pickDownloadedModel(
 ): Promise<string | undefined> {
   const config = store.getConfig();
   const modelsDir = getModelsDir(config);
-  invalidateModelLibraryCache();
-  const local = listLocalModelEntries(config);
   const current = store.getState().selectedModelPath || "";
 
+  const qp = vscode.window.createQuickPick<PickItem>();
+  qp.title = "Select model";
+  qp.placeholder = "Scanning library…";
+  qp.busy = true;
+  qp.ignoreFocusOut = true;
+  qp.matchOnDescription = true;
+  qp.matchOnDetail = true;
+
+  let dismissed = false;
+  const hideSub = qp.onDidHide(() => {
+    dismissed = true;
+  });
+  qp.show();
+  await yieldToUi();
+  if (dismissed) {
+    hideSub.dispose();
+    qp.dispose();
+    return undefined;
+  }
+
+  const local = listLocalModelEntries(config);
+  await yieldToUi();
+  hideSub.dispose();
+  if (dismissed) {
+    qp.dispose();
+    return undefined;
+  }
+
   if (!local.length) {
+    qp.dispose();
     const choice = await vscode.window.showInformationMessage(
       `No GGUF models found in ${modelsDir} or common tool folders (LM Studio, Unsloth, HF cache, …). Download one, or open a file.`,
       "Download from Hugging Face",
@@ -176,12 +214,8 @@ export async function pickDownloadedModel(
     return store.getState().selectedModelPath || undefined;
   }
 
-  const qp = vscode.window.createQuickPick<PickItem>();
-  qp.title = "Select model";
   qp.placeholder = "Filter models, or type to search Hugging Face…";
-  qp.matchOnDescription = true;
-  qp.matchOnDetail = true;
-  qp.ignoreFocusOut = true;
+  qp.busy = false;
 
   const openItem: PickItem = {
     action: "openFile",
@@ -288,64 +322,61 @@ export async function pickDraftModelFile(
 export async function pickDraftModelFromLibrary(
   store: SettingsStore
 ): Promise<string | undefined> {
-  const { readModelCapabilities, isDflashDraftArchitecture, isMtpDraftArchitecture, isMtpSidecarFile } =
-    await import("@llama-aio/core");
-  const { listMtpDraftEntries } = await import("@llama-aio/core");
   const config = store.getConfig();
+  type DraftPickItem = vscode.QuickPickItem & { path?: string; openFile?: boolean };
+  type Scored = {
+    path: string;
+    source: string;
+    sizeBytes: number;
+    arch: string;
+    dflash: boolean;
+    mtp: boolean;
+  };
 
-  // Scan can take a while with many GGUFs — show progress so the sidebar click isn't a no-op.
-  const scored = await vscode.window.withProgress(
-    {
-      location: vscode.ProgressLocation.Notification,
-      title: "Llama AIO: Scanning for draft GGUFs…",
-      cancellable: false,
-    },
-    async (progress) => {
-      invalidateModelLibraryCache();
-      const local = [
-        ...listLocalModelEntries(config),
-        ...listMtpDraftEntries(config),
-      ];
-      const seen = new Set<string>();
-      const unique = local.filter((e) => {
-        if (seen.has(e.path)) {
-          return false;
-        }
-        seen.add(e.path);
-        return true;
-      });
-      const out: Array<{
-        e: (typeof unique)[number];
-        arch: string;
-        dflash: boolean;
-        mtp: boolean;
-      }> = [];
-      for (let i = 0; i < unique.length; i++) {
-        const e = unique[i]!;
-        if (i === 0 || (i + 1) % 5 === 0 || i + 1 === unique.length) {
-          progress.report({
-            message: `${i + 1}/${unique.length} · ${path.basename(e.path)}`,
-          });
-        }
-        let arch = "";
-        try {
-          arch = readModelCapabilities(e.path).architecture || "";
-        } catch {
-          arch = "";
-        }
-        out.push({
-          e,
-          arch,
-          dflash: isDflashDraftArchitecture(arch),
-          mtp: isMtpDraftArchitecture(arch) || isMtpSidecarFile({ path: e.path, size: e.sizeBytes }),
-        });
-      }
-      out.sort((a, b) => Number(b.dflash || b.mtp) - Number(a.dflash || a.mtp) || Number(b.mtp) - Number(a.mtp));
-      return out;
+  const qp = vscode.window.createQuickPick<DraftPickItem>();
+  qp.title = "Select DFlash or MTP draft model";
+  qp.placeholder = "Scanning library…";
+  qp.busy = true;
+  qp.matchOnDescription = true;
+  qp.matchOnDetail = true;
+  qp.ignoreFocusOut = true;
+
+  const openItem: DraftPickItem = {
+    label: "$(folder-opened) Open GGUF file…",
+    description: "Browse for a DFlash or MTP draft .gguf",
+    openFile: true,
+  };
+
+  let dismissed = false;
+  const hideSub = qp.onDidHide(() => {
+    dismissed = true;
+  });
+  qp.show();
+  await yieldToUi();
+  if (dismissed) {
+    hideSub.dispose();
+    qp.dispose();
+    return undefined;
+  }
+
+  const listed = [...listLocalModelEntries(config), ...listMtpDraftEntries(config)];
+  const seen = new Set<string>();
+  const unique = listed.filter((e) => {
+    if (seen.has(e.path)) {
+      return false;
     }
-  );
+    seen.add(e.path);
+    return true;
+  });
+  await yieldToUi();
+  hideSub.dispose();
+  if (dismissed) {
+    qp.dispose();
+    return undefined;
+  }
 
-  if (!scored.length) {
+  if (!unique.length) {
+    qp.dispose();
     const choice = await vscode.window.showInformationMessage(
       "No local GGUF models found. Download a DFlash or sidecar MTP draft GGUF, then pick it here (or browse to the file).",
       "Open GGUF file…"
@@ -356,44 +387,102 @@ export async function pickDraftModelFromLibrary(
     return undefined;
   }
 
-  type DraftPickItem = vscode.QuickPickItem & { path?: string; openFile?: boolean };
-  const dflashCount = scored.filter((s) => s.dflash).length;
-  const mtpCount = scored.filter((s) => s.mtp).length;
-  const items: DraftPickItem[] = [
-    {
-      label: "$(folder-opened) Open GGUF file…",
-      description: "Browse for a DFlash or MTP draft .gguf",
-      openFile: true,
-    },
-    ...scored.map(({ e, arch, dflash, mtp }) => ({
-      label: (dflash || mtp ? "$(rocket) " : "") + path.basename(e.path),
-      description: dflash
-        ? `DFlash draft · ${e.source}`
-        : mtp
-          ? `MTP drafter · ${e.source}`
-          : e.source + (arch ? ` · ${arch}` : ""),
-      detail: `${formatBytes(e.sizeBytes)}  ·  ${e.path}`,
-      path: e.path,
-    })),
-  ];
-
-  const picked = await vscode.window.showQuickPick(items, {
-    title: "Select DFlash or MTP draft model",
-    placeHolder:
-      dflashCount + mtpCount > 0
-        ? `${dflashCount} DFlash · ${mtpCount} MTP — rocket icons first`
-        : "No draft GGUFs yet — pick Open GGUF file… or any local draft",
-    matchOnDescription: true,
-    matchOnDetail: true,
-    ignoreFocusOut: true,
+  const scored = new Map<string, Scored>();
+  const cheap = (e: (typeof unique)[number]): DraftPickItem => ({
+    label: path.basename(e.path),
+    description: e.source,
+    detail: `${formatBytes(e.sizeBytes)}  ·  ${e.path}`,
+    path: e.path,
   });
-  if (!picked) {
-    return undefined;
-  }
-  if (picked.openFile) {
-    return pickDraftModelFile(store);
-  }
-  return picked.path;
+  const rich = (s: Scored): DraftPickItem => ({
+    label: (s.dflash || s.mtp ? "$(rocket) " : "") + path.basename(s.path),
+    description: s.dflash
+      ? `DFlash draft · ${s.source}`
+      : s.mtp
+        ? `MTP drafter · ${s.source}`
+        : s.source + (s.arch ? ` · ${s.arch}` : ""),
+    detail: `${formatBytes(s.sizeBytes)}  ·  ${s.path}`,
+    path: s.path,
+  });
+  const paint = (filterHint: boolean) => {
+    const rows = unique.map((e) => {
+      const s = scored.get(e.path);
+      return s ? rich(s) : cheap(e);
+    });
+    if (filterHint) {
+      rows.sort((a, b) => {
+        const as = scored.get(a.path || "");
+        const bs = scored.get(b.path || "");
+        return (
+          Number(!!(bs?.dflash || bs?.mtp)) - Number(!!(as?.dflash || as?.mtp)) ||
+          Number(!!bs?.mtp) - Number(!!as?.mtp)
+        );
+      });
+    }
+    const drafts = [...scored.values()].filter((s) => s.dflash || s.mtp).length;
+    qp.placeholder =
+      drafts > 0
+        ? `${drafts} draft GGUF${drafts === 1 ? "" : "s"} — rocket icons first`
+        : "Pick a draft GGUF, or Open GGUF file…";
+    qp.items = [openItem, ...rows];
+  };
+  paint(false);
+
+  void (async () => {
+    try {
+      qp.busy = true;
+      for (const e of unique) {
+        if (qp.items.length === 0) {
+          break;
+        }
+        let arch = "";
+        try {
+          arch = readModelCapabilities(e.path).architecture || "";
+        } catch {
+          arch = "";
+        }
+        scored.set(e.path, {
+          path: e.path,
+          source: e.source,
+          sizeBytes: e.sizeBytes,
+          arch,
+          dflash: isDflashDraftArchitecture(arch),
+          mtp: isMtpDraftArchitecture(arch) || isMtpSidecarFile({ path: e.path, size: e.sizeBytes }),
+        });
+        paint(false);
+        await yieldToUi();
+      }
+      paint(true);
+      qp.busy = false;
+    } catch {
+      // Quick pick was dismissed while badges were filling in.
+    }
+  })();
+
+  return await new Promise<string | undefined>((resolve) => {
+    let settled = false;
+    const finish = (value: string | undefined) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      qp.dispose();
+      resolve(value);
+    };
+    qp.onDidAccept(async () => {
+      const picked = qp.selectedItems[0];
+      if (!picked) {
+        finish(undefined);
+        return;
+      }
+      if (picked.openFile) {
+        finish(await pickDraftModelFile(store));
+        return;
+      }
+      finish(picked.path);
+    });
+    qp.onDidHide(() => finish(undefined));
+  });
 }
 
 /**
@@ -423,25 +512,36 @@ export async function pickMmprojFile(store: SettingsStore): Promise<string | und
 
 /** Pick a vision projector from the local library (does not change the main model). */
 export async function pickMmprojFromLibrary(store: SettingsStore): Promise<string | undefined> {
-  const { listMmprojEntries, formatModelSize, findSiblingMmproj } = await import("@llama-aio/core");
   const config = store.getConfig();
   const sibling = findSiblingMmproj(store.getState().selectedModelPath || "");
 
-  const local = await vscode.window.withProgress(
-    {
-      location: vscode.ProgressLocation.Notification,
-      title: "Llama AIO: Scanning for mmproj GGUFs…",
-      cancellable: false,
-    },
-    async () => {
-      invalidateModelLibraryCache();
-      const entries = listMmprojEntries(config);
-      if (!sibling) {
-        return entries;
-      }
-      return [...entries].sort((a, b) => Number(b.path === sibling) - Number(a.path === sibling));
-    }
-  );
+  const qp = vscode.window.createQuickPick<vscode.QuickPickItem & { path?: string; openFile?: boolean }>();
+  qp.title = "Select vision projector (mmproj)";
+  qp.placeholder = "Scanning library…";
+  qp.busy = true;
+  qp.ignoreFocusOut = true;
+  let dismissed = false;
+  const hideSub = qp.onDidHide(() => {
+    dismissed = true;
+  });
+  qp.show();
+  await yieldToUi();
+  if (dismissed) {
+    hideSub.dispose();
+    qp.dispose();
+    return undefined;
+  }
+
+  let local = listMmprojEntries(config);
+  if (sibling) {
+    local = [...local].sort((a, b) => Number(b.path === sibling) - Number(a.path === sibling));
+  }
+  await yieldToUi();
+  hideSub.dispose();
+  qp.dispose();
+  if (dismissed) {
+    return undefined;
+  }
 
   if (!local.length) {
     const choice = await vscode.window.showInformationMessage(

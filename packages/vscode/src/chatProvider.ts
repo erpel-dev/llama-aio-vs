@@ -6,7 +6,7 @@ import { ProcessManager } from "@llama-aio/core";
 import {
   applyReplacementsToSystemMessages,
   buildReplacementStats,
-  estimateRequestTokens,
+  estimateTokensFromChars,
   loadPromptReplacements,
   messageContentChars,
   type PromptReplacement,
@@ -706,6 +706,11 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
   private cachedRulesKey: string | undefined;
   /** One toast per session when the slot is under 16k but the prompt still fits. */
   private warnedSmallSlot = false;
+  /** Successful /health, /props, and /v1/models probes shared across one chat turn. */
+  private static readonly PROBE_TTL_MS = 2_000;
+  private readyProbe: { endpoint: string; at: number } | undefined;
+  private propsProbe: { endpoint: string; at: number; props: ServerProps } | undefined;
+  private modelProbe: { endpoint: string; at: number; modelId: string } | undefined;
 
   private async getReplacementRules(): Promise<PromptReplacement[]> {
     const custom = this.store.getPromptReplacementsFile();
@@ -731,34 +736,29 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
   }
 
   private async prepareMessagesWithReplacements(
-    messages: OpenAiChatMessage[],
-    tools: unknown[] | undefined
-  ): Promise<{ messages: OpenAiChatMessage[]; stats: PromptReplacementStats }> {
-    const tokensBefore = estimateRequestTokens(messages, tools);
+    messages: OpenAiChatMessage[]
+  ): Promise<{
+    messages: OpenAiChatMessage[];
+    enabled: boolean;
+    matchedRuleNames: string[];
+    /** Characters removed from system text. Negative when a rule expands it. */
+    charsSaved: number;
+  }> {
     const enabled = this.store.isPromptReplacementsEnabled();
     if (!enabled) {
-      return {
-        messages,
-        stats: buildReplacementStats({
-          enabled: false,
-          tokensBefore,
-          tokensAfter: tokensBefore,
-          matchedRuleNames: [],
-        }),
-      };
+      return { messages, enabled: false, matchedRuleNames: [], charsSaved: 0 };
     }
     const rules = await this.getReplacementRules();
     const { messages: next, matchedRuleNames } = applyReplacementsToSystemMessages(messages, rules);
-    const tokensAfter = estimateRequestTokens(next, tools);
-    return {
-      messages: next,
-      stats: buildReplacementStats({
-        enabled: true,
-        tokensBefore,
-        tokensAfter,
-        matchedRuleNames,
-      }),
-    };
+    let charsSaved = 0;
+    for (let i = 0; i < messages.length; i++) {
+      const before = messages[i]?.content;
+      const after = next[i]?.content;
+      if (typeof before === "string" && typeof after === "string") {
+        charsSaved += before.length - after.length;
+      }
+    }
+    return { messages: next, enabled: true, matchedRuleNames, charsSaved };
   }
 
   notifyChanged(): void {
@@ -766,37 +766,63 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
   }
 
   private async fetchServerProps(): Promise<ServerProps | undefined> {
+    const endpoint = this.store.getEndpoint();
+    const hit = this.propsProbe;
+    if (hit && hit.endpoint === endpoint && Date.now() - hit.at < LlamaAioChatProvider.PROBE_TTL_MS) {
+      return hit.props;
+    }
     try {
-      return await httpJson<ServerProps>(`${this.store.getEndpoint()}/props`, { timeoutMs: 3000 });
+      const props = await httpJson<ServerProps>(`${endpoint}/props`, { timeoutMs: 3000 });
+      if (props) {
+        this.propsProbe = { endpoint, at: Date.now(), props };
+      }
+      return props;
     } catch {
       return undefined;
     }
+  }
+
+  /** One successful /health probe is reused for a short window (P-12). */
+  private async serverReady(): Promise<boolean> {
+    const endpoint = this.store.getEndpoint();
+    const hit = this.readyProbe;
+    if (hit && hit.endpoint === endpoint && Date.now() - hit.at < LlamaAioChatProvider.PROBE_TTL_MS) {
+      return true;
+    }
+    const ready = await this.processManager.isHttpReady();
+    if (ready) {
+      this.readyProbe = { endpoint, at: Date.now() };
+    }
+    return ready;
+  }
+
+  private async cachedModelId(fallback: string): Promise<string> {
+    const endpoint = this.store.getEndpoint();
+    const hit = this.modelProbe;
+    if (hit && hit.endpoint === endpoint && Date.now() - hit.at < LlamaAioChatProvider.PROBE_TTL_MS) {
+      return hit.modelId;
+    }
+    try {
+      const models = await httpJson<OpenAiModelsResponse>(`${endpoint}/v1/models`, { timeoutMs: 3000 });
+      const modelId = models.data?.[0]?.id;
+      if (modelId) {
+        this.modelProbe = { endpoint, at: Date.now(), modelId };
+        return modelId;
+      }
+    } catch {
+      // fall through to the selected file name
+    }
+    return fallback;
   }
 
   async provideLanguageModelChatInformation(
     options: { silent: boolean },
     _token: vscode.CancellationToken
   ): Promise<vscode.LanguageModelChatInformation[]> {
-    const ready = await this.processManager.isHttpReady();
-    let modelId = "local-model";
-    if (ready) {
-      try {
-        const models = await httpJson<OpenAiModelsResponse>(`${this.store.getEndpoint()}/v1/models`, {
-          timeoutMs: 3000,
-        });
-        modelId = models.data?.[0]?.id || modelId;
-      } catch {
-        const selected = this.store.getState().selectedModelPath;
-        if (selected) {
-          modelId = selected.split(/[/\\]/).pop() || modelId;
-        }
-      }
-    } else {
-      const selected = this.store.getState().selectedModelPath;
-      if (selected) {
-        modelId = selected.split(/[/\\]/).pop() || modelId;
-      }
-    }
+    const ready = await this.serverReady();
+    const selected = this.store.getState().selectedModelPath;
+    const fallback = selected ? selected.split(/[/\\]/).pop() || "local-model" : "local-model";
+    const modelId = ready ? await this.cachedModelId(fallback) : fallback;
 
     const state = this.store.getState();
     const props = await this.fetchServerProps();
@@ -840,7 +866,7 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
     progress: vscode.Progress<vscode.LanguageModelResponsePart>,
     token: vscode.CancellationToken
   ): Promise<void> {
-    if (!(await this.processManager.isHttpReady())) {
+    if (!(await this.serverReady())) {
       const starting = this.processManager.getStatus().starting;
       throw new vscode.LanguageModelError(
         starting
@@ -879,8 +905,8 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
       }
     }
 
-    const { messages: converted, stats: replacementStats } =
-      await this.prepareMessagesWithReplacements(convertedRaw, tools);
+    const prepared = await this.prepareMessagesWithReplacements(convertedRaw);
+    const converted = prepared.messages;
     const guardDuplicates = this.store.isDuplicateToolCallGuardEnabled();
     if (guardDuplicates && tools?.length) {
       converted.push({
@@ -930,7 +956,24 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
       applyModeToRequestBody(body, params);
     }
 
-    const estimatedPromptTokens = estimateRequestTokens(converted, tools);
+    let toolChars = 0;
+    if (tools?.length) {
+      try {
+        toolChars = JSON.stringify(tools).length;
+      } catch {
+        toolChars = 0;
+      }
+    }
+    const requestChars = messageContentChars(converted) + toolChars;
+    const tokensAfter = estimateTokensFromChars(requestChars);
+    const tokensBefore = estimateTokensFromChars(requestChars + prepared.charsSaved);
+    const replacementStats: PromptReplacementStats = buildReplacementStats({
+      enabled: prepared.enabled,
+      tokensBefore,
+      tokensAfter,
+      matchedRuleNames: prepared.matchedRuleNames,
+    });
+    const estimatedPromptTokens = tokensAfter;
     if (estimatedPromptTokens >= slotCtx) {
       throw new vscode.LanguageModelError(
         `This prompt is about ${estimatedPromptTokens} tokens and the server slot is ${slotCtx}. ` +

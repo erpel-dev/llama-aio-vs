@@ -1,4 +1,5 @@
 import * as fs from "fs";
+import * as os from "os";
 import * as path from "path";
 import { spawn, spawnSync, ChildProcess } from "child_process";
 import { ensureDirs, whichOnPath } from "./paths";
@@ -50,6 +51,43 @@ const HOST_BIN_DIRS = ["/usr/bin", "/usr/local/bin", "/bin"];
 
 function shQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+const childErrors = new WeakMap<ChildProcess, Error>();
+
+/**
+ * Attach an `error` listener so ENOENT/EACCES does not become an unhandled
+ * exception. {@link childSpawnError} reads it back for the status object.
+ */
+export function captureChildError(child: ChildProcess): ChildProcess {
+  child.on("error", (err: Error) => {
+    childErrors.set(child, err);
+  });
+  return child;
+}
+
+export function childSpawnError(child: ChildProcess | undefined): Error | undefined {
+  return child ? childErrors.get(child) : undefined;
+}
+
+/** AppleScript double-quoted string. Only `\` and `"` are special. */
+export function appleScriptString(value: string): string {
+  return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+
+/**
+ * Ask Terminal.app to run a script file. The shell body stays on disk so
+ * quotes in it are not AppleScript syntax.
+ */
+export function appleScriptTerminalLaunch(scriptPath: string): string {
+  return `tell application "Terminal" to do script "bash " & quoted form of ${appleScriptString(scriptPath)}`;
+}
+
+function writeLaunchScript(body: string): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "llama-aio-launch-"));
+  const scriptPath = path.join(dir, "launch.sh");
+  fs.writeFileSync(scriptPath, `#!/bin/bash\n${body}\n`, { mode: 0o700 });
+  return scriptPath;
 }
 
 /** Ensure llama-server also writes the extension log (no shell tee on Windows). */
@@ -300,11 +338,13 @@ function spawnLinux(
   // flatpak-spawn --host must keep the sandbox env (portal). Host env for
   // llama-server is applied in the bash script above, not on this process.
   const childEnv = term.viaFlatpakHost ? process.env : { ...process.env, ...env };
-  const child = spawn(term.command, [...term.prefix, "bash", "-lc", cmd], {
-    detached: true,
-    stdio: "ignore",
-    env: childEnv,
-  });
+  const child = captureChildError(
+    spawn(term.command, [...term.prefix, "bash", "-lc", cmd], {
+      detached: true,
+      stdio: "ignore",
+      env: childEnv,
+    })
+  );
   child.unref();
   return child;
 }
@@ -325,16 +365,19 @@ function spawnMac(
     `echo "llama-server exited with code $code"`,
     `echo "Press Enter to close…"`,
     `read -r _ || true`,
-  ].join("; ");
+  ].join("\n");
+  const scriptPath = writeLaunchScript(script);
 
-  const child = spawn(
-    "osascript",
-    ["-e", `tell application "Terminal" to do script ${shQuote(script)}`, "-e", 'tell application "Terminal" to activate'],
-    {
-      detached: true,
-      stdio: "ignore",
-      env: { ...process.env, ...env },
-    }
+  const child = captureChildError(
+    spawn(
+      "osascript",
+      ["-e", appleScriptTerminalLaunch(scriptPath), "-e", 'tell application "Terminal" to activate'],
+      {
+        detached: true,
+        stdio: "ignore",
+        env: { ...process.env, ...env },
+      }
+    )
   );
   child.unref();
   return child;
@@ -353,14 +396,16 @@ function spawnWindows(
     logPath,
     windowsTerminal: wt,
   });
-  const child = spawn(plan.command, plan.argv, {
-    detached: true,
-    stdio: "ignore",
-    windowsHide: false,
-    cwd: plan.cwd,
-    env: { ...process.env, ...env, PATH: `${plan.cwd};${env.PATH || process.env.PATH || ""}` },
-    shell: false,
-  });
+  const child = captureChildError(
+    spawn(plan.command, plan.argv, {
+      detached: true,
+      stdio: "ignore",
+      windowsHide: false,
+      cwd: plan.cwd,
+      env: { ...process.env, ...env, PATH: `${plan.cwd};${env.PATH || process.env.PATH || ""}` },
+      shell: false,
+    })
+  );
   child.unref();
   return child;
 }

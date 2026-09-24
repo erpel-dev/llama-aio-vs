@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import path from "node:path";
 import { describe, it } from "node:test";
 import {
+  appleScriptString,
+  appleScriptTerminalLaunch,
   buildWindowsExternalLaunch,
   linuxTerminalArgsPrefix,
   missingLinuxTerminalMessage,
@@ -120,5 +122,23 @@ describe("resolveLinuxTerminalLauncher", () => {
     });
     assert.equal(plan, undefined);
     assert.match(missingLinuxTerminalMessage({ flatpak: true, flatpakId: "com.visualstudio.code" }), /Flatpak/);
+  });
+});
+
+describe("appleScriptTerminalLaunch", () => {
+  it("runs a script file and escapes backslash and quote for AppleScript", () => {
+    const plain = appleScriptTerminalLaunch("/tmp/llama-aio/launch.sh");
+    assert.equal(
+      plain,
+      'tell application "Terminal" to do script "bash " & quoted form of "/tmp/llama-aio/launch.sh"'
+    );
+    assert.equal(plain.includes("echo "), false);
+
+    const tricky = '/tmp/llama "aio"\\launch.sh';
+    const quoted = appleScriptString(tricky);
+    assert.equal(quoted, '"/tmp/llama \\"aio\\"\\\\launch.sh"');
+    const launched = appleScriptTerminalLaunch(tricky);
+    assert.match(launched, /quoted form of "/);
+    assert.equal(launched.includes("'\''"), false);
   });
 });

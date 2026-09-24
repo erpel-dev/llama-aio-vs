@@ -110,97 +110,174 @@ function checkedCount(value: bigint, limit: number, what: string): number {
 
 type GgufValue = number | boolean | string | GgufValue[];
 
-function readExact(fd: number, size: number, position: number): { buf: Buffer; next: number } {
-  const buf = Buffer.alloc(size);
-  const n = fs.readSync(fd, buf, 0, size, position);
-  if (n !== size) {
-    throw new Error(`Unexpected EOF reading GGUF (wanted ${size}, got ${n})`);
+/** Window size for header reads. One syscall covers many small fields. */
+const GGUF_READ_CHUNK = 1024 * 1024;
+
+/**
+ * Sequential GGUF reader. Small fields are served from a 1 MiB window so a
+ * model with hundreds of thousands of tensors is not one `readSync` per field.
+ * The returned buffer view is only valid until the next read that refills.
+ */
+class GgufReader {
+  private window: Buffer = Buffer.alloc(0);
+  private windowPos = 0;
+
+  constructor(private readonly fd: number) {}
+
+  private fill(position: number, size: number): void {
+    if (size <= 0) {
+      return;
+    }
+    if (position >= this.windowPos && position + size <= this.windowPos + this.window.length) {
+      return;
+    }
+    const want = Math.max(size, GGUF_READ_CHUNK);
+    const buf = Buffer.alloc(want);
+    let got = 0;
+    while (got < size) {
+      const n = fs.readSync(this.fd, buf, got, want - got, position + got);
+      if (n <= 0) {
+        break;
+      }
+      got += n;
+    }
+    if (got < size) {
+      throw new Error(`Unexpected EOF reading GGUF (wanted ${size}, got ${got})`);
+    }
+    this.window = got === buf.length ? buf : buf.subarray(0, got);
+    this.windowPos = position;
   }
-  return { buf, next: position + size };
+
+  readU8(pos: number): { value: number; next: number } {
+    this.fill(pos, 1);
+    return { value: this.window.readUInt8(pos - this.windowPos), next: pos + 1 };
+  }
+
+  readU32(pos: number): { value: number; next: number } {
+    this.fill(pos, 4);
+    return { value: this.window.readUInt32LE(pos - this.windowPos), next: pos + 4 };
+  }
+
+  readU64(pos: number): { value: bigint; next: number } {
+    this.fill(pos, 8);
+    return { value: this.window.readBigUInt64LE(pos - this.windowPos), next: pos + 8 };
+  }
+
+  readI8(pos: number): { value: number; next: number } {
+    this.fill(pos, 1);
+    return { value: this.window.readInt8(pos - this.windowPos), next: pos + 1 };
+  }
+
+  readU16(pos: number): { value: number; next: number } {
+    this.fill(pos, 2);
+    return { value: this.window.readUInt16LE(pos - this.windowPos), next: pos + 2 };
+  }
+
+  readI16(pos: number): { value: number; next: number } {
+    this.fill(pos, 2);
+    return { value: this.window.readInt16LE(pos - this.windowPos), next: pos + 2 };
+  }
+
+  readI32(pos: number): { value: number; next: number } {
+    this.fill(pos, 4);
+    return { value: this.window.readInt32LE(pos - this.windowPos), next: pos + 4 };
+  }
+
+  readF32(pos: number): { value: number; next: number } {
+    this.fill(pos, 4);
+    return { value: this.window.readFloatLE(pos - this.windowPos), next: pos + 4 };
+  }
+
+  readI64(pos: number): { value: bigint; next: number } {
+    this.fill(pos, 8);
+    return { value: this.window.readBigInt64LE(pos - this.windowPos), next: pos + 8 };
+  }
+
+  readF64(pos: number): { value: number; next: number } {
+    this.fill(pos, 8);
+    return { value: this.window.readDoubleLE(pos - this.windowPos), next: pos + 8 };
+  }
+
+  readBytes(pos: number, size: number): { buf: Buffer; next: number } {
+    if (size === 0) {
+      return { buf: Buffer.alloc(0), next: pos };
+    }
+    this.fill(pos, size);
+    const start = pos - this.windowPos;
+    return { buf: this.window.subarray(start, start + size), next: pos + size };
+  }
 }
 
-function readU32(fd: number, pos: number): { value: number; next: number } {
-  const { buf, next } = readExact(fd, 4, pos);
-  return { value: buf.readUInt32LE(0), next };
-}
-
-function readU64(fd: number, pos: number): { value: bigint; next: number } {
-  const { buf, next } = readExact(fd, 8, pos);
-  return { value: buf.readBigUInt64LE(0), next };
-}
-
-function readString(fd: number, pos: number): { value: string; next: number } {
-  const len = readU64(fd, pos);
+function readString(r: GgufReader, pos: number): { value: string; next: number } {
+  const len = r.readU64(pos);
   const n = Number(len.value);
   if (!Number.isFinite(n) || n < 0 || n > 16 * 1024 * 1024) {
     throw new Error(`Invalid GGUF string length: ${len.value}`);
   }
-  const { buf, next } = readExact(fd, n, len.next);
+  const { buf, next } = r.readBytes(len.next, n);
   return { value: buf.toString("utf8"), next };
 }
 
-function readValue(fd: number, pos: number, type: number): { value: GgufValue; next: number } {
+function readValue(r: GgufReader, pos: number, type: number): { value: GgufValue; next: number } {
   switch (type) {
     case 0: {
-      // UINT8
-      const { buf, next } = readExact(fd, 1, pos);
-      return { value: buf.readUInt8(0), next };
+      const v = r.readU8(pos);
+      return { value: v.value, next: v.next };
     }
     case 1: {
-      const { buf, next } = readExact(fd, 1, pos);
-      return { value: buf.readInt8(0), next };
+      const v = r.readI8(pos);
+      return { value: v.value, next: v.next };
     }
     case 2: {
-      const { buf, next } = readExact(fd, 2, pos);
-      return { value: buf.readUInt16LE(0), next };
+      const v = r.readU16(pos);
+      return { value: v.value, next: v.next };
     }
     case 3: {
-      const { buf, next } = readExact(fd, 2, pos);
-      return { value: buf.readInt16LE(0), next };
+      const v = r.readI16(pos);
+      return { value: v.value, next: v.next };
     }
     case 4: {
-      const { buf, next } = readExact(fd, 4, pos);
-      return { value: buf.readUInt32LE(0), next };
+      const v = r.readU32(pos);
+      return { value: v.value, next: v.next };
     }
     case 5: {
-      const { buf, next } = readExact(fd, 4, pos);
-      return { value: buf.readInt32LE(0), next };
+      const v = r.readI32(pos);
+      return { value: v.value, next: v.next };
     }
     case 6: {
-      const { buf, next } = readExact(fd, 4, pos);
-      return { value: buf.readFloatLE(0), next };
+      const v = r.readF32(pos);
+      return { value: v.value, next: v.next };
     }
     case 7: {
-      const { buf, next } = readExact(fd, 1, pos);
-      return { value: buf.readUInt8(0) !== 0, next };
+      const v = r.readU8(pos);
+      return { value: v.value !== 0, next: v.next };
     }
     case 8:
-      return readString(fd, pos);
+      return readString(r, pos);
     case 9: {
-      // ARRAY
-      const at = readU32(fd, pos);
-      const n = readU64(fd, at.next);
+      const at = r.readU32(pos);
+      const n = r.readU64(at.next);
       let p = n.next;
       const arr: GgufValue[] = [];
       const count = checkedCount(n.value, MAX_ARRAY_ITEMS, "array length");
       for (let i = 0; i < count; i++) {
-        const v = readValue(fd, p, at.value);
+        const v = readValue(r, p, at.value);
         arr.push(v.value);
         p = v.next;
       }
       return { value: arr, next: p };
     }
     case 10: {
-      const { buf, next } = readExact(fd, 8, pos);
-      return { value: Number(buf.readBigUInt64LE(0)), next };
+      const v = r.readU64(pos);
+      return { value: Number(v.value), next: v.next };
     }
     case 11: {
-      const { buf, next } = readExact(fd, 8, pos);
-      return { value: Number(buf.readBigInt64LE(0)), next };
+      const v = r.readI64(pos);
+      return { value: Number(v.value), next: v.next };
     }
     case 12: {
-      const { buf, next } = readExact(fd, 8, pos);
-      return { value: buf.readDoubleLE(0), next };
+      const v = r.readF64(pos);
+      return { value: v.value, next: v.next };
     }
     default:
       throw new Error(`Unsupported GGUF value type: ${type}`);
@@ -306,13 +383,7 @@ export function capsMissDefaultSwaPattern(caps: {
 
 /** Read GGUF key/value metadata (header only — does not scan tensors). */
 export function readGgufMetadata(filePath: string): Record<string, GgufValue> {
-  const fd = fs.openSync(filePath, "r");
-  try {
-    const { meta } = readGgufHeader(fd);
-    return meta;
-  } finally {
-    fs.closeSync(fd);
-  }
+  return readGgufHeaderFromFile(filePath).meta;
 }
 
 interface GgufHeaderScan {
@@ -322,31 +393,31 @@ interface GgufHeaderScan {
   tensors: Array<{ name: string; offset: number }>;
 }
 
-function readGgufHeader(fd: number): GgufHeaderScan {
+function readGgufHeader(r: GgufReader): GgufHeaderScan {
   let pos = 0;
-  const magic = readU32(fd, pos);
+  const magic = r.readU32(pos);
   if (magic.value !== GGUF_MAGIC) {
     throw new Error("Not a GGUF file");
   }
   pos = magic.next;
-  const version = readU32(fd, pos);
+  const version = r.readU32(pos);
   pos = version.next;
   if (version.value < 2 || version.value > 3) {
     // Still attempt parse for forward compatibility within known layout.
   }
-  const tensorCount = readU64(fd, pos);
+  const tensorCount = r.readU64(pos);
   pos = tensorCount.next;
-  const kvCount = readU64(fd, pos);
+  const kvCount = r.readU64(pos);
   pos = kvCount.next;
 
   const meta: Record<string, GgufValue> = {};
   const nKv = checkedCount(kvCount.value, MAX_KV_ENTRIES, "metadata");
   for (let i = 0; i < nKv; i++) {
-    const key = readString(fd, pos);
+    const key = readString(r, pos);
     pos = key.next;
-    const type = readU32(fd, pos);
+    const type = r.readU32(pos);
     pos = type.next;
-    const val = readValue(fd, pos, type.value);
+    const val = readValue(r, pos, type.value);
     pos = val.next;
     meta[key.value] = val.value;
   }
@@ -354,20 +425,20 @@ function readGgufHeader(fd: number): GgufHeaderScan {
   const nTensor = checkedCount(tensorCount.value, MAX_TENSORS, "tensor");
   const tensors: Array<{ name: string; offset: number }> = [];
   for (let i = 0; i < nTensor; i++) {
-    const name = readString(fd, pos);
+    const name = readString(r, pos);
     pos = name.next;
-    const nDims = readU32(fd, pos);
+    const nDims = r.readU32(pos);
     pos = nDims.next;
     if (nDims.value > MAX_TENSOR_DIMS) {
       throw new Error(`Invalid GGUF tensor dimensions: ${nDims.value} — file may be corrupt`);
     }
     for (let d = 0; d < nDims.value; d++) {
-      const dim = readU64(fd, pos);
+      const dim = r.readU64(pos);
       pos = dim.next;
     }
-    const type = readU32(fd, pos);
+    const type = r.readU32(pos);
     pos = type.next;
-    const offset = readU64(fd, pos);
+    const offset = r.readU64(pos);
     pos = offset.next;
     tensors.push({ name: name.value, offset: Number(offset.value) });
   }
@@ -377,6 +448,46 @@ function readGgufHeader(fd: number): GgufHeaderScan {
     typeof alignmentRaw === "number" && alignmentRaw > 0 ? Math.floor(alignmentRaw) : 32;
   const dataStart = Math.floor((pos + alignment - 1) / alignment) * alignment;
   return { meta, dataStart, tensors };
+}
+
+interface HeaderCacheEntry {
+  mtimeMs: number;
+  size: number;
+  scan: GgufHeaderScan;
+}
+
+/** Parsed headers keyed by path + mtime + size. Callers must not mutate `scan`. */
+const HEADER_CACHE_MAX = 32;
+const headerCache = new Map<string, HeaderCacheEntry>();
+
+function rememberHeader(key: string, entry: HeaderCacheEntry): void {
+  headerCache.delete(key);
+  headerCache.set(key, entry);
+  while (headerCache.size > HEADER_CACHE_MAX) {
+    const oldest = headerCache.keys().next().value;
+    if (oldest === undefined) {
+      break;
+    }
+    headerCache.delete(oldest);
+  }
+}
+
+/** Header scan memoised by path, mtime, and size. */
+function readGgufHeaderFromFile(filePath: string): GgufHeaderScan {
+  const key = path.resolve(filePath);
+  const st = fs.statSync(filePath);
+  const hit = headerCache.get(key);
+  if (hit && hit.mtimeMs === st.mtimeMs && hit.size === st.size) {
+    return hit.scan;
+  }
+  const fd = fs.openSync(filePath, "r");
+  try {
+    const scan = readGgufHeader(new GgufReader(fd));
+    rememberHeader(key, { mtimeMs: st.mtimeMs, size: st.size, scan });
+    return scan;
+  } finally {
+    fs.closeSync(fd);
+  }
 }
 
 /**
@@ -414,51 +525,13 @@ function computeMoeExpertShare(
  * Shared-expert tensors (`*shexp*`) are excluded — `--n-cpu-moe` mainly moves `*_exps`.
  */
 export function measureMoeExpertShare(filePath: string): number | undefined {
-  const fd = fs.openSync(filePath, "r");
   try {
-    const { dataStart, tensors } = readGgufHeader(fd);
-    let fileSize = 0;
-    try {
-      fileSize = fs.fstatSync(fd).size;
-    } catch {
-      return undefined;
-    }
+    const { dataStart, tensors } = readGgufHeaderFromFile(filePath);
+    const fileSize = fs.statSync(filePath).size;
     return computeMoeExpertShare(tensors, dataStart, fileSize);
   } catch {
     return undefined;
-  } finally {
-    fs.closeSync(fd);
   }
-}
-
-/**
- * Share of GGUF tensor bytes belonging to dense FFN weights
- * (`ffn_(gate|up|down).weight`) — the tensors `--n-cpu-ffn` moves to CPU.
- */
-function computeDenseFfnShare(
-  tensors: Array<{ name: string; offset: number }>,
-  dataStart: number,
-  fileSize: number
-): number | undefined {
-  if (!tensors.length || fileSize <= dataStart) {
-    return undefined;
-  }
-  const sorted = [...tensors].sort((a, b) => a.offset - b.offset);
-  let total = 0;
-  let ffn = 0;
-  for (let i = 0; i < sorted.length; i++) {
-    const off = sorted[i].offset;
-    const next = i + 1 < sorted.length ? sorted[i + 1].offset : Math.max(off, fileSize - dataStart);
-    const size = Math.max(0, next - off);
-    total += size;
-    if (/ffn_(?:gate|up|down)\.weight$/i.test(sorted[i].name)) {
-      ffn += size;
-    }
-  }
-  if (total <= 0 || ffn <= 0) {
-    return undefined;
-  }
-  return Math.min(0.95, Math.max(0.05, ffn / total));
 }
 
 /** Heuristic when tensor scan is unavailable. */
@@ -550,33 +623,40 @@ function measureTensorClassInFile(
   filePath: string,
   match: (name: string) => boolean
 ): { total: number; matched: number } | undefined {
-  const fd = fs.openSync(filePath, "r");
   try {
-    const { dataStart, tensors } = readGgufHeader(fd);
-    const fileSize = fs.fstatSync(fd).size;
+    const { dataStart, tensors } = readGgufHeaderFromFile(filePath);
+    const fileSize = fs.statSync(filePath).size;
     return tensorByteTotals(tensors, dataStart, fileSize, match);
   } catch {
     return undefined;
-  } finally {
-    fs.closeSync(fd);
   }
 }
 
+function isMoeExpertTensor(name: string): boolean {
+  return /_exps(?:\.|$)/i.test(name);
+}
+
+function isDenseFfnTensor(name: string): boolean {
+  return /ffn_(?:gate|up|down)\.weight$/i.test(name);
+}
+
 /**
- * PLE share across every shard of a split GGUF. The n-gram table often lives
- * alone in a later shard (`*-00002-of-00002.gguf`); scanning only the opened
- * file missed it and fell back to the 40% qwen4exp heuristic.
+ * Share of tensor bytes matching `match`, summed across every shard.
+ * Each shard is sized from its own file length — passing the split total into
+ * one shard's tensor list made the last tensor absorb the other shards (B-37).
  */
-function measurePleShareForModel(
+function measureClassShareForModel(
   filePath: string,
-  selected?: { tensors: Array<{ name: string; offset: number }>; dataStart: number }
+  match: (name: string) => boolean,
+  selected: { tensors: Array<{ name: string; offset: number }>; dataStart: number } | undefined,
+  clamp: { min: number; max: number }
 ): number | undefined {
   const names = shardFileNames(path.basename(filePath));
   const dir = path.dirname(filePath);
   const selectedName = path.basename(filePath);
   const files = names || [selectedName];
   let total = 0;
-  let ple = 0;
+  let matched = 0;
   for (const name of files) {
     const p = names ? path.join(dir, name) : filePath;
     const reuse = selected && name === selectedName ? selected : undefined;
@@ -588,27 +668,20 @@ function measurePleShareForModel(
       } catch {
         continue;
       }
-      part = tensorByteTotals(reuse.tensors, reuse.dataStart, fileSize, isPleTensorName);
+      part = tensorByteTotals(reuse.tensors, reuse.dataStart, fileSize, match);
     } else {
-      try {
-        if (!fs.existsSync(p)) {
-          continue;
-        }
-      } catch {
-        continue;
-      }
-      part = measureTensorClassInFile(p, isPleTensorName);
+      part = measureTensorClassInFile(p, match);
     }
     if (!part) {
       continue;
     }
     total += part.total;
-    ple += part.matched;
+    matched += part.matched;
   }
-  if (total <= 0 || ple <= 0) {
+  if (total <= 0 || matched <= 0) {
     return undefined;
   }
-  return Math.min(0.95, Math.max(0.01, ple / total));
+  return Math.min(clamp.max, Math.max(clamp.min, matched / total));
 }
 
 /** When the GGUF scan misses PLE tensors on qwen4exp, assume ~40% of the file. */
@@ -667,15 +740,17 @@ const capsCache = new Map<string, CapsCacheEntry>();
 export function invalidateModelCapabilitiesCache(filePath?: string): void {
   if (!filePath) {
     capsCache.clear();
+    headerCache.clear();
     return;
   }
-  capsCache.delete(path.resolve(filePath));
+  const key = path.resolve(filePath);
+  capsCache.delete(key);
+  headerCache.delete(key);
 }
 
 /**
- * Header-only GGUF parse, memoised. Reading a header is a handful of small
- * reads, but the sidebar re-requested it (plus the draft model's) on every
- * refresh, and large tensor lists make it a noticeable part of a click.
+ * Header-only GGUF parse, memoised by path + mtime + size. The header itself
+ * is read in 1 MiB chunks (see {@link GgufReader}).
  */
 export function readModelCapabilities(filePath: string): ModelCapabilities {
   const key = path.resolve(filePath);
@@ -706,18 +781,10 @@ export function readModelCapabilities(filePath: string): ModelCapabilities {
 }
 
 function readModelCapabilitiesUncached(filePath: string): ModelCapabilities {
-  const fd = fs.openSync(filePath, "r");
-  let meta: Record<string, GgufValue>;
-  let dataStart = 0;
-  let tensors: Array<{ name: string; offset: number }> = [];
-  try {
-    const header = readGgufHeader(fd);
-    meta = header.meta;
-    dataStart = header.dataStart;
-    tensors = header.tensors;
-  } finally {
-    fs.closeSync(fd);
-  }
+  const header = readGgufHeaderFromFile(filePath);
+  const meta = header.meta;
+  const dataStart = header.dataStart;
+  const tensors = header.tensors;
   const arch = typeof meta["general.architecture"] === "string" ? meta["general.architecture"] : undefined;
   const name = typeof meta["general.name"] === "string" ? meta["general.name"] : undefined;
 
@@ -836,10 +903,11 @@ function readModelCapabilitiesUncached(filePath: string): ModelCapabilities {
   const { bytes: fileSizeBytes, shardCount, shardsFound } = totalModelBytes(filePath);
 
   const isMoe = (expertCount || 0) > 0;
+  const selectedTensors = { tensors, dataStart };
   let moeExpertShare: number | undefined;
   if (isMoe) {
     moeExpertShare =
-      computeMoeExpertShare(tensors, dataStart, fileSizeBytes || 0) ??
+      measureClassShareForModel(filePath, isMoeExpertTensor, selectedTensors, { min: 0.05, max: 0.98 }) ??
       heuristicMoeExpertShare(expertCount);
   }
 
@@ -847,12 +915,12 @@ function readModelCapabilitiesUncached(filePath: string): ModelCapabilities {
   // MoE routers keep their experts in ffn_*_exps tensors, matched separately.
   const ffnLength = pickArchNumber("feed_forward_length");
   const denseFfnShare = !isMoe && ffnLength
-    ? computeDenseFfnShare(tensors, dataStart, fileSizeBytes || 0) ??
+    ? measureClassShareForModel(filePath, isDenseFfnTensor, selectedTensors, { min: 0.05, max: 0.95 }) ??
       heuristicDenseFfnShare(ffnLength, embeddingLength)
     : undefined;
 
   const pleShare =
-    measurePleShareForModel(filePath, { tensors, dataStart }) ??
+    measureClassShareForModel(filePath, isPleTensorName, selectedTensors, { min: 0.01, max: 0.95 }) ??
     (isQwen4expArchitecture(arch) ? heuristicPleShare(arch) : undefined);
 
   return {

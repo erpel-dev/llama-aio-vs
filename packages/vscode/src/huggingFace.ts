@@ -7,6 +7,7 @@ import {
   attachDownloadedCompanion,
   companionDownloadHint,
   describeLanguageGgufFile,
+  displayModelTitle,
   downloadManager,
   downloadPickerFiles,
   formatLicenseQuickPick,
@@ -246,7 +247,7 @@ export async function browseAndDownloadModel(
       : "";
   const lic = pickedModel.license.badge;
   vscode.window.showInformationMessage(
-    `Model ready: ${caps?.name || dest}` +
+    `Model ready: ${displayModelTitle(caps?.name, dest) || dest}` +
       (caps
         ? ` (${caps.maxContextLength} max ctx, ${caps.blockCount} layers${caps.isMoe ? ", MoE" : ""})`
         : "") +

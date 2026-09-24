@@ -834,6 +834,26 @@ export function displayGgufTitle(filePath: string): string {
   return stem;
 }
 
+/** GGUF `general.name` values that are content hashes, not titles. */
+const HASH_LIKE_MODEL_NAME = /^[0-9a-f]{12,}$/i;
+
+export function isHashLikeModelName(name: string | undefined): boolean {
+  return HASH_LIKE_MODEL_NAME.test((name || "").trim());
+}
+
+/**
+ * Sidebar / toast title. Prefer `general.name`, but a hash-like value
+ * ("Dec5630A5621B75…") falls back to the file name.
+ */
+export function displayModelTitle(name: string | undefined, filePath?: string): string {
+  const trimmed = (name || "").trim();
+  const fromFile = filePath ? displayGgufTitle(filePath) : "";
+  if (!trimmed || isHashLikeModelName(trimmed)) {
+    return fromFile || trimmed;
+  }
+  return trimmed;
+}
+
 /**
  * One library row per split GGUF. Points at the first shard; `sizeBytes` is the
  * sum of every part we found (B-38).

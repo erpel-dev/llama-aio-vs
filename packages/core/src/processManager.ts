@@ -10,7 +10,12 @@ import {
   getLockPath,
   getLogPath,
 } from "./paths";
-import { resolveLaunchMode, spawnInExternalTerminal } from "./externalTerminal";
+import {
+  captureChildError,
+  childSpawnError,
+  resolveLaunchMode,
+  spawnInExternalTerminal,
+} from "./externalTerminal";
 import { clampLoadSettingsToModel, readModelCapabilities } from "./ggufMetadata";
 import { detectGpus } from "./gpuInfo";
 import { LlamaInstaller } from "./llamaInstaller";
@@ -49,6 +54,63 @@ interface LockFile {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Tail a log from the last byte offset. The start-wait loop used to
+ * `readFileSync` the whole file (and run `ss`/`netstat`) on every tick.
+ */
+class IncrementalLog {
+  private offset = 0;
+  private remainder = "";
+
+  constructor(private readonly logPath: string) {}
+
+  async poll(): Promise<{ fatal?: string; sawLoading: boolean }> {
+    let chunk = "";
+    try {
+      const fh = await fs.promises.open(this.logPath, "r");
+      try {
+        const st = await fh.stat();
+        if (st.size < this.offset) {
+          this.offset = 0;
+          this.remainder = "";
+        }
+        const len = st.size - this.offset;
+        if (len > 0) {
+          const buf = Buffer.alloc(len);
+          const { bytesRead } = await fh.read(buf, 0, len, this.offset);
+          this.offset += bytesRead;
+          chunk = buf.subarray(0, bytesRead).toString("utf8");
+        }
+      } finally {
+        await fh.close();
+      }
+    } catch {
+      return { sawLoading: false };
+    }
+
+    const text = this.remainder + chunk;
+    const lines = text.split(/\r?\n/);
+    this.remainder = lines.pop() ?? "";
+    let sawLoading = false;
+    let fatal: string | undefined;
+    const consider = (line: string) => {
+      if (/loading model/i.test(line)) {
+        sawLoading = true;
+      }
+      if (FATAL_LOG_RE.test(line)) {
+        fatal = line.trim();
+      }
+    };
+    for (const line of lines) {
+      consider(line);
+    }
+    if (this.remainder) {
+      consider(this.remainder);
+    }
+    return { fatal, sawLoading };
+  }
 }
 
 /** Fatal / terminal failure lines from llama-server logs. */
@@ -557,6 +619,7 @@ export class ProcessManager {
           : `Starting llama-server (${path.basename(model)})…`
     );
     let launcherPid: number | undefined;
+    let launched: ReturnType<typeof captureChildError> | undefined;
     if (launchMode === "externalTerminal") {
       const child = spawnInExternalTerminal({
         binary,
@@ -566,24 +629,40 @@ export class ProcessManager {
         command: launch.method === "direct" ? undefined : launch.command,
         prefixArgs: launch.method === "direct" ? undefined : launch.prefixArgs,
       });
+      launched = child;
+      await sleep(0);
       launcherPid = child.pid;
-      if (!launcherPid) {
-        throw new Error("Failed to open external terminal for llama-server.");
+      const failed = childSpawnError(child);
+      if (failed || !launcherPid) {
+        throw new Error(
+          failed
+            ? `Failed to open external terminal for llama-server: ${failed.message}`
+            : "Failed to open external terminal for llama-server."
+        );
       }
       this.rememberSpawned(launcherPid);
     } else {
       const logFd = fs.openSync(logPath, "a");
-      const child = spawn(launch.command, spawnArgv, {
-        detached: true,
-        stdio: ["ignore", logFd, logFd],
-        windowsHide: true,
-        cwd: path.dirname(binary),
-        env: childEnv,
-      });
+      const child = captureChildError(
+        spawn(launch.command, spawnArgv, {
+          detached: true,
+          stdio: ["ignore", logFd, logFd],
+          windowsHide: true,
+          cwd: path.dirname(binary),
+          env: childEnv,
+        })
+      );
+      launched = child;
       fs.closeSync(logFd);
+      await sleep(0);
       launcherPid = child.pid;
-      if (!launcherPid) {
-        throw new Error("Failed to spawn llama-server (no pid).");
+      const failed = childSpawnError(child);
+      if (failed || !launcherPid) {
+        throw new Error(
+          failed
+            ? `Failed to spawn llama-server: ${failed.message}`
+            : "Failed to spawn llama-server (no pid)."
+        );
       }
       this.rememberSpawned(launcherPid);
       child.unref();
@@ -602,20 +681,30 @@ export class ProcessManager {
       configFingerprint,
     });
 
-    // Wait for readiness — fail fast on log fatals / dead process instead of hanging ~45s.
+    // Wait for HTTP readiness. Log is tailed from the last offset; port scans
+    // (`ss` / `netstat`) stay out of this loop — one lookup once /health answers.
     const maxWaitMs = 180_000; // large MoE models can take a while to mmap/load
     const startedAt = Date.now();
     let sawLoading = false;
-    let sawServerPid = false;
     let lastProgressAt = 0;
+    const logTail = new IncrementalLog(logPath);
 
     while (Date.now() - startedAt < maxWaitMs) {
-      await sleep(400);
-
-      const fatal = this.findFatalLogLine(logPath);
-      if (fatal) {
+      const failed = childSpawnError(launched);
+      if (failed) {
         await this.stop(true).catch(() => undefined);
-        throw new Error(this.formatStartFailure("llama-server failed while loading.", fatal));
+        throw new Error(
+          this.formatStartFailure(`Failed to spawn llama-server (${failed.message}).`)
+        );
+      }
+
+      const log = await logTail.poll();
+      if (log.sawLoading) {
+        sawLoading = true;
+      }
+      if (log.fatal) {
+        await this.stop(true).catch(() => undefined);
+        throw new Error(this.formatStartFailure("llama-server failed while loading.", log.fatal));
       }
 
       if (await this.isHttpReady()) {
@@ -651,26 +740,11 @@ export class ProcessManager {
         };
       }
 
-      const portPids = this.findPidsOnPort(port);
-      if (portPids.length) {
-        sawServerPid = true;
-      } else if (sawServerPid) {
-        // Was bound, then vanished — crash during init.
-        await this.stop(true).catch(() => undefined);
-        throw new Error(
-          this.formatStartFailure("llama-server exited while starting (port closed).")
-        );
-      }
-
       if (launchMode === "background" && launcherPid && !isPidAlive(launcherPid)) {
         await this.stop(true).catch(() => undefined);
         throw new Error(this.formatStartFailure("llama-server exited early."));
       }
 
-      const logTail = this.readLogSnippet(logPath, 8);
-      if (/loading model/i.test(logTail)) {
-        sawLoading = true;
-      }
       const elapsedSec = Math.floor((Date.now() - startedAt) / 1000);
       if (Date.now() - lastProgressAt > 2500) {
         lastProgressAt = Date.now();
@@ -680,6 +754,8 @@ export class ProcessManager {
             : `Waiting for llama-server… ${elapsedSec}s`
         );
       }
+
+      await sleep(400);
     }
 
     await this.stop(true).catch(() => undefined);
@@ -688,22 +764,6 @@ export class ProcessManager {
         `llama-server did not become ready within ${Math.round(maxWaitMs / 1000)}s.`
       )
     );
-  }
-
-  private findFatalLogLine(logPath: string): string | undefined {
-    try {
-      const text = fs.readFileSync(logPath, "utf8");
-      const lines = text.split(/\r?\n/);
-      for (let i = lines.length - 1; i >= 0; i--) {
-        const line = lines[i];
-        if (FATAL_LOG_RE.test(line)) {
-          return line.trim();
-        }
-      }
-    } catch {
-      // ignore
-    }
-    return undefined;
   }
 
   private formatStartFailure(prefix: string, fatalLine?: string): string {

@@ -3,6 +3,7 @@ import { describe, it } from "node:test";
 import {
   computeOverheadBytes,
   deviceWouldSpill,
+  VRAM_HEADROOM_BYTES,
   estimateKvBytes,
   estimateMemory,
   estimateRecurrentStateBytesPerLayer,
@@ -351,6 +352,9 @@ describe("iGPU / APU guidance", () => {
     assert.equal(deviceWouldSpill(512 * MiB + 1, 512 * MiB), true);
     assert.equal(deviceWouldSpill(11 * GiB, 12 * GiB), true);
     assert.equal(deviceWouldSpill(9 * GiB, 12 * GiB), false);
+    assert.equal(VRAM_HEADROOM_BYTES, 1.5 * GiB);
+    assert.equal(deviceWouldSpill(12 * GiB - VRAM_HEADROOM_BYTES, 12 * GiB), false);
+    assert.equal(deviceWouldSpill(12 * GiB - VRAM_HEADROOM_BYTES + 1, 12 * GiB), true);
   });
 
   it("classifies APU names and UMA+GTT, but not a discrete RX card", () => {
@@ -1278,8 +1282,8 @@ describe("estimateMemory", () => {
     );
     assert.ok(est);
     assert.equal(est.willSpill, false);
-    assert.ok(est.charts.vram.totalBytes <= 16 * GiB - 2 * GiB);
-    assert.ok((est.charts.vram2?.totalBytes || 0) <= 16 * GiB - 2 * GiB);
+    assert.ok(est.charts.vram.totalBytes <= 16 * GiB - VRAM_HEADROOM_BYTES);
+    assert.ok((est.charts.vram2?.totalBytes || 0) <= 16 * GiB - VRAM_HEADROOM_BYTES);
   });
 
   it("prices Vulkan dual-GPU compute near RADV occupancy for Flash-Next", () => {

@@ -9,6 +9,7 @@ import { LlamaInstaller, UiBackend } from "@llama-aio/core";
 import { estimateMemory, memoryEstimateInputs, mmprojFileSize, resolveDraftCapabilities } from "@llama-aio/core";
 import { resolveModelModes } from "@llama-aio/core";
 import {
+  displayModelTitle,
   listActiveModelSourceDirs,
   listLocalModelEntries,
   findSiblingMtpDraft,
@@ -529,7 +530,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         localModelCount,
         localSources,
         localSourceDirs,
-        modelName: caps?.name || (state.selectedModelPath ? path.basename(state.selectedModelPath) : ""),
+        modelName: displayModelTitle(caps?.name, state.selectedModelPath),
         build,
         backendOptions,
         selectedUiBackend,
@@ -625,12 +626,12 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
    * Patch the Server card from live process state (does not wait on Copilot
    * dialogs). Returns the /health result so callers can reuse it.
    */
-  async postStatusNow(): Promise<boolean> {
+  async postStatusNow(knownHttpReady?: boolean): Promise<boolean> {
     if (!this.view) {
-      return false;
+      return knownHttpReady ?? false;
     }
     const status = this.processManager.getStatus();
-    const httpReady = await this.processManager.isHttpReady();
+    const httpReady = knownHttpReady ?? (await this.processManager.isHttpReady());
     const ui = effectiveServerUiState({
       starting: status.starting,
       running: status.running,
@@ -2090,6 +2091,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       installBtn.dataset.action = '';
     }
 
+    const VRAM_HEADROOM = 1.5 * 1024 ** 3;
+    const VRAM_SOFT_HEADROOM = 4 * 1024 ** 3;
+
     function fmtBytes(bytes) {
       const GiB = 1024 ** 3, MiB = 1024 ** 2;
       if (!bytes || bytes <= 0) return '0 B';
@@ -2876,11 +2880,11 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       const pct = chart.capacityBytes
         ? Math.round((chart.totalBytes / chart.capacityBytes) * 100)
         : undefined;
-      // 2 / 4 GiB free only apply when the bar is big enough to leave that much.
+      // Headroom only applies when the bar is big enough to leave that much.
       const remaining = chart.capacityBytes != null ? chart.capacityBytes - chart.totalBytes : undefined;
       const cap = chart.capacityBytes || 0;
-      const over = remaining !== undefined && (remaining < 0 || (cap > 2 * 1024 ** 3 && remaining < 2 * 1024 ** 3));
-      const warn = !over && remaining !== undefined && cap > 4 * 1024 ** 3 && remaining < 4 * 1024 ** 3;
+      const over = remaining !== undefined && (remaining < 0 || (cap > VRAM_HEADROOM && remaining < VRAM_HEADROOM));
+      const warn = !over && remaining !== undefined && cap > VRAM_SOFT_HEADROOM && remaining < VRAM_SOFT_HEADROOM;
       stack.classList.toggle('over', over);
       stack.classList.toggle('warn', warn);
       sub.className = 'sub' + (over ? ' over' : warn ? ' warn' : '');
@@ -3167,10 +3171,6 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           draftCpuWarmBundle = mtpKvOnGpu ? 0 : mtpKvWarm;
           draftLine = 'MTP: next-n heads already in GGUF · extra KV ~' + fmtBytes(mtpKv) +
             ' (' + mtpLayers + ' layers)' + (mtpKvOnGpu ? ' (GPU)' : ' (CPU RAM)');
-          warnings.push(
-            'MTP overhead included: next-n heads are already in the GGUF weights; extra ~' +
-            fmtBytes(mtpKv) + ' MTP KV at full context.'
-          );
         } else {
           warnings.push('MTP is on but this GGUF reports no nextn_predict_layers — speculative overhead omitted from the bars.');
         }
@@ -3266,10 +3266,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           if (used > cap) {
             willSpill = true;
             warnings.unshift('Estimated ' + label + ' at full context ~' + fmtBytes(used) + ' is over the full ' + fmtBytes(cap) + ' (' + pct + '%). Expect spill to system RAM. Lower Context or GPU Offload.');
-          } else if (cap > 2 * 1024 ** 3 && used > cap - 2 * 1024 ** 3) {
+          } else if (cap > VRAM_HEADROOM && used > cap - VRAM_HEADROOM) {
             willSpill = true;
-            warnings.unshift('Tight on ' + label + ' at full context: ~' + fmtBytes(used) + ' of ' + fmtBytes(cap) + ' (' + pct + '%). Only ~' + fmtBytes(cap - used) + ' left — target is 2 GiB free. Lower Context or GPU Offload.');
-          } else if (cap > 4 * 1024 ** 3 && cap - used < 4 * 1024 ** 3) {
+            warnings.unshift('Tight on ' + label + ' at full context: ~' + fmtBytes(used) + ' of ' + fmtBytes(cap) + ' (' + pct + '%). Only ~' + fmtBytes(cap - used) + ' left — target is ' + fmtBytes(VRAM_HEADROOM) + ' free. Lower Context or GPU Offload.');
+          } else if (cap > VRAM_SOFT_HEADROOM && cap - used < VRAM_SOFT_HEADROOM) {
             warnings.push('Getting full on ' + label + ' at full context: ~' + fmtBytes(used) + ' of ' + fmtBytes(cap) + ' VRAM (' + pct + '%).');
           }
         }
@@ -3315,10 +3315,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         if (totalGpu > cap) {
           willSpill = true;
           warnings.unshift('Estimated VRAM at full context ~' + fmtBytes(totalGpu) + ' is over the full ' + fmtBytes(cap) + ' GPU (' + pct + '%). Expect spill to system RAM. Lower Context or GPU Offload.');
-        } else if (cap > 2 * 1024 ** 3 && totalGpu > cap - 2 * 1024 ** 3) {
+        } else if (cap > VRAM_HEADROOM && totalGpu > cap - VRAM_HEADROOM) {
           willSpill = true;
-          warnings.unshift('Tight on VRAM at full context: ~' + fmtBytes(totalGpu) + ' of ' + fmtBytes(cap) + ' (' + pct + '%). Only ~' + fmtBytes(cap - totalGpu) + ' left — target is 2 GiB free. Lower Context or GPU Offload.');
-        } else if (cap > 4 * 1024 ** 3 && cap - totalGpu < 4 * 1024 ** 3) {
+          warnings.unshift('Tight on VRAM at full context: ~' + fmtBytes(totalGpu) + ' of ' + fmtBytes(cap) + ' (' + pct + '%). Only ~' + fmtBytes(cap - totalGpu) + ' left — target is ' + fmtBytes(VRAM_HEADROOM) + ' free. Lower Context or GPU Offload.');
+        } else if (cap > VRAM_SOFT_HEADROOM && cap - totalGpu < VRAM_SOFT_HEADROOM) {
           warnings.push('Getting full at full context: ~' + fmtBytes(totalGpu) + ' of ' + fmtBytes(cap) + ' VRAM (' + pct + '%).');
         }
         }
@@ -3739,7 +3739,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
 
     /**
      * Largest context (8192…model max, aligned to 256) whose live estimate
-     * still leaves 2 GiB free on every card. Mirrors fittingContextLength in core.
+     * still leaves 1.5 GiB free on every card. Mirrors fittingContextLength in core.
      */
     function fittingContext(maxCtx) {
       if (!memInputs) return maxCtx;

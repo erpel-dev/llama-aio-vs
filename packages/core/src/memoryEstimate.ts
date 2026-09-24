@@ -120,7 +120,7 @@ const GiB = 1024 ** 3;
 const MiB = 1024 ** 2;
 
 /** Keep this much VRAM free on every GPU (compositor / driver / allocator slop). */
-export const VRAM_HEADROOM_BYTES = 2 * GiB;
+export const VRAM_HEADROOM_BYTES = 1.5 * GiB;
 /** Soft “getting full” warning once remaining VRAM drops below this. */
 export const VRAM_SOFT_HEADROOM_BYTES = 4 * GiB;
 
@@ -133,7 +133,7 @@ export function deviceWouldSpill(
   if (!(cap > 0)) {
     return false;
   }
-  // A 512 MiB iGPU can never keep 2 GiB free — only count real overflow.
+  // A 512 MiB iGPU can never keep 1.5 GiB free — only count real overflow.
   const reserve = cap > headroom ? headroom : 0;
   return used > cap - reserve;
 }
@@ -1327,18 +1327,13 @@ export function estimateMemory(
         " at full context."
     );
   }
-  if (mtp) {
-    warnings.push(
-      `MTP overhead included: next-n heads are already in the GGUF weights; extra ~${formatBytes(mtp.kvBytes)} MTP KV at full context.`
-    );
-  }
   if (mmprojMissing) {
     warnings.push(
       "Vision projector path is set but the file is missing — llama-server --mmproj will fail until you pick a valid mmproj or Clear."
     );
   }
 
-  // Keep a fixed 2 GiB free on every card (not 8% of a large GPU).
+  // Keep a fixed 1.5 GiB free on every card (not 8% of a large GPU).
   const perGpuParts = gpus.map((_, i) => {
     const share = shares[i] || 0;
     const isMain = i === mainGpuIndex;

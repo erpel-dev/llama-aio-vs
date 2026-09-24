@@ -733,6 +733,8 @@ export function activate(context: vscode.ExtensionContext): void {
     serverReadyCache = status.running || (await processManager.isHttpReady());
     const build = currentBuildInfo(forceBuildInfo);
     statusBar.text = perf.statusBarText(serverReadyCache);
+    // Same probe feeds the sidebar so a crash or a TUI stop clears "Server ready".
+    await settingsView.postStatusNow(serverReadyCache);
     statusBar.tooltip = [
       "Llama AIO",
       `Endpoint: ${store.getEndpoint()}`,

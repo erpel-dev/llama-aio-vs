@@ -9,7 +9,13 @@ import {
   modelLikelySupportsTools,
   quantFromGgufName,
 } from "../src/modelPickerInfo";
-import { collapseLocalModelEntries, displayGgufTitle, localShardGroupKey } from "../src/modelLibrary";
+import {
+  collapseLocalModelEntries,
+  displayGgufTitle,
+  displayModelTitle,
+  isHashLikeModelName,
+  localShardGroupKey,
+} from "../src/modelLibrary";
 import { denseCaps, moeCaps } from "./helpers";
 import type { MemoryEstimate } from "../src/memoryEstimate";
 
@@ -55,6 +61,15 @@ describe("displayGgufTitle / quant", () => {
     );
     assert.equal(quantFromGgufName("/m/Qwen3-32B-Q5_K_M.gguf"), "Q5_K_M");
     assert.equal(quantFromGgufName("gpt-oss-20b-MXFP4.gguf"), "MXFP4");
+  });
+
+  it("falls back to the file name when general.name looks like a hash", () => {
+    const file = "/m/Qwen3-30B-A3B-Q4_K_M.gguf";
+    assert.equal(isHashLikeModelName("Dec5630A5621B75"), true);
+    assert.equal(isHashLikeModelName("Qwen3-30B-A3B"), false);
+    assert.equal(displayModelTitle("Dec5630A5621B75", file), "Qwen3-30B-A3B-Q4_K_M");
+    assert.equal(displayModelTitle("Qwen3-30B-A3B", file), "Qwen3-30B-A3B");
+    assert.equal(displayModelTitle(undefined, file), "Qwen3-30B-A3B-Q4_K_M");
   });
 });
 

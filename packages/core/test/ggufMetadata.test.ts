@@ -384,6 +384,10 @@ describe("split GGUF PLE scan", () => {
     );
     assert.equal(caps.shardCount, 2);
     assert.equal(caps.shardsFound, 2);
+    assert.ok(
+      Math.abs((caps.moeExpertShare || 0) - 0.3) < 0.02,
+      `moeExpertShare ${caps.moeExpertShare} should be ~0.3 (3000/10000 across both shards)`
+    );
   });
 
   it("finds the same PLE share when the later shard is selected", () => {
