@@ -1,7 +1,7 @@
 {
   "name": "llama-aio-workspace",
   "private": true,
-  "version": "0.1.19",
+  "version": "0.2.0",
   "description": "Llama AIO monorepo: shared core, VS Code extension, and terminal UI.",
   "license": "MIT",
   "workspaces": [
@@ -12,7 +12,7 @@
   "scripts": {
     "compile": "npm run compile -w @llama-aio/core && npm run bundle -w llama-aio-vs && npm run compile -w @llama-aio/tui",
     "lint": "npm run lint --workspaces --if-present",
-    "test": "npm run test -w @llama-aio/core",
+    "test": "npm run test -w @llama-aio/core && npm run compile -w @llama-aio/core && npm run test -w llama-aio-vs",
     "tui": "npm run compile -w @llama-aio/core && npm start -w @llama-aio/tui",
     "package:vsix": "node scripts/package-vsix.mjs",
     "package:tui": "node scripts/package-tui.mjs",

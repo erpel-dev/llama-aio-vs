@@ -854,6 +854,45 @@ export function displayModelTitle(name: string | undefined, filePath?: string): 
   return trimmed;
 }
 
+const QUANT_TOKEN = /^(I?Q\d(?:_[A-Z0-9]+)*|F16|BF16|F32|MXFP4(?:_MOE)?|TQ\d_\d)$/i;
+const SIZE_TOKEN = /^\d+(?:\.\d+)?[BM](?:-?A\d+(?:\.\d+)?B)?$/i;
+
+/**
+ * "family size · quant" for the sidebar header, e.g.
+ * `Swift-1.5-Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf` → "Swift 1.5 Qwen3.8 27B · IQ3_XXS".
+ * Keeps `general.name` when it already carries a parameter count; otherwise
+ * the file name is usually the more informative of the two.
+ */
+export function friendlyModelTitle(name: string | undefined, filePath?: string): string {
+  const fallback = displayModelTitle(name, filePath);
+  const stem = filePath ? displayGgufTitle(filePath) : "";
+  // Split on "-" only so quant tokens like IQ3_XXS stay whole.
+  const parts = stem.split(/-/).filter(Boolean);
+  let quant = parts.find((p) => QUANT_TOKEN.test(p)) || "";
+  if (!quant) {
+    const m = /(?:^|[-_.])(I?Q\d(?:_[A-Z0-9]+)+|MXFP4|BF16|F16)(?=$|[-_.])/i.exec(stem);
+    quant = m?.[1] || "";
+  }
+  const trimmedName = (name || "").trim();
+  const nameHasSize = /\b\d+(?:\.\d+)?\s?[BM]\b/i.test(trimmedName);
+  if (trimmedName && !isHashLikeModelName(trimmedName) && nameHasSize) {
+    return quant && !trimmedName.toLowerCase().includes(quant.toLowerCase())
+      ? `${trimmedName} · ${quant.toUpperCase()}`
+      : trimmedName;
+  }
+  const sizeIdx = parts.findIndex((p) => SIZE_TOKEN.test(p));
+  if (sizeIdx <= 0) {
+    return fallback;
+  }
+  // "30B-A3B" arrives as two dash parts.
+  let size = parts[sizeIdx]!;
+  if (/^A\d+(?:\.\d+)?B$/i.test(parts[sizeIdx + 1] || "")) {
+    size = `${size}-${parts[sizeIdx + 1]}`;
+  }
+  const family = parts.slice(0, sizeIdx).join(" ");
+  return quant ? `${family} ${size} · ${quant.toUpperCase()}` : `${family} ${size}`;
+}
+
 /**
  * One library row per split GGUF. Points at the first shard; `sizeBytes` is the
  * sum of every part we found (B-38).

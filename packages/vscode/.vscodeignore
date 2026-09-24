@@ -1,6 +1,10 @@
 .vscode/**
 .vscode-test/**
 src/**
+out-harness*/**
+scripts/**
+test/**
+tsconfig.tsbuildinfo
 node_modules/**
 tsconfig.json
 esbuild.mjs

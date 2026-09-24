@@ -35,7 +35,7 @@ import {
 } from "./processIdentity";
 import { buildServerArgs, serverConfigFingerprint, SettingsStore } from "./settings";
 import { formatCommandDisplay, normalizeLoadSettingsForCpuBackend } from "./serverArgs";
-import { ServerStatus } from "./types";
+import { LlamaLoadSettings, ServerStatus } from "./types";
 import { activeInstallLock } from "./installSwap";
 import { acquireLaunchLock, activeLaunchLock, LaunchLockHandle } from "./launchLock";
 
@@ -50,6 +50,16 @@ interface LockFile {
   launchMode?: string;
   /** Fingerprint of model + load settings (+ launch mode) applied at start. */
   configFingerprint?: string;
+  /** Load settings the server was started with (sidebar "what changed" / Discard). */
+  loadSettings?: LlamaLoadSettings;
+}
+
+/** Model + settings of the running server, as recorded in the lock at start. */
+export interface LaunchedConfig {
+  modelPath: string;
+  loadSettings?: LlamaLoadSettings;
+  launchMode?: string;
+  startedAt: string;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -334,6 +344,20 @@ export class ProcessManager {
     }
     const launchMode = resolveLaunchMode(this.store.getConfig().get<string>("launchMode"));
     return serverConfigFingerprint(model, loadSettings, launchMode);
+  }
+
+  /** What the running server was launched with, or undefined when none of ours is up. */
+  getLaunchedConfig(): LaunchedConfig | undefined {
+    const lock = this.readLock();
+    if (!lock || !this.lockPidIsOurs(lock)) {
+      return undefined;
+    }
+    return {
+      modelPath: lock.modelPath,
+      loadSettings: lock.loadSettings,
+      launchMode: lock.launchMode,
+      startedAt: lock.startedAt,
+    };
   }
 
   private isConfigDirty(lock: LockFile): boolean {
@@ -679,6 +703,7 @@ export class ProcessManager {
       args,
       launchMode,
       configFingerprint,
+      loadSettings,
     });
 
     // Wait for HTTP readiness. Log is tailed from the last offset; port scans
@@ -720,6 +745,7 @@ export class ProcessManager {
           args,
           launchMode,
           configFingerprint,
+          loadSettings,
         };
         this.writeLock(finalLock);
         // We just watched this pid answer on our port — no need to re-inspect it.

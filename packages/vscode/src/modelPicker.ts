@@ -73,7 +73,7 @@ export async function openModelFileDialog(
   return selected;
 }
 
-type PickAction = "model" | "openFile" | "hfSearch";
+type PickAction = "model" | "openFile" | "hfSearch" | "downloads";
 type PickItem = vscode.QuickPickItem & { action: PickAction; modelPath?: string };
 
 function fitIcon(fit: string): string {
@@ -224,12 +224,19 @@ export async function pickDownloadedModel(
     alwaysShow: true,
   };
 
+  const downloadsItem: PickItem = {
+    action: "downloads",
+    label: "$(cloud-download) Downloads…",
+    description: "Pause, resume or cancel running downloads",
+    alwaysShow: true,
+  };
+
   const byPath = new Map<string, PickItem>();
   for (const e of local) {
     byPath.set(e.path, cheapModelItem(e, current));
   }
   const rebuild = (filter: string) => {
-    qp.items = [openItem, ...local.map((e) => byPath.get(e.path)!), hfSearchItem(filter)];
+    qp.items = [openItem, ...local.map((e) => byPath.get(e.path)!), hfSearchItem(filter), downloadsItem];
   };
   rebuild("");
 
@@ -268,6 +275,12 @@ export async function pickDownloadedModel(
       }
       if (picked.action === "openFile") {
         finish(await openModelFileDialog(store));
+        return;
+      }
+      if (picked.action === "downloads") {
+        qp.hide();
+        await vscode.commands.executeCommand("llamaAio.showDownloads");
+        finish(undefined);
         return;
       }
       if (picked.action === "hfSearch") {

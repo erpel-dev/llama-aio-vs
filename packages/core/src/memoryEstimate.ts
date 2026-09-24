@@ -105,6 +105,8 @@ export interface MemoryEstimate {
     /** Second GPU when two (or more) discrete GPUs are detected. */
     vram2?: MemoryBarChart;
     ram: MemoryBarChart;
+    /** One bar per detected GPU in display order (Main first); `gpuIndex` is the llama.cpp index. */
+    gpus?: Array<MemoryBarChart & { gpuIndex: number }>;
   };
   /** Estimated VRAM exceeds detected GPU memory (with headroom). */
   willSpill: boolean;
@@ -1658,6 +1660,7 @@ export function estimateMemory(
       totalBytes: totalCpuBytes,
       capacityBytes: systemRamTotalBytes,
     },
+    gpus: gpuCharts.map((c, k) => ({ ...c, gpuIndex: chartOrder[k]! })),
   };
 
   const primaryGpu = gpus[mainGpuIndex] || gpus[0] || gpu;

@@ -6,10 +6,11 @@ import { promptUseInCopilotChat } from "./copilotChatPrompt";
 import { copyServerCommandLine, openServerLog, reportLaunchFailure } from "./serverDiagnostics";
 import { detectGpus, activeInstallLock, type GpuMemoryInfo } from "@llama-aio/core";
 import { LlamaInstaller, UiBackend } from "@llama-aio/core";
-import { estimateMemory, memoryEstimateInputs, mmprojFileSize, resolveDraftCapabilities } from "@llama-aio/core";
+import { computeMemoryView, diffLoadSettings, fittingContextLength, memoryEstimateInputs, mmprojFileSize, resolveDraftCapabilities, shortGpuName, type SettingChange } from "@llama-aio/core";
 import { resolveModelModes } from "@llama-aio/core";
 import {
   displayModelTitle,
+  friendlyModelTitle,
   listActiveModelSourceDirs,
   listLocalModelEntries,
   findSiblingMtpDraft,
@@ -67,6 +68,8 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
 
   private view?: vscode.WebviewView;
   private updateCheckInFlight = false;
+  /** GPUs from the last full state push; live estimates reuse them instead of re-probing. */
+  private lastGpus: GpuMemoryInfo[] = [];
 
   constructor(
     private readonly extensionUri: vscode.Uri,
@@ -155,6 +158,46 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           }
           case "resetRequestDefaults":
             await this.store.updateRequestSettings({ ...DEFAULT_REQUEST_SETTINGS });
+            await this.pushState();
+            break;
+          case "estimate": {
+            // Live estimate for unsaved form values; the webview only renders it.
+            const draft = {
+              ...this.store.getState().loadSettings,
+              ...((msg.payload || {}) as Partial<LlamaLoadSettings>),
+            };
+            const cpuOnly = !!msg.cpuOnly;
+            const gpus = cpuOnly ? [] : this.lastGpus;
+            const { view } = computeMemoryView(this.store.getState().modelCapabilities, draft, gpus, {
+              cpuOnly,
+              withFixes: true,
+            });
+            this.view?.webview.postMessage({ type: "memoryEstimate", seq: msg.seq, view: view ?? null });
+            break;
+          }
+          case "applyLoadPatch": {
+            const patch = { ...((msg.payload || {}) as Partial<LlamaLoadSettings>) };
+            if (msg.fitContext) {
+              const caps = this.store.getState().modelCapabilities;
+              if (caps) {
+                patch.contextLength = fittingContextLength(
+                  caps,
+                  { ...this.store.getState().loadSettings, ...patch },
+                  { cpuOnly: !!msg.cpuOnly, gpus: msg.cpuOnly ? [] : this.lastGpus }
+                );
+              }
+            }
+            await this.store.updateLoadSettings(patch);
+            this.syncSpeculativeMode();
+            await this.pushState();
+            break;
+          }
+          case "discardChanges":
+            await this.discardUnappliedChanges();
+            await this.pushState();
+            break;
+          case "changeModel":
+            await this.modelActions.pickDownloaded();
             await this.pushState();
             break;
           case "reload": {
@@ -400,21 +443,70 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     return detectGpus(false, this.processManager.resolveBinary());
   }
 
-  private currentMemoryEstimate() {
+  /**
+   * The one memory path for the sidebar: core estimate + fit verdict for the
+   * saved settings. Spill confirmation, the state push and live edits all go
+   * through `computeMemoryView`, so the bars and the dialog cannot disagree.
+   */
+  private memoryForSaved(cpuOnly: boolean) {
     const state = this.store.getState();
-    const cpuOnly =
-      this.installer.resolveActiveUiBackend() === "cpu" || this.processManager.isCpuBackend();
     const gpus = this.detectGpusForEstimate(cpuOnly);
-    return estimateMemory(
-      state.modelCapabilities,
-      state.loadSettings,
-      cpuOnly ? undefined : gpus[0],
-      {
+    this.lastGpus = gpus;
+    return {
+      gpus,
+      ...computeMemoryView(state.modelCapabilities, state.loadSettings, gpus, {
         cpuOnly,
         draftCaps: resolveDraftCapabilities(state.loadSettings),
-        gpus: cpuOnly ? undefined : gpus,
-      }
-    );
+        withFixes: true,
+      }),
+    };
+  }
+
+  private cpuOnlyBackend(): boolean {
+    return this.installer.resolveActiveUiBackend() === "cpu" || this.processManager.isCpuBackend();
+  }
+
+  /** Model / load settings / launch mode edits that the running server has not picked up. */
+  private pendingChanges(): SettingChange[] {
+    const launched = this.processManager.getLaunchedConfig();
+    if (!launched) {
+      return [];
+    }
+    const state = this.store.getState();
+    const changes = diffLoadSettings(launched.loadSettings, state.loadSettings);
+    if (launched.modelPath && state.selectedModelPath && path.resolve(launched.modelPath) !== path.resolve(state.selectedModelPath)) {
+      changes.unshift({
+        key: "model",
+        label: "model",
+        from: path.basename(launched.modelPath),
+        to: path.basename(state.selectedModelPath),
+      });
+    }
+    const mode = resolveLaunchMode(this.store.getConfig().get<string>("launchMode"));
+    if (launched.launchMode && launched.launchMode !== mode) {
+      changes.push({ key: "launchMode", label: "launch mode", from: launched.launchMode, to: mode });
+    }
+    return changes;
+  }
+
+  /** Put the sidebar back to what the running server was started with. */
+  private async discardUnappliedChanges(): Promise<void> {
+    const launched = this.processManager.getLaunchedConfig();
+    if (!launched) {
+      return;
+    }
+    const state = this.store.getState();
+    if (launched.modelPath && launched.modelPath !== state.selectedModelPath) {
+      await this.store.applySelectedModel(launched.modelPath);
+    }
+    if (launched.loadSettings) {
+      await this.store.updateLoadSettings(launched.loadSettings);
+    }
+    const mode = resolveLaunchMode(this.store.getConfig().get<string>("launchMode"));
+    if (launched.launchMode && launched.launchMode !== mode) {
+      await this.store.getConfig().update("launchMode", launched.launchMode);
+    }
+    this.syncSpeculativeMode();
   }
 
   /** Keep sidebar speculative line in sync with Load settings (clears stale % when off). */
@@ -428,11 +520,12 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
    * The webview's live chart is display-only and is not consulted here.
    */
   async confirmIfMemorySpill(): Promise<boolean> {
-    const est = this.currentMemoryEstimate();
+    const { estimate: est, view } = this.memoryForSaved(this.cpuOnlyBackend());
     if (!est?.willSpill) {
       return true;
     }
     const warning =
+      view?.headline ||
       est.warnings[0] ||
       "These settings leave too little memory headroom and may spill or thrash (much slower).";
     // Modal dialogs already include a localized Cancel — passing "Cancel" too
@@ -501,14 +594,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       build.resolvedBackend ||
       (build.configuredBackend === "auto" ? "vulkan" : build.configuredBackend)) as string;
     const cpuOnly = selectedUiBackend === "cpu";
-    const gpus = this.detectGpusForEstimate(cpuOnly);
-    const gpu = gpus[0];
+    const { gpus, view: memoryView } = this.memoryForSaved(cpuOnly);
     const draftCaps = resolveDraftCapabilities(state.loadSettings);
-    const memory = estimateMemory(caps, state.loadSettings, gpu, {
-      cpuOnly,
-      draftCaps,
-      gpus: cpuOnly ? undefined : gpus,
-    });
+    const launched = this.processManager.getLaunchedConfig();
     const updateCheck = this.installer.peekUpdateCheck();
 
     this.view.webview.postMessage({
@@ -530,30 +618,32 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         localModelCount,
         localSources,
         localSourceDirs,
-        modelName: displayModelTitle(caps?.name, state.selectedModelPath),
+        modelName: friendlyModelTitle(caps?.name, state.selectedModelPath),
+        modelNameRaw: displayModelTitle(caps?.name, state.selectedModelPath),
+        changes: this.pendingChanges(),
+        startedAt: launched?.startedAt,
+        launchedSettings: launched?.loadSettings ?? null,
+        defaults: DEFAULT_LOAD_SETTINGS,
         build,
         backendOptions,
         selectedUiBackend,
         cpuOnly,
         launchMode: resolveLaunchMode(this.store.getConfig().get<string>("launchMode")),
         updateCheck,
-        memory,
+        memoryView: memoryView ?? null,
         modeSampling: describeModeSampling(caps, state.selectedModelPath),
         memInputs: memoryEstimateInputs(
           caps,
           draftCaps,
           mmprojFileSize(state.loadSettings.mmprojPath)
         ),
-        systemRamTotalBytes: os.totalmem(),
         cpuCount: Math.max(1, os.cpus().length || 1),
         isWindows: process.platform === "win32",
-        gpu: gpu
-          ? { totalBytes: gpu.totalBytes, usedBytes: gpu.usedBytes, name: gpu.name }
-          : null,
         gpus: gpus.map((g, i) => ({
           totalBytes: g.totalBytes,
           usedBytes: g.usedBytes,
           name: g.name,
+          shortName: shortGpuName(g, g.index ?? i),
           index: g.index ?? i,
           llamaDeviceId: g.llamaDeviceId,
         })),
@@ -641,6 +731,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       type: "statusPatch",
       payload: {
         configDirty: ui.starting ? false : !!status.configDirty,
+        changes: !ui.starting && status.configDirty ? this.pendingChanges() : [],
         running: ui.ready,
         starting: ui.starting,
         httpReady,
@@ -1353,97 +1444,208 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     .hidden { display: none !important; }
     .ok { color: var(--ok); }
     .caps {
-      margin-top: 8px;
-      padding-top: 8px;
-      border-top: 1px solid var(--border);
+      margin: 2px 0 4px;
       color: var(--muted);
       font-size: 11px;
       line-height: 1.5;
     }
+    /* ---- Header ---- */
+    .sticky-head {
+      position: sticky;
+      top: 0;
+      z-index: 30;
+      box-shadow: 0 3px 8px rgba(0, 0, 0, 0.25);
+    }
+    .srv-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; }
+    .srv-top .status-line { flex-wrap: wrap; margin: 0; }
+    .srv-top .meta-row { margin: 0; font-weight: 400; }
+    .srv-icons { display: flex; gap: 4px; align-items: center; flex-shrink: 0; }
+    .icon-btn {
+      width: 24px;
+      height: 24px;
+      padding: 0;
+      border-radius: 4px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      background: var(--secondary);
+      color: var(--secondary-fg);
+      font-size: 12px;
+      line-height: 1;
+      cursor: pointer;
+      list-style: none;
+    }
+    .icon-btn::-webkit-details-marker { display: none; }
+    .menu { position: relative; }
+    .menu-body {
+      position: absolute;
+      right: 0;
+      top: 28px;
+      z-index: 50;
+      min-width: 210px;
+      padding: 4px 0 8px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--vscode-editorWidget-background, var(--input-bg));
+      box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+    }
+    .menu-item {
+      display: block;
+      width: 100%;
+      background: transparent;
+      color: var(--fg);
+      font-weight: 500;
+      padding: 6px 12px;
+      border-radius: 0;
+    }
+    .menu-item:hover { background: color-mix(in srgb, var(--fg) 10%, transparent); }
+    .menu-sep { border-top: 1px solid var(--border); margin: 4px 0 6px; }
+    .menu-label { display: block; font-size: 11px; color: var(--muted); padding: 0 12px 4px; }
+    .menu-body select { margin: 0 12px; width: calc(100% - 24px); }
+    .srv-model { font-weight: 650; margin-top: 6px; overflow-wrap: anywhere; }
+    .srv-sub { color: var(--muted); font-size: 11px; margin-top: 1px; }
+    /* ---- Cards & folds ---- */
+    .card-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 6px; }
+    .card-title { font-weight: 650; font-size: 12.5px; }
+    .card-head .sub { color: var(--muted); font-size: 11px; font-weight: 400; }
+    button.small { padding: 3px 10px; font-size: 11px; border-radius: 4px; }
+    details.fold { border-top: 1px solid var(--border); margin-top: 8px; }
+    details.fold.top { border-top: 0; margin-top: 0; }
+    details.fold > summary {
+      list-style: none;
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 8px;
+      padding: 7px 0 5px;
+      cursor: pointer;
+      user-select: none;
+      font-weight: 600;
+    }
+    details.fold > summary::-webkit-details-marker { display: none; }
+    details.fold > summary > span:first-child::before { content: '▸'; color: var(--muted); display: inline-block; width: 1.1em; }
+    details.fold[open] > summary > span:first-child::before { content: '▾'; }
+    details.fold > summary .sum {
+      font-weight: 400;
+      font-size: 11px;
+      color: var(--muted);
+      text-align: right;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      min-width: 0;
+    }
+    .fold-body { padding: 2px 0 6px; }
+    .btn-row { display: flex; gap: 6px; flex-wrap: wrap; }
+    .btn-row button { flex: 1; text-align: center; padding: 6px 8px; font-size: 11px; }
+    .opt-row { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 4px 0; font-size: 11px; }
+    .opt-row .hint { font-size: 10px; margin: 0; }
+    .section-sep { border-top: 1px solid var(--border); margin: 10px 0 10px; }
+    /* ---- Memory verdict ---- */
+    .verdict { border-radius: 5px; padding: 6px 9px; font-size: 12px; margin: 2px 0 8px; line-height: 1.4; border: 1px solid var(--border); }
+    .verdict.good { border-color: color-mix(in srgb, var(--ok) 50%, var(--border)); background: color-mix(in srgb, var(--ok) 13%, transparent); }
+    .verdict.tight { border-color: color-mix(in srgb, var(--warn) 55%, var(--border)); background: color-mix(in srgb, var(--warn) 14%, transparent); }
+    .verdict.spill { border-color: color-mix(in srgb, var(--bad) 55%, var(--border)); background: color-mix(in srgb, var(--bad) 15%, transparent); }
+    .verdict.unknown { color: var(--muted); }
+    .mem-dev { margin: 6px 0; }
+    .mem-stack { position: relative; overflow: visible; }
+    .mem-stack > span:first-child { border-radius: 3px 0 0 3px; }
+    .mem-stack .target {
+      position: absolute;
+      top: -3px;
+      bottom: -3px;
+      width: 2px;
+      margin-left: -1px;
+      background: var(--fg);
+      opacity: 0.75;
+      border-radius: 1px;
+    }
+    .fix-row { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; margin: 6px 0 2px; }
+    .fix-row .hint { margin: 0 2px 0 0; }
+    .chip.fix { border-color: color-mix(in srgb, var(--ok) 50%, var(--border)); background: color-mix(in srgb, var(--ok) 12%, transparent); }
+    .chip.fix.tight { border-color: color-mix(in srgb, var(--warn) 50%, var(--border)); background: color-mix(in srgb, var(--warn) 10%, transparent); }
+    #memNotes > div, #memLines > div { margin: 2px 0; }
+    #memNotes { margin-bottom: 6px; color: var(--fg); }
+    /* ---- Load controls ---- */
+    .chip.custom { cursor: default; opacity: 0.6; }
+    .chip.custom.active { opacity: 1; }
+    .num-pair { display: inline-flex; align-items: center; gap: 6px; }
+    .num-pair .sub { color: var(--muted); font-size: 11px; }
+    .ticks { position: relative; height: 12px; margin: -2px 7px 2px; font-size: 9.5px; color: var(--muted); }
+    .ticks span { position: absolute; transform: translateX(-50%); white-space: nowrap; }
+    .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 5px; overflow: hidden; }
+    .seg-btn {
+      background: transparent;
+      color: var(--fg);
+      font-weight: 500;
+      font-size: 11px;
+      padding: 2px 9px;
+      border-radius: 0;
+      text-align: center;
+    }
+    .seg-btn + .seg-btn { border-left: 1px solid var(--border); }
+    .seg-btn.active { background: color-mix(in srgb, var(--accent) 35%, transparent); color: var(--fg); }
+    /* ---- Performance ---- */
+    .kpis { display: grid; grid-template-columns: repeat(4, 1fr); gap: 5px; margin: 2px 0 8px; }
+    .kpi { border: 1px solid var(--border); border-radius: 5px; padding: 4px 6px; background: color-mix(in srgb, var(--fg) 3%, transparent); }
+    .kpi b { display: block; font-size: 14px; font-variant-numeric: tabular-nums; }
+    .kpi b.muted { color: var(--muted); }
+    .kpi i { font-style: normal; font-size: 10px; color: var(--muted); white-space: nowrap; }
+    /* ---- Advanced ---- */
+    .adv-tools { display: flex; gap: 8px; align-items: center; margin: 2px 0 6px; }
+    .adv-tools input[type="text"] { flex: 1; width: auto; padding: 4px 6px; }
+    .adv-tools .auto { display: inline-flex; gap: 4px; align-items: center; font-size: 11px; color: var(--muted); white-space: nowrap; }
+    .row.changed > .label > .name::before,
+    .toggle.changed > span:first-child::before { content: '●'; color: var(--warn); font-size: 9px; margin-right: 4px; vertical-align: 1px; }
+    .filtered-out { display: none !important; }
   </style>
 </head>
 <body>
-  <div class="card server stopped" id="serverCard">
-    <div class="srv-head">
-      <div class="srv-title">Server</div>
-    </div>
-    <div class="status-line stopped" id="statusLine">
-      <span class="pill">
-        <span class="dot stopped" id="statusDot"></span>
-        <span id="statusText">Loading…</span>
-      </span>
-    </div>
-    <div class="meta-row" id="statusMeta">—</div>
-    <div class="dirty-hint hidden" id="dirtyHint">
-      <span class="label">Settings changed</span>
-      Reload to apply load settings and launch mode.
-    </div>
-    <div class="actions-row">
-      <button class="primary" id="primaryBtn" data-action="start">Start</button>
-      <button class="secondary" id="stopBtn" disabled>Stop</button>
-    </div>
-    <div class="actions-row diag-row">
-      <button class="secondary" id="openLogBtn" type="button">Open log</button>
-      <button class="secondary" id="copyCmdBtn" type="button">Copy command</button>
-    </div>
-    <div class="launch-row">
-      <label for="launchMode">Launch mode</label>
-      <select id="launchMode" class="wide" title="How llama-server is started">
-        <option value="externalTerminal">External terminal (logs visible)</option>
-        <option value="background">Background (hidden process)</option>
-      </select>
-    </div>
-  </div>
-
-  <div class="card" id="perfCard">
-    <div class="model-title">Performance</div>
-    <div class="ctx-chart-title">
-      <span id="ctxLabel">Context</span>
-      <span class="sub" id="ctxSub">— (send a chat to measure)</span>
-    </div>
-    <div class="ctx-stack" id="ctxStack" role="img" aria-label="Context"></div>
-    <div class="ctx-legend tight" id="ctxLegend">
-      <span><i class="seg-tools"></i>Tools</span>
-      <span><i class="seg-system"></i>Sys</span>
-      <span><i class="seg-history"></i>Hist</span>
-      <span><i class="seg-toolResults"></i>Results</span>
-      <span><i class="seg-request"></i>Req</span>
-    </div>
-    <div class="chart-legend hidden" id="perfChartLegend">
-      <span><i class="gen"></i>Generation</span>
-      <span><i class="prompt"></i>Prompt processing</span>
-    </div>
-    <div class="perf-session hidden" id="perfSession"></div>
-    <div class="metric-line" id="perfMetrics">No generation yet</div>
-    <details class="perf-history" id="perfMore">
-      <summary>History, options &amp; debug</summary>
-      <div id="perfHistoryTable"></div>
-      <div class="opt-list">
-        <div class="opt-row">
-          <span>Prompt replacements <span class="hint" id="replacementStats">—</span></span>
-          <input type="checkbox" id="promptReplacementsEnabled" title="Strip Copilot system-prompt boilerplate before llama.cpp" />
-        </div>
-        <div class="opt-row">
-          <span>Wikipedia lookup</span>
-          <input type="checkbox" id="wikipediaLookupEnabled" title="Let the model call wikipedia_lookup for encyclopedic facts. Off by default." />
-        </div>
-        <div class="opt-row">
-          <span>Skip duplicate tools</span>
-          <input type="checkbox" id="duplicateToolCallGuardEnabled" title="Skip a tool that already ran with the same arguments in this turn. Off by default — can block a legitimate retry." />
-        </div>
-        <div class="btn-row">
-          <button class="secondary" id="viewContextBtn" disabled title="Open the last Copilot → llama.cpp request (messages + tools) in an editor">Last call</button>
-          <button class="secondary" id="viewResponseBtn" disabled title="Open the last llama.cpp assistant stream (helps debug empty Chat replies)">Last response</button>
-        </div>
+  <div class="card server stopped sticky-head" id="serverCard">
+    <div class="srv-top">
+      <div class="status-line stopped" id="statusLine">
+        <span class="pill">
+          <span class="dot stopped" id="statusDot"></span>
+          <span id="statusText">Loading…</span>
+        </span>
+        <span class="meta-row" id="statusMeta">—</span>
       </div>
-    </details>
+      <div class="srv-icons">
+        <button class="icon-btn hidden" id="reloadIconBtn" type="button" title="Reload llama-server (restart with the same settings)" aria-label="Reload server">⟳</button>
+        <button class="icon-btn" id="stopBtn" type="button" title="Stop llama-server" aria-label="Stop server" disabled>■</button>
+        <details class="menu" id="srvMenu">
+          <summary class="icon-btn" title="More server actions" aria-label="More server actions">⋯</summary>
+          <div class="menu-body">
+            <button class="menu-item" id="openLogBtn" type="button">Open log</button>
+            <button class="menu-item" id="copyCmdBtn" type="button">Copy command line</button>
+            <button class="menu-item" id="openWebUiBtn" type="button">Open llama.cpp web UI</button>
+            <div class="menu-sep"></div>
+            <label class="menu-label" for="launchMode">Launch mode</label>
+            <select id="launchMode" class="wide" title="How llama-server is started">
+              <option value="externalTerminal">External terminal (logs visible)</option>
+              <option value="background">Background (hidden process)</option>
+            </select>
+          </div>
+        </details>
+      </div>
+    </div>
+    <div class="srv-model" id="srvModel">No model selected</div>
+    <div class="srv-sub" id="srvSummary"></div>
+    <div class="srv-sub" id="srvPerf"></div>
+    <div class="dirty-hint hidden" id="dirtyHint">
+      <span class="label">Not applied yet:</span> <span id="dirtyList">load settings or launch mode changed.</span>
+    </div>
+    <div class="actions-row" id="primaryRow">
+      <button class="primary" id="primaryBtn" data-action="start">Start</button>
+      <button class="secondary hidden" id="discardBtn" type="button" title="Put the settings back to what the running server uses">Discard</button>
+    </div>
   </div>
 
   <div class="setup hidden" id="setupBox">
     <strong>Get a model first</strong>
     <p class="hint" style="margin:8px 0">One-click starter: Unsloth ${STARTER_MODEL.label} (${STARTER_MODEL.approxSizeLabel}, ${STARTER_MODEL.detail}).</p>
     <div class="btn-col" style="margin-top:4px">
-      <button class="primary" id="setupStarterBtn">⬇ Download starter (${STARTER_MODEL.label})</button>
+      <button class="primary" id="setupStarterBtn">Download starter (${STARTER_MODEL.label})</button>
     </div>
     <ol>
       <li>Install llama.cpp (once)</li>
@@ -1452,128 +1654,107 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     </ol>
   </div>
 
-  <h2>llama.cpp</h2>
-  <div class="card">
-    <div class="row" style="margin-top:0;margin-bottom:6px">
-      <div class="label"><span class="name">Backend</span></div>
-      <select id="backendSelect" class="wide"></select>
-      <div class="hint" id="backendHint"></div>
+  <div class="card" id="modelCard">
+    <div class="card-head">
+      <span class="card-title">Model</span>
+      <button class="secondary small" id="changeModelBtn" type="button" title="Pick a downloaded GGUF, open a file, or search Hugging Face">Change…</button>
     </div>
-    <div class="btn-col">
-      <button class="secondary hidden" id="installLlamaBtn">Upgrade to latest</button>
+    <div class="model-title" id="modelTitle">No model selected</div>
+    <div class="caps hidden" id="modelCaps"></div>
+    <div class="model-path" id="modelPath"></div>
+    <div class="btn-col hidden" id="starterCol">
+      <button class="primary hidden" id="starterModelBtn">Download starter (${STARTER_MODEL.label})</button>
+      <div class="hint hidden" id="starterModelHint" style="margin-top:0">${STARTER_MODEL.approxSizeLabel} · ${STARTER_MODEL.detail}</div>
     </div>
-    <details class="advanced" style="margin-top:10px">
-      <summary>More install options<span class="sub">pin a tag, local archive, releases</span></summary>
-      <div class="meta" id="llamaBinaryDetail" style="margin:6px 0 4px"></div>
-      <div class="meta" id="llamaAssetDetail" style="margin:0 0 8px"></div>
-      <div class="btn-col">
-        <button class="secondary" id="checkUpdatesBtn">Check for updates</button>
-        <button class="secondary" id="reinstallLlamaBtn">Reinstall current release</button>
-        <button class="secondary" id="installByTagBtn">Install release tag…</button>
-        <button class="secondary" id="installArchiveBtn">Install from archive…</button>
+    <details class="fold" id="visionFold">
+      <summary><span class="tip" data-flag="-mm, --mmproj" data-help="Path to a multimodal projector GGUF. llama-server loads it with the language model so Copilot Chat can send images. Auto-attached when a sibling mmproj-*.gguf sits next to the model.">Vision projector</span><span class="sum" id="visionSum">none · text only</span></summary>
+      <div class="fold-body">
+        <div class="hint" id="mmprojPathHint" style="margin:0 0 8px">No mmproj — text only.</div>
+        <div class="btn-row">
+          <button class="secondary" id="pickMmprojBtn" type="button">Choose mmproj…</button>
+          <button class="secondary" id="clearMmprojBtn" type="button">Clear</button>
+        </div>
+        <div class="toggle hidden" id="mmprojOffloadRow"><span class="tip" data-flag="--mmproj-offload / --no-mmproj-offload" data-help="Whether to offload the CLIP vision projector to GPU (llama.cpp default: on). Uncheck to pass --no-mmproj-offload and keep the projector in system RAM. Frees VRAM on the Main GPU; image encode becomes CPU-bound.">Offload vision projector to GPU</span><input type="checkbox" id="mmprojOffloadToGpu" checked /></div>
       </div>
-      <div class="hint" style="margin-top:8px">
-        Tag / archive installs skip the GitHub API (useful on shared IPs).
-        <a href="https://github.com/ggml-org/llama.cpp/releases" id="releasesLink">Browse releases</a>
+    </details>
+    <details class="fold" id="libraryFold">
+      <summary><span>Library &amp; downloads</span><span class="sum" id="librarySum">—</span></summary>
+      <div class="fold-body">
+        <div class="meta" id="modelsDirMeta"></div>
+        <div class="btn-row">
+          <button class="secondary" id="downloadModelBtn" type="button">Hugging Face…</button>
+          <button class="secondary" id="openFileBtn" type="button">Open GGUF…</button>
+          <button class="secondary" id="showDownloadsBtn" type="button">Downloads</button>
+        </div>
       </div>
     </details>
   </div>
-
-  <h2>Model</h2>
-  <div class="card">
-    <div class="model-title" id="modelTitle">No model selected</div>
-    <div class="model-path" id="modelPath"></div>
-    <div class="caps hidden" id="modelCaps"></div>
-    <div class="meta" id="modelsDirMeta"></div>
-    <div class="btn-col">
-      <button class="primary hidden" id="starterModelBtn">⬇ Download starter (${STARTER_MODEL.label})</button>
-      <div class="hint hidden" id="starterModelHint" style="margin-top:0">${STARTER_MODEL.approxSizeLabel} · ${STARTER_MODEL.detail}</div>
-      <button class="primary" id="downloadModelBtn">⬇ Download from Hugging Face…</button>
-      <button class="secondary" id="openFileBtn">📂 Open GGUF file…</button>
-      <button class="secondary" id="pickDownloadedBtn">📚 Choose from downloaded…</button>
-      <button class="secondary" id="showDownloadsBtn">⬇ Downloads</button>
-    </div>
-    <div class="row" style="margin-top:12px;margin-bottom:0">
-      <div class="label"><span class="name tip" data-flag="-mm, --mmproj" data-help="Path to a multimodal projector GGUF. llama-server loads it with the language model so Copilot Chat can send images. Auto-attached when a sibling mmproj-*.gguf sits next to the model.">Vision projector</span></div>
-      <div class="hint" id="mmprojPathHint" style="margin:4px 0 8px">No mmproj — text only.</div>
-      <div class="btn-row" style="margin:0;gap:8px;flex-wrap:wrap">
-        <button class="secondary" id="pickMmprojBtn" type="button">Choose mmproj…</button>
-        <button class="secondary" id="clearMmprojBtn" type="button">Clear</button>
-      </div>
-      <div class="toggle" style="margin-top:8px"><span class="tip" data-flag="--mmproj-offload / --no-mmproj-offload" data-help="Whether to offload the CLIP vision projector to GPU (llama.cpp default: on). Uncheck to pass --no-mmproj-offload and keep the projector in system RAM. Frees VRAM on the Main GPU; image encode becomes CPU-bound.">Offload vision projector to GPU</span><input type="checkbox" id="mmprojOffloadToGpu" checked /></div>
-    </div>
-  </div>
-
-  <h2>Load settings</h2>
 
   <div class="card" id="memCard">
-    <div class="model-title">Memory estimate</div>
-    <div class="hint" style="margin-top:0;margin-bottom:8px">Bars = estimate at <strong>full context</strong>. “Live GPU free” is current occupancy, not the bar.</div>
-    <div class="mem-charts" id="memCharts">
-      <div>
-        <div class="mem-chart-title"><span id="vramChartTitle">VRAM · est. at full context</span><span class="sub" id="vramChartSub">—</span></div>
-        <div class="mem-stack" id="vramStack"></div>
-      </div>
-      <div id="vram2ChartWrap" class="hidden">
-        <div class="mem-chart-title"><span id="vram2ChartTitle">VRAM · GPU 1 · est. at full context</span><span class="sub" id="vram2ChartSub">—</span></div>
-        <div class="mem-stack" id="vram2Stack"></div>
-      </div>
-      <div>
-        <div class="mem-chart-title"><span id="ramChartTitle">System RAM · est. at full context</span><span class="sub" id="ramChartSub">—</span></div>
-        <div class="mem-stack" id="ramStack"></div>
-      </div>
-      <div class="mem-legend">
-        <span><i class="seg-weights"></i>Weights</span>
-        <span><i class="seg-vision"></i>Vision (CLIP)</span>
-        <span><i class="seg-draft"></i>Spec (MTP/DFlash)</span>
-        <span><i class="seg-kv"></i>KV cache</span>
-        <span><i class="seg-overhead"></i>Overhead</span>
-      </div>
+    <div class="card-head">
+      <span class="card-title">Memory &amp; load</span>
+      <span class="sub" id="memCtxNote" title="Bars are the estimate at full context. Live use is what the driver reports now.">at full context</span>
     </div>
-    <div class="meta" id="memSummary" style="margin-top:8px">Select a model to estimate VRAM / RAM use.</div>
-    <details class="advanced" id="memDetails" style="margin:8px 0 0">
-      <summary>Details<span class="sub">capacity, weights, KV</span></summary>
-      <div class="meta" id="memLines" style="padding-bottom:8px"></div>
+    <div class="verdict unknown" id="memVerdict">Select a model to estimate VRAM / RAM use.</div>
+    <div id="memDevices"></div>
+    <div class="mem-legend hidden" id="memLegend"></div>
+    <div class="hint" id="memFootnote"></div>
+    <div class="fix-row hidden" id="memFixes"></div>
+    <details class="fold" id="memDetails">
+      <summary><span>Breakdown</span><span class="sum">capacity · weights · KV · notes</span></summary>
+      <div class="fold-body">
+        <div class="meta" id="memNotes"></div>
+        <div class="meta" id="memLines"></div>
+      </div>
     </details>
-    <div class="mem-note hidden" id="memNotes"></div>
-    <div class="mem-warn hidden" id="memWarn"></div>
-  </div>
 
-  <div class="row" style="margin-bottom:10px">
-    <div class="label"><span class="name">Presets</span></div>
+    <div class="section-sep"></div>
     <div class="presets" id="presetChips">
       <button class="chip" id="presetAgent" data-preset="agent" title="Coding agent: q8_0 K + q8_0 V, one slot, 64K context — near-lossless quality with room for tools + history">Coding agent</button>
       <button class="chip" id="presetContext" data-preset="context" title="Max context: q8_0 K + q4_0 V, largest context that still fits your VRAM. K stays at q8_0 because the key cache is far more sensitive to quantization than the value cache.">Max context</button>
       <button class="chip" id="presetQuality" data-preset="quality" title="Max quality: f16 K + q8_0 V at 64K context — spends VRAM on key precision instead of shrinking the context (truncated prompts cost more quality than q8_0 V does).">Max quality</button>
+      <span class="chip custom" id="presetCustom" title="Your own mix of context, KV cache types and slots">Custom</span>
     </div>
-    <div class="hint" id="presetHint">Sets context length, KV cache types, and slots together. Reload to apply.</div>
-  </div>
+    <div class="hint" id="presetHint">Sets context length, KV cache types, and slots together.</div>
 
-  <div class="row">
-    <div class="label"><span class="name tip" data-flag="-c, --ctx-size" data-help="Size of the prompt context (default: 0 = loaded from model).">Context Length</span><input type="number" id="contextLength" min="512" step="256" /></div>
-    <input type="range" id="contextLengthRange" min="512" max="131072" step="1" />
-    <div class="hint" id="ctxHint">Tokens for prompt + generation</div>
-  </div>
-  <div class="row" id="gpuOffloadRow">
-    <div class="label"><span class="name tip" data-flag="-ngl, --n-gpu-layers" data-help="Max number of layers to store in VRAM (exact number, auto, or all).">GPU Offload</span><input type="number" id="gpuOffload" min="0" max="128" /></div>
-    <input type="range" id="gpuOffloadRange" min="0" max="128" step="1" />
-    <div class="hint" id="gpuOffloadHint">Max = all model layers.</div>
-  </div>
-  <div class="row hidden" id="dualGpuRow">
-    <div class="label"><span class="name tip" data-flag="-mg, --main-gpu" data-help="GPU that holds the compute graph, scratch buffers, and the slider’s share of weights + KV. Index matches llama.cpp --list-devices (Vulkan0, Vulkan1, …), which is often not PCI / btop order.">Main GPU</span></div>
-      <select id="mainGpu" class="wide"></select>
-    <div class="label" style="margin-top:6px"><span class="name tip" data-flag="-ts, --tensor-split" data-help="Percent of GPU-resident weights on the Main GPU after CPU MoE/FFN. llama.cpp --tensor-split still fills by layer count, so the emitted fractions can differ (cheap first layers get more of Main). The rest is split evenly across the other cards. Disabled when Split mode is None.">Weights on main GPU</span><span id="tensorSplitPct">75%</span></div>
-    <input type="range" id="tensorSplitRange" min="10" max="90" step="1" />
-    <div class="hint" id="tensorSplitHint"></div>
-    <div class="label" style="margin-top:6px"><span class="name tip" data-flag="-sm, --split-mode" data-help="How tensors are split. Layer (default) shares the model across cards. Row needs a fast x16 link. Tensor splits every weight matrix across cards (experimental, fastest for multi-GPU inference). None keeps every GPU layer on the Main GPU and leaves the other cards free (--device).">Split mode</span></div>
-      <select id="splitMode" class="wide">
-        <option value="layer">Layer (default)</option>
-        <option value="row">Row</option>
-        <option value="tensor">Tensor (experimental)</option>
-        <option value="none">None — Main GPU only</option>
-      </select>
-    <div class="hint" id="dualGpuHint">Two GPUs detected. Pick the faster card as Main, then raise the slider to give it more weights.</div>
-  </div>
+    <div class="row">
+      <div class="label"><span class="name tip" data-flag="-c, --ctx-size" data-help="Size of the prompt context (default: 0 = loaded from model). The slider snaps to 8k, 16k, 32k, 64k, 128k, 256k; type any value in the box.">Context</span><span class="num-pair"><span class="sub" id="ctxK"></span><input type="number" id="contextLength" min="512" step="256" /></span></div>
+      <input type="range" id="contextLengthRange" min="0" max="1000" step="1" />
+      <div class="ticks" id="ctxTicks"></div>
+      <div class="hint" id="ctxHint">Tokens for prompt + generation</div>
+    </div>
+    <div class="row" id="gpuOffloadRow">
+      <div class="label"><span class="name tip" data-flag="-ngl, --n-gpu-layers" data-help="Max number of layers to store in VRAM (exact number, auto, or all).">GPU layers</span>
+        <span class="seg" id="nglSeg"><button class="seg-btn" type="button" id="nglAll" data-ngl="all">All</button><button class="seg-btn" type="button" id="nglCustom" data-ngl="custom">Custom</button></span>
+      </div>
+      <div class="hidden" id="nglCustomRow">
+        <div class="label"><span class="hint" style="margin:0">Layers on GPU</span><input type="number" id="gpuOffload" min="0" max="128" /></div>
+        <input type="range" id="gpuOffloadRange" min="0" max="128" step="1" />
+      </div>
+      <div class="hint" id="gpuOffloadHint">Max = all model layers.</div>
+    </div>
+    <details class="fold" id="offloadFold">
+      <summary><span>Multi-GPU &amp; CPU offload</span><span class="sum" id="offloadSum">—</span></summary>
+      <div class="fold-body">
+        <div class="row hidden" id="dualGpuRow">
+          <div class="label"><span class="name tip" data-flag="-sm, --split-mode" data-help="How tensors are split. Layer (default) shares the model across cards. Row needs a fast x16 link. Tensor splits every weight matrix across cards (experimental, fastest for multi-GPU inference). None keeps every GPU layer on the Main GPU and leaves the other cards free (--device).">Split</span>
+            <span class="seg" id="splitSeg"><button class="seg-btn" type="button" data-split="none">None</button><button class="seg-btn" type="button" data-split="layer">Layer</button><button class="seg-btn" type="button" data-split="row">Row</button><button class="seg-btn" type="button" data-split="tensor">Tensor</button></span>
+          </div>
+          <select id="splitMode" class="wide hidden" aria-label="Split mode">
+            <option value="layer">Layer (default)</option>
+            <option value="row">Row</option>
+            <option value="tensor">Tensor (experimental)</option>
+            <option value="none">None — Main GPU only</option>
+          </select>
+          <div class="label" style="margin-top:8px"><span class="name tip" data-flag="-mg, --main-gpu" data-help="GPU that holds the compute graph, scratch buffers, and the slider’s share of weights + KV. Index matches llama.cpp --list-devices (Vulkan0, Vulkan1, …), which is often not PCI / btop order.">Main GPU</span></div>
+          <select id="mainGpu" class="wide"></select>
+          <div id="splitDetails">
+            <div class="label" style="margin-top:8px"><span class="name tip" data-flag="-ts, --tensor-split" data-help="Percent of GPU-resident weights on the Main GPU after CPU MoE/FFN. llama.cpp --tensor-split still fills by layer count, so the emitted fractions can differ (cheap first layers get more of Main). The rest is split evenly across the other cards.">Weights on main GPU</span><span id="tensorSplitPct">75%</span></div>
+            <input type="range" id="tensorSplitRange" min="10" max="90" step="1" />
+            <div class="hint" id="tensorSplitHint"></div>
+          </div>
+          <div class="hint" id="dualGpuHint"></div>
+        </div>
   <div class="row" id="moeRow">
     <div id="moeFields">
       <div class="label"><span class="name tip" data-flag="-ncmoe, --n-cpu-moe" data-help="Keep the Mixture of Experts (MoE) weights of the first N layers in the CPU.">CPU MoE layers</span><span class="badge">MoE only</span><input type="number" id="nCpuMoe" min="0" max="256" /></div>
@@ -1586,9 +1767,12 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       <div class="hint" id="ffnHint">Only applies to dense (non-MoE) models.</div>
     </div>
   </div>
-
-  <details class="advanced">
-    <summary>Advanced Settings<span class="sub">threads, batch, KV, RoPE, speculative…</span></summary>
+      </div>
+    </details>
+  <details class="fold" id="advancedFold">
+    <summary><span>Advanced</span><span class="sum" id="advSum">threads, batch, KV, RoPE, speculative</span></summary>
+  <div class="fold-body" id="advancedBody">
+  <div class="adv-tools"><input type="text" id="advFilter" placeholder="Filter by label or flag (e.g. -ub, rope)" aria-label="Filter advanced settings" /><label class="auto"><input type="checkbox" id="advChangedOnly" /> Changed only</label></div>
 
   <div class="subgroup-title">Compute</div>
   <div class="row">
@@ -1791,10 +1975,64 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     <button class="secondary" id="resetAdvancedBtn" title="Restore Advanced Settings to Llama AIO defaults (does not change Context Length / GPU Offload / MoE)">Reset advanced to defaults</button>
   </div>
 
+  </div>
   </details>
+  </div>
 
-  <details class="advanced">
-    <summary>Request defaults<span class="sub">temperature, top-p/k, min-p, penalties, max tokens</span></summary>
+  <div class="card" id="perfCard">
+    <div class="card-head">
+      <span class="card-title">Performance</span>
+      <span class="sub" id="perfWindow"></span>
+    </div>
+    <div class="kpis" id="perfKpis">
+      <div class="kpi"><b id="kpiGen">—</b><i>gen tok/s</i></div>
+      <div class="kpi"><b id="kpiPrompt">—</b><i>prompt tok/s</i></div>
+      <div class="kpi"><b id="kpiReuse">—</b><i>cache reuse</i></div>
+      <div class="kpi"><b id="kpiSpec">—</b><i id="kpiSpecLabel">draft accept</i></div>
+    </div>
+    <div class="chart-legend hidden" id="perfChartLegend">
+      <span><i class="gen"></i>gen tok/s (left)</span>
+      <span><i class="prompt"></i>prompt tok/s (right)</span>
+    </div>
+    <div class="perf-session hidden" id="perfSession"></div>
+    <div class="ctx-chart-title">
+      <span id="ctxLabel">Context</span>
+      <span class="sub" id="ctxSub">— (send a chat to measure)</span>
+    </div>
+    <div class="ctx-stack" id="ctxStack" role="img" aria-label="Context"></div>
+    <div class="ctx-legend" id="ctxLegend"></div>
+    <div class="metric-line" id="perfMetrics">No generation yet</div>
+    <details class="fold" id="perfMore">
+      <summary><span>History</span><span class="sum" id="perfHistSum">per-request table</span></summary>
+      <div class="fold-body perf-history"><div id="perfHistoryTable"></div></div>
+    </details>
+  </div>
+
+  <div class="card" id="copilotCard">
+    <details class="fold top" id="copilotFold">
+      <summary><span class="card-title">Copilot Chat</span><span class="sum" id="copilotSum">—</span></summary>
+      <div class="fold-body">
+        <div class="opt-list">
+          <div class="opt-row">
+            <span>Prompt replacements <span class="hint" id="replacementStats">—</span></span>
+            <input type="checkbox" id="promptReplacementsEnabled" title="Strip Copilot system-prompt boilerplate before llama.cpp" />
+          </div>
+          <div class="opt-row">
+            <span>Wikipedia lookup</span>
+            <input type="checkbox" id="wikipediaLookupEnabled" title="Let the model call wikipedia_lookup for encyclopedic facts. Off by default." />
+          </div>
+          <div class="opt-row">
+            <span>Skip duplicate tools</span>
+            <input type="checkbox" id="duplicateToolCallGuardEnabled" title="Skip a tool that already ran with the same arguments in this turn. Off by default — can block a legitimate retry." />
+          </div>
+        </div>
+        <div class="btn-row" style="margin:8px 0 4px">
+          <button class="secondary" id="viewContextBtn" disabled title="Open the last Copilot → llama.cpp request (messages + tools) in an editor">Last call</button>
+          <button class="secondary" id="viewResponseBtn" disabled title="Open the last llama.cpp assistant stream (helps debug empty Chat replies)">Last response</button>
+        </div>
+  <details class="fold" id="requestFold">
+    <summary><span>Request defaults</span><span class="sum">temperature, top-p/k, min-p, penalties, max tokens</span></summary>
+  <div class="fold-body">
   <div class="hint hidden" id="modeOverrideHint" style="margin-bottom:10px"></div>
   <div class="row">
     <div class="label"><span class="name tip" data-flag="Chat / API request body" data-help="Sampling temperature for completions (extension request default, not a llama-server load flag).">Temperature</span><input type="number" id="temperature" min="0" max="2" step="0.05" /></div>
@@ -1825,16 +2063,46 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
   <div class="btn-col" style="margin:12px 0 8px">
     <button class="secondary" id="resetRequestBtn" title="Restore temperature, top-p/k, min-p, penalties, and max tokens to Llama AIO defaults">Reset request defaults</button>
   </div>
+  </div>
   </details>
+
+      </div>
+    </details>
+  </div>
+
+  <div class="card" id="backendCard">
+    <div class="card-head">
+      <span><span class="card-title">llama.cpp</span> <span class="sub" id="backendLine">—</span></span>
+      <button class="secondary small hidden" id="installLlamaBtn" type="button">Upgrade to latest</button>
+    </div>
+    <div class="hint" id="backendHint"></div>
+    <details class="fold" id="backendFold">
+      <summary><span>Backends &amp; install options</span><span class="sum" id="backendSum">—</span></summary>
+      <div class="fold-body">
+        <select id="backendSelect" class="wide" aria-label="Backend"></select>
+        <div class="meta" id="llamaBinaryDetail" style="margin:8px 0 4px"></div>
+        <div class="meta" id="llamaAssetDetail" style="margin:0 0 8px"></div>
+        <div class="btn-col">
+          <button class="secondary" id="checkUpdatesBtn">Check for updates</button>
+          <button class="secondary" id="reinstallLlamaBtn">Reinstall current release</button>
+          <button class="secondary" id="installByTagBtn">Install release tag…</button>
+          <button class="secondary" id="installArchiveBtn">Install from archive…</button>
+        </div>
+        <div class="hint" style="margin-top:8px">
+          Tag / archive installs skip the GitHub API (useful on shared IPs).
+          <a href="https://github.com/ggml-org/llama.cpp/releases" id="releasesLink">Browse releases</a>
+        </div>
+      </div>
+    </details>
+  </div>
+
 
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
     const $ = (id) => document.getElementById(id);
 
     let memInputs = null;
-    let gpuInfo = null;
     let gpuInfos = [];
-    let systemRamTotalBytes = 0;
     let mtpSidecarPath = '';
     let backendOptionsCache = [];
     let modelIsMoe = false;
@@ -1854,6 +2122,13 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     let lastChartPrompt = [];
     let perfChartRO = null;
     let updateCheck = { latestTag: undefined, installedTag: undefined, updateAvailable: false, checkFailed: false, pending: true };
+    /** Settings the running server has not picked up yet ({ label, from, to }). */
+    let pendingChanges = [];
+    let lastPayload = null;
+    let lastMemoryView = null;
+    let loadDefaults = {};
+    /** "Custom" GPU layers stays open while the user works with the slider. */
+    let nglCustomOpen = false;
 
     function setServerCardKind(kind) {
       const card = $('serverCard');
@@ -1940,58 +2215,148 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       if (hint) hint.classList.toggle('hidden', starting || !(ready && dirty));
     }
 
+    /**
+     * The big button only appears when there is something to do: Start,
+     * Loading…, or Reload to apply. A clean running server gets the small ⟳.
+     */
     function updatePrimaryAction() {
       const primary = $('primaryBtn');
       const stop = $('stopBtn');
+      const row = $('primaryRow');
+      const reloadIcon = $('reloadIconBtn');
+      const discard = $('discardBtn');
       if (!primary || !stop) return;
       stop.disabled = !serverRunning && !serverStarting;
       primary.classList.remove('warn-primary');
       primary.classList.add('primary');
+      let showRow = true;
+      let showDiscard = false;
       if (serverStarting) {
         primary.disabled = true;
         primary.textContent = 'Loading…';
         primary.dataset.action = '';
-        primary.classList.remove('warn-primary');
-        primary.classList.add('primary');
       } else if (!serverRunning) {
         primary.disabled = false;
         primary.textContent = 'Start';
         primary.dataset.action = 'start';
       } else if (configDirty) {
         primary.disabled = false;
-        primary.textContent = 'Reload to apply';
+        const n = pendingChanges.length;
+        primary.textContent = n ? ('Reload to apply (' + n + ' change' + (n === 1 ? '' : 's') + ')') : 'Reload to apply';
         primary.dataset.action = 'reload';
         primary.classList.remove('primary');
         primary.classList.add('warn-primary');
+        showDiscard = n > 0;
       } else {
-        // Status lives in the pill above; keep this slot as a usable action.
-        primary.disabled = false;
-        primary.textContent = 'Reload';
+        showRow = false;
         primary.dataset.action = 'reload';
       }
+      if (row) row.classList.toggle('hidden', !showRow);
+      if (discard) discard.classList.toggle('hidden', !showDiscard);
+      if (reloadIcon) reloadIcon.classList.toggle('hidden', !(serverRunning && !serverStarting && !configDirty));
+      renderDirtyList();
+    }
+
+    function renderDirtyList() {
+      const list = $('dirtyList');
+      if (!list) return;
+      list.textContent = pendingChanges.length
+        ? pendingChanges.map((c) => c.label + ' ' + c.from + ' → ' + c.to).join(' · ')
+        : 'load settings or launch mode changed.';
+    }
+
+    function fmtTokShort(n) {
+      if (!(n > 0)) return '—';
+      if (n >= 1024 && n % 1024 === 0) return (n / 1024) + 'k';
+      return n >= 1000 ? Math.round(n / 1000) + 'k' : String(n);
+    }
+
+    function fmtUptime(iso) {
+      const t = Date.parse(iso || '');
+      if (!isFinite(t)) return '';
+      const min = Math.max(0, Math.round((Date.now() - t) / 60000));
+      if (min < 60) return 'up ' + min + ' min';
+      const h = Math.floor(min / 60);
+      return 'up ' + h + ' h' + (min % 60 ? ' ' + (min % 60) + ' min' : '');
+    }
+
+    /** Header: what is loaded, with which settings, and how it is doing. */
+    function renderHeader() {
+      const p = lastPayload;
+      const modelEl = $('srvModel');
+      const sumEl = $('srvSummary');
+      const perfEl = $('srvPerf');
+      if (!p || !modelEl) return;
+      const hasModel = !!(p.state && p.state.selectedModelPath);
+      modelEl.textContent = hasModel ? (p.modelName || 'model') : 'No model selected';
+      modelEl.title = p.modelNameRaw || '';
+      // Describe the running server; pending edits are listed separately below.
+      const L = (serverRunning && p.launchedSettings) || (p.state && p.state.loadSettings) || {};
+      const caps = p.capabilities || {};
+      const blocks = caps.blockCount || 0;
+      const bits = [];
+      if (hasModel) {
+        bits.push('ctx ' + fmtTokShort(L.contextLength));
+        if (p.cpuOnly) {
+          bits.push('CPU backend');
+        } else {
+          const ngl = L.gpuOffload >= 99 || (blocks && L.gpuOffload >= blocks) ? blocks : L.gpuOffload;
+          const mainIdx = clampMainGpu(L.mainGpu, (gpuInfos || []).length || 1);
+          const mainG = gpuInfos && gpuInfos[mainIdx];
+          const where = (gpuInfos || []).length >= 2 && L.splitMode !== 'none'
+            ? gpuInfos.map((g, i) => gpuLabel(g, i)).join(' + ')
+            : (mainG ? gpuLabel(mainG, mainIdx) : 'GPU');
+          bits.push((blocks ? ngl + '/' + blocks : ngl) + ' layers on ' + where);
+        }
+        if (L.speculativeMode && L.speculativeMode !== 'off') bits.push(specAcceptLabel(L.speculativeMode));
+        const backend = (backendOptionsCache.find((o) => o.id === activeBackendId) || {});
+        if (backend.label) bits.push(backend.label + (backend.installedTag ? ' ' + backend.installedTag : ''));
+      }
+      sumEl.textContent = bits.join(' · ');
+      const perfBits = [];
+      const perf = p.perf || {};
+      const rows = Array.isArray(perf.history) ? perf.history : [];
+      const gen = pickNum(perf.genTokPerSec, rows[0] && rows[0].genTokPerSec);
+      if (serverRunning && fmtRate(gen)) perfBits.push(fmtRate(gen) + ' tok/s');
+      if (serverRunning && p.startedAt) perfBits.push(fmtUptime(p.startedAt));
+      if (!configDirty && lastMemoryView && lastMemoryView.devices && lastMemoryView.devices.length) {
+        const d = lastMemoryView.devices[0];
+        if (d.capacityBytes) perfBits.push(fmtBytes(d.usedBytes) + ' / ' + fmtBytes(d.capacityBytes) + ' ' + (d.kind === 'ram' ? 'RAM' : d.label));
+      }
+      perfEl.textContent = perfBits.join(' · ');
+      perfEl.classList.toggle('hidden', !perfBits.length);
+    }
+
+    function markDirtyIfRunning() {
+      // Optimistic dirty UI while running — confirmed via silent save + statusPatch.
+      if (!serverRunning) return;
+      configDirty = true;
+      updatePrimaryAction();
+      const hint = $('dirtyHint');
+      if (hint) hint.classList.remove('hidden');
+      setServerCardKind('dirty');
+      const line = $('statusLine');
+      const dot = $('statusDot');
+      if (line) line.className = 'status-line dirty';
+      if (dot) dot.className = 'dot dirty';
     }
 
     function scheduleSaveLoad() {
       if (saveLoadTimer) clearTimeout(saveLoadTimer);
       highlightPreset();
-      // Optimistic dirty UI while running — confirmed via silent save + statusPatch.
-      if (serverRunning) {
-        configDirty = true;
-        updatePrimaryAction();
-        const hint = $('dirtyHint');
-        if (hint) hint.classList.remove('hidden');
-        setServerCardKind('dirty');
-        const line = $('statusLine');
-        const dot = $('statusDot');
-        if (line) line.className = 'status-line dirty';
-        if (dot) dot.className = 'dot dirty';
-      }
+      markDirtyIfRunning();
+      refreshAdvancedMarks();
       saveLoadTimer = setTimeout(() => {
         vscode.postMessage({ type: 'saveLoad', payload: readLoad(), silent: true });
       }, 280);
     }
 
     function updateBackendUi() {
+      updateBackendControls();
+      renderBackendLine();
+    }
+
+    function updateBackendControls() {
       const sel = $('backendSelect');
       const installBtn = $('installLlamaBtn');
       const hint = $('backendHint');
@@ -2078,7 +2443,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       }
 
       if (updateCheck.updateAvailable && latestTag) {
-        hint.textContent = (installedTag ? ('Installed ' + installedTag + ' · ') : '') + 'Update available.';
+        hint.textContent = '';
         installBtn.textContent = 'Upgrade to ' + latestTag;
         installBtn.disabled = false;
         installBtn.classList.remove('hidden');
@@ -2086,43 +2451,52 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         return;
       }
 
-      hint.textContent = (installedTag || 'Installed') + ' · up to date' + (latestTag ? (' (latest ' + latestTag + ')') : '');
+      hint.textContent = '';
       installBtn.classList.add('hidden');
       installBtn.dataset.action = '';
     }
 
-    const VRAM_HEADROOM = 1.5 * 1024 ** 3;
-    const VRAM_SOFT_HEADROOM = 4 * 1024 ** 3;
+    /** "Vulkan · b11163" once, plus the alternatives as a summary of the fold. */
+    function renderBackendLine() {
+      const line = $('backendLine');
+      const sum = $('backendSum');
+      const active = backendOptionsCache.find((o) => o.id === activeBackendId) || backendOptionsCache.find((o) => o.active);
+      if (line) {
+        const tag = (active && active.installedTag) || updateCheck.installedTag || '';
+        const upToDate = !updateCheck.pending && !updateCheck.checkFailed && !updateCheck.updateAvailable && tag;
+        line.textContent = active
+          ? active.label + (tag ? ' · ' + tag : '') + (upToDate ? ' · ✓ latest' : '')
+          : 'not installed';
+      }
+      if (sum) {
+        sum.textContent = backendOptionsCache
+          .filter((o) => o.available && o.id !== 'path')
+          .map((o) => o.label + (o.id === activeBackendId ? ' ✓' : ''))
+          .join(' · ');
+      }
+      const hint = $('backendHint');
+      if (hint) hint.classList.toggle('hidden', !hint.textContent);
+    }
 
+    /** One unit style everywhere: GiB with one decimal, MiB below 1 GiB. */
     function fmtBytes(bytes) {
       const GiB = 1024 ** 3, MiB = 1024 ** 2;
       if (!bytes || bytes <= 0) return '0 B';
-      if (bytes >= GiB) return (bytes / GiB).toFixed(bytes >= 10 * GiB ? 1 : 2) + ' GiB';
+      if (bytes >= GiB) return (bytes / GiB).toFixed(1) + ' GiB';
       if (bytes >= MiB) return (bytes / MiB).toFixed(0) + ' MiB';
       return Math.round(bytes / 1024) + ' KiB';
     }
 
+    /** Short device name ("RX 9070"); the full name and llama.cpp id live in tooltips. */
     function gpuLabel(gpu, index) {
-      const name = (gpu && gpu.name) ? String(gpu.name).trim() : '';
-      const pretty = name && !/^(amdgpu|nvidia|i915|xe)$/i.test(name) ? name : '';
+      if (gpu && gpu.shortName) return String(gpu.shortName);
       const id = (gpu && gpu.llamaDeviceId) ? String(gpu.llamaDeviceId) : ('GPU ' + index);
-      return pretty ? (id + ' · ' + pretty) : id;
+      return id;
     }
-
-    // Mirrors isIntegratedGpu() / gpuBarCapacityBytes() in core.
-    function isIntegratedGpu(gpu) {
-      if (!gpu || !(gpu.totalBytes > 0)) return false;
-      const name = String(gpu.name || '') + ' ' + String(gpu.llamaDeviceId || '');
-      if (/onboard|\bigd\b|integrated|iris|uhd graphics|hd graphics|radeon graphics|vega mobile|cezanne|renoir|lucienne|barcelo|mendocino|rembrandt|raphael|phoenix|hawk.?point|strix|gfx[0-9]+c\b/i.test(name)) {
-        return true;
-      }
-      const gtt = gpu.gttTotalBytes || 0;
-      return gpu.totalBytes <= 2 * 1024 ** 3 && gtt >= 4 * 1024 ** 3 && gtt >= gpu.totalBytes * 4;
-    }
-    function gpuBarCapacityBytes(gpu) {
-      if (!gpu || !(gpu.totalBytes > 0)) return undefined;
-      if (isIntegratedGpu(gpu) && (gpu.gttTotalBytes || 0) > gpu.totalBytes) return gpu.gttTotalBytes;
-      return gpu.totalBytes;
+    function gpuFullLabel(gpu, index) {
+      const name = (gpu && gpu.name) ? String(gpu.name).trim() : '';
+      const id = (gpu && gpu.llamaDeviceId) ? String(gpu.llamaDeviceId) : ('GPU ' + index);
+      return name ? (id + ' · ' + name) : id;
     }
 
     function parseTensorSplit(raw) {
@@ -2368,11 +2742,53 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       const ts = $('tensorSplitRange');
       const none = $('splitMode') && $('splitMode').value === 'none';
       const cpu = cpuOnlyLive();
-      if (ts) {
-        ts.disabled = cpu || none;
-        ts.style.opacity = (cpu || none) ? '0.45' : '1';
-      }
+      if (ts) ts.disabled = cpu || none;
+      // Weight share means nothing with split None — hide it instead of greying it out.
+      const details = $('splitDetails');
+      if (details) details.classList.toggle('hidden', !!(cpu || none));
+      syncSplitSeg();
       syncTensorSplitPctLabel();
+      renderOffloadSum();
+    }
+
+    function syncSplitSeg() {
+      const mode = ($('splitMode') && $('splitMode').value) || 'layer';
+      document.querySelectorAll('#splitSeg .seg-btn').forEach((b) => {
+        b.classList.toggle('active', b.dataset.split === mode);
+      });
+    }
+
+    /** One-line state of the Multi-GPU & CPU offload fold, visible while collapsed. */
+    function renderOffloadSum() {
+      const el = $('offloadSum');
+      if (!el) return;
+      const bits = [];
+      const n = (gpuInfos && gpuInfos.length) || 0;
+      const mode = ($('splitMode') && $('splitMode').value) || 'layer';
+      if (cpuOnlyLive()) {
+        bits.push('CPU backend');
+      } else if (n >= 2) {
+        const main = clampMainGpu(readMainGpuIndex(), n);
+        bits.push(mode === 'none'
+          ? gpuLabel(gpuInfos[main], main) + ' only'
+          : 'split ' + mode + ' · main ' + gpuLabel(gpuInfos[main], main) + ' ' + (($('tensorSplitPct') && $('tensorSplitPct').textContent) || ''));
+      } else if (n === 1) {
+        bits.push(gpuLabel(gpuInfos[0], 0));
+      }
+      if (modelIsMoe) bits.push('CPU MoE ' + (Number($('nCpuMoe').value) || 0));
+      else bits.push('CPU FFN ' + (Number($('nCpuFfn').value) || 0));
+      el.textContent = bits.join(' · ');
+    }
+
+    /** GPU layers: "All" hides the slider; "Custom" shows it. */
+    function syncNglMode() {
+      const blocks = Math.max(1, modelBlockCount || 1);
+      const ngl = Number($('gpuOffload').value);
+      const all = !nglCustomOpen && (ngl >= blocks || ngl >= 99);
+      $('nglAll').classList.toggle('active', all);
+      $('nglAll').textContent = 'All (' + blocks + ')';
+      $('nglCustom').classList.toggle('active', !all);
+      $('nglCustomRow').classList.toggle('hidden', all);
     }
 
     function fillMainGpuSelect(selected) {
@@ -2392,98 +2808,6 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         sel.appendChild(opt);
       }
       sel.value = String(want);
-    }
-
-    function buildGpuChart(index, gpu, weights, kv, overhead, spec, specLabel, labeled, vision) {
-      return {
-        title: labeled && gpu
-          ? ((isIntegratedGpu(gpu) ? 'iGPU GTT' : 'VRAM') + ' · ' + gpuLabel(gpu, index) + ' · est. at full context')
-          : (isIntegratedGpu(gpu) ? 'iGPU GTT · est. at full context' : 'VRAM · est. at full context'),
-        segments: [
-          { key: 'weights', label: 'Weights', bytes: weights },
-          { key: 'vision', label: 'Vision (CLIP)', bytes: vision || 0 },
-          { key: 'draft', label: specLabel || 'Speculative', bytes: spec || 0 },
-          { key: 'kv', label: 'KV cache (full ctx)', bytes: kv },
-          { key: 'overhead', label: 'Overhead', bytes: overhead },
-        ],
-        totalBytes: weights + kv + overhead + (spec || 0) + (vision || 0),
-        capacityBytes: gpuBarCapacityBytes(gpu),
-      };
-    }
-
-    function overheadForGpu(i, mainIdx, share, gpuOverhead, peerOverhead) {
-      if (!(share > 0)) return 0;
-      return i === mainIdx ? gpuOverhead : (peerOverhead || 0);
-    }
-
-    function buildCharts(gpuWeights, cpuWeights, gpuKv, cpuKv, gpuOverhead, cpuOverhead, totalGpu, totalCpu, draftGpu, draftCpu, specLabel, split, gpuVision, cpuVision, peerOverhead, weightShares, kvPerGpu) {
-      const gpus = (!cpuOnlyLive() && gpuInfos && gpuInfos.length) ? gpuInfos : (gpuInfo ? [gpuInfo] : []);
-      const shares = effectiveTensorSplitShares(
-        split && split.tensorSplit,
-        gpus,
-        split && split.splitMode,
-        split && split.mainGpu
-      );
-      const wShares = (weightShares && weightShares.length === shares.length) ? weightShares : shares;
-      const mainIdx = gpus.length ? clampMainGpu(split && split.mainGpu, gpus.length) : 0;
-      const kvFor = (i) => (kvPerGpu && kvPerGpu[i] != null) ? kvPerGpu[i] : gpuKv * (shares[i] || 0);
-      const labeled = gpus.length >= 2;
-      const order = gpuDisplayOrder(gpus, mainIdx);
-      const i0 = order[0];
-      const i1 = order[1];
-      const vram0 = gpus.length && i0 !== undefined && gpus[i0]
-        ? buildGpuChart(
-            i0,
-            gpus[i0],
-            gpuWeights * (wShares[i0] || 0),
-            kvFor(i0),
-            overheadForGpu(i0, mainIdx, shares[i0] || 0, gpuOverhead, peerOverhead),
-            (draftGpu || 0) * (wShares[i0] || 0),
-            specLabel,
-            labeled,
-            mainIdx === i0 ? (gpuVision || 0) : 0
-          )
-        : {
-            title: 'VRAM · est. at full context',
-            segments: [
-              { key: 'weights', label: 'Weights', bytes: gpuWeights },
-              { key: 'vision', label: 'Vision (CLIP)', bytes: gpuVision || 0 },
-              { key: 'draft', label: specLabel || 'Speculative', bytes: draftGpu || 0 },
-              { key: 'kv', label: 'KV cache (full ctx)', bytes: gpuKv },
-              { key: 'overhead', label: 'Overhead', bytes: gpuOverhead },
-            ],
-            totalBytes: totalGpu,
-            capacityBytes: gpuBarCapacityBytes(gpuInfo),
-          };
-      const vram2 = i1 !== undefined && gpus[i1]
-        ? buildGpuChart(
-            i1,
-            gpus[i1],
-            gpuWeights * (wShares[i1] || 0),
-            kvFor(i1),
-            overheadForGpu(i1, mainIdx, shares[i1] || 0, gpuOverhead, peerOverhead),
-            (draftGpu || 0) * (wShares[i1] || 0),
-            specLabel,
-            labeled,
-            mainIdx === i1 ? (gpuVision || 0) : 0
-          )
-        : undefined;
-      return {
-        vram: vram0,
-        vram2,
-        ram: {
-          title: 'System RAM · est. at full context',
-          segments: [
-            { key: 'weights', label: 'Weights', bytes: cpuWeights },
-            { key: 'vision', label: 'Vision (CLIP)', bytes: cpuVision || 0 },
-            { key: 'draft', label: specLabel || 'Speculative', bytes: draftCpu || 0 },
-            { key: 'kv', label: 'KV cache (full ctx)', bytes: cpuKv },
-            { key: 'overhead', label: 'Overhead', bytes: cpuOverhead },
-          ],
-          totalBytes: totalCpu,
-          capacityBytes: systemRamTotalBytes || undefined,
-        },
-      };
     }
 
     function cpuOnlyLive() {
@@ -2515,24 +2839,6 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       const ffnElems = 3 * ffn;
       const attnElems = 4 * embed;
       return Math.min(0.95, Math.max(0.05, ffnElems / (ffnElems + attnElems)));
-    }
-
-    function pleShareOf(inputs) {
-      if (!inputs) return 0;
-      if (inputs.pleShare != null && isFinite(inputs.pleShare)) {
-        return Math.min(0.95, Math.max(0, Number(inputs.pleShare)));
-      }
-      return 0;
-    }
-
-    // Mirrors resolveLoadMode + lazyModeReadsFromDisk in core.
-    function livePleFromDisk(L, pleBytes) {
-      if (!(pleBytes > 0) || !L.tryMmap) return false;
-      const lazy = L.lazyMode || 'auto';
-      const wants = lazy === 'on' || (lazy === 'auto' && pleBytes > 4 * 1024 ** 3);
-      if (!wants) return false;
-      if (L.keepModelInMemory && !payload.isWindows) return false;
-      return true;
     }
 
     function fmtNum(n) {
@@ -2624,18 +2930,34 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       }
 
       stack.innerHTML = '';
+      const legend = $('ctxLegend');
+      if (legend) legend.textContent = '';
       if (!breakdown || !Array.isArray(breakdown.segments)) {
         return;
       }
       const scale = Math.max(1, breakdown.limitTokens || contextLimit || 1);
+      const used = [];
       for (const seg of breakdown.segments) {
         if (!seg || seg.key === 'free' || !(seg.tokens > 0)) continue;
+        used.push(seg);
         const el = document.createElement('span');
         el.className = 'seg-' + seg.key;
         el.style.width = Math.max(0.4, (seg.tokens / scale) * 100) + '%';
         const pct = Math.round((seg.tokens / scale) * 1000) / 10;
         el.title = seg.label + ': ≈' + Number(seg.tokens).toLocaleString() + ' tok (' + pct + '% of slot)';
         stack.appendChild(el);
+      }
+      // Largest first, with counts, so "tools + results eat ⅔" is readable without hovering.
+      if (legend) {
+        used.sort((a, b) => b.tokens - a.tokens);
+        for (const seg of used) {
+          const span = document.createElement('span');
+          const swatch = document.createElement('i');
+          swatch.className = 'seg-' + seg.key;
+          span.appendChild(swatch);
+          span.appendChild(document.createTextNode((seg.label || seg.key) + ' ' + fmtTokK(seg.tokens)));
+          legend.appendChild(span);
+        }
       }
     }
 
@@ -2709,19 +3031,14 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       if (genPts.length > 1) {
         parts.push('<polyline points="' + poly(genPts) + '" fill="none" stroke="' + GEN + '" stroke-width="1.7"/>');
       }
+      // Latest values are in the KPI tiles; end labels here collided with the right axis.
       if (promptPts.length) {
         const last = promptPts[promptPts.length - 1];
-        const label = fmtRate(last.v) || fmtAxis(last.v);
         parts.push('<circle cx="' + last.x.toFixed(1) + '" cy="' + last.y.toFixed(1) + '" r="2.3" fill="' + PROMPT + '"/>');
-        parts.push('<text x="' + (last.x - 4).toFixed(1) + '" y="' + (last.y - 5).toFixed(1) +
-          '" text-anchor="end" fill="' + PROMPT + '" font-size="9" font-weight="650">' + label + '</text>');
       }
       if (genPts.length) {
         const last = genPts[genPts.length - 1];
-        const label = fmtRate(last.v) || fmtAxis(last.v);
         parts.push('<circle cx="' + last.x.toFixed(1) + '" cy="' + last.y.toFixed(1) + '" r="2.5" fill="' + GEN + '"/>');
-        parts.push('<text x="' + (last.x + 5).toFixed(1) + '" y="' + (last.y + 12).toFixed(1) +
-          '" fill="' + GEN + '" font-size="9" font-weight="650">' + label + '</text>');
       }
       parts.push('<text x="' + x0 + '" y="' + (H - 2) + '" fill="currentColor" font-size="8">oldest</text>');
       parts.push('<text x="' + (x0 + plotW) + '" y="' + (H - 2) +
@@ -2821,632 +3138,39 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         if (legendEl) legendEl.classList.add('hidden');
       }
 
+      const setKpi = (id, text, muted) => {
+        const el = $(id);
+        if (!el) return;
+        el.textContent = text;
+        el.classList.toggle('muted', !!muted);
+      };
+      setKpi('kpiGen', fmtRate(genNow) || '—', stale);
+      setKpi('kpiPrompt', fmtRate(promptNow) || '—', stale);
+      setKpi('kpiReuse', typeof cacheHitPct === 'number' ? Math.round(cacheHitPct) + '%' : '—', stale);
+      const specOn = !!(p.speculativeMode && p.speculativeMode !== 'off');
+      setKpi('kpiSpec', specOn && typeof draftAcceptancePct === 'number' ? Math.round(draftAcceptancePct) + '%' : (specOn ? '—' : 'off'), stale);
+      const specLabel = $('kpiSpecLabel');
+      if (specLabel) specLabel.textContent = specOn ? specAcceptLabel(p.speculativeMode) + ' accept' : 'speculative';
+      const windowEl = $('perfWindow');
+      if (windowEl) windowEl.textContent = rows.length ? 'last ' + rows.length + ' request' + (rows.length === 1 ? '' : 's') : '';
+      const histSum = $('perfHistSum');
+      if (histSum) histSum.textContent = rows.length ? rows.length + ' request' + (rows.length === 1 ? '' : 's') : 'per-request table';
+
       const bits = [];
       if (p.generating) {
         const live = fmtRate(p.genTokPerSec);
         bits.push('<span class="ok">● Generating…' + (live ? ' ' + live + ' tok/s' : '') + '</span>');
-      } else if (!svg) {
-        const genLabel = fmtRate(genNow);
-        const promptLabel = fmtRate(promptNow);
-        if (genLabel) bits.push('<span class="gen">' + genLabel + ' gen</span>');
-        if (promptLabel) bits.push('<span class="prompt">' + promptLabel + ' prompt</span>');
-      }
-      if (typeof cacheHitPct === 'number') {
-        bits.push('<span' + (stale ? ' class="muted"' : '') + '>' + cacheHitPct + '% reuse</span>');
-      }
-      if (p.speculativeMode && p.speculativeMode !== 'off') {
-        const specName = specAcceptLabel(p.speculativeMode);
-        if (typeof draftAcceptancePct === 'number') {
-          const cls = stale ? 'muted' : (draftAcceptancePct >= 50 ? 'ok' : '');
-          bits.push('<span' + (cls ? ' class="' + cls + '"' : '') + '>' +
-            draftAcceptancePct.toFixed(1) + '% ' + specName + '</span>');
-        } else if (!p.generating) {
-          bits.push('<span class="muted">' + specName + ' —</span>');
-        }
       }
       if (typeof completionTokens === 'number') {
         const dur = typeof durationMs === 'number' && durationMs > 0 && !p.generating
-          ? ' · ' + (durationMs / 1000).toFixed(1) + 's'
+          ? ' in ' + (durationMs / 1000).toFixed(1) + ' s'
           : '';
-        bits.push('<span class="muted">' + fmtNum(completionTokens) + ' tok' + dur + '</span>');
+        bits.push('<span class="muted">Last reply: ' + fmtNum(completionTokens) + ' tok' + dur + '</span>');
       }
       if (metricsEl) {
-        metricsEl.innerHTML = bits.length ? bits.join('') : (rows.length ? 'Last ' + rows.length + ' call' + (rows.length === 1 ? '' : 's') : 'No generation yet');
+        metricsEl.innerHTML = bits.length ? bits.join('') : (rows.length ? '' : 'No generation yet');
         metricsEl.title = Array.isArray(perfLines) ? perfLines.join('\\n') : '';
       }
-    }
-
-    function renderStackedBar(stackId, subId, chart) {
-      const stack = $(stackId);
-      const sub = $(subId);
-      if (!chart) {
-        stack.innerHTML = '';
-        stack.classList.remove('over', 'warn');
-        sub.className = 'sub';
-        sub.textContent = '—';
-        return;
-      }
-      const capacity = chart.capacityBytes || chart.totalBytes || 1;
-      const scale = Math.max(capacity, chart.totalBytes || 0) || 1;
-      stack.innerHTML = '';
-      for (const seg of chart.segments || []) {
-        if (!seg.bytes || seg.bytes <= 0) continue;
-        const el = document.createElement('span');
-        el.className = 'seg-' + seg.key;
-        el.style.width = Math.max(0.5, (seg.bytes / scale) * 100) + '%';
-        el.title = seg.label + ': ~' + fmtBytes(seg.bytes);
-        stack.appendChild(el);
-      }
-      const pct = chart.capacityBytes
-        ? Math.round((chart.totalBytes / chart.capacityBytes) * 100)
-        : undefined;
-      // Headroom only applies when the bar is big enough to leave that much.
-      const remaining = chart.capacityBytes != null ? chart.capacityBytes - chart.totalBytes : undefined;
-      const cap = chart.capacityBytes || 0;
-      const over = remaining !== undefined && (remaining < 0 || (cap > VRAM_HEADROOM && remaining < VRAM_HEADROOM));
-      const warn = !over && remaining !== undefined && cap > VRAM_SOFT_HEADROOM && remaining < VRAM_SOFT_HEADROOM;
-      stack.classList.toggle('over', over);
-      stack.classList.toggle('warn', warn);
-      sub.className = 'sub' + (over ? ' over' : warn ? ' warn' : '');
-      sub.textContent =
-        '~' + fmtBytes(chart.totalBytes) +
-        (chart.capacityBytes
-          ? ' / ' + fmtBytes(chart.capacityBytes) + (pct !== undefined ? ' (' + pct + '%)' : '')
-          : '');
-    }
-
-    function liveMemoryEstimate() {
-      if (!memInputs || !memInputs.fileSizeBytes) return null;
-      const L = readLoad();
-      const nLayers = Math.max(1, memInputs.blockCount || 1);
-      // Follow the dropdown (pending switch), not a sticky flag.
-      const cpuOnly = $('backendSelect').value === 'cpu';
-      let onGpu = cpuOnly ? 0 : (L.gpuOffload <= 0 ? 0 : (L.gpuOffload >= 99 ? nLayers : Math.min(L.gpuOffload, nLayers)));
-      const expertShare = moeExpertShareOf(memInputs);
-      const ffnShare = denseFfnShareOf(memInputs);
-      const pleShare = pleShareOf(memInputs);
-      const pleBytes = memInputs.fileSizeBytes * pleShare;
-      const pleFromDisk = livePleFromDisk(L, pleBytes);
-      let gpuWeights = memInputs.fileSizeBytes * (onGpu / nLayers);
-      if (!cpuOnly && onGpu > 0 && pleShare > 0) {
-        gpuWeights = Math.max(0, gpuWeights - pleBytes);
-      }
-      if (!cpuOnly && memInputs.isMoe && L.nCpuMoe > 0 && onGpu > 0 && expertShare > 0) {
-        const moeCpu = Math.min(L.nCpuMoe, onGpu);
-        gpuWeights = Math.max(0, gpuWeights - memInputs.fileSizeBytes * (moeCpu / nLayers) * expertShare);
-      }
-      if (!cpuOnly && !memInputs.isMoe && L.nCpuFfn > 0 && onGpu > 0 && ffnShare > 0) {
-        const ffnCpu = Math.min(L.nCpuFfn, onGpu);
-        gpuWeights = Math.max(0, gpuWeights - memInputs.fileSizeBytes * (ffnCpu / nLayers) * ffnShare);
-      }
-      let cpuWeights = Math.max(0, memInputs.fileSizeBytes - gpuWeights - (pleFromDisk ? pleBytes : 0));
-      const mmprojBytes = Math.max(0, Number(memInputs.mmprojFileSizeBytes) || 0);
-      const gpuVisionBytes = !cpuOnly && onGpu > 0 && mmprojBytes > 0 && L.mmprojOffloadToGpu !== false ? mmprojBytes : 0;
-      const cpuVisionBytes = gpuVisionBytes > 0 ? 0 : mmprojBytes;
-      const heads = Math.max(1, memInputs.attentionHeadCount || 8);
-      const defaultKvHeads = Math.max(1, memInputs.attentionHeadCountKv || heads);
-      const defaultKeyDim = Math.max(1, memInputs.keyLength || Math.floor((memInputs.embeddingLength || heads * 128) / heads));
-      const defaultValDim = Math.max(1, memInputs.valueLength || defaultKeyDim);
-      const swa = memInputs.slidingWindow > 0 ? memInputs.slidingWindow : 0;
-      const pattern = memInputs.slidingWindowPattern;
-      const perKv = memInputs.attentionHeadCountKvPerLayer;
-      const recurrent = memInputs.recurrentLayers;
-      const fullInterval = memInputs.fullAttentionInterval > 1 ? memInputs.fullAttentionInterval : 0;
-      // Recurrent (SSM / linear-attention) layers keep no growing KV, but hold a
-      // fixed f32 state per layer per sequence slot. Mirrors
-      // estimateRecurrentStateBytesPerLayer() in core/memoryEstimate.ts.
-      const ssmStateSize = Math.max(0, Math.round(Number(memInputs.ssmStateSize) || 0));
-      const ssmInnerSize = Math.max(0, Math.round(Number(memInputs.ssmInnerSize) || Number(memInputs.embeddingLength) || 0));
-      const ssmConvKernel = Math.min(16, Math.max(2, Math.round(Number(memInputs.ssmConvKernel) || 4)));
-      const ssmGroupCount = Math.max(1, Math.round(Number(memInputs.ssmGroupCount) || 1));
-      const ssmPerLayerBytes = (ssmStateSize > 0 && ssmStateSize <= 4096 && ssmInnerSize > 0 && ssmInnerSize <= 1000000)
-        ? (ssmInnerSize * ssmStateSize + (ssmConvKernel - 1) * (ssmInnerSize + 2 * ssmGroupCount * ssmStateSize)) * 4
-        : 0;
-      function kvElemBytes(t) {
-        // Mirrors kvCacheTypeElemBytes in core/memoryEstimate.ts (block-quant scale overhead included)
-        if (t === 'q4_0' || t === 'iq4_nl') return 0.5625;
-        if (t === 'q4_1') return 0.625;
-        if (t === 'q5_0') return 0.6875;
-        if (t === 'q5_1') return 0.75;
-        if (t === 'q8_0') return 1;
-        if (t === 'f32') return 4;
-        return 2; // f16 / bf16
-      }
-      // llama.cpp offloads the *last* onGpu layers; each layer's KV lives on the
-      // device that owns the layer. Mirrors estimateMemory() in core.
-      const firstGpuLayer = Math.max(0, nLayers - onGpu);
-      function kvAt(ctx) {
-        const kBytes = kvElemBytes(L.cacheTypeK);
-        const vBytes = kvElemBytes(L.cacheTypeV);
-        let bytes = 0;
-        let gpuBytes = 0;
-        let fullAttnLayers = 0;
-        for (let i = 0; i < nLayers; i++) {
-          const isRecurrent = (recurrent && recurrent.length === nLayers)
-            ? !!recurrent[i]
-            : (perKv && perKv.length === nLayers && Number(perKv[i]) <= 0)
-              ? true
-              : !!(fullInterval && ((i + 1) % fullInterval !== 0));
-          if (isRecurrent) {
-            // Fixed per-slot SSM state (context-independent, still device memory).
-            bytes += ssmPerLayerBytes;
-            if (i >= firstGpuLayer) gpuBytes += ssmPerLayerBytes;
-            continue;
-          }
-          fullAttnLayers++;
-          const isSwa = !!(swa && pattern && pattern.length && pattern[i % pattern.length]);
-          let nKv;
-          if (perKv && perKv.length === nLayers && Number.isFinite(perKv[i])) {
-            nKv = Number(perKv[i]);
-            if (nKv <= 0) continue;
-          } else {
-            nKv = Math.max(1, defaultKvHeads);
-          }
-          const keyDim = (isSwa && memInputs.keyLengthSwa > 0) ? memInputs.keyLengthSwa : defaultKeyDim;
-          const valDim = (isSwa && memInputs.valueLengthSwa > 0) ? memInputs.valueLengthSwa : defaultValDim;
-          const tokens = isSwa ? Math.min(ctx, swa) : ctx;
-          const layerBytes = (nKv * keyDim * kBytes + nKv * valDim * vBytes) * tokens;
-          bytes += layerBytes;
-          if (i >= firstGpuLayer) gpuBytes += layerBytes;
-        }
-        return { bytes, gpuBytes, fullAttnLayers };
-      }
-      const slots = Math.max(1, Math.round(Number(L.maxConcurrentPredictions)) || 1);
-      const slotMul = L.unifiedKvCache || slots <= 1 ? 1 : slots;
-      const fullKv = kvAt(L.contextLength);
-      const warmCtx = Math.min(2048, Math.max(512, L.contextLength));
-      const warmKv = kvAt(warmCtx);
-      const kvBytes = fullKv.bytes * slotMul;
-      const kvBytesWarm = warmKv.bytes * slotMul;
-      const fullAttnLayers = fullKv.fullAttnLayers;
-      const kvOnGpu = !cpuOnly && !!L.offloadKvCacheToGpu && onGpu > 0;
-      // Under partial offload only the offloaded layers' KV is in VRAM.
-      const gpuKv = kvOnGpu ? fullKv.gpuBytes * slotMul : 0;
-      const gpuKvWarm = kvOnGpu ? warmKv.gpuBytes * slotMul : 0;
-      const cpuKv = Math.max(0, kvBytes - gpuKv);
-      const cpuKvWarm = Math.max(0, kvBytesWarm - gpuKvWarm);
-      const kvSplit = kvOnGpu && cpuKv > 1024 * 1024;
-      // Mirrors computeOverheadBytes() / peerGpuOverheadBytes() in memoryEstimate.ts.
-      const gpusForOh = (!cpuOnly && gpuInfos && gpuInfos.length) ? gpuInfos : (gpuInfo ? [gpuInfo] : []);
-      const ohIds = gpusForOh.map((g) => String((g && g.llamaDeviceId) || '').toLowerCase());
-      const ohBackend = cpuOnly
-        ? 'cpu'
-        : (ohIds.some((id) => id.indexOf('vulkan') === 0)
-          ? 'vulkan'
-          : (ohIds.some((id) => /^(cuda|rocm|hip)/.test(id))
-            ? 'cuda'
-            : (ohIds.some((id) => id.indexOf('metal') === 0) ? 'metal' : 'unknown')));
-      const embedForOverhead = Math.max(2048, memInputs.embeddingLength || 4096);
-      const ubatchForOverhead = Math.min(Math.max(32, L.physicalBatchSize || 512), 8192);
-      const batchForOverhead = Math.min(Math.max(32, L.evalBatchSize || 2048), 8192);
-      const ctxForOverhead = Math.min(Math.max(512, L.contextLength || 4096), 262144);
-      const splitNone = L.splitMode === 'none';
-      const vulkanDeviceCount = (onGpu > 0 && ohBackend === 'vulkan')
-        ? ((gpusForOh.length >= 2 && !splitNone) ? gpusForOh.length : 1)
-        : 0;
-      // Mirrors vulkanDeviceReservedBytes() / vulkanDriverBytes(): 384 MiB
-      // driver + 256 MiB slop on one Vulkan device. Split Flash-Next keeps
-      // 768 MiB driver + 2.5 GiB reserve; Qwen3.5 RCO (and qwen4exp with
-      // SSM geometry) keeps the 256 MiB slop even when split.
-      // Linear-recurrent hybrids also run a smaller graph; full/SWA
-      // Flash-Next without ssm.* keeps the dense graph.
-      // Inline isLinearRecurrentHybrid(): this is webview JS, the TS import
-      // above is not in scope here.
-      const archNorm = String((memInputs && memInputs.architecture) || '').toLowerCase().replace(/[._-]/g, '');
-      const ssmState = Number(memInputs && memInputs.ssmStateSize) || 0;
-      const discountRecurrent = archNorm.indexOf('qwen35') === 0 || (ssmState > 0 && ssmState <= 4096);
-      const ohTax = {
-        vulkan: { driver: 768 * 1024 * 1024, peer: 512 * 1024 * 1024, graph: 12, reserved: 2.5 * 1024 ** 3 },
-        cuda: { driver: 384 * 1024 * 1024, peer: 256 * 1024 * 1024, graph: 8, reserved: 0 },
-        metal: { driver: 384 * 1024 * 1024, peer: 256 * 1024 * 1024, graph: 8, reserved: 0 },
-        unknown: { driver: 512 * 1024 * 1024, peer: 384 * 1024 * 1024, graph: 10, reserved: 0 },
-      }[ohBackend] || { driver: 512 * 1024 * 1024, peer: 384 * 1024 * 1024, graph: 10, reserved: 0 };
-      const reservedBytes = ohBackend === 'vulkan'
-        ? (vulkanDeviceCount <= 0 ? 0 : ((vulkanDeviceCount > 1 && !discountRecurrent) ? 2.5 * 1024 ** 3 : 256 * 1024 * 1024))
-        : (ohTax.reserved || 0);
-      const driverBytes = ohBackend === 'vulkan'
-        ? (vulkanDeviceCount > 1 ? ohTax.driver : (vulkanDeviceCount === 1 ? 384 * 1024 * 1024 : 0))
-        : ohTax.driver;
-      const graphElem = L.flashAttention === 'off' ? Math.max(ohTax.graph, 36) : ohTax.graph;
-      const fullAttnFrac = discountRecurrent && nLayers > 0
-        ? Math.min(1, Math.max(0.05, fullAttnLayers / nLayers))
-        : 1;
-      const graphRaw = ctxForOverhead * embedForOverhead * graphElem * fullAttnFrac;
-      const graphCap = L.flashAttention === 'off'
-        ? 6 * 1024 * 1024 * 1024
-        : (ohBackend === 'vulkan' ? 2.5 * 1024 ** 3 : (ohBackend === 'cuda' ? 1.75 * 1024 ** 3 : 2 * 1024 ** 3));
-      const overhead = ohBackend === 'cpu'
-        ? Math.round(256 * 1024 * 1024)
-        : Math.round(
-          driverBytes +
-          reservedBytes +
-          ubatchForOverhead * embedForOverhead * 96 +
-          batchForOverhead * 8 * 1024 +
-          Math.min(graphRaw, graphCap)
-        );
-      const gpuOverhead = onGpu > 0 ? overhead : 0;
-      const peerReserved = ohBackend === 'vulkan'
-        ? (discountRecurrent ? 256 * 1024 * 1024 : (ohTax.reserved || 0))
-        : (ohTax.reserved || 0);
-      const peerOverhead = (onGpu > 0 && gpusForOh.length >= 2 && !splitNone && ohBackend !== 'cpu')
-        ? Math.round(ohTax.peer + peerReserved + ubatchForOverhead * embedForOverhead * 32)
-        : 0;
-      const cpuOverhead = onGpu > 0 ? Math.round(overhead * 0.15) : Math.round(overhead * 0.5);
-
-      const warnings = [];
-      let willSpill = false;
-
-      // DFlash draft weights + f16 KV (mirrors estimateMemory draft footprint).
-      let draftGpuBundle = 0;
-      let draftCpuBundle = 0;
-      let draftGpuWarmBundle = 0;
-      let draftCpuWarmBundle = 0;
-      let draftLine = '';
-      const sidecarMtp = (L.speculativeMode === 'mtp' || L.speculativeMode === 'ngram-mtp') && memInputs.draft && memInputs.draft.fileSizeBytes && !(Number(memInputs.nextnPredictLayers) > 0);
-      const draftIn = ((L.speculativeMode === 'dflash' || L.speculativeMode === 'ngram-dflash' || sidecarMtp) && memInputs.draft && memInputs.draft.fileSizeBytes)
-        ? memInputs.draft
-        : null;
-      if (draftIn) {
-        const dLayers = Math.max(1, draftIn.blockCount || 1);
-        const dOff = Number(L.draftGpuOffload);
-        const dOnGpu = cpuOnly ? 0 : (dOff <= 0 ? 0 : (dOff >= 99 ? dLayers : Math.min(dOff, dLayers)));
-        const dGpuW = draftIn.fileSizeBytes * (dOnGpu / dLayers);
-        const dCpuW = Math.max(0, draftIn.fileSizeBytes - dGpuW);
-        function draftKvAt(ctx) {
-          const kBytes = sidecarMtp ? kvElemBytes(L.cacheTypeK) : 2; // DFlash forces f16
-          const vBytes = sidecarMtp ? kvElemBytes(L.cacheTypeV) : 2;
-          const heads = Math.max(1, draftIn.attentionHeadCount || 8);
-          const defaultKvHeads = Math.max(1, draftIn.attentionHeadCountKv || heads);
-          const defaultKeyDim = Math.max(1, draftIn.keyLength || Math.floor((draftIn.embeddingLength || heads * 128) / heads));
-          const defaultValDim = Math.max(1, draftIn.valueLength || defaultKeyDim);
-          // Mirrors draftKvCaps() in core/memoryEstimate.ts: a sidecar mtp-*.gguf
-          // carries the parent's block_count/interval/recurrent mask but holds
-          // only the next-n heads, so its cache is one next-n layer, not the
-          // parent's 16 full-attn layers (~5 GiB of cache that never exists).
-          const nextn = Math.max(1, Math.floor(Number(draftIn.nextnPredictLayers) || 1));
-          const sidecarReduced = sidecarMtp && nextn < dLayers;
-          const kvLayers = sidecarReduced ? nextn : dLayers;
-          const swa = !sidecarReduced && draftIn.slidingWindow > 0 ? draftIn.slidingWindow : 0;
-          const pattern = sidecarReduced ? null : draftIn.slidingWindowPattern;
-          const perKv = sidecarReduced ? null : draftIn.attentionHeadCountKvPerLayer;
-          const recurrent = sidecarReduced ? null : draftIn.recurrentLayers;
-          const fullInterval = !sidecarReduced && draftIn.fullAttentionInterval > 1 ? draftIn.fullAttentionInterval : 0;
-          let bytes = 0;
-          for (let i = 0; i < kvLayers; i++) {
-            const isRecurrent = (recurrent && recurrent.length === kvLayers)
-              ? !!recurrent[i]
-              : (perKv && perKv.length === kvLayers && Number(perKv[i]) <= 0)
-                ? true
-                : !!(fullInterval && ((i + 1) % fullInterval !== 0));
-            if (isRecurrent) continue;
-            const isSwa = !!(swa && pattern && pattern.length && pattern[i % pattern.length]);
-            let nKv;
-            if (perKv && perKv.length === kvLayers && Number.isFinite(perKv[i])) {
-              nKv = Number(perKv[i]);
-              if (nKv <= 0) continue;
-            } else {
-              nKv = Math.max(1, defaultKvHeads);
-            }
-            const keyDim = (isSwa && draftIn.keyLengthSwa > 0) ? draftIn.keyLengthSwa : defaultKeyDim;
-            const valDim = (isSwa && draftIn.valueLengthSwa > 0) ? draftIn.valueLengthSwa : defaultValDim;
-            const tokens = isSwa ? Math.min(ctx, swa) : ctx;
-            bytes += (nKv * keyDim * kBytes + nKv * valDim * vBytes) * tokens;
-          }
-          return bytes;
-        }
-        const dKv = draftKvAt(L.contextLength) * slotMul;
-        const dKvWarm = draftKvAt(warmCtx) * slotMul;
-        const dKvOnGpu = dOnGpu > 0;
-        draftGpuBundle = dGpuW + (dKvOnGpu ? dKv : 0);
-        draftCpuBundle = dCpuW + (dKvOnGpu ? 0 : dKv);
-        draftGpuWarmBundle = dGpuW + (dKvOnGpu ? dKvWarm : 0);
-        draftCpuWarmBundle = dCpuW + (dKvOnGpu ? 0 : dKvWarm);
-        draftLine = (sidecarMtp ? 'MTP sidecar: ~' : 'DFlash draft: ~') + fmtBytes(dGpuW) + ' GPU / ~' + fmtBytes(dCpuW) + ' RAM weights (' +
-          dOnGpu + '/' + dLayers + ' layers) · draft KV ~' + fmtBytes(dKv) + (sidecarMtp ? '' : ' f16') +
-          (dKvOnGpu ? ' (GPU)' : ' (CPU RAM)');
-        warnings.push(
-          (sidecarMtp ? 'MTP sidecar included: ~' : 'DFlash draft included: ~') + fmtBytes(draftIn.fileSizeBytes) + ' weights (' +
-          dOnGpu + '/' + dLayers + ' GPU layers) + ~' + fmtBytes(dKv) + ' draft KV' + (sidecarMtp ? '' : ' (f16)') + ' at full context.'
-        );
-      } else if (L.speculativeMode === 'dflash' || L.speculativeMode === 'ngram-dflash') {
-        warnings.push('DFlash is on but no draft GGUF is selected — memory bars omit the draft; pick a draft model before starting.');
-      } else if ((L.speculativeMode === 'mtp' || L.speculativeMode === 'ngram-mtp') && !sidecarMtp) {
-        const mtpLayers = Math.max(0, Math.floor(Number(memInputs.nextnPredictLayers) || 0));
-        if (mtpLayers > 0) {
-          function mtpKvAt(ctx) {
-            const kBytes = kvElemBytes(L.cacheTypeK);
-            const vBytes = kvElemBytes(L.cacheTypeV);
-            const heads = Math.max(1, memInputs.attentionHeadCount || 8);
-            const nKv = Math.max(1, memInputs.attentionHeadCountKv || heads);
-            const keyDim = Math.max(1, memInputs.keyLength || Math.floor((memInputs.embeddingLength || heads * 128) / heads));
-            const valDim = Math.max(1, memInputs.valueLength || keyDim);
-            return mtpLayers * (nKv * keyDim * kBytes + nKv * valDim * vBytes) * ctx;
-          }
-          const mtpKv = mtpKvAt(L.contextLength) * slotMul;
-          const mtpKvWarm = mtpKvAt(warmCtx) * slotMul;
-          const mtpKvOnGpu = kvOnGpu;
-          draftGpuBundle = mtpKvOnGpu ? mtpKv : 0;
-          draftCpuBundle = mtpKvOnGpu ? 0 : mtpKv;
-          draftGpuWarmBundle = mtpKvOnGpu ? mtpKvWarm : 0;
-          draftCpuWarmBundle = mtpKvOnGpu ? 0 : mtpKvWarm;
-          draftLine = 'MTP: next-n heads already in GGUF · extra KV ~' + fmtBytes(mtpKv) +
-            ' (' + mtpLayers + ' layers)' + (mtpKvOnGpu ? ' (GPU)' : ' (CPU RAM)');
-        } else {
-          warnings.push('MTP is on but this GGUF reports no nextn_predict_layers — speculative overhead omitted from the bars.');
-        }
-      }
-
-      if (mmprojBytes > 0) {
-        const gpusForVision = (!cpuOnly && gpuInfos && gpuInfos.length) ? gpuInfos : [];
-        const mainIdxForVision = gpusForVision.length
-          ? Math.min(Math.max(0, Number(L.mainGpu) || 0), gpusForVision.length - 1)
-          : 0;
-        const where = gpuVisionBytes > 0
-          ? (gpusForVision.length
-            ? ' on ' + gpuLabel(gpusForVision[mainIdxForVision], mainIdxForVision) + ' (CLIP / --mmproj, not tensor-split)'
-            : ' in VRAM (--mmproj)')
-          : (L.mmprojOffloadToGpu === false ? ' in system RAM (--no-mmproj-offload)' : ' in system RAM');
-        warnings.push('Vision projector included: ~' + fmtBytes(mmprojBytes) + where + '.');
-      }
-
-      const liveShares = (!cpuOnly && gpusForOh.length)
-        ? effectiveTensorSplitShares(L.tensorSplit, gpusForOh, L.splitMode, L.mainGpu)
-        : [1];
-      const liveMassOpts = {
-        isMoe: !!memInputs.isMoe,
-        nCpuMoe: L.nCpuMoe,
-        moeExpertShare: expertShare,
-        nCpuFfn: L.nCpuFfn,
-        denseFfnShare: ffnShare,
-      };
-      const liveWeightShares = (!cpuOnly && gpusForOh.length >= 2)
-        ? layerAwareWeightSharesLive(nLayers, onGpu, liveShares, L.splitMode, L.mainGpu, liveMassOpts)
-        : liveShares;
-      const liveKvShares = (!cpuOnly && gpusForOh.length >= 2)
-        ? layerAwareWeightSharesLive(nLayers, onGpu, liveShares, L.splitMode, L.mainGpu, {})
-        : liveShares;
-      const liveKvPerGpu = liveShares.map((_, i) => (kvOnGpu ? gpuKv * (liveKvShares[i] || 0) : 0));
-      const liveMainIdx = gpusForOh.length ? Math.min(Math.max(0, Number(L.mainGpu) || 0), gpusForOh.length - 1) : 0;
-      const livePeerCount = gpusForOh.filter((_, i) => i !== liveMainIdx && (liveShares[i] || 0) > 0).length;
-      const totalPeer = peerOverhead * livePeerCount;
-      const totalGpu = gpuWeights + gpuKv + gpuOverhead + totalPeer + draftGpuBundle + gpuVisionBytes;
-      const totalCpu = cpuWeights + cpuKv + cpuOverhead + draftCpuBundle + cpuVisionBytes;
-      const totalGpuWarm = gpuWeights + gpuKvWarm + gpuOverhead + totalPeer + draftGpuWarmBundle + gpuVisionBytes;
-      const totalCpuWarm = cpuWeights + cpuKvWarm + cpuOverhead + draftCpuWarmBundle + cpuVisionBytes;
-      if (cpuOnly) {
-        warnings.push('CPU backend: no GPU acceleration — weights, KV cache, and compute use system RAM (GPU Offload is ignored).');
-      }
-      if (!cpuOnly && onGpu > 0 && onGpu < nLayers) {
-        warnings.push('Partial GPU offload: ' + (nLayers - onGpu) + '/' + nLayers + ' layers (~' + fmtBytes(cpuWeights) + ') stay in system RAM.');
-      }
-      const singleIgpu = !cpuOnly && gpuInfos && gpuInfos.length === 1 && isIntegratedGpu(gpuInfos[0]);
-      if (!cpuOnly && onGpu === 0 && !singleIgpu) warnings.push('GPU offload is 0 — weights run from system RAM.');
-      if (!cpuOnly && !L.offloadKvCacheToGpu) warnings.push('KV cache (~' + fmtBytes(kvBytes) + ' at full context) is in system RAM.');
-      else if (kvSplit) warnings.push('KV cache follows the layers: ~' + fmtBytes(gpuKv) + ' in VRAM for the ' + onGpu + ' offloaded layers, ~' + fmtBytes(cpuKv) + ' in system RAM for the ' + (nLayers - onGpu) + ' CPU layers (at full context).');
-      if (!cpuOnly && memInputs.isMoe && L.nCpuMoe > 0) {
-        warnings.push('CPU MoE layers = ' + L.nCpuMoe + ': ~' + Math.round(expertShare * 100) + '% of weights are experts; those layers’ experts stay in system RAM.');
-        if (
-          gpusForOh.length >= 2 &&
-          L.splitMode !== 'none' && L.splitMode !== 'row' && L.splitMode !== 'tensor' &&
-          liveWeightShares.some((w, i) => (w || 0) > (liveShares[i] || 0) + 0.08)
-        ) {
-          warnings.push('Layer split + CPU MoE: llama.cpp assigns the first layers (cheap after --n-cpu-moe) to earlier GPUs, so later cards hold more expert weight than the tensor-split percentages suggest.');
-        }
-      }
-      if (!cpuOnly && !memInputs.isMoe && L.nCpuFfn > 0) {
-        warnings.push('CPU FFN layers = ' + L.nCpuFfn + ': ~' + Math.round(ffnShare * 100) + '% of per-layer weights are dense FFN; those layers’ FFN stays in system RAM.');
-      }
-      if (!cpuOnly && gpuInfos && gpuInfos.length) {
-        const shares = liveShares;
-        const mainIdx = liveMainIdx;
-        if (singleIgpu) {
-          const g = gpuInfos[0];
-          const used = gpuWeights * (liveWeightShares[0] || 0) + (liveKvPerGpu[0] || 0) + overheadForGpu(0, mainIdx, shares[0] || 0, gpuOverhead, peerOverhead) + (draftGpuBundle * (liveWeightShares[0] || 0)) + gpuVisionBytes;
-          const vram = fmtBytes(g.totalBytes);
-          const gttCap = g.gttTotalBytes || 0;
-          const gttLabel = gttCap > 0 ? '~' + fmtBytes(gttCap) : 'system RAM';
-          if (onGpu <= 0) {
-            warnings.unshift('CPU only — iGPU unused. The ' + vram + ' VRAM bar is the carve-out, not your budget.');
-            warnings.push('To try the iGPU, set GPU offload to ' + nLayers + '. Weights go to GTT (' + gttLabel + '), not that ' + vram + '.');
-          } else if (gttCap > 0 && used > gttCap) {
-            willSpill = true;
-            warnings.unshift('Too big for GTT (~' + fmtBytes(used) + ' of ' + fmtBytes(gttCap) + '). Lower context or keep offload at 0.');
-          } else {
-            warnings.unshift('iGPU via GTT — ~' + fmtBytes(gpuWeights) + ' weights in system RAM. Dedicated ' + vram + ' VRAM is unused; that is normal.');
-          }
-        } else {
-        for (let i = 0; i < gpuInfos.length; i++) {
-          const g = gpuInfos[i];
-          const share = shares[i] || 0;
-          const used = gpuWeights * (liveWeightShares[i] || 0) + (liveKvPerGpu[i] || 0) + overheadForGpu(i, mainIdx, share, gpuOverhead, peerOverhead) + (draftGpuBundle * (liveWeightShares[i] || 0)) + (i === mainIdx ? gpuVisionBytes : 0);
-          const cap = g.totalBytes;
-          if (!cap) continue;
-          const pct = Math.round((used / cap) * 100);
-          const label = gpuLabel(g, i);
-          if (used > cap) {
-            willSpill = true;
-            warnings.unshift('Estimated ' + label + ' at full context ~' + fmtBytes(used) + ' is over the full ' + fmtBytes(cap) + ' (' + pct + '%). Expect spill to system RAM. Lower Context or GPU Offload.');
-          } else if (cap > VRAM_HEADROOM && used > cap - VRAM_HEADROOM) {
-            willSpill = true;
-            warnings.unshift('Tight on ' + label + ' at full context: ~' + fmtBytes(used) + ' of ' + fmtBytes(cap) + ' (' + pct + '%). Only ~' + fmtBytes(cap - used) + ' left — target is ' + fmtBytes(VRAM_HEADROOM) + ' free. Lower Context or GPU Offload.');
-          } else if (cap > VRAM_SOFT_HEADROOM && cap - used < VRAM_SOFT_HEADROOM) {
-            warnings.push('Getting full on ' + label + ' at full context: ~' + fmtBytes(used) + ' of ' + fmtBytes(cap) + ' VRAM (' + pct + '%).');
-          }
-        }
-        // Mirrors hostFallbackWarning() — skip APUs; only discrete GTT fallback.
-        for (let i = 0; i < gpuInfos.length; i++) {
-          const g = gpuInfos[i];
-          if (isIntegratedGpu(g)) continue;
-          const cap = g.totalBytes || 0;
-          if (!cap) continue;
-          const vramUsed = g.usedBytes || 0;
-          const gttUsed = g.gttUsedBytes || 0;
-          const visTotal = g.visVramTotalBytes || 0;
-          const smallBar = visTotal > 0 && visTotal < cap / 2;
-          const gttHeavy = gttUsed >= 1024 ** 3 && gttUsed > Math.max(vramUsed * 2, cap * 0.25);
-          if (!gttHeavy && !(smallBar && gttUsed >= 1024 ** 3)) continue;
-          warnings.unshift(
-            gpuLabel(g, i) + ' is in GTT (~' + fmtBytes(gttUsed) + '), not VRAM.' +
-            (smallBar ? ' Likely ReBAR off.' : '') +
-            ' That card will be slow. Use one GPU, or fix ReBAR.'
-          );
-        }
-        }
-        if (gpuInfos.length >= 2 && L.splitMode !== 'none' && parseTensorSplit(L.tensorSplit).length < 2) {
-          warnings.push('Tensor split is empty — llama.cpp will split by VRAM size (often 1:1). Pick the faster card as Main GPU and raise Weights on main GPU so that card gets more of the model.');
-        }
-      } else if (!cpuOnly && gpuInfo && gpuInfo.totalBytes) {
-        if (isIntegratedGpu(gpuInfo)) {
-          const vram = fmtBytes(gpuInfo.totalBytes);
-          const gttCap = gpuInfo.gttTotalBytes || 0;
-          const gttLabel = gttCap > 0 ? '~' + fmtBytes(gttCap) : 'system RAM';
-          if (onGpu <= 0) {
-            warnings.unshift('CPU only — iGPU unused. The ' + vram + ' VRAM bar is the carve-out, not your budget.');
-            warnings.push('To try the iGPU, set GPU offload to ' + nLayers + '. Weights go to GTT (' + gttLabel + '), not that ' + vram + '.');
-          } else if (gttCap > 0 && totalGpu > gttCap) {
-            willSpill = true;
-            warnings.unshift('Too big for GTT (~' + fmtBytes(totalGpu) + ' of ' + fmtBytes(gttCap) + '). Lower context or keep offload at 0.');
-          } else {
-            warnings.unshift('iGPU via GTT — ~' + fmtBytes(gpuWeights) + ' weights in system RAM. Dedicated ' + vram + ' VRAM is unused; that is normal.');
-          }
-        } else {
-        const cap = gpuInfo.totalBytes;
-        const pct = Math.round((totalGpu / cap) * 100);
-        if (totalGpu > cap) {
-          willSpill = true;
-          warnings.unshift('Estimated VRAM at full context ~' + fmtBytes(totalGpu) + ' is over the full ' + fmtBytes(cap) + ' GPU (' + pct + '%). Expect spill to system RAM. Lower Context or GPU Offload.');
-        } else if (cap > VRAM_HEADROOM && totalGpu > cap - VRAM_HEADROOM) {
-          willSpill = true;
-          warnings.unshift('Tight on VRAM at full context: ~' + fmtBytes(totalGpu) + ' of ' + fmtBytes(cap) + ' (' + pct + '%). Only ~' + fmtBytes(cap - totalGpu) + ' left — target is ' + fmtBytes(VRAM_HEADROOM) + ' free. Lower Context or GPU Offload.');
-        } else if (cap > VRAM_SOFT_HEADROOM && cap - totalGpu < VRAM_SOFT_HEADROOM) {
-          warnings.push('Getting full at full context: ~' + fmtBytes(totalGpu) + ' of ' + fmtBytes(cap) + ' VRAM (' + pct + '%).');
-        }
-        }
-      }
-      if (cpuOnly && systemRamTotalBytes && totalCpu > systemRamTotalBytes * 0.9) {
-        willSpill = true;
-        warnings.unshift('Estimated system RAM at full context ~' + fmtBytes(totalCpu) + ' is very high vs ' + fmtBytes(systemRamTotalBytes) + '. Lower Context Length or use a smaller model/quant.');
-      }
-      const lines = [];
-      if (cpuOnly) {
-        lines.push('Backend: CPU — GPU Offload / VRAM not used');
-      } else if (gpuInfos && gpuInfos.length) {
-        for (let i = 0; i < gpuInfos.length; i++) {
-          const g = gpuInfos[i];
-          lines.push(gpuLabel(g, i) + ' capacity: ' + fmtBytes(g.totalBytes));
-          if (g.usedBytes != null) {
-            const free = Math.max(0, g.totalBytes - g.usedBytes);
-            lines.push('Live ' + gpuLabel(g, i) + ' free now: ~' + fmtBytes(free) + ' (current occupancy — not part of the estimate bars)');
-          }
-          if ((g.gttUsedBytes || 0) > 0) {
-            lines.push('Live ' + gpuLabel(g, i) + ' GTT now: ~' + fmtBytes(g.gttUsedBytes) + ' of host RAM mapped to the GPU (VRAM in use ~' + fmtBytes(g.usedBytes || 0) + ')');
-          }
-        }
-        if (gpuInfos.length >= 2) {
-          const mainIdx = clampMainGpu(L.mainGpu, gpuInfos.length);
-          const mainG = gpuInfos[mainIdx];
-          const mainLabel = mainG ? gpuLabel(mainG, mainIdx) : ('GPU ' + mainIdx);
-          if (L.splitMode === 'none') {
-            lines.push('No GPU split — all GPU layers on ' + mainLabel + ' (--split-mode none)');
-          } else {
-            const split = parseTensorSplit(L.tensorSplit);
-            lines.push('Tensor split: ' + (split.length >= 2 ? L.tensorSplit : 'auto (by VRAM)') + ' · split-mode ' + (L.splitMode || 'layer') + ' · main ' + mainLabel);
-          }
-        }
-      } else {
-        lines.push('GPU VRAM: unknown');
-      }
-      if (systemRamTotalBytes) lines.push('System RAM capacity: ' + fmtBytes(systemRamTotalBytes));
-      if (cpuOnly) {
-        lines.push('Weights in RAM: ~' + fmtBytes(cpuWeights) + ' (' + nLayers + ' layers)');
-        lines.push('KV @ full ' + Number(L.contextLength).toLocaleString() + ' ctx: ~' + fmtBytes(kvBytes) + ' (system RAM)' +
-          (fullAttnLayers < nLayers ? (' · ' + fullAttnLayers + '/' + nLayers + ' full-attn layers') : ''));
-        if (draftLine) lines.push(draftLine);
-        if (mmprojBytes > 0) lines.push('Vision projector in RAM: ~' + fmtBytes(mmprojBytes));
-        if (kvBytesWarm < kvBytes) {
-          lines.push('KV @ ~' + warmCtx.toLocaleString() + ' ctx (mid-chat): ~' + fmtBytes(kvBytesWarm) + ' → total ~' + fmtBytes(totalCpuWarm));
-        }
-        lines.push('Est. total system RAM at full context: ~' + fmtBytes(totalCpu));
-      } else {
-        lines.push('Weights on GPU: ~' + fmtBytes(gpuWeights) + ' (' + onGpu + '/' + nLayers + ' layers)' + (cpuWeights > 1024*1024 ? ' · RAM: ~' + fmtBytes(cpuWeights) : '') +
-          (memInputs.isMoe && expertShare > 0 ? (' · MoE experts ~' + Math.round(expertShare * 100) + '% of file') : ''));
-        const kvPlacement = kvSplit
-          ? ' (~' + fmtBytes(gpuKv) + ' GPU · ~' + fmtBytes(cpuKv) + ' CPU RAM)'
-          : (kvOnGpu ? ' (GPU)' : ' (CPU RAM)');
-        lines.push('KV @ full ' + Number(L.contextLength).toLocaleString() + ' ctx: ~' + fmtBytes(kvBytes) + kvPlacement +
-          (fullAttnLayers < nLayers ? (' · ' + fullAttnLayers + '/' + nLayers + ' full-attn layers') : ''));
-        if (draftLine) lines.push(draftLine);
-        if (mmprojBytes > 0) {
-          const mainIdx = (gpuInfos && gpuInfos.length) ? clampMainGpu(L.mainGpu, gpuInfos.length) : 0;
-          const mainG = gpuInfos && gpuInfos[mainIdx];
-          lines.push('Vision projector: ~' + fmtBytes(mmprojBytes) + (gpuVisionBytes > 0
-            ? (mainG ? ' (' + gpuLabel(mainG, mainIdx) + ', CLIP / --mmproj)' : ' (GPU, --mmproj)')
-            : (L.mmprojOffloadToGpu === false ? ' (CPU RAM, --no-mmproj-offload)' : ' (CPU RAM)')));
-        }
-        if (kvBytesWarm < kvBytes) {
-          lines.push('KV @ ~' + warmCtx.toLocaleString() + ' ctx (mid-chat): ~' + fmtBytes(kvBytesWarm) +
-            (kvSplit ? ' (~' + fmtBytes(gpuKvWarm) + ' GPU · ~' + fmtBytes(cpuKvWarm) + ' CPU RAM)' : (kvOnGpu ? ' (GPU)' : ' (CPU RAM)')) +
-            ' → VRAM ~' + fmtBytes(totalGpuWarm));
-        }
-        lines.push('Est. total at full context — VRAM: ~' + fmtBytes(totalGpu) + (totalCpu > 1024*1024 ? ' · system RAM: ~' + fmtBytes(totalCpu) : ''));
-      }
-      lines.push('Bars show estimate at full context, including Vulkan/CUDA compute and per-GPU heaps. Actual use still varies by quant and driver.');
-      const specLabel = draftIn
-        ? (sidecarMtp ? 'MTP draft (weights + KV)' : 'DFlash draft (weights + KV)')
-        : ((L.speculativeMode === 'mtp' || L.speculativeMode === 'ngram-mtp') && draftGpuBundle + draftCpuBundle > 0
-          ? 'MTP head + KV'
-          : 'Speculative');
-      const charts = buildCharts(gpuWeights, cpuWeights, gpuKv, cpuKv, gpuOverhead, cpuOverhead, totalGpu, totalCpu, draftGpuBundle, draftCpuBundle, specLabel, { tensorSplit: L.tensorSplit, mainGpu: L.mainGpu, splitMode: L.splitMode }, gpuVisionBytes, cpuVisionBytes, peerOverhead, liveWeightShares, liveKvPerGpu);
-      if (cpuOnly) {
-        charts.vram.capacityBytes = undefined;
-      }
-      let summary;
-      const specBytes = draftGpuBundle + draftCpuBundle;
-      const specSuffix = specBytes > 0
-        ? (L.speculativeMode === 'dflash' || L.speculativeMode === 'ngram-dflash'
-          ? (cpuOnly
-            ? ' · DFlash +' + fmtBytes(specBytes)
-            : ' · DFlash +' + fmtBytes(draftGpuBundle) + (draftCpuBundle > 1024 * 1024 ? ' (+' + fmtBytes(draftCpuBundle) + ' RAM)' : ''))
-          : (L.speculativeMode === 'mtp' || L.speculativeMode === 'ngram-mtp')
-            ? (cpuOnly
-              ? ' · MTP +' + fmtBytes(specBytes)
-              : ' · MTP +' + fmtBytes(draftGpuBundle) + (draftCpuBundle > 1024 * 1024 ? ' (+' + fmtBytes(draftCpuBundle) + ' RAM)' : ''))
-            : '')
-        : '';
-      if (cpuOnly) {
-        summary = 'System RAM ~' + fmtBytes(totalCpu) +
-          (systemRamTotalBytes ? ' of ' + fmtBytes(systemRamTotalBytes) : '') +
-          ' · KV ~' + fmtBytes(kvBytes) + ' at full context' + specSuffix;
-      } else if (gpuInfos && gpuInfos.length >= 2 && charts.vram2) {
-        const p0 = charts.vram.capacityBytes ? Math.round((charts.vram.totalBytes / charts.vram.capacityBytes) * 100) : undefined;
-        const p1 = charts.vram2.capacityBytes ? Math.round((charts.vram2.totalBytes / charts.vram2.capacityBytes) * 100) : undefined;
-        const order = gpuDisplayOrder(gpuInfos, L.mainGpu);
-        const g0 = gpuInfos[order[0]];
-        const g1 = gpuInfos[order[1]];
-        summary = 'VRAM ' + gpuLabel(g0, order[0]) + ' ~' + fmtBytes(charts.vram.totalBytes) +
-          (charts.vram.capacityBytes ? ' of ' + fmtBytes(charts.vram.capacityBytes) + (p0 !== undefined ? ' (' + p0 + '%)' : '') : '') +
-          ' · ' + gpuLabel(g1, order[1]) + ' ~' + fmtBytes(charts.vram2.totalBytes) +
-          (charts.vram2.capacityBytes ? ' of ' + fmtBytes(charts.vram2.capacityBytes) + (p1 !== undefined ? ' (' + p1 + '%)' : '') : '') +
-          ' · KV ~' + fmtBytes(kvBytes) + (kvSplit ? ' (~' + fmtBytes(gpuKv) + ' on GPU)' : (kvOnGpu ? ' on GPU' : ' in RAM')) +
-          ' · ' + onGpu + '/' + nLayers + ' layers offloaded' + specSuffix;
-      } else {
-        const cap = gpuBarCapacityBytes(gpuInfo) || (gpuInfo && gpuInfo.totalBytes);
-        const pct = cap ? Math.round((totalGpu / cap) * 100) : undefined;
-        const kind = isIntegratedGpu(gpuInfo) ? 'iGPU GTT' : 'VRAM';
-        summary = kind + ' ~' + fmtBytes(totalGpu) +
-          (cap ? ' of ' + fmtBytes(cap) + (pct !== undefined ? ' (' + pct + '%)' : '') : '') +
-          ' · KV ~' + fmtBytes(kvBytes) + (kvSplit ? ' (~' + fmtBytes(gpuKv) + ' on GPU)' : (kvOnGpu ? ' on GPU' : ' in RAM')) +
-          ' · ' + onGpu + '/' + nLayers + ' layers offloaded' + specSuffix;
-      }
-      return {
-        summary,
-        lines,
-        warnings,
-        willSpill,
-        charts,
-        totalGpu,
-        totalCpu,
-      };
     }
 
     /** Say when a curated model mode replaces the sampling values below. */
@@ -3469,8 +3193,17 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       const el = $('mmprojOffloadToGpu');
       if (!el) return;
       const hint = $('mmprojPathHint');
-      const hasProj = !!(hint && (hint.dataset.path || '').trim());
-      el.disabled = !!cpuOnly || !hasProj;
+      const projPath = (hint && (hint.dataset.path || '').trim()) || '';
+      el.disabled = !!cpuOnly || !projPath;
+      // The offload toggle does nothing without a projector, so it only shows with one.
+      const row = $('mmprojOffloadRow');
+      if (row) row.classList.toggle('hidden', !projPath);
+      const sum = $('visionSum');
+      if (sum) {
+        sum.textContent = projPath
+          ? (projPath.split(/[/\\\\]/).pop() + (el.checked && !cpuOnly ? ' · GPU' : ' · RAM'))
+          : 'none · text only';
+      }
     }
 
     function applyCpuOnlyUi(cpuOnly) {
@@ -3479,9 +3212,13 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       $('offloadKvCacheToGpu').disabled = cpuOnly;
       syncMmprojOffloadUi(cpuOnly);
       $('gpuOffloadHint').textContent = cpuOnly
-        ? 'CPU backend installed — GPU Offload is ignored; everything runs in system RAM.'
-        : ('Layers on GPU (-ngl). Range 0–' + modelBlockCount + '; max = all model layers.');
+        ? 'CPU backend — GPU layers are ignored; everything runs in system RAM.'
+        : '';
+      $('gpuOffloadHint').classList.toggle('hidden', !cpuOnly);
+      $('nglAll').disabled = cpuOnly;
+      $('nglCustom').disabled = cpuOnly;
       $('gpuOffloadRow').style.opacity = cpuOnly ? '0.55' : '1';
+      syncNglMode();
 
       // --n-cpu-moe only splits experts GPU↔CPU; meaningless when everything is already on CPU.
       $('nCpuMoe').disabled = cpuOnly;
@@ -3516,12 +3253,13 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         syncTensorSplitEnabled();
         const hint = $('dualGpuHint');
         if (hint && showDual) {
-          const names = gpuInfos.map((g, i) => gpuLabel(g, i) + ' · ' + fmtBytes(g.totalBytes)).join('  ·  ');
           hint.textContent = splitModeIsNone()
-            ? names + '. Split mode None keeps every GPU layer on Main GPU and leaves the other cards free. Reload to apply.'
-            : names + '. Pick the faster card as Main GPU (Vulkan/CUDA order from llama.cpp, which may differ from btop). The slider is GPU-resident weight share on that card after CPU MoE/FFN.';
+            ? 'Every GPU layer stays on the Main GPU; the other cards stay free.'
+            : 'Pick the faster card as Main GPU, then give it more of the weights.';
+          hint.title = gpuInfos.map((g, i) => gpuFullLabel(g, i) + ' · ' + fmtBytes(g.totalBytes)).join('\\n');
         }
       }
+      renderOffloadSum();
     }
 
     function splitModeIsNone() {
@@ -3557,72 +3295,148 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       return isLegacyGpu0FirstSplit(L.tensorSplit) && clampMainGpu(L.mainGpu ?? 0, n) > 0;
     }
 
-    function renderMemory(est) {
-      if (!est) {
-        $('memSummary').textContent = 'Select a model to estimate VRAM / RAM use.';
-        $('memLines').textContent = '';
-        $('memNotes').classList.add('hidden');
-        $('memWarn').classList.add('hidden');
-        renderStackedBar('vramStack', 'vramChartSub', null);
-        renderStackedBar('vram2Stack', 'vram2ChartSub', null);
-        const wrap = $('vram2ChartWrap');
-        if (wrap) wrap.classList.add('hidden');
-        renderStackedBar('ramStack', 'ramChartSub', null);
+    // Memory: the extension runs core's estimator on the form values and sends
+    // back a verdict. The webview has no estimator of its own.
+    let estimateSeq = 0;
+    let renderedSeq = 0;
+    let estimateTimer = null;
+    function requestEstimate() {
+      if (estimateTimer) clearTimeout(estimateTimer);
+      estimateTimer = setTimeout(() => {
+        estimateTimer = null;
+        estimateSeq += 1;
+        vscode.postMessage({ type: 'estimate', seq: estimateSeq, payload: readLoad(), cpuOnly: cpuOnlyLive() });
+      }, 90);
+    }
+    function refreshMemoryLive() { requestEstimate(); }
+    function scheduleLiveMemory() { requestEstimate(); }
+
+    const SEG_LABEL = { weights: 'Weights', vision: 'Vision', draft: 'Spec', kv: 'KV', overhead: 'Overhead' };
+
+    function memBar(device, targetFree) {
+      const bar = document.createElement('div');
+      bar.className = 'mem-stack';
+      const scale = Math.max(device.capacityBytes || 0, device.usedBytes || 0) || 1;
+      for (const seg of device.segments || []) {
+        if (!(seg.bytes > 0)) continue;
+        const el = document.createElement('span');
+        el.className = 'seg-' + seg.key;
+        el.style.width = Math.max(0.5, (seg.bytes / scale) * 100) + '%';
+        el.title = seg.label + ': ~' + fmtBytes(seg.bytes);
+        bar.appendChild(el);
+      }
+      if (device.kind !== 'ram' && device.capacityBytes > targetFree && targetFree > 0) {
+        const mark = document.createElement('i');
+        mark.className = 'target';
+        mark.style.left = (((device.capacityBytes - targetFree) / scale) * 100) + '%';
+        mark.title = 'Target: keep ' + fmtBytes(targetFree) + ' free';
+        bar.appendChild(mark);
+      }
+      return bar;
+    }
+
+    function renderMemoryView(view) {
+      const verdict = $('memVerdict');
+      const devicesEl = $('memDevices');
+      const legend = $('memLegend');
+      const fixes = $('memFixes');
+      devicesEl.textContent = '';
+      fixes.textContent = '';
+      legend.textContent = '';
+      $('memNotes').textContent = '';
+      $('memLines').textContent = '';
+      if (!view) {
+        verdict.className = 'verdict unknown';
+        verdict.textContent = 'Select a model to estimate VRAM / RAM use.';
+        legend.classList.add('hidden');
+        fixes.classList.add('hidden');
+        $('memFootnote').textContent = '';
+        renderHeader();
         return;
       }
-      if (est.charts) {
-        if (est.charts.vram && est.charts.vram.title) {
-          const t = $('vramChartTitle');
-          if (t) t.textContent = est.charts.vram.title;
+      lastMemoryView = view;
+      verdict.className = 'verdict ' + view.level;
+      const icon = view.level === 'good' ? '✓ ' : view.level === 'spill' ? '✕ ' : view.level === 'tight' ? '⚠ ' : '';
+      verdict.textContent = icon + view.headline;
+
+      const totals = {};
+      for (const d of view.devices || []) {
+        const row = document.createElement('div');
+        row.className = 'mem-dev';
+        const head = document.createElement('div');
+        head.className = 'mem-chart-title';
+        const name = document.createElement('span');
+        name.textContent = d.label + (d.capacityBytes && d.kind !== 'ram' ? ' · ' + fmtBytes(d.capacityBytes) : '');
+        name.title = d.fullLabel;
+        const sub = document.createElement('span');
+        sub.className = 'sub' + (d.level === 'spill' ? ' over' : d.level === 'tight' ? ' warn' : '');
+        let text = '~' + fmtBytes(d.usedBytes) + (d.capacityBytes ? ' / ' + fmtBytes(d.capacityBytes) : '');
+        if (serverRunning && d.kind !== 'ram' && d.liveUsedBytes > 0) {
+          text += ' · live ' + fmtBytes(d.liveUsedBytes);
         }
-        renderStackedBar('vramStack', 'vramChartSub', est.charts.vram);
-        const wrap = $('vram2ChartWrap');
-        if (wrap) {
-          const show2 = !!(est.charts.vram2);
-          wrap.classList.toggle('hidden', !show2);
-          if (show2) {
-            const t2 = $('vram2ChartTitle');
-            if (t2 && est.charts.vram2.title) t2.textContent = est.charts.vram2.title;
-            renderStackedBar('vram2Stack', 'vram2ChartSub', est.charts.vram2);
-          } else {
-            renderStackedBar('vram2Stack', 'vram2ChartSub', null);
-          }
+        sub.textContent = text;
+        sub.title = 'Estimate at full context' + (d.liveUsedBytes > 0 ? '. Live = what the driver reports now.' : '');
+        head.appendChild(name);
+        head.appendChild(sub);
+        row.appendChild(head);
+        row.appendChild(memBar(d, view.targetFreeBytes));
+        devicesEl.appendChild(row);
+        for (const s of d.segments || []) {
+          if (s.bytes > 0) totals[s.key] = (totals[s.key] || 0) + s.bytes;
         }
-        renderStackedBar('ramStack', 'ramChartSub', est.charts.ram);
       }
-      $('memSummary').textContent = est.summary || '';
-      $('memLines').innerHTML = (est.lines || []).map((l) => String(l)).join('<br/>');
-      const soft = (est.warnings || []).filter((_, i) => !(est.willSpill && i === 0));
-      if (soft.length) {
-        $('memNotes').classList.remove('hidden');
-        $('memNotes').innerHTML = soft.map((w) => String(w)).join('<br/>');
-      } else {
-        $('memNotes').classList.add('hidden');
+      for (const key of ['weights', 'vision', 'draft', 'kv', 'overhead']) {
+        if (!totals[key]) continue;
+        const span = document.createElement('span');
+        const swatch = document.createElement('i');
+        swatch.className = 'seg-' + key;
+        span.appendChild(swatch);
+        span.appendChild(document.createTextNode(SEG_LABEL[key] + ' ' + fmtBytes(totals[key])));
+        legend.appendChild(span);
       }
-      if (est.willSpill && est.warnings && est.warnings.length) {
-        $('memWarn').classList.remove('hidden');
-        $('memWarn').textContent = est.warnings[0];
-      } else {
-        $('memWarn').classList.add('hidden');
+      legend.classList.toggle('hidden', !Object.keys(totals).length);
+      $('memFootnote').textContent = view.footnote || '';
+
+      const fixList = Array.isArray(view.fixes) ? view.fixes : [];
+      fixes.classList.toggle('hidden', !fixList.length);
+      if (fixList.length) {
+        const lead = document.createElement('span');
+        lead.className = 'hint';
+        lead.textContent = view.level === 'spill' ? 'Make it fit:' : 'Get to ' + fmtBytes(view.targetFreeBytes) + ' free:';
+        fixes.appendChild(lead);
+        for (const f of fixList) {
+          const b = document.createElement('button');
+          b.type = 'button';
+          b.className = 'chip fix ' + f.level;
+          b.textContent = f.label + ' → ' + f.detail;
+          b.title = 'Apply ' + Object.entries(f.patch).map(([k, v]) => k + ' = ' + (v === '' ? 'auto' : v)).join(', ');
+          b.addEventListener('click', () => applyLoadPatch(f.patch));
+          fixes.appendChild(b);
+        }
       }
+      for (const [targetId, list] of [['memNotes', view.notes], ['memLines', view.lines]]) {
+        const el = $(targetId);
+        for (const line of list || []) {
+          const div = document.createElement('div');
+          div.textContent = String(line);
+          el.appendChild(div);
+        }
+      }
+      renderHeader();
     }
 
-    function refreshMemoryLive() {
-      try {
-        syncTensorSplitEnabled();
-        renderMemory(liveMemoryEstimate());
-      } catch (err) {
-        const msg = err && err.message ? err.message : String(err);
-        $('memSummary').textContent = 'Memory estimate failed: ' + msg;
+    /** Apply a set of load settings in one round-trip (fix chips, "fit" preset). */
+    function applyLoadPatch(patch, opts) {
+      if (saveLoadTimer) {
+        clearTimeout(saveLoadTimer);
+        saveLoadTimer = null;
       }
-    }
-
-    let liveMemRaf = 0;
-    function scheduleLiveMemory() {
-      if (liveMemRaf) return;
-      liveMemRaf = requestAnimationFrame(() => {
-        liveMemRaf = 0;
-        refreshMemoryLive();
+      markDirtyIfRunning();
+      vscode.postMessage({
+        type: 'applyLoadPatch',
+        payload: Object.assign({}, readLoad(), patch),
+        fitContext: !!(opts && opts.fitContext),
+        cpuOnly: cpuOnlyLive(),
       });
     }
 
@@ -3662,7 +3476,57 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         });
       }
     }
-    bindRange('contextLength', 'contextLengthRange', 256);
+    // Context: logarithmic slider (0–1000) that snaps to the common sizes; the
+    // number box keeps any exact value.
+    const CTX_SNAPS = [8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576];
+    let ctxMin = 2048;
+    let ctxMax = 131072;
+    function ctxToSlider(ctx) {
+      const c = Math.min(ctxMax, Math.max(ctxMin, Number(ctx) || ctxMin));
+      return Math.round((1000 * Math.log(c / ctxMin)) / Math.log(ctxMax / ctxMin));
+    }
+    function sliderToCtx(v) {
+      const raw = ctxMin * Math.pow(ctxMax / ctxMin, Number(v) / 1000);
+      for (const s of CTX_SNAPS.concat([ctxMax])) {
+        if (s <= ctxMax && Math.abs(raw - s) / s < 0.06) return s;
+      }
+      return Math.max(ctxMin, Math.min(ctxMax, Math.round(raw / 256) * 256));
+    }
+    function syncCtxK() {
+      const el = $('ctxK');
+      if (el) el.textContent = '≈' + fmtTokShort(Number($('contextLength').value));
+    }
+    function setContextField(ctx) {
+      if (!fieldFocused('contextLength')) setField('contextLength', ctx);
+      if (!fieldFocused('contextLengthRange')) $('contextLengthRange').value = String(ctxToSlider(ctx));
+      syncCtxK();
+    }
+    function renderCtxTicks() {
+      const ticks = $('ctxTicks');
+      if (!ticks) return;
+      ticks.textContent = '';
+      const marks = CTX_SNAPS.filter((s) => s >= ctxMin && s < ctxMax * 0.97).concat([ctxMax]);
+      for (const s of marks) {
+        const t = document.createElement('span');
+        t.textContent = fmtTokShort(s);
+        t.style.left = (ctxToSlider(s) / 10) + '%';
+        ticks.appendChild(t);
+      }
+    }
+    (function bindContext() {
+      const num = $('contextLength');
+      const range = $('contextLengthRange');
+      num.addEventListener('input', () => {
+        range.value = String(ctxToSlider(num.value));
+        syncCtxK();
+        scheduleLiveMemory();
+      });
+      range.addEventListener('input', () => {
+        num.value = String(sliderToCtx(range.value));
+        syncCtxK();
+        scheduleLiveMemory();
+      });
+    })();
     bindRange('gpuOffload', 'gpuOffloadRange');
     bindRange('cpuThreads', 'cpuThreadsRange');
     bindRange('nCpuMoe', 'nCpuMoeRange');
@@ -3730,60 +3594,19 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     });
     $('flashAttention').addEventListener('change', syncFlashAttentionWarning);
 
-    // 'fit' = largest context that still fits the detected VRAM (see fittingContext).
+    // 'fit' = largest context that still fits the detected VRAM (core fittingContextLength).
     const LOAD_PRESETS = {
       agent: { contextLength: 65536, cacheTypeK: 'q8_0', cacheTypeV: 'q8_0', slots: 1 },
       context: { contextLength: 'fit', cacheTypeK: 'q8_0', cacheTypeV: 'q4_0', slots: 1 },
       quality: { contextLength: 65536, cacheTypeK: 'f16', cacheTypeV: 'q8_0', slots: 1 },
     };
 
-    /**
-     * Largest context (8192…model max, aligned to 256) whose live estimate
-     * still leaves 1.5 GiB free on every card. Mirrors fittingContextLength in core.
-     */
-    function fittingContext(maxCtx) {
-      if (!memInputs) return maxCtx;
-      const previous = $('contextLength').value;
-      const align = 256;
-      const high = Math.min(maxCtx, Math.max(align, Math.floor(maxCtx / align) * align));
-      const lowMin = Math.min(8192, high);
-      function fits(ctx) {
-        $('contextLength').value = ctx;
-        const est = liveMemoryEstimate();
-        return !!(est && !est.willSpill);
-      }
-      let best = lowMin;
-      if (fits(high)) {
-        $('contextLength').value = previous;
-        return high;
-      }
-      if (!fits(lowMin)) {
-        $('contextLength').value = previous;
-        return lowMin;
-      }
-      let lo = lowMin;
-      let hi = high;
-      while (lo <= hi) {
-        let mid = Math.max(align, Math.floor((lo + hi) / 2 / align) * align);
-        if (mid < lo) mid = lo;
-        if (mid > hi) break;
-        if (fits(mid)) {
-          best = mid;
-          lo = mid + align;
-        } else {
-          hi = mid - align;
-        }
-      }
-      $('contextLength').value = previous;
-      return best || Math.min(8192, maxCtx);
-    }
-
     function currentPresetId() {
       const k = $('cacheTypeK').value;
       const v = $('cacheTypeV').value;
       if (Number($('maxConcurrentPredictions').value) !== 1) return '';
       const ctx = Number($('contextLength').value);
-      const maxCtx = Number($('contextLengthRange').max) || 131072;
+      const maxCtx = ctxMax;
       for (const [id, p] of Object.entries(LOAD_PRESETS)) {
         if (p.cacheTypeK !== k || p.cacheTypeV !== v) continue;
         // 'fit' depends on live VRAM, so any context counts as a match once the
@@ -3793,35 +3616,47 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       return '';
     }
 
+    /** Highlight the matching preset, or "Custom" with what the mix is. */
     function highlightPreset() {
       const active = currentPresetId();
-      document.querySelectorAll('#presetChips .chip').forEach((chip) => {
+      document.querySelectorAll('#presetChips .chip[data-preset]').forEach((chip) => {
         chip.classList.toggle('active', chip.dataset.preset === active);
       });
+      const custom = $('presetCustom');
+      if (custom) custom.classList.toggle('active', !active);
+      const hint = $('presetHint');
+      if (hint) {
+        const k = $('cacheTypeK').value;
+        const v = $('kvTypesLinked').checked ? k : $('cacheTypeV').value;
+        const slots = Number($('maxConcurrentPredictions').value) || 1;
+        const mix = 'ctx ' + fmtTokShort(Number($('contextLength').value)) + ' · KV ' + k + '/' + v + ' · ' + slots + ' slot' + (slots === 1 ? '' : 's');
+        hint.textContent = active
+          ? mix + '. Presets set context, KV cache types and slots together.'
+          : 'Custom: ' + mix + '.';
+      }
     }
 
     function applyPreset(id) {
       const p = LOAD_PRESETS[id];
       if (!p) return;
-      const maxCtx = Number($('contextLengthRange').max) || 131072;
       $('maxConcurrentPredictions').value = p.slots;
       $('cacheTypeK').value = p.cacheTypeK;
       $('cacheTypeV').value = p.cacheTypeV;
       $('kvTypesLinked').checked = p.cacheTypeK === p.cacheTypeV;
       syncKvLink(false);
-      // KV types must already be on the form — fittingContext measures with them.
-      const ctx = p.contextLength === 'fit'
-        ? fittingContext(maxCtx)
-        : Math.min(p.contextLength, maxCtx);
-      $('contextLength').value = ctx;
-      $('contextLengthRange').value = ctx;
-      highlightPreset();
       syncFlashAttentionWarning();
+      if (p.contextLength === 'fit') {
+        // The extension searches with core's estimator and pushes the result.
+        applyLoadPatch({ cacheTypeK: p.cacheTypeK, cacheTypeV: p.cacheTypeV, maxConcurrentPredictions: p.slots }, { fitContext: true });
+        return;
+      }
+      setContextField(Math.min(p.contextLength, ctxMax));
+      highlightPreset();
       refreshMemoryLive();
       scheduleSaveLoad();
     }
 
-    document.querySelectorAll('#presetChips .chip').forEach((chip) => {
+    document.querySelectorAll('#presetChips .chip[data-preset]').forEach((chip) => {
       chip.addEventListener('click', () => applyPreset(chip.dataset.preset));
     });
 
@@ -3847,6 +3682,87 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       el.addEventListener('change', () => { scheduleSaveLoad(); refreshMemoryLive(); });
       el.addEventListener('input', () => { scheduleSaveLoad(); scheduleLiveMemory(); syncTensorSplitPctLabel(); });
     }
+
+    // Advanced: mark values that differ from Llama AIO defaults, filter by label or flag.
+    const ADV_KEYS = new Set([
+      'cpuThreads', 'evalBatchSize', 'physicalBatchSize', 'maxConcurrentPredictions', 'flashAttention',
+      'offloadKvCacheToGpu', 'cacheTypeK', 'cacheTypeV', 'keepModelInMemory', 'tryMmap', 'lazyMode',
+      'unifiedKvCache', 'contextCheckpoints', 'cacheReuse', 'reasoningFormat', 'reasoningBudget',
+      'ropeFreqBase', 'ropeFreqScale', 'seed', 'speculativeMode', 'ngramVariant', 'ngramSizeN',
+      'ngramSizeM', 'ngramMinHits', 'maxDraftTokens', 'minDraftTokens', 'draftProbability', 'draftGpuOffload',
+    ]);
+    const ADV_ALIAS = {
+      reasoningBudgetUnlimited: 'reasoningBudget', ropeBaseAuto: 'ropeFreqBase', ropeScaleAuto: 'ropeFreqScale',
+      seedRandom: 'seed', cpuThreadsRange: 'cpuThreads', ngramSizeNRange: 'ngramSizeN',
+    };
+    function advRowKey(row) {
+      for (const el of row.querySelectorAll('input[id], select[id]')) {
+        const key = ADV_ALIAS[el.id] || el.id;
+        if (ADV_KEYS.has(key)) return key;
+      }
+      return '';
+    }
+    function refreshAdvancedMarks() {
+      const body = $('advancedBody');
+      if (!body) return;
+      const L = readLoad();
+      const query = String(($('advFilter') && $('advFilter').value) || '').trim().toLowerCase();
+      const changedOnly = !!($('advChangedOnly') && $('advChangedOnly').checked);
+      const filtering = !!query || changedOnly;
+      let changedCount = 0;
+      const rows = [...body.querySelectorAll('.row, .toggle')];
+      for (const row of rows) {
+        const key = advRowKey(row);
+        const changed = !!key && key in loadDefaults && JSON.stringify(L[key]) !== JSON.stringify(loadDefaults[key]);
+        row.classList.toggle('changed', changed);
+        // Settings hidden for this mode (e.g. n-gram variant with MTP) do not count.
+        if (changed && !row.closest('.hidden')) changedCount++;
+        const flags = [...row.querySelectorAll('[data-flag]')].map((n) => n.getAttribute('data-flag')).join(' ');
+        const text = (row.textContent + ' ' + flags).toLowerCase();
+        const visible = (!query || text.includes(query)) && (!changedOnly || changed);
+        row.classList.toggle('filtered-out', filtering && !visible);
+      }
+      // Hide sub-headings (and spec groups) that have nothing left to show.
+      for (const title of body.querySelectorAll('.subgroup-title, .spec-group-title')) {
+        let n = title.nextElementSibling;
+        let any = false;
+        while (n && !n.classList.contains('subgroup-title')) {
+          if (n.matches('.row, .toggle, .spec-group') && !n.classList.contains('hidden')) {
+            const inner = n.matches('.spec-group') ? [...n.querySelectorAll('.row')] : [n];
+            if (inner.some((r) => !r.classList.contains('filtered-out') && !r.classList.contains('hidden'))) any = true;
+          }
+          n = n.nextElementSibling;
+        }
+        title.classList.toggle('filtered-out', filtering && !any);
+      }
+      for (const hint of body.querySelectorAll(':scope > .hint')) hint.classList.toggle('filtered-out', filtering);
+      const sum = $('advSum');
+      if (sum) sum.textContent = changedCount
+        ? changedCount + ' changed from defaults'
+        : 'threads, batch, KV, RoPE, speculative';
+    }
+    if ($('advFilter')) $('advFilter').addEventListener('input', refreshAdvancedMarks);
+    if ($('advChangedOnly')) $('advChangedOnly').addEventListener('change', refreshAdvancedMarks);
+
+    // Remember open sections and scroll position while the view is hidden (G-15).
+    const savedUi = vscode.getState() || {};
+    let scrollRestored = false;
+    function saveUiState() {
+      const open = [...document.querySelectorAll('details[id]')]
+        .filter((d) => d.open && d.id !== 'srvMenu')
+        .map((d) => d.id);
+      vscode.setState({ open: open, scrollY: window.scrollY });
+    }
+    for (const id of Array.isArray(savedUi.open) ? savedUi.open : []) {
+      const d = $(id);
+      if (d && d.tagName === 'DETAILS') d.open = true;
+    }
+    document.querySelectorAll('details[id]').forEach((d) => d.addEventListener('toggle', saveUiState));
+    let scrollSaveTimer = null;
+    window.addEventListener('scroll', () => {
+      if (scrollSaveTimer) clearTimeout(scrollSaveTimer);
+      scrollSaveTimer = setTimeout(saveUiState, 200);
+    });
 
     // Request defaults apply to the next chat call (no server reload). Persist on edit.
     let saveRequestTimer = null;
@@ -3967,9 +3883,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       modelBlockCount = Math.max(1, blocks);
 
       $('contextLength').max = String(maxCtx);
-      $('contextLengthRange').max = String(maxCtx);
-      $('contextLengthRange').min = '512';
-      $('contextLengthRange').step = '1';
+      ctxMax = Math.max(512, maxCtx);
+      ctxMin = Math.min(2048, ctxMax);
+      renderCtxTicks();
       // Slider max = actual layer count (legacy 99/"all" is shown as all layers).
       $('gpuOffload').max = String(modelBlockCount);
       $('gpuOffloadRange').max = String(modelBlockCount);
@@ -3980,7 +3896,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
 
       // Visibility finalized in applyCpuOnlyUi (also hides on CPU backend).
       if (caps) {
-        $('ctxHint').textContent = 'Model supports up to ' + maxCtx + ' tokens (from GGUF metadata)';
+        $('ctxHint').textContent = 'Model max ' + fmtTokShort(maxCtx) + ' (' + Number(maxCtx).toLocaleString() + ' tokens).';
         $('moeHint').textContent = isMoe
           ? ('MoE model' + (caps.expertCount ? (' · ' + caps.expertCount + ' experts') : '') +
              (caps.expertUsedCount ? (' · ' + caps.expertUsedCount + ' used/token') : '') +
@@ -3995,22 +3911,20 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         if (!isMoe) {
           ffnHintDefault = $('ffnHint').textContent;
         }
-        $('modelCaps').classList.remove('hidden');
-        $('modelCaps').innerHTML =
-          'Architecture: <strong>' + (caps.architecture || '?') + '</strong><br/>' +
-          'Max context: <strong>' + maxCtx + '</strong> · Layers: <strong>' + blocks + '</strong>' +
-          (isMoe ? (' · MoE experts: <strong>' + (caps.expertCount || '?') + '</strong>') : ' · Dense (non-MoE)') +
-          (caps.fullAttentionInterval > 1
-            ? (' · hybrid full-attn every <strong>' + caps.fullAttentionInterval + '</strong> layers')
-            : '') +
-          (caps.pleShare > 0
-            ? (' · PLE table ~<strong>' + Math.round(caps.pleShare * 100) + '%</strong>')
-            : '') +
-          (caps.nextnPredictLayers > 0
-            ? (' · MTP next-n: <strong>' + caps.nextnPredictLayers + '</strong>')
-            : (mtpSidecarPath
-              ? (' · MTP sidecar: <strong>' + String(mtpSidecarPath).split(/[/\\\\]/).pop() + '</strong>')
-              : ''));
+        const capBits = [
+          caps.architecture || '?',
+          isMoe ? ('MoE ' + (caps.expertCount || '?') + ' experts') : 'dense',
+          blocks + ' layers',
+          'max ctx ' + fmtTokShort(maxCtx),
+        ];
+        if (caps.fullAttentionInterval > 1) capBits.push('full attn every ' + caps.fullAttentionInterval);
+        if (caps.pleShare > 0) capBits.push('PLE ~' + Math.round(caps.pleShare * 100) + '%');
+        if (caps.nextnPredictLayers > 0) capBits.push('MTP ✓');
+        else if (mtpSidecarPath) capBits.push('MTP sidecar');
+        const modelCaps = $('modelCaps');
+        modelCaps.classList.remove('hidden');
+        modelCaps.textContent = capBits.join(' · ');
+        modelCaps.title = mtpSidecarPath ? 'MTP sidecar: ' + String(mtpSidecarPath).split(/[/\\\\]/).pop() : '';
         applySpecUi(!!(caps.nextnPredictLayers > 0), sidecarMtpAvailable());
       } else {
         $('modelCaps').classList.add('hidden');
@@ -4189,6 +4103,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       const hasModel = !!(s.selectedModelPath);
       const caps = payload.capabilities;
       mtpSidecarPath = payload.mtpSidecarPath || '';
+      lastPayload = payload;
+      pendingChanges = Array.isArray(payload.changes) ? payload.changes : [];
+      loadDefaults = payload.defaults || {};
+      gpuInfos = Array.isArray(payload.gpus) ? payload.gpus : [];
 
       applyCapabilities(caps);
 
@@ -4377,20 +4295,21 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       const showStarter = !hasModel;
       const starterBtn = $('starterModelBtn');
       const starterHint = $('starterModelHint');
-      const downloadBtn = $('downloadModelBtn');
-      const pickBtn = $('pickDownloadedBtn');
+      const changeBtn = $('changeModelBtn');
+      $('starterCol').classList.toggle('hidden', !showStarter);
       if (starterBtn) starterBtn.classList.toggle('hidden', !showStarter);
       if (starterHint) starterHint.classList.toggle('hidden', !showStarter);
-      if (downloadBtn) {
-        downloadBtn.className = showStarter && localCount === 0 ? 'secondary' : 'primary';
+      if (changeBtn) {
+        changeBtn.textContent = hasModel ? 'Change…' : 'Choose…';
+        changeBtn.className = (showStarter && localCount > 0 ? 'primary' : 'secondary') + ' small';
       }
-      if (pickBtn) {
-        // Prefer choosing an existing GGUF when the library already has files.
-        pickBtn.className = showStarter && localCount > 0 ? 'primary' : 'secondary';
+      $('modelTitle').textContent = hasModel ? (payload.modelName || 'model') : 'No model selected';
+      $('modelTitle').title = hasModel && payload.modelNameRaw ? 'general.name: ' + payload.modelNameRaw : '';
+      const libSum = $('librarySum');
+      if (libSum) {
+        const sources = (Array.isArray(payload.localSourceDirs) ? payload.localSourceDirs : []).map((d) => d.source);
+        libSum.textContent = localCount + ' GGUF' + (sources.length ? ' · ' + sources.slice(0, 3).join(', ') + (sources.length > 3 ? '…' : '') : '');
       }
-      $('modelTitle').textContent = hasModel
-        ? ('Selected: ' + (payload.modelName || 'model'))
-        : 'No model selected';
       function escAttr(v) {
         return String(v).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
       }
@@ -4412,13 +4331,18 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       }
 
       if (hasModel && s.selectedModelPath) {
+        // Middle-ellipsis keeps the folder and the file name; the full path is the tooltip.
         const p = String(s.selectedModelPath);
+        const parts = p.split(/[/\\\\]/);
+        const file = parts.pop() || p;
+        const dir = parts.pop() || '';
+        const short = (dir ? '…/' + (dir.length > 28 ? dir.slice(0, 26) + '…' : dir) + '/' : '') + file;
         $('modelPath').innerHTML =
           '<a class="model-path-link" href="#" data-path="' + escAttr(p) +
-          '" title="Reveal in File Explorer">' + escText(p) + '</a>';
+          '" title="' + escAttr(p) + ' — reveal in file manager">' + escText(short) + '</a>';
         bindFolderLinks($('modelPath'));
       } else {
-        $('modelPath').textContent = 'Choose one of the options below to install or select a GGUF model.';
+        $('modelPath').textContent = 'Pick a downloaded GGUF, open a file, or download one from Hugging Face.';
       }
 
       const modelsDir = payload.modelsDir || '';
@@ -4429,7 +4353,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           ).join(', ')
         : '';
       $('modelsDirMeta').innerHTML =
-        'Llama AIO downloads: ' +
+        'Downloads go to ' +
         (modelsDir ? folderLink(modelsDir, modelsDir, 'Open downloads folder') : '—') +
         ' · ' + (payload.localModelCount || 0) + ' GGUF found' +
         sourceHtml +
@@ -4446,7 +4370,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       const ffn = (caps && caps.isMoe) ? 0 : Math.min(L.nCpuFfn ?? 0, blocks);
       const threads = Math.min(Math.max(1, L.cpuThreads || 1), cpuLogicalCores);
 
-      setPair('contextLength', 'contextLengthRange', ctx);
+      setContextField(ctx);
       setPair('gpuOffload', 'gpuOffloadRange', ngl);
       setPair('cpuThreads', 'cpuThreadsRange', threads);
       setField('evalBatchSize', L.evalBatchSize);
@@ -4531,20 +4455,37 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       highlightPreset();
 
       memInputs = payload.memInputs || null;
-      gpuInfo = payload.gpu || null;
-      gpuInfos = Array.isArray(payload.gpus) ? payload.gpus : (gpuInfo ? [gpuInfo] : []);
-      systemRamTotalBytes = payload.systemRamTotalBytes || 0;
       const splitDirty = applyDualGpuUi(L);
       applyCpuOnlyUi(!!payload.cpuOnly || payload.selectedUiBackend === 'cpu');
-      if (gpuInfos.length >= 2) {
-        refreshMemoryLive();
-      } else if (payload.memory) {
-        renderMemory(payload.memory);
-      } else {
-        refreshMemoryLive();
+      // Core already estimated the saved settings; newer live requests still win.
+      renderedSeq = estimateSeq;
+      renderMemoryView(payload.memoryView || null);
+      renderCopilotSummary(payload);
+      refreshAdvancedMarks();
+      updatePrimaryAction();
+      renderHeader();
+      if (splitDirty) {
+        scheduleSaveLoad();
+        requestEstimate();
       }
-      if (splitDirty) scheduleSaveLoad();
+      if (!scrollRestored) {
+        scrollRestored = true;
+        if (savedUi.scrollY > 0) window.scrollTo(0, savedUi.scrollY);
       }
+    }
+
+    function renderCopilotSummary(payload) {
+      const el = $('copilotSum');
+      if (!el) return;
+      const R = (payload.state && payload.state.requestSettings) || {};
+      const bits = [];
+      if (payload.modeSampling) bits.push(payload.modeSampling.familyLabel + ' modes');
+      else if (typeof R.temperature === 'number') bits.push('temp ' + R.temperature);
+      bits.push('replacements ' + (payload.promptReplacementsEnabled ? 'on' : 'off'));
+      if (payload.wikipediaLookupEnabled) bits.push('wiki on');
+      if (payload.duplicateToolCallGuardEnabled) bits.push('dup-guard on');
+      el.textContent = bits.join(' · ');
+    }
 
     $('ropeBaseAuto').addEventListener('change', () => {
       $('ropeFreqBase').disabled = $('ropeBaseAuto').checked;
@@ -4694,7 +4635,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       setupStarterBtn.addEventListener('click', () => vscode.postMessage({ type: 'downloadStarter' }));
     }
     $('openFileBtn').addEventListener('click', () => vscode.postMessage({ type: 'openModelFile' }));
-    $('pickDownloadedBtn').addEventListener('click', () => vscode.postMessage({ type: 'pickDownloadedModel' }));
+    $('changeModelBtn').addEventListener('click', () => vscode.postMessage({ type: 'changeModel' }));
     $('installLlamaBtn').addEventListener('click', () => {
       const action = $('installLlamaBtn').dataset.action;
       if (action === 'check') {
@@ -4733,43 +4674,71 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       vscode.postMessage({ type: 'switchBackend', payload: next });
     });
 
-    $('primaryBtn').addEventListener('click', () => {
-      const action = $('primaryBtn').dataset.action;
-      if (action === 'reload') {
-        serverStarting = true;
-        updatePrimaryAction();
-        renderStatusUi({
-          ready: false,
-          dirty: false,
-          starting: true,
-          endpoint: '',
-          message: '',
-        });
-        vscode.postMessage({
-          type: 'reload',
-          payload: readLoad(),
-        });
-        vscode.postMessage({ type: 'saveRequest', payload: readRequest() });
-      } else if (action === 'start') {
-        serverStarting = true;
-        updatePrimaryAction();
-        renderStatusUi({
-          ready: false,
-          dirty: false,
-          starting: true,
-          endpoint: '',
-          message: '',
-        });
-        vscode.postMessage({
-          type: 'start',
-          payload: readLoad(),
-        });
-        vscode.postMessage({ type: 'saveRequest', payload: readRequest() });
+    function launch(action) {
+      if (action !== 'reload' && action !== 'start') return;
+      serverStarting = true;
+      updatePrimaryAction();
+      renderStatusUi({
+        ready: false,
+        dirty: false,
+        starting: true,
+        endpoint: '',
+        message: '',
+      });
+      vscode.postMessage({ type: action, payload: readLoad() });
+      vscode.postMessage({ type: 'saveRequest', payload: readRequest() });
+    }
+    $('primaryBtn').addEventListener('click', () => launch($('primaryBtn').dataset.action));
+    $('reloadIconBtn').addEventListener('click', () => launch('reload'));
+    $('discardBtn').addEventListener('click', () => {
+      if (saveLoadTimer) {
+        clearTimeout(saveLoadTimer);
+        saveLoadTimer = null;
       }
+      vscode.postMessage({ type: 'discardChanges' });
     });
     $('stopBtn').addEventListener('click', () => vscode.postMessage({ type: 'stop' }));
-    $('openLogBtn').addEventListener('click', () => vscode.postMessage({ type: 'openLog' }));
-    $('copyCmdBtn').addEventListener('click', () => vscode.postMessage({ type: 'copyCommandLine' }));
+    const closeMenu = () => {
+      const menu = $('srvMenu');
+      if (menu) menu.open = false;
+    };
+    $('openLogBtn').addEventListener('click', () => { closeMenu(); vscode.postMessage({ type: 'openLog' }); });
+    $('copyCmdBtn').addEventListener('click', () => { closeMenu(); vscode.postMessage({ type: 'copyCommandLine' }); });
+    $('openWebUiBtn').addEventListener('click', () => {
+      closeMenu();
+      if (lastEndpoint) vscode.postMessage({ type: 'openExternal', url: lastEndpoint });
+    });
+    document.addEventListener('click', (e) => {
+      const menu = $('srvMenu');
+      if (menu && menu.open && !menu.contains(e.target)) menu.open = false;
+    });
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') closeMenu();
+    });
+
+    $('nglAll').addEventListener('click', () => {
+      nglCustomOpen = false;
+      const blocks = Math.max(1, modelBlockCount || 1);
+      $('gpuOffload').value = String(blocks);
+      $('gpuOffloadRange').value = String(blocks);
+      syncNglMode();
+      scheduleSaveLoad();
+      refreshMemoryLive();
+    });
+    $('nglCustom').addEventListener('click', () => {
+      nglCustomOpen = true;
+      syncNglMode();
+      $('gpuOffloadRange').focus();
+    });
+    document.querySelectorAll('#splitSeg .seg-btn').forEach((b) => {
+      b.addEventListener('click', () => {
+        const sel = $('splitMode');
+        if (!sel || sel.disabled || sel.value === b.dataset.split) return;
+        sel.value = b.dataset.split;
+        sel.dispatchEvent(new Event('change'));
+        applyCpuOnlyUi(cpuOnlyLive());
+      });
+    });
     $('launchMode').addEventListener('change', () => {
       const mode = $('launchMode').value === 'background' ? 'background' : 'externalTerminal';
       if (serverRunning) {
@@ -4789,6 +4758,13 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     window.addEventListener('message', (event) => {
       const msg = event.data;
       if (msg.type === 'state') applyState(msg.payload);
+      if (msg.type === 'memoryEstimate') {
+        // Drop replies to superseded requests (typing or dragging fires many).
+        if (typeof msg.seq === 'number' && msg.seq >= renderedSeq && msg.seq === estimateSeq) {
+          renderedSeq = msg.seq;
+          renderMemoryView(msg.view || null);
+        }
+      }
       if (msg.type === 'updateCheck' && msg.payload) {
         updateCheck = msg.payload;
         updateBackendUi();
@@ -4853,6 +4829,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         serverStarting = starting;
         serverRunning = httpUp;
         configDirty = starting ? false : !!p.configDirty;
+        pendingChanges = Array.isArray(p.changes) ? p.changes : [];
         updatePrimaryAction();
         renderStatusUi({
           ready: httpUp,
@@ -4862,6 +4839,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           pid: lastPid,
           message: starting ? (p.startMessage || p.message || 'Starting…') : (p.message || ''),
         });
+        renderHeader();
         if (p.perf || Array.isArray(p.perfLines)) {
           renderPerfStats(p.perf || {}, p.perfLines || []);
         }

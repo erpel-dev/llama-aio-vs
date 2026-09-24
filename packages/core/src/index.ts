@@ -19,6 +19,8 @@ export * from "./launchLock";
 export * from "./llamaInstaller";
 export * from "./llamaTimings";
 export * from "./memoryEstimate";
+export * from "./memoryView";
+export * from "./settingsDiff";
 export * from "./modelLibrary";
 export * from "./modelPickerInfo";
 export * from "./modelModes";
