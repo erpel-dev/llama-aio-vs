@@ -1032,6 +1032,326 @@ export function listActiveModelSourceDirs(
   return out;
 }
 
+export interface LibraryCompanion {
+  path: string;
+  name: string;
+  role: "mmproj" | "mtp";
+  sizeBytes: number;
+  /** Other quants in this folder still use the file. */
+  shared: boolean;
+}
+
+export interface LibraryQuant {
+  path: string;
+  label: string;
+  sizeBytes: number;
+  shardCount: number;
+  shardPaths: string[];
+  source: string;
+  owned: boolean;
+}
+
+export interface LibraryGroup {
+  id: string;
+  title: string;
+  source: string;
+  owned: boolean;
+  /** Repo id or parent folder, for the line under the title. */
+  detail: string;
+  quants: LibraryQuant[];
+  companions: LibraryCompanion[];
+}
+
+export interface PartialDownload {
+  path: string;
+  sizeBytes: number;
+}
+
+/** Canonical path for hide-list membership. Missing files keep their resolved path. */
+export function canonicalModelPath(filePath: string): string {
+  const trimmed = (filePath || "").trim();
+  if (!trimmed) {
+    return "";
+  }
+  try {
+    return fs.realpathSync(trimmed);
+  } catch {
+    return path.resolve(trimmed);
+  }
+}
+
+/**
+ * True when `filePath` stays inside `modelsDir` after resolving symlinks.
+ * A link from the downloads folder into the Hugging Face blob store is not owned.
+ */
+export function isOwnedModelPath(filePath: string, modelsDir: string): boolean {
+  const root = (modelsDir || "").trim();
+  const file = (filePath || "").trim();
+  if (!root || !file) {
+    return false;
+  }
+  const rootReal = canonicalModelPath(root);
+  const fileReal = canonicalModelPath(file);
+  const rel = path.relative(rootReal, fileReal);
+  if (!rel || rel === ".") {
+    return false;
+  }
+  return rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel);
+}
+
+export function hiddenModelPaths(config: ConfigAccessor): string[] {
+  const raw = config.get<string[]>("hiddenModels") || [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const entry of raw) {
+    if (typeof entry !== "string" || !entry.trim()) {
+      continue;
+    }
+    const canon = canonicalModelPath(entry);
+    if (!canon || seen.has(canon)) {
+      continue;
+    }
+    seen.add(canon);
+    out.push(canon);
+  }
+  return out;
+}
+
+export function withoutHiddenModels(
+  entries: LocalModelEntry[],
+  hidden: readonly string[]
+): LocalModelEntry[] {
+  if (!hidden.length) {
+    return entries;
+  }
+  const skip = new Set(hidden.map((p) => canonicalModelPath(p)));
+  return entries.filter((entry) => !skip.has(canonicalModelPath(entry.path)));
+}
+
+/** Every shard file for a split GGUF, or just `filePath` when it is not split. */
+export function listShardPaths(filePath: string): string[] {
+  const key = localShardGroupKey(filePath);
+  if (!key) {
+    return [filePath];
+  }
+  const dir = path.dirname(filePath);
+  const stem = path.basename(key);
+  let names: string[];
+  try {
+    names = fs.readdirSync(dir);
+  } catch {
+    return [filePath];
+  }
+  const shards = names
+    .filter((name) => {
+      const match = SHARD_NAME_RE.exec(name);
+      return !!match && match[1]!.toLowerCase() === stem;
+    })
+    .sort()
+    .map((name) => path.join(dir, name));
+  return shards.length ? shards : [filePath];
+}
+
+function familyStem(filePath: string): string {
+  let stem = displayGgufTitle(filePath);
+  const quant = extractQuantToken(filePath);
+  if (quant) {
+    stem = stem.replace(new RegExp(`[-_.]${quant.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i"), "");
+  }
+  return stem.toLowerCase();
+}
+
+function groupTitle(filePath: string): string {
+  const friendly = friendlyModelTitle(undefined, filePath);
+  const split = friendly.split(" · ");
+  if (split.length > 1) {
+    return split.slice(0, -1).join(" · ");
+  }
+  return friendly;
+}
+
+function quantLabel(filePath: string): string {
+  return extractQuantToken(filePath)?.toUpperCase() || displayGgufTitle(filePath);
+}
+
+function fileBytes(filePath: string): number {
+  try {
+    const st = fs.statSync(filePath);
+    return st.isFile() ? st.size : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * Group language GGUFs by download repo (an `org__repo` folder) or, otherwise,
+ * by parent directory plus the filename with the quant token removed.
+ */
+export function buildLibraryGroups(entries: LocalModelEntry[], modelsDir: string): LibraryGroup[] {
+  const buckets = new Map<string, LocalModelEntry[]>();
+  for (const entry of entries) {
+    const dir = path.dirname(entry.path);
+    const folder = path.basename(dir);
+    const key = folder.includes("__")
+      ? `${entry.source}\0${dir}`
+      : `${entry.source}\0${dir}\0${familyStem(entry.path)}`;
+    const bucket = buckets.get(key) || [];
+    bucket.push(entry);
+    buckets.set(key, bucket);
+  }
+
+  const groups: LibraryGroup[] = [];
+  for (const [key, bucket] of buckets) {
+    const sorted = [...bucket].sort((a, b) => quantLabel(a.path).localeCompare(quantLabel(b.path)));
+    const first = sorted[0]!;
+    const dir = path.dirname(first.path);
+    const folder = path.basename(dir);
+    const quants: LibraryQuant[] = sorted.map((entry) => {
+      const shardPaths = listShardPaths(entry.path);
+      return {
+        path: entry.path,
+        label: quantLabel(entry.path),
+        sizeBytes: entry.sizeBytes,
+        shardCount: Math.max(entry.shardCount || 1, shardPaths.length),
+        shardPaths,
+        source: entry.source,
+        owned: isOwnedModelPath(entry.path, modelsDir) && shardPaths.every((shard) => isOwnedModelPath(shard, modelsDir)),
+      };
+    });
+    const companions: LibraryCompanion[] = [];
+    const mmproj = findSiblingMmproj(first.path);
+    if (mmproj) {
+      companions.push({
+        path: mmproj,
+        name: path.basename(mmproj),
+        role: "mmproj",
+        sizeBytes: fileBytes(mmproj),
+        shared: quants.length > 1,
+      });
+    }
+    const mtp = findSiblingMtpDraft(first.path);
+    if (mtp && mtp !== mmproj) {
+      companions.push({
+        path: mtp,
+        name: path.basename(mtp),
+        role: "mtp",
+        sizeBytes: fileBytes(mtp),
+        shared: quants.length > 1,
+      });
+    }
+    const sources = [...new Set(quants.map((q) => q.source))];
+    groups.push({
+      id: key,
+      title: groupTitle(first.path),
+      source: sources.length === 1 ? sources[0]! : "Mixed",
+      owned: quants.every((q) => q.owned),
+      detail: folder.includes("__") ? folder.replace("__", "/").replace(/-gguf$/i, "") : folder,
+      quants,
+      companions,
+    });
+  }
+
+  groups.sort((a, b) => {
+    if (a.owned !== b.owned) {
+      return a.owned ? -1 : 1;
+    }
+    if (a.source !== b.source) {
+      if (a.source === "Llama AIO") {
+        return -1;
+      }
+      if (b.source === "Llama AIO") {
+        return 1;
+      }
+      return a.source.localeCompare(b.source);
+    }
+    return a.title.localeCompare(b.title);
+  });
+  return groups;
+}
+
+/** Incomplete `*.partial` files under the Llama AIO models folder. */
+export function listPartialDownloads(modelsDir: string): PartialDownload[] {
+  const root = (modelsDir || "").trim();
+  if (!root || !fs.existsSync(root)) {
+    return [];
+  }
+  const rootReal = canonicalModelPath(root);
+  const out: PartialDownload[] = [];
+  const stack: Array<{ dir: string; depth: number }> = [{ dir: root, depth: 0 }];
+  while (stack.length) {
+    const { dir, depth } = stack.pop()!;
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const ent of entries) {
+      if (ent.name.startsWith(".")) {
+        continue;
+      }
+      const full = path.join(dir, ent.name);
+      if (ent.isSymbolicLink()) {
+        continue;
+      }
+      if (ent.isDirectory()) {
+        if (depth < 5 && !SKIP_DIR_NAMES.has(ent.name)) {
+          stack.push({ dir: full, depth: depth + 1 });
+        }
+        continue;
+      }
+      if (!ent.isFile() || !ent.name.toLowerCase().endsWith(".partial")) {
+        continue;
+      }
+      if (!isOwnedModelPath(full, rootReal)) {
+        continue;
+      }
+      out.push({ path: full, sizeBytes: fileBytes(full) });
+    }
+  }
+  return out.sort((a, b) => a.path.localeCompare(b.path));
+}
+
+/**
+ * Paths that may be deleted for this quant. The quant and its shards must all
+ * sit inside `modelsDir`. Companion paths are included only when they are owned
+ * and live in the same directory.
+ */
+export function removalPathsForQuant(
+  quantPath: string,
+  modelsDir: string,
+  companionPaths: readonly string[] = []
+): { files: string[]; rejected: string[] } {
+  const shards = listShardPaths(quantPath);
+  const rejected: string[] = [];
+  const files: string[] = [];
+  const seen = new Set<string>();
+  const push = (filePath: string, allowCompanion: boolean) => {
+    const canon = canonicalModelPath(filePath);
+    if (!canon || seen.has(canon)) {
+      return;
+    }
+    const owned = isOwnedModelPath(filePath, modelsDir);
+    const sameDir = path.dirname(canon) === path.dirname(canonicalModelPath(quantPath));
+    if (!owned || (allowCompanion && !sameDir)) {
+      rejected.push(filePath);
+      return;
+    }
+    seen.add(canon);
+    files.push(canon);
+  };
+  for (const shard of shards) {
+    push(shard, false);
+  }
+  if (!files.length) {
+    rejected.unshift(quantPath);
+  }
+  for (const extra of companionPaths) {
+    push(extra, true);
+  }
+  return { files, rejected };
+}
+
 export function formatModelSize(n: number): string {
   if (n < 1024 * 1024) {
     return `${(n / 1024).toFixed(1)} KB`;

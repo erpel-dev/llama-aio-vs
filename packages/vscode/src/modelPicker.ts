@@ -13,7 +13,9 @@ import {
   isDflashDraftArchitecture,
   isMtpDraftArchitecture,
   isMtpSidecarFile,
+  hiddenModelPaths,
   listLocalModelEntries,
+  withoutHiddenModels,
   listMmprojEntries,
   listMtpDraftEntries,
   pickerGpus,
@@ -189,7 +191,8 @@ export async function pickDownloadedModel(
     return undefined;
   }
 
-  const local = listLocalModelEntries(config);
+  const allLocal = listLocalModelEntries(config);
+  const local = withoutHiddenModels(allLocal, hiddenModelPaths(config));
   await yieldToUi();
   hideSub.dispose();
   if (dismissed) {
@@ -199,6 +202,12 @@ export async function pickDownloadedModel(
 
   if (!local.length) {
     qp.dispose();
+    if (allLocal.length) {
+      await vscode.window.showInformationMessage(
+        "Every downloaded model is hidden. Use Show hidden in the Llama AIO library to bring one back."
+      );
+      return store.getState().selectedModelPath || undefined;
+    }
     const choice = await vscode.window.showInformationMessage(
       `No GGUF models found in ${modelsDir} or common tool folders (LM Studio, Unsloth, HF cache, …). Download one, or open a file.`,
       "Download from Hugging Face",

@@ -25,6 +25,7 @@ export * from "./modelLibrary";
 export * from "./modelPickerInfo";
 export * from "./modelModes";
 export * from "./nixCompat";
+export * from "./overthinkingBias";
 export * from "./paths";
 export * from "./perfStats";
 export * from "./processIdentity";

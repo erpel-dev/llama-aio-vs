@@ -347,6 +347,14 @@ export interface RequestSettings {
   frequencyPenalty: number;
   /** Repetition penalty (llama.cpp style; 1.0 = disabled) */
   repeatPenalty: number;
+  /**
+   * Subtract {@link overthinkingPenaltyStrength} from hesitation-word logits
+   * (Wait, maybe, But, …) on each chat request. Off by default: those words
+   * are normal in code and tool calls.
+   */
+  overthinkingPenalty: boolean;
+  /** Logit penalty applied when {@link overthinkingPenalty} is on. Paper sweep: 0.5–4. */
+  overthinkingPenaltyStrength: number;
 }
 
 export interface ExtensionState {
@@ -529,6 +537,13 @@ export function normalizeRequestSettings(raw: Partial<RequestSettings> | undefin
     presencePenalty: float(s.presencePenalty, -2, 2, d.presencePenalty),
     frequencyPenalty: float(s.frequencyPenalty, -2, 2, d.frequencyPenalty),
     repeatPenalty: float(s.repeatPenalty, 0.5, 2, d.repeatPenalty),
+    overthinkingPenalty: toBoolean(s.overthinkingPenalty, d.overthinkingPenalty),
+    overthinkingPenaltyStrength: float(
+      s.overthinkingPenaltyStrength,
+      0.5,
+      4,
+      d.overthinkingPenaltyStrength
+    ),
   };
 }
 
@@ -544,6 +559,8 @@ export const DEFAULT_REQUEST_SETTINGS: RequestSettings = {
   presencePenalty: 0,
   frequencyPenalty: 0,
   repeatPenalty: 1,
+  overthinkingPenalty: false,
+  overthinkingPenaltyStrength: 2,
 };
 
 export interface ServerStatus {

@@ -2,7 +2,7 @@
   "name": "llama-aio-vs",
   "displayName": "Llama AIO",
   "description": "All-in-one local llama.cpp for VS Code: install, HF models, LM Studio-style settings, shared server, Copilot Chat provider.",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "publisher": "erpel-dev",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -71,6 +71,18 @@
       {
         "command": "llamaAio.selectLocalModel",
         "title": "Llama AIO: Choose from Downloaded Models"
+      },
+      {
+        "command": "llamaAio.removeSelectedModel",
+        "title": "Llama AIO: Remove Selected Model…"
+      },
+      {
+        "command": "llamaAio.hideModel",
+        "title": "Llama AIO: Hide Model from Library…"
+      },
+      {
+        "command": "llamaAio.cleanPartialDownloads",
+        "title": "Llama AIO: Clean Incomplete Downloads"
       },
       {
         "command": "llamaAio.selectDraftModel",

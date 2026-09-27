@@ -114,7 +114,9 @@ const store = {
     state = { ...state, requestSettings: { ...state.requestSettings, ...p } };
   },
   applySelectedModel: async (p) => {
+    const prev = state.selectedModelPath;
     state = { ...state, selectedModelPath: p, modelCapabilities: core.readModelCapabilities(p) };
+    config.set("recentModels", [...new Set([p, prev, ...(config.get("recentModels") || [])].filter(Boolean))].slice(0, 8));
     return state;
   },
   isPromptReplacementsEnabled: () => true,
@@ -136,6 +138,7 @@ const processManager = {
     pid: running ? 8992 : undefined,
     endpoint: "http://127.0.0.1:8742",
     message: running ? "Running (pid 8992)" : "Stopped",
+    modelPath: running ? launched.modelPath : undefined,
     configDirty: running && !sameConfig(),
   }),
   isHttpReady: async () => running,
@@ -222,8 +225,12 @@ const perf = {
 const modelActions = new Proxy(
   {},
   {
-    get: (_t, name) => async () => {
+    get: (_t, name) => async (...a) => {
       log.push({ dir: "action", name: String(name) });
+      if (name === "selectModel" && a[0]) {
+        await store.applySelectedModel(a[0]);
+        await provider.pushState();
+      }
     },
   }
 );
@@ -303,6 +310,13 @@ function applyScenario(name) {
   } else if (name === "spill") {
     state = freshState({ contextLength: 262144, cacheTypeK: "f16", cacheTypeV: "f16" });
     launched = snapshot();
+  } else if (name === "model") {
+    // Server still runs an older pick; the sidebar selection has moved on.
+    const other = core.listLocalModelEntries({ get: () => undefined }).find((e) => e.path !== state.selectedModelPath);
+    if (other) {
+      launched = { ...snapshot(), modelPath: other.path };
+      config.set("recentModels", [state.selectedModelPath, other.path]);
+    }
   } else if (name === "cpu") {
     cpuBackend = true;
     state = freshState({ contextLength: 32768 });

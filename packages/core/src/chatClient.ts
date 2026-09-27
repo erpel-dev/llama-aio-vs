@@ -47,6 +47,8 @@ export interface ChatCompletionOptions {
   frequencyPenalty?: number;
   /** Repetition penalty (llama.cpp style, 1.0 = disabled). */
   repeatPenalty?: number;
+  /** Token-id string → logit delta. Omitted when empty. */
+  logitBias?: Record<string, number>;
   signal?: AbortSignal;
 }
 
@@ -83,6 +85,9 @@ export async function* streamChatCompletion(
     presence_penalty: options.presencePenalty ?? 0,
     frequency_penalty: options.frequencyPenalty ?? 0,
     repeat_penalty: options.repeatPenalty ?? 1,
+    ...(options.logitBias && Object.keys(options.logitBias).length > 0
+      ? { logit_bias: options.logitBias }
+      : {}),
     stream: true,
     stream_options: { include_usage: true },
   };

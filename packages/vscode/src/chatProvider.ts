@@ -18,6 +18,7 @@ import {
   resolveModeParams,
   resolveModelModes,
 } from "@llama-aio/core";
+import { overthinkingLogitBias } from "@llama-aio/core";
 import {
   estimateContextBreakdown,
   formatExceedContextError,
@@ -1030,6 +1031,17 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
           toolsEnabled: boolean;
         }
       | undefined;
+    // After mode sampling, so a Copilot mode that rewrites temperature does not
+    // drop the penalty. Ids are resolved once per model from /tokenize.
+    const markerBias = await overthinkingLogitBias(
+      this.store.getEndpoint(),
+      state.selectedModelPath || "",
+      state.requestSettings.overthinkingPenalty,
+      state.requestSettings.overthinkingPenaltyStrength
+    );
+    if (markerBias) {
+      body.logit_bias = markerBias;
+    }
     try {
       for await (const event of streamChatCompletions(this.store.getEndpoint(), body, token, {
         maxContext: state.modelCapabilities?.maxContextLength,

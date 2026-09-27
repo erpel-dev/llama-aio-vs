@@ -66,7 +66,7 @@ export type LoadFieldDef =
       kind: "enum";
       label: string;
       help: string;
-      store: "load";
+      store: "load" | "request";
       key: string;
       options: Array<{ value: string; name: string }>;
     }
@@ -448,6 +448,29 @@ export const LOAD_FIELD_DEFS: LoadFieldDef[] = [
     key: "frequencyPenalty",
     min: -2,
     max: 2,
+  },
+  {
+    id: "overthinkingPenalty",
+    kind: "enum",
+    label: "Overthinking Penalty",
+    help: "Subtract Penalty Strength from Wait, maybe, But, and the other branch words on each chat request. Ids come from the running server and are cached per model. Off by default.",
+    store: "request",
+    key: "overthinkingPenalty",
+    options: [
+      { value: "off", name: "Off" },
+      { value: "on", name: "On" },
+    ],
+  },
+  {
+    id: "overthinkingPenaltyStrength",
+    kind: "number",
+    label: "Penalty Strength",
+    help: "Logit penalty when Overthinking Penalty is on. 2 shortened a lily-pad trace from 828 to 233 tokens. Range 0.5–4.",
+    step: 0.5,
+    store: "request",
+    key: "overthinkingPenaltyStrength",
+    min: 0.5,
+    max: 4,
   },
   {
     id: "maxTokens",

@@ -40,7 +40,7 @@ The **Performance** card shows generation and prompt speed, cache reuse, specula
 
 ## Copilot Chat
 
-The running model appears in Copilot Chat as **Llama AIO: …**, including Agent mode with streamed replies and tool calls. Curated sampling modes are applied automatically for well-known model families; otherwise set temperature, top-p/k and max tokens under **Copilot Chat → Request defaults**.
+The running model appears in Copilot Chat as **Llama AIO: …**, including Agent mode with streamed replies and tool calls. Curated sampling modes are applied automatically for well-known model families; otherwise set temperature, top-p/k and max tokens under **Chat Requests → Sampling**.
 
 ## Good to know
 

@@ -1,3 +1,4 @@
+import * as path from "path";
 import { AppConfig, ConfigAccessor, ConfigFile, toExtensionState } from "./config";
 import { Event } from "./events";
 import { clampLoadSettingsToModel, isQwen4expArchitecture, readModelCapabilities } from "./ggufMetadata";
@@ -18,6 +19,8 @@ import {
   RequestSettings,
   speculativeUsesMtp,
 } from "./types";
+
+const RECENT_MODELS_MAX = 8;
 
 /**
  * Everything the frontends read and write, backed by the shared config file so
@@ -165,12 +168,31 @@ export class SettingsStore {
     }
     loadSettings = clampLoadSettingsToModel(loadSettings, caps);
 
-    return this.setState({
+    const next = await this.setState({
       selectedModelPath: modelPath,
       modelCapabilities: caps,
       modelMaxContext: caps.maxContextLength,
       loadSettings,
     });
+    if (pathChanged) {
+      await this.rememberRecentModels([modelPath, prev.selectedModelPath]);
+    }
+    return next;
+  }
+
+  /** Newest first, one entry per file. */
+  private async rememberRecentModels(newest: string[]): Promise<void> {
+    const list = [...newest, ...(this.getConfig().get<string[]>("recentModels") || [])].filter(Boolean);
+    const seen = new Set<string>();
+    const out = list.filter((p) => {
+      const key = path.resolve(p);
+      if (seen.has(key)) {
+        return false;
+      }
+      seen.add(key);
+      return true;
+    });
+    await this.getConfig().update("recentModels", out.slice(0, RECENT_MODELS_MAX));
   }
 
   getConfig(): ConfigAccessor {

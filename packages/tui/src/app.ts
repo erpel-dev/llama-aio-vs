@@ -37,6 +37,7 @@ import {
   invalidateModelLibraryCache,
   STARTER_MODEL,
   streamChatCompletion,
+  overthinkingLogitBias,
   parseTensorSplit,
   tensorSplitForTargetWeightShare,
   mainWeightShareFromSplit,
@@ -899,6 +900,8 @@ export async function runApp(services: AppServices): Promise<void> {
         "repeatPenalty",
         "presencePenalty",
         "frequencyPenalty",
+        "overthinkingPenalty",
+        "overthinkingPenaltyStrength",
         "maxTokens",
       ],
     },
@@ -938,7 +941,8 @@ export async function runApp(services: AppServices): Promise<void> {
     }
     if (id === "sampling") {
       const req = services.store.getState().requestSettings;
-      return `temp ${req.temperature} · top_p ${req.topP} · max ${req.maxTokens}`;
+      const overthink = req.overthinkingPenalty ? ` · overthink −${req.overthinkingPenaltyStrength}` : "";
+      return `temp ${req.temperature} · top_p ${req.topP} · max ${req.maxTokens}${overthink}`;
     }
     return "threads · flash · batches";
   }
@@ -1073,6 +1077,9 @@ export async function runApp(services: AppServices): Promise<void> {
     }
     if (field.kind === "enum") {
       const load = state.loadSettings;
+      if (field.key === "overthinkingPenalty") {
+        return state.requestSettings.overthinkingPenalty ? "on" : "off";
+      }
       if (field.key === "offloadKvCacheToGpu") {
         return load.offloadKvCacheToGpu ? "true" : "false";
       }
@@ -1115,6 +1122,7 @@ export async function runApp(services: AppServices): Promise<void> {
       if (field.key === "repeatPenalty") return req.repeatPenalty;
       if (field.key === "presencePenalty") return req.presencePenalty;
       if (field.key === "frequencyPenalty") return req.frequencyPenalty;
+      if (field.key === "overthinkingPenaltyStrength") return req.overthinkingPenaltyStrength;
       return 0;
     }
     const load = state.loadSettings;
@@ -1346,6 +1354,10 @@ export async function runApp(services: AppServices): Promise<void> {
   }
 
   async function commitLoadEnum(field: Extract<(typeof LOAD_FIELD_DEFS)[number], { kind: "enum" }>, value: string): Promise<void> {
+    if (field.key === "overthinkingPenalty") {
+      await services.store.updateRequestSettings({ overthinkingPenalty: value === "on" });
+      return;
+    }
     if (field.key === "offloadKvCacheToGpu") {
       await services.store.updateLoadSettings({ offloadKvCacheToGpu: value === "true" });
       return;
@@ -2563,6 +2575,12 @@ export async function runApp(services: AppServices): Promise<void> {
         presencePenalty: req.presencePenalty,
         frequencyPenalty: req.frequencyPenalty,
         repeatPenalty: req.repeatPenalty,
+        logitBias: await overthinkingLogitBias(
+          services.store.getEndpoint(),
+          services.store.getState().selectedModelPath || "",
+          req.overthinkingPenalty,
+          req.overthinkingPenaltyStrength
+        ),
         signal: chatAbort.signal,
       })) {
         if (ev.kind === "text") {

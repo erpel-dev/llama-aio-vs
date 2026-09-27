@@ -6,16 +6,28 @@ import { promptUseInCopilotChat } from "./copilotChatPrompt";
 import { copyServerCommandLine, openServerLog, reportLaunchFailure } from "./serverDiagnostics";
 import { detectGpus, activeInstallLock, type GpuMemoryInfo } from "@llama-aio/core";
 import { LlamaInstaller, UiBackend } from "@llama-aio/core";
-import { computeMemoryView, diffLoadSettings, fittingContextLength, memoryEstimateInputs, mmprojFileSize, resolveDraftCapabilities, shortGpuName, type SettingChange } from "@llama-aio/core";
+import { clampLoadSettingsToModel, computeMemoryView, diffLoadSettings, fittingContextLength, memoryEstimateInputs, mmprojFileSize, resolveDraftCapabilities, shortGpuName, type SettingChange } from "@llama-aio/core";
 import { resolveModelModes } from "@llama-aio/core";
 import {
+  buildLibraryGroups,
+  canonicalModelPath,
   displayModelTitle,
+  formatModelSize,
   friendlyModelTitle,
+  hiddenModelPaths,
+  isOwnedModelPath,
   listActiveModelSourceDirs,
   listLocalModelEntries,
+  listPartialDownloads,
+  listShardPaths,
   findSiblingMtpDraft,
   invalidateModelLibraryCache,
   isMtpSidecarFile,
+  readPickerCapabilities,
+  removalPathsForQuant,
+  sameModelFile,
+  withoutHiddenModels,
+  type LibraryGroup,
 } from "@llama-aio/core";
 import { getModelsDir } from "@llama-aio/core";
 import { PerfStats } from "@llama-aio/core";
@@ -23,7 +35,20 @@ import { LaunchToken, LAUNCH_IN_PROGRESS_MSG, ProcessManager } from "@llama-aio/
 import { SettingsStore } from "@llama-aio/core";
 import { resolveLaunchMode } from "@llama-aio/core";
 import { capsMissDefaultSwaPattern, DEFAULT_LOAD_SETTINGS, DEFAULT_REQUEST_SETTINGS, effectiveServerUiState, isQwen4expArchitecture, LlamaLoadSettings, normalizeSpeculativeMode, RequestSettings } from "@llama-aio/core";
-import { STARTER_MODEL } from "./huggingFace";
+import { isDflashDraftArchitecture, recommendedMaxDraftTokens, speculativeUsesMtp, speculativeUsesNgram } from "@llama-aio/core";
+import {
+  companionDownloadHint,
+  describeLanguageGgufFile,
+  DownloadAbortError,
+  downloadManager,
+  downloadPickerFiles,
+  GatedDownloadError,
+  licenseFromTags,
+  listingBaseName,
+  resolveLicenseUrl,
+  type DownloadJobSnapshot,
+} from "@llama-aio/core";
+import { downloadGgufSelection, HuggingFaceClient, STARTER_MODEL } from "./huggingFace";
 
 export type ModelActions = {
   downloadFromHuggingFace: () => Promise<void>;
@@ -38,6 +63,7 @@ export type ModelActions = {
   installLlamaCppFromArchive: () => Promise<void>;
   switchBackend: (backend: UiBackend) => Promise<void>;
   showDownloads: () => Promise<void>;
+  selectModel: (filePath: string) => Promise<void>;
 };
 
 /**
@@ -70,6 +96,15 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
   private updateCheckInFlight = false;
   /** GPUs from the last full state push; live estimates reuse them instead of re-probing. */
   private lastGpus: GpuMemoryInfo[] = [];
+  /** Drops fit-badge work from an older library scan when a newer state arrives. */
+  private libraryFitGen = 0;
+  private hfClient?: HuggingFaceClient;
+  private downloadsBound = false;
+  private latestJobs: DownloadJobSnapshot[] = [];
+  private postedJobState = "";
+  private downloadPostTimer: ReturnType<typeof setTimeout> | undefined;
+  private libraryFocus: { filter?: boolean; downloads?: boolean; query?: string; search?: boolean } | null = null;
+  private libraryReady = false;
 
   constructor(
     private readonly extensionUri: vscode.Uri,
@@ -92,6 +127,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     webviewView.onDidDispose(() => {
       if (this.view === webviewView) {
         this.view = undefined;
+        this.libraryReady = false;
       }
     });
     webviewView.webview.options = {
@@ -99,11 +135,15 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       localResourceRoots: [this.extensionUri],
     };
     webviewView.webview.html = this.getHtml(webviewView.webview);
+    this.bindDownloads();
     webviewView.webview.onDidReceiveMessage(async (msg) => {
       try {
         switch (msg.type) {
           case "ready":
+            this.libraryReady = true;
             await this.pushState();
+            this.flushDownloadPost();
+            this.flushLibraryFocus();
             break;
           case "saveLoad":
             await this.store.updateLoadSettings(msg.payload as Partial<LlamaLoadSettings>);
@@ -397,6 +437,81 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             }
             break;
           }
+          case "useLibraryModel": {
+            const filePath = typeof msg.path === "string" ? msg.path : "";
+            if (filePath) {
+              await this.modelActions.selectModel(filePath);
+            }
+            break;
+          }
+          case "useLibraryDraft": {
+            const filePath = typeof msg.path === "string" ? msg.path : "";
+            if (filePath) {
+              await this.useDflashDraft(filePath);
+            }
+            break;
+          }
+          case "copyPath": {
+            const filePath = typeof msg.path === "string" ? msg.path : "";
+            if (filePath) {
+              await vscode.env.clipboard.writeText(filePath);
+              vscode.window.setStatusBarMessage("Llama AIO: path copied", 2000);
+            }
+            break;
+          }
+          case "hideLibraryModel": {
+            await this.hideLibraryPath(typeof msg.path === "string" ? msg.path : "");
+            break;
+          }
+          case "unhideLibraryModel": {
+            await this.unhideLibraryPath(typeof msg.path === "string" ? msg.path : "");
+            break;
+          }
+          case "removeLibraryQuant": {
+            const quantPath = typeof msg.path === "string" ? msg.path : "";
+            const companions = Array.isArray(msg.companionPaths)
+              ? msg.companionPaths.filter((p: unknown): p is string => typeof p === "string")
+              : [];
+            await this.removeOwnedQuant(quantPath, companions);
+            break;
+          }
+          case "cleanPartialDownloads":
+            await this.cleanPartialDownloads();
+            break;
+          case "searchLibraryHf":
+            await this.searchLibraryHf(typeof msg.query === "string" ? msg.query : "");
+            break;
+          case "listLibraryHfFiles":
+            await this.listLibraryHfFiles(typeof msg.modelId === "string" ? msg.modelId : "");
+            break;
+          case "downloadLibraryHf":
+            void this.runLibraryDownload(
+              typeof msg.modelId === "string" ? msg.modelId : "",
+              typeof msg.filePath === "string" ? msg.filePath : ""
+            );
+            break;
+          case "pauseDownload":
+            downloadManager.pause(typeof msg.id === "string" ? msg.id : "");
+            break;
+          case "resumeDownload":
+            downloadManager.resume(typeof msg.id === "string" ? msg.id : "");
+            break;
+          case "cancelDownload":
+            downloadManager.cancel(typeof msg.id === "string" ? msg.id : "");
+            break;
+          case "setHfToken": {
+            const token = await vscode.window.showInputBox({
+              title: "Hugging Face access token",
+              prompt: "Paste a token with access to gated repos (stored in Llama AIO config).",
+              password: true,
+              ignoreFocusOut: true,
+            });
+            if (token !== undefined) {
+              await this.store.getConfig().update("hfToken", token.trim());
+              vscode.window.setStatusBarMessage("Llama AIO: Hugging Face token saved", 4000);
+            }
+            break;
+          }
           case "revealInOs": {
             const targetPath = typeof msg.path === "string" ? msg.path : "";
             if (!targetPath) {
@@ -582,6 +697,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     const modelsDir = getModelsDir(this.store.getConfig());
     const localEntries = listLocalModelEntries(this.store.getConfig());
     const localModelCount = localEntries.length;
+    const library = this.libraryPayload(state.selectedModelPath, status);
     const localSourceDirs = listActiveModelSourceDirs(this.store.getConfig(), localEntries);
     const localSources = localSourceDirs.map((s) => s.source);
 
@@ -616,6 +732,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         binaryExists: fs.existsSync(binary),
         modelsDir,
         localModelCount,
+        library,
         localSources,
         localSourceDirs,
         modelName: friendlyModelTitle(caps?.name, state.selectedModelPath),
@@ -683,6 +800,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           : null,
       },
     });
+    void this.postLibraryFits(
+      [...library.groups, ...library.hiddenGroups].flatMap((group) => group.quants.map((quant) => quant.path)),
+      cpuOnly
+    );
 
     // Resolve latest tag in the background when cache is cold (no GitHub API).
     // Patch the hint immediately — a full pushState re-probes the binary and
@@ -819,6 +940,482 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       language: "markdown",
     });
     await vscode.window.showTextDocument(doc, { preview: false, viewColumn: vscode.ViewColumn.Active });
+  }
+
+  /** Attach a library DFlash GGUF as the draft for the current model instead of replacing it. */
+  private async useDflashDraft(filePath: string): Promise<void> {
+    const cur = this.store.getState().loadSettings;
+    const mode = speculativeUsesNgram(cur.speculativeMode)
+      ? "ngram-dflash"
+      : cur.speculativeMode === "off" || speculativeUsesMtp(cur.speculativeMode)
+        ? "dflash"
+        : cur.speculativeMode;
+    await this.store.updateLoadSettings({
+      draftModelPath: filePath,
+      speculativeMode: mode,
+      maxDraftTokens: recommendedMaxDraftTokens(mode, cur.maxDraftTokens),
+    });
+    this.postDraftModelSelected(filePath);
+    this.syncSpeculativeMode();
+    await this.pushState();
+    void vscode.window.showInformationMessage(`DFlash draft set to ${path.basename(filePath)}`);
+  }
+
+  private libraryPayload(selectedPath: string, status: { running: boolean; starting?: boolean; modelPath?: string }) {
+    const config = this.store.getConfig();
+    const modelsDir = getModelsDir(config);
+    const hidden = hiddenModelPaths(config);
+    const present = hidden.filter((filePath) => fs.existsSync(filePath));
+    if (present.length !== hidden.length) {
+      void config.update("hiddenModels", present);
+    }
+    const hiddenSet = new Set(present);
+    const all = listLocalModelEntries(config);
+    const visible = withoutHiddenModels(all, present);
+    const hiddenEntries = all.filter((entry) => hiddenSet.has(canonicalModelPath(entry.path)));
+    const decorate = (groups: LibraryGroup[]) =>
+      groups.map((group) => ({
+        id: group.id,
+        title: group.title,
+        source: group.source,
+        owned: group.owned,
+        detail: group.detail,
+        companions: group.companions.map((companion) => ({
+          path: companion.path,
+          name: companion.name,
+          role: companion.role,
+          sizeBytes: companion.sizeBytes,
+          sizeLabel: formatModelSize(companion.sizeBytes),
+          shared: companion.shared,
+        })),
+        quants: group.quants.map((quant) => ({
+          path: quant.path,
+          label: quant.label,
+          sizeBytes: quant.sizeBytes,
+          sizeLabel: formatModelSize(quant.sizeBytes),
+          shardCount: quant.shardCount,
+          source: quant.source,
+          owned: quant.owned,
+          current: sameModelFile(quant.path, selectedPath),
+          loaded: !!(
+            status.running &&
+            (sameModelFile(quant.path, status.modelPath) ||
+              (!status.modelPath && sameModelFile(quant.path, selectedPath)))
+          ),
+        })),
+      }));
+    const partials = listPartialDownloads(modelsDir);
+    const partialBytes = partials.reduce((sum, file) => sum + file.sizeBytes, 0);
+    return {
+      groups: decorate(buildLibraryGroups(visible, modelsDir)),
+      hiddenGroups: decorate(buildLibraryGroups(hiddenEntries, modelsDir)),
+      partials: partials.map((file) => ({
+        path: file.path,
+        sizeBytes: file.sizeBytes,
+        name: path.basename(file.path),
+        sizeLabel: formatModelSize(file.sizeBytes),
+      })),
+      partialBytes,
+      partialSizeLabel: formatModelSize(partialBytes),
+      serverStarting: !!status.starting,
+      recent: [selectedPath, ...(config.get<string[]>("recentModels") || [])].filter(
+        (p, i, all) => !!p && fs.existsSync(p) && all.findIndex((q) => sameModelFile(q, p)) === i
+      ),
+    };
+  }
+
+  private async postLibraryFits(paths: string[], cpuOnly: boolean): Promise<void> {
+    const gen = ++this.libraryFitGen;
+    const fits: Record<string, string> = {};
+    const ratios: Record<string, number> = {};
+    const drafts: Record<string, boolean> = {};
+    let capacityBytes = 0;
+    const settings = this.store.getState().loadSettings;
+    for (const filePath of paths) {
+      if (gen !== this.libraryFitGen) {
+        return;
+      }
+      try {
+        const caps = readPickerCapabilities(filePath);
+        if (!caps) {
+          continue;
+        }
+        if (isDflashDraftArchitecture(caps.architecture)) {
+          drafts[filePath] = true;
+        }
+        const current = sameModelFile(filePath, this.store.getState().selectedModelPath);
+        const load = clampLoadSettingsToModel(settings, caps);
+        const { view } = computeMemoryView(
+          caps,
+          current ? load : { ...load, draftModelPath: "", mmprojPath: "" },
+          cpuOnly ? [] : this.lastGpus,
+          { cpuOnly }
+        );
+        // Same verdict as the Memory card: tight means under the 1.5 GiB
+        // headroom, not merely under 4 GiB free.
+        const level = view?.level;
+        if (level === "good") {
+          fits[filePath] = "fits";
+        } else if (level === "tight") {
+          fits[filePath] = "tight";
+        } else if (level === "spill") {
+          fits[filePath] = "wont-fit";
+        }
+        const devices = (view?.devices || []).filter((d) => (d.capacityBytes || 0) > 0);
+        const cap = devices.reduce((sum, d) => sum + (d.capacityBytes || 0), 0);
+        if (cap > 0) {
+          ratios[filePath] = devices.reduce((sum, d) => sum + d.usedBytes, 0) / cap;
+          capacityBytes = Math.max(capacityBytes, cap);
+        }
+      } catch {
+        // Leave the badge blank when the GGUF header cannot be read.
+      }
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    if (gen !== this.libraryFitGen || !this.view) {
+      return;
+    }
+    this.view.webview.postMessage({
+      type: "libraryFits",
+      fits,
+      ratios,
+      drafts,
+      budgetLabel: capacityBytes > 0 ? `${formatModelSize(capacityBytes)} ${cpuOnly ? "RAM" : "VRAM"}` : "",
+    });
+  }
+
+  /** Palette and the status-bar chip land in this list instead of a second picker. */
+  focusLibrary(opts: { filter?: boolean; downloads?: boolean; query?: string; search?: boolean } = {}): void {
+    this.libraryFocus = opts;
+    void vscode.commands.executeCommand("llamaAio.settingsView.focus").then(() => {
+      if (this.libraryReady) {
+        this.flushLibraryFocus();
+      }
+    });
+  }
+
+  private flushLibraryFocus(): void {
+    if (!this.view || !this.libraryFocus) {
+      return;
+    }
+    this.view.webview.postMessage({ type: "focusLibrary", ...this.libraryFocus });
+    this.libraryFocus = null;
+  }
+
+  private hf(): HuggingFaceClient {
+    if (!this.hfClient) {
+      this.hfClient = new HuggingFaceClient(this.store);
+    }
+    return this.hfClient;
+  }
+
+  private bindDownloads(): void {
+    if (this.downloadsBound) {
+      return;
+    }
+    this.downloadsBound = true;
+    downloadManager.subscribe((jobs) => this.postLibraryDownloads(jobs));
+  }
+
+  private postLibraryDownloads(jobs: DownloadJobSnapshot[]): void {
+    this.latestJobs = jobs;
+    const sig = jobs.map((job) => job.id + ":" + job.state).join("|");
+    if (sig !== this.postedJobState) {
+      this.postedJobState = sig;
+      if (this.downloadPostTimer) {
+        clearTimeout(this.downloadPostTimer);
+        this.downloadPostTimer = undefined;
+      }
+      this.flushDownloadPost();
+      return;
+    }
+    if (this.downloadPostTimer) {
+      return;
+    }
+    this.downloadPostTimer = setTimeout(() => {
+      this.downloadPostTimer = undefined;
+      this.flushDownloadPost();
+    }, 300);
+  }
+
+  private flushDownloadPost(): void {
+    if (!this.view) {
+      return;
+    }
+    const jobs = this.latestJobs
+      .filter((job) => job.state !== "done" && job.state !== "cancelled")
+      .map((job) => ({
+        id: job.id,
+        label: job.label,
+        received: job.received,
+        total: job.total,
+        bytesPerSec: job.bytesPerSec,
+        etaSeconds: job.etaSeconds,
+        state: job.state,
+        error: job.error || "",
+        pageUrl: job.pageUrl || "",
+      }));
+    this.view.webview.postMessage({ type: "libraryDownloads", jobs });
+  }
+
+  private async searchLibraryHf(query: string): Promise<void> {
+    const q = query.trim();
+    if (q.length < 2 || !this.view) {
+      return;
+    }
+    try {
+      const models = await this.hf().searchGgufModels(q, 8);
+      const licenses = await this.hf().enrichLicenses(models);
+      const repos = models.map((model) => {
+        const license = licenses.get(model.id) || licenseFromTags(model.tags);
+        return {
+          id: model.id,
+          downloads: model.downloads,
+          badge: license.badge,
+          needsConfirm: license.needsConfirm,
+          summary: license.summary,
+          licenseUrl: resolveLicenseUrl(model.id, license) || "",
+        };
+      });
+      this.view.webview.postMessage({ type: "libraryHfResults", query: q, repos });
+    } catch (e) {
+      this.view?.webview.postMessage({
+        type: "libraryHfError",
+        query: q,
+        message: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+
+  private async listLibraryHfFiles(modelId: string): Promise<void> {
+    if (!modelId || !this.view) {
+      return;
+    }
+    try {
+      const files = await this.hf().listGgufFiles(modelId);
+      const picker = downloadPickerFiles(files);
+      this.view.webview.postMessage({
+        type: "libraryHfFiles",
+        modelId,
+        companionOnly: picker.companionOnly,
+        companionHint: picker.companionOnly ? "" : companionDownloadHint(files),
+        files: picker.files.map((file) => ({
+          path: file.path,
+          label: listingBaseName(file.path),
+          detail: describeLanguageGgufFile(file, files),
+        })),
+      });
+    } catch (e) {
+      this.view?.webview.postMessage({
+        type: "libraryHfError",
+        query: "",
+        message: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+
+  private async runLibraryDownload(modelId: string, filePath: string): Promise<void> {
+    if (!modelId || !filePath) {
+      return;
+    }
+    try {
+      const dest = await downloadGgufSelection(this.hf(), this.store, modelId, filePath);
+      invalidateModelLibraryCache();
+      if (dest) {
+        await this.modelActions.selectModel(dest);
+      } else {
+        await this.pushState();
+      }
+    } catch (e) {
+      if (e instanceof DownloadAbortError || e instanceof GatedDownloadError) {
+        return;
+      }
+      vscode.window.showErrorMessage(
+        `Download failed: ${e instanceof Error ? e.message : String(e)}`
+      );
+    }
+  }
+
+  private async trashOwnedFile(filePath: string): Promise<void> {
+    const uri = vscode.Uri.file(filePath);
+    try {
+      await vscode.workspace.fs.delete(uri, { useTrash: true });
+    } catch {
+      await fs.promises.rm(filePath, { force: true });
+    }
+  }
+
+  private async removeEmptyOwnedDir(dir: string, modelsDir: string): Promise<void> {
+    const dirReal = canonicalModelPath(dir);
+    const rootReal = canonicalModelPath(modelsDir);
+    if (!dirReal || dirReal === rootReal || !isOwnedModelPath(dir, modelsDir)) {
+      return;
+    }
+    let names: string[] = [];
+    try {
+      names = fs.readdirSync(dirReal);
+    } catch {
+      return;
+    }
+    if (names.length) {
+      return;
+    }
+    try {
+      await fs.promises.rmdir(dirReal);
+    } catch {
+      // Another file appeared, or the directory is busy.
+    }
+  }
+
+  async hideLibraryPath(filePath: string): Promise<void> {
+    const canon = canonicalModelPath(filePath);
+    if (!canon || !fs.existsSync(canon)) {
+      vscode.window.showWarningMessage("Llama AIO: That model file is not on disk.");
+      return;
+    }
+    const config = this.store.getConfig();
+    const hidden = hiddenModelPaths(config);
+    if (!hidden.includes(canon)) {
+      await config.update("hiddenModels", [...hidden, canon]);
+    }
+    await this.pushState();
+  }
+
+  async unhideLibraryPath(filePath: string): Promise<void> {
+    const canon = canonicalModelPath(filePath);
+    if (!canon) {
+      return;
+    }
+    const config = this.store.getConfig();
+    const hidden = hiddenModelPaths(config).filter((entry) => entry !== canon);
+    await config.update("hiddenModels", hidden);
+    await this.pushState();
+  }
+
+  async hideSelectedModel(): Promise<void> {
+    const selected = this.store.getState().selectedModelPath;
+    if (!selected) {
+      vscode.window.showInformationMessage("Llama AIO: Select a model first.");
+      return;
+    }
+    await this.hideLibraryPath(selected);
+    void vscode.window.showInformationMessage(
+      "Hidden from the library. Use Show hidden in the sidebar to bring it back."
+    );
+  }
+
+  /**
+   * Delete an owned quant (and any checked companions). The webview confirm
+   * dialog is the prompt; this re-checks every path and stops the server when
+   * a mapped file is in the set.
+   */
+  async removeOwnedQuant(quantPath: string, companionPaths: string[]): Promise<void> {
+    const trimmed = quantPath.trim();
+    if (!trimmed) {
+      return;
+    }
+    const modelsDir = getModelsDir(this.store.getConfig());
+    const plan = removalPathsForQuant(trimmed, modelsDir, companionPaths);
+    const shardSet = new Set(listShardPaths(trimmed).map((filePath) => canonicalModelPath(filePath)));
+    const shardRejected = plan.rejected.some((filePath) => shardSet.has(canonicalModelPath(filePath)));
+    if (shardRejected || !plan.files.some((filePath) => shardSet.has(filePath))) {
+      vscode.window.showWarningMessage(
+        "Llama AIO only removes files inside its own models folder. Use Hide for models found in other apps, or delete them in your file manager."
+      );
+      return;
+    }
+    const status = this.processManager.getStatus();
+    if (status.starting) {
+      vscode.window.showWarningMessage("Llama AIO: the server is still starting. Wait, then remove the model.");
+      return;
+    }
+    const state = this.store.getState();
+    const hits = (candidate: string | undefined) =>
+      !!candidate && plan.files.some((filePath) => sameModelFile(filePath, candidate));
+    const mapped =
+      hits(status.modelPath) ||
+      hits(state.selectedModelPath) ||
+      hits(state.loadSettings.mmprojPath) ||
+      hits(state.loadSettings.draftModelPath);
+    if (status.running && mapped) {
+      await this.processManager.stop(true);
+    }
+    for (const filePath of plan.files) {
+      await this.trashOwnedFile(filePath);
+    }
+    await this.removeEmptyOwnedDir(path.dirname(plan.files[0] || trimmed), modelsDir);
+    const clearModel = hits(state.selectedModelPath);
+    const clearMm = hits(state.loadSettings.mmprojPath);
+    const clearDraft = hits(state.loadSettings.draftModelPath);
+    if (clearModel || clearMm || clearDraft) {
+      await this.store.setState({
+        ...(clearModel
+          ? { selectedModelPath: "", modelCapabilities: undefined, modelMaxContext: undefined }
+          : {}),
+        loadSettings: {
+          ...state.loadSettings,
+          ...(clearMm ? { mmprojPath: "" } : {}),
+          ...(clearDraft ? { draftModelPath: "" } : {}),
+        },
+      });
+    }
+    invalidateModelLibraryCache();
+    await this.pushState();
+  }
+
+  async removeSelectedModel(): Promise<void> {
+    const state = this.store.getState();
+    const selected = state.selectedModelPath;
+    if (!selected) {
+      vscode.window.showInformationMessage("Llama AIO: Select a model first.");
+      return;
+    }
+    const modelsDir = getModelsDir(this.store.getConfig());
+    const plan = removalPathsForQuant(selected, modelsDir, []);
+    if (!plan.files.length || plan.rejected.length) {
+      vscode.window.showWarningMessage(
+        "Llama AIO only removes files inside its own models folder. Use Hide for models found in other apps, or delete them in your file manager."
+      );
+      return;
+    }
+    const status = this.processManager.getStatus();
+    const loaded =
+      status.running &&
+      (sameModelFile(status.modelPath, selected) ||
+        (!status.modelPath && sameModelFile(state.selectedModelPath, selected)));
+    const extra = plan.files.length > 1 ? ` and ${plan.files.length - 1} other shard${plan.files.length > 2 ? "s" : ""}` : "";
+    const choice = await vscode.window.showWarningMessage(
+      `Remove ${path.basename(selected)}${extra}? Files go to the trash when the system allows it.`,
+      { modal: true },
+      loaded ? "Stop and remove" : "Remove"
+    );
+    if (choice !== "Remove" && choice !== "Stop and remove") {
+      return;
+    }
+    await this.removeOwnedQuant(selected, []);
+  }
+
+  async cleanPartialDownloads(): Promise<void> {
+    const modelsDir = getModelsDir(this.store.getConfig());
+    const partials = listPartialDownloads(modelsDir).filter((file) => isOwnedModelPath(file.path, modelsDir));
+    if (!partials.length) {
+      vscode.window.showInformationMessage("No incomplete downloads in the Llama AIO models folder.");
+      return;
+    }
+    const bytes = partials.reduce((sum, file) => sum + file.sizeBytes, 0);
+    const choice = await vscode.window.showWarningMessage(
+      `Remove ${partials.length} incomplete download${partials.length === 1 ? "" : "s"} (${formatModelSize(bytes)})? They go to the trash when the system allows it.`,
+      { modal: true },
+      "Clean"
+    );
+    if (choice !== "Clean") {
+      return;
+    }
+    for (const file of partials) {
+      await this.trashOwnedFile(file.path);
+    }
+    invalidateModelLibraryCache();
+    await this.pushState();
   }
 
   private getHtml(webview: vscode.Webview): string {
@@ -1417,21 +2014,33 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       opacity: 0.55;
       cursor: default;
     }
-    .model-title { font-weight: 600; margin-bottom: 4px; }
+    .model-title { font-weight: 650; font-size: 14px; line-height: 1.35; margin: 2px 0 6px; }
     .model-path, .meta {
       word-break: break-all;
       color: var(--muted);
       font-size: 11px;
     }
+    .model-path {
+      margin: 0;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      word-break: normal;
+    }
     a.model-path-link {
-      color: var(--vscode-textLink-foreground);
-      text-decoration: underline;
+      color: var(--muted);
+      text-decoration: none;
       cursor: pointer;
-      word-break: break-all;
+      display: block;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      word-break: normal;
       font-size: 11px;
     }
     a.model-path-link:hover {
-      color: var(--vscode-textLink-activeForeground);
+      color: var(--vscode-textLink-foreground);
+      text-decoration: underline;
     }
     .meta a.folder-link {
       color: var(--vscode-textLink-foreground);
@@ -1444,10 +2053,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     .hidden { display: none !important; }
     .ok { color: var(--ok); }
     .caps {
-      margin: 2px 0 4px;
+      margin: 0 0 8px;
       color: var(--muted);
       font-size: 11px;
-      line-height: 1.5;
+      line-height: 1.45;
     }
     /* ---- Header ---- */
     .sticky-head {
@@ -1522,7 +2131,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       user-select: none;
       font-weight: 600;
     }
-    details.fold > summary::-webkit-details-marker { display: none; }
+    details.fold > summary > span:first-child { flex: none; white-space: nowrap; }
     details.fold > summary > span:first-child::before { content: '▸'; color: var(--muted); display: inline-block; width: 1.1em; }
     details.fold[open] > summary > span:first-child::before { content: '▾'; }
     details.fold > summary .sum {
@@ -1541,6 +2150,68 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     .opt-row { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 4px 0; font-size: 11px; }
     .opt-row .hint { font-size: 10px; margin: 0; }
     .section-sep { border-top: 1px solid var(--border); margin: 10px 0 10px; }
+    /* ---- Request settings ---- */
+    #copilotFold > summary { align-items: center; }
+    #copilotFold > summary .hdr-btns { display: none; gap: 4px; margin-left: auto; }
+    #copilotFold[open] > summary .hdr-btns { display: inline-flex; }
+    #copilotFold[open] > summary .sum { display: none; }
+    .hdr-btns button:disabled { pointer-events: none; }
+    #copilotFold[open] ~ .ot-quick { display: none; }
+    .ot-quick { border-top: 1px solid var(--border); margin-top: 4px; padding-top: 6px; }
+    .ot-quick-ctl { display: inline-flex; align-items: center; gap: 8px; }
+    .sec-label {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      font-size: 10px;
+      letter-spacing: 0.07em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin: 10px 0 4px;
+    }
+    .sec-label:first-child { margin-top: 2px; }
+    button.link-btn {
+      background: none;
+      color: var(--link);
+      padding: 0;
+      font-size: 11px;
+      font-weight: 500;
+      letter-spacing: 0;
+      text-transform: none;
+    }
+    button.link-btn:hover { text-decoration: underline; }
+    .ot-box {
+      border: 1px solid var(--border);
+      border-radius: 5px;
+      padding: 4px 8px 6px;
+      background: color-mix(in srgb, var(--fg) 3%, transparent);
+    }
+    .ot-box.on {
+      border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+      background: color-mix(in srgb, var(--accent) 12%, transparent);
+    }
+    .ot-box .hint { margin: 2px 0 0; }
+    .ot-box:not(.on) .seg { opacity: 0.55; }
+    .muted { color: var(--muted); }
+    .req-line { margin-top: 4px; }
+    .req-line input, .req-cell input { width: 64px; }
+    .req-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 2px 14px; }
+    .req-cell { display: flex; justify-content: space-between; align-items: center; gap: 6px; padding: 3px 0; font-size: 11px; }
+    @media (max-width: 250px) { .req-grid { grid-template-columns: 1fr; } }
+    .mode-strip {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      align-items: center;
+      gap: 4px 8px;
+      border: 1px dashed var(--border);
+      border-radius: 4px;
+      padding: 4px 8px;
+      margin-bottom: 4px;
+      font-size: 11px;
+    }
+    .mode-strip .chip { display: inline-block; cursor: default; margin: 0 0 0 3px; padding: 0 7px; }
+    .mode-strip .chip:hover { background: transparent; }
     /* ---- Memory verdict ---- */
     .verdict { border-radius: 5px; padding: 6px 9px; font-size: 12px; margin: 2px 0 8px; line-height: 1.4; border: 1px solid var(--border); }
     .verdict.good { border-color: color-mix(in srgb, var(--ok) 50%, var(--border)); background: color-mix(in srgb, var(--ok) 13%, transparent); }
@@ -1598,6 +2269,106 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     .row.changed > .label > .name::before,
     .toggle.changed > span:first-child::before { content: '●'; color: var(--warn); font-size: 9px; margin-right: 4px; vertical-align: 1px; }
     .filtered-out { display: none !important; }
+    /* ---- Model card ---- */
+    #modelFold > summary { align-items: center; padding-top: 0; }
+    #modelFold > summary > span.card-title::before { font-weight: 400; }
+    .model-closed-sum { display: none; flex: 1; min-width: 0; align-items: center; gap: 6px; font-weight: 400; }
+    #modelFold:not([open]) > summary .model-closed-sum { display: flex; }
+    .mc-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+    .mc-name .q, .model-title .q { color: var(--muted); font-weight: 500; }
+    .model-closed-line { display: none; align-items: center; gap: 8px; margin: 2px 0 0 1.1em; font-size: 11px; color: var(--muted); }
+    #modelFold:not([open]) ~ .model-closed-line.has-model { display: flex; }
+    .model-closed-line .grow { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .model-closed-line .fit-bar { width: 64px; flex: none; }
+    .model-hero { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
+    .model-hero .model-title { min-width: 0; overflow-wrap: anywhere; }
+    .model-status { flex: none; font-size: 10.5px; font-weight: 500; line-height: 1.5; padding: 0 7px; border-radius: 99px; border: 1px solid var(--border); color: var(--muted); white-space: nowrap; }
+    .model-hero .model-status { margin-top: 3px; }
+    .model-status.running { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 50%, transparent); background: color-mix(in srgb, var(--ok) 10%, transparent); }
+    .model-status.pending { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 50%, transparent); background: color-mix(in srgb, var(--warn) 10%, transparent); }
+    .model-status.starting { color: var(--starting); border-color: color-mix(in srgb, var(--starting) 50%, transparent); }
+    .cap-chips { display: flex; flex-wrap: wrap; gap: 4px; margin: 0 0 8px; }
+    .cap-chip { font-size: 10.5px; line-height: 1.6; padding: 0 6px; border-radius: 3px; border: 1px solid var(--border); background: color-mix(in srgb, var(--fg) 5%, transparent); color: var(--fg); white-space: nowrap; }
+    .cap-chip.ok { color: var(--ok); }
+    .mm-attach { display: flex; align-items: center; gap: 6px; padding: 4px 6px 4px 8px; margin: 0 0 4px; border: 1px solid var(--border); border-radius: 5px; background: color-mix(in srgb, var(--fg) 3%, transparent); font-size: 11px; }
+    .mm-attach .mm-label { color: var(--muted); flex: none; }
+    .mm-attach .mm-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .mm-attach .mm-name .sub { color: var(--muted); }
+    .mm-attach .seg-btn { padding: 0 6px; font-size: 10.5px; }
+    .mm-attach .icon-btn { width: 20px; height: 20px; background: transparent; color: var(--muted); font-size: 11px; }
+    .mm-attach .icon-btn:hover { background: color-mix(in srgb, var(--fg) 10%, transparent); color: var(--fg); }
+    button.link-btn { background: transparent; color: var(--muted); padding: 2px 0; font-weight: 400; font-size: 11px; }
+    button.link-btn:hover { color: var(--link); }
+    .model-reload { display: flex; align-items: center; gap: 8px; margin-top: 8px; padding: 6px 8px; border-radius: 5px; font-size: 11px; border: 1px solid color-mix(in srgb, var(--warn) 40%, var(--border)); background: color-mix(in srgb, var(--warn) 8%, transparent); }
+    .model-reload .grow { flex: 1; min-width: 0; }
+    .lib-tools { display: flex; gap: 4px; margin: 0 0 6px; }
+    .lib-tools input[type="text"] { flex: 1; min-width: 0; width: auto; padding: 5px 8px; }
+    .lib-tools select { flex: none; width: auto; font-size: 11px; }
+    .lib-filters { display: flex; flex-wrap: wrap; gap: 4px; margin: 0 0 8px; }
+    .lib-filters .chip { padding: 0 8px; line-height: 1.6; }
+    .lib-filters .chip .n { color: var(--muted); margin-left: 4px; font-weight: 400; }
+    .lib-list { border: 1px solid var(--border); border-radius: 5px; margin: 0 0 8px; }
+    .lib-grp { display: flex; align-items: baseline; gap: 6px; padding: 5px 8px 1px; border-top: 1px solid var(--border); min-width: 0; }
+    .lib-grp:first-child { border-top: 0; }
+    .lib-grp .lib-title { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 0 1 auto; min-width: 0; }
+    .lib-grp .lib-detail { flex: 1 1 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+    .lib-grp .lib-tag { margin-left: 0; flex: none; }
+    .lib-title { font-weight: 600; }
+    .lib-detail { font-size: 11px; color: var(--muted); }
+    .lib-quant { position: relative; display: grid; grid-template-columns: 10px minmax(0, 1fr) auto 56px 20px; align-items: center; gap: 6px; padding: 2px 4px 2px 8px; cursor: pointer; }
+    .lib-quant:hover { background: var(--vscode-list-hoverBackground, color-mix(in srgb, var(--fg) 8%, transparent)); }
+    .lib-quant.selected { background: var(--vscode-list-activeSelectionBackground, color-mix(in srgb, var(--accent) 25%, transparent)); color: var(--vscode-list-activeSelectionForeground, var(--fg)); }
+    .lib-quant.selected::before { content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 2px; background: var(--accent); }
+    .lib-quant:focus-visible { outline: 1px solid var(--vscode-focusBorder, var(--accent)); outline-offset: -1px; }
+    .lib-quant.nofit .lib-label, .lib-quant.nofit .lib-meta { opacity: 0.55; }
+    .lib-dot { width: 7px; height: 7px; border-radius: 50%; justify-self: center; }
+    .lib-dot.live { background: var(--ok); box-shadow: 0 0 0 2px color-mix(in srgb, var(--ok) 25%, transparent); }
+    .lib-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .lib-label .sub { color: var(--muted); font-size: 10.5px; margin-left: 4px; }
+    .lib-tag { font-size: 9.5px; padding: 0 4px; border-radius: 3px; margin-left: 4px; border: 1px solid var(--border); color: var(--muted); vertical-align: 1px; }
+    .lib-tag.draft { color: #b180d7; border-color: color-mix(in srgb, #b180d7 50%, transparent); }
+    .lib-tag.vision { color: var(--link); border-color: color-mix(in srgb, var(--link) 50%, transparent); }
+    .lib-meta { color: var(--muted); font-size: 11px; white-space: nowrap; font-variant-numeric: tabular-nums; text-align: right; }
+    .fit-bar { position: relative; height: 5px; border-radius: 3px; background: color-mix(in srgb, var(--fg) 14%, transparent); }
+    .fit-bar > i { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 3px; background: var(--muted); }
+    .fit-bar::after { content: ''; position: absolute; right: 0; top: -2px; bottom: -2px; width: 1px; background: var(--muted); }
+    .fit-bar.fits > i { background: var(--ok); }
+    .fit-bar.tight > i { background: var(--warn); }
+    .fit-bar.wont-fit > i { background: var(--bad); }
+    .lib-more { width: 20px; height: 18px; padding: 0; border-radius: 3px; background: transparent; color: var(--muted); font-weight: 400; text-align: center; opacity: 0; }
+    .lib-quant:hover .lib-more, .lib-quant.selected .lib-more, .lib-more:focus-visible { opacity: 1; }
+    .lib-more:hover { background: color-mix(in srgb, var(--fg) 12%, transparent); color: var(--fg); }
+    .lib-menu { position: absolute; right: 4px; top: 100%; z-index: 45; min-width: 170px; padding: 4px 0; border: 1px solid var(--border); border-radius: 5px; background: var(--vscode-menu-background, var(--vscode-editorWidget-background, var(--input-bg))); color: var(--vscode-menu-foreground, var(--fg)); box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35); cursor: default; }
+    .lib-menu button { display: block; width: 100%; padding: 3px 12px; border-radius: 0; background: transparent; color: inherit; font-weight: 400; font-size: 12px; }
+    .lib-menu button:hover { background: var(--vscode-menu-selectionBackground, color-mix(in srgb, var(--accent) 30%, transparent)); color: var(--vscode-menu-selectionForeground, inherit); }
+    .lib-menu button.danger-item { color: var(--bad); }
+    .lib-menu .menu-sep { margin: 4px 0; }
+    .lib-foot { display: flex; align-items: center; gap: 8px; }
+    .lib-foot .meta { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; word-break: normal; }
+    .lib-foot button { flex: none; }
+    .lib-quick { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; margin: 0 0 4px 1.1em; }
+    #libraryFold[open] + .lib-quick { display: none; }
+    .lib-quick .qlabel { font-size: 10.5px; color: var(--muted); margin-right: 2px; }
+    .lib-quick .chip { display: inline-flex; align-items: center; gap: 4px; padding: 0 8px; line-height: 1.6; border-radius: 4px; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .lib-quick .lib-dot { width: 6px; height: 6px; }
+    .lib-actions { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 10px 0; }
+    .lib-actions button { text-align: center; font-weight: 600; }
+    .lib-wide { display: block; width: 100%; text-align: left; margin: 0 0 8px; }
+    .lib-job { border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; margin: 0 0 8px; background: color-mix(in srgb, var(--accent) 14%, transparent); }
+    .lib-job-top { display: flex; justify-content: space-between; gap: 8px; font-weight: 600; }
+    .lib-bar { height: 6px; margin: 6px 0; border-radius: 99px; background: color-mix(in srgb, var(--fg) 12%, transparent); overflow: hidden; }
+    .lib-bar > span { display: block; height: 100%; background: var(--accent); }
+    .lib-bar.paused > span { background: var(--muted); }
+    .lib-job-meta { display: flex; justify-content: space-between; gap: 8px; align-items: center; color: var(--muted); font-size: 11px; }
+    .lib-file { display: flex; gap: 8px; align-items: center; padding: 6px 2px; border-top: 1px solid var(--border); }
+    .lib-file .grow { flex: 1; min-width: 0; }
+    .lib-file .grow b { display: block; font-weight: 600; }
+    .lib-partial { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin: 0 0 8px; font-size: 12px; color: var(--muted); }
+    .lib-dialog { margin: 0 0 8px; border: 1px solid color-mix(in srgb, #f85149 45%, var(--border)); border-radius: 6px; padding: 8px; background: color-mix(in srgb, #f85149 8%, transparent); }
+    .lib-dialog-title { font-weight: 600; margin-bottom: 4px; }
+    .lib-check { display: flex; gap: 6px; align-items: flex-start; font-size: 12px; margin: 4px 0; }
+    button.danger { background: color-mix(in srgb, #f85149 18%, transparent); border: 1px solid color-mix(in srgb, #f85149 55%, var(--border)); color: var(--fg); border-radius: 4px; padding: 3px 8px; cursor: pointer; }
+    button.danger:disabled { opacity: 0.5; cursor: default; }
   </style>
 </head>
 <body>
@@ -1655,39 +2426,63 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
   </div>
 
   <div class="card" id="modelCard">
-    <div class="card-head">
-      <span class="card-title">Model</span>
-      <button class="secondary small" id="changeModelBtn" type="button" title="Pick a downloaded GGUF, open a file, or search Hugging Face">Change…</button>
-    </div>
-    <div class="model-title" id="modelTitle">No model selected</div>
-    <div class="caps hidden" id="modelCaps"></div>
-    <div class="model-path" id="modelPath"></div>
-    <div class="btn-col hidden" id="starterCol">
-      <button class="primary hidden" id="starterModelBtn">Download starter (${STARTER_MODEL.label})</button>
-      <div class="hint hidden" id="starterModelHint" style="margin-top:0">${STARTER_MODEL.approxSizeLabel} · ${STARTER_MODEL.detail}</div>
-    </div>
-    <details class="fold" id="visionFold">
-      <summary><span class="tip" data-flag="-mm, --mmproj" data-help="Path to a multimodal projector GGUF. llama-server loads it with the language model so Copilot Chat can send images. Auto-attached when a sibling mmproj-*.gguf sits next to the model.">Vision projector</span><span class="sum" id="visionSum">none · text only</span></summary>
-      <div class="fold-body">
-        <div class="hint" id="mmprojPathHint" style="margin:0 0 8px">No mmproj — text only.</div>
-        <div class="btn-row">
-          <button class="secondary" id="pickMmprojBtn" type="button">Choose mmproj…</button>
-          <button class="secondary" id="clearMmprojBtn" type="button">Clear</button>
+    <details class="fold top" id="modelFold" data-default-open open>
+      <summary>
+        <span class="card-title">Model</span>
+        <span class="model-closed-sum"><span class="mc-name" id="modelClosedName"></span><span class="model-status hidden" id="modelClosedStatus"></span></span>
+      </summary>
+      <div class="model-hero">
+        <div class="model-title" id="modelTitle">No model selected</div>
+        <span class="model-status hidden" id="modelStatus"></span>
+      </div>
+      <div class="cap-chips hidden" id="modelCaps"></div>
+      <div class="model-path" id="modelPath"></div>
+      <div class="btn-col hidden" id="starterCol">
+        <button class="primary hidden" id="starterModelBtn">Download starter (${STARTER_MODEL.label})</button>
+        <div class="hint hidden" id="starterModelHint" style="margin-top:0">${STARTER_MODEL.approxSizeLabel} · ${STARTER_MODEL.detail}</div>
+      </div>
+      <div class="mm-attach hidden" id="mmprojAttach">
+        <span class="tip mm-label" data-flag="-mm, --mmproj" data-help="Multimodal projector GGUF. llama-server loads it with the language model so Copilot Chat can send images. Auto-attached when a sibling mmproj-*.gguf sits next to the model. Reload the server to apply.">Vision</span>
+        <span class="mm-name" id="mmprojName"></span>
+        <span class="seg" id="mmprojSeg" title="--mmproj-offload / --no-mmproj-offload&#10;Where the CLIP vision projector runs (llama.cpp default: GPU). RAM frees VRAM on the Main GPU; image encode becomes CPU-bound."><button class="seg-btn" type="button" data-mm="gpu">GPU</button><button class="seg-btn" type="button" data-mm="ram">RAM</button></span>
+        <button class="icon-btn" id="pickMmprojBtn" type="button" title="Choose another mmproj…">✎</button>
+        <button class="icon-btn" id="clearMmprojBtn" type="button" title="Detach (text only)">✕</button>
+        <input type="checkbox" id="mmprojOffloadToGpu" class="hidden" checked />
+      </div>
+      <button class="link-btn hidden" id="attachMmprojBtn" type="button" title="Attach a multimodal projector (--mmproj) so Copilot Chat can send images">+ Attach vision projector…</button>
+      <details class="fold" id="libraryFold">
+        <summary><span>Library</span><span class="sum" id="librarySum">—</span></summary>
+        <div class="fold-body">
+          <div class="lib-tools">
+            <input type="text" id="libraryFilter" placeholder="Filter local models, or search Hugging Face…" />
+            <select id="librarySort" title="Sort the library">
+              <option value="recent">Recent</option>
+              <option value="name">Name</option>
+              <option value="size">Size</option>
+            </select>
+          </div>
+          <div class="lib-filters" id="libraryFilters"></div>
+          <div id="libraryJobs"></div>
+          <div id="libraryList"></div>
+          <div class="lib-partial hidden" id="libraryPartials"></div>
+          <div class="lib-dialog hidden" id="libraryDialog"></div>
+          <div class="lib-foot">
+            <span class="meta" id="modelsDirMeta"></span>
+            <button class="secondary small" id="openFileBtn" type="button">Open GGUF…</button>
+          </div>
         </div>
-        <div class="toggle hidden" id="mmprojOffloadRow"><span class="tip" data-flag="--mmproj-offload / --no-mmproj-offload" data-help="Whether to offload the CLIP vision projector to GPU (llama.cpp default: on). Uncheck to pass --no-mmproj-offload and keep the projector in system RAM. Frees VRAM on the Main GPU; image encode becomes CPU-bound.">Offload vision projector to GPU</span><input type="checkbox" id="mmprojOffloadToGpu" checked /></div>
+      </details>
+      <div class="lib-quick hidden" id="libraryQuick"></div>
+      <div class="model-reload hidden" id="modelReloadBar">
+        <span class="grow" id="modelReloadText"></span>
+        <button class="primary small" type="button" data-model-reload>Reload server</button>
       </div>
     </details>
-    <details class="fold" id="libraryFold">
-      <summary><span>Library &amp; downloads</span><span class="sum" id="librarySum">—</span></summary>
-      <div class="fold-body">
-        <div class="meta" id="modelsDirMeta"></div>
-        <div class="btn-row">
-          <button class="secondary" id="downloadModelBtn" type="button">Hugging Face…</button>
-          <button class="secondary" id="openFileBtn" type="button">Open GGUF…</button>
-          <button class="secondary" id="showDownloadsBtn" type="button">Downloads</button>
-        </div>
-      </div>
-    </details>
+    <div class="model-closed-line" id="modelClosedLine">
+      <span class="grow" id="modelClosedMeta"></span>
+      <span class="fit-bar hidden" id="modelClosedBar"><i></i></span>
+      <button class="primary small hidden" type="button" id="modelClosedReload" data-model-reload>Reload</button>
+    </div>
   </div>
 
   <div class="card" id="memCard">
@@ -2010,8 +2805,52 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
 
   <div class="card" id="copilotCard">
     <details class="fold top" id="copilotFold">
-      <summary><span class="card-title">Copilot Chat</span><span class="sum" id="copilotSum">—</span></summary>
+      <summary>
+        <span class="card-title">Chat Requests</span>
+        <span class="sum" id="copilotSum">—</span>
+        <span class="hdr-btns" id="copilotDebugBtns">
+          <button class="secondary small" id="viewContextBtn" type="button" disabled title="Open the last Copilot → llama.cpp request (messages + tools) in an editor">Last call</button>
+          <button class="secondary small" id="viewResponseBtn" type="button" disabled title="Open the last llama.cpp assistant stream (helps debug empty Chat replies)">Last reply</button>
+        </span>
+      </summary>
       <div class="fold-body">
+        <div class="sec-label"><span>Reasoning</span></div>
+        <div class="ot-box" id="overthinkingBox">
+          <div class="opt-row">
+            <label for="overthinkingPenalty"><span class="tip" data-flag="logit_bias" data-help="When on, each chat request subtracts the strength from the logits of hesitation words (Wait, maybe, But, and the rest of the measured list). Token ids are looked up once from the running server and cached per model. Off by default: those words are normal in code and tool calls.">Overthinking penalty</span></label>
+            <input type="checkbox" id="overthinkingPenalty" />
+          </div>
+          <div class="opt-row">
+            <span class="tip muted" data-flag="logit_bias" data-help="How much to subtract from each marker logit. 2 shortened the lily-pad trace from 828 to 233 tokens and a binary-search answer from 681 to 458 on Qwen3.8. The paper swept 0.5 to 4.">Strength</span>
+            <span class="seg" id="otStrengthSeg"><button class="seg-btn" type="button" data-v="0.5">0.5</button><button class="seg-btn" type="button" data-v="1">1</button><button class="seg-btn" type="button" data-v="2">2</button><button class="seg-btn" type="button" data-v="3">3</button><button class="seg-btn" type="button" data-v="4">4</button></span>
+            <input type="hidden" id="overthinkingPenaltyStrength" value="2" />
+          </div>
+          <div class="hint" id="overthinkingHint">Off. Strength is remembered, but chat requests do not send it.</div>
+        </div>
+        <div class="opt-row req-line">
+          <span class="tip" data-flag="Chat / API request body" data-help="Max tokens to generate per reply (extension request default / n_predict-style cap).">Max tokens</span>
+          <input type="number" id="maxTokens" min="16" step="16" />
+        </div>
+
+        <div class="sec-label">
+          <span>Sampling</span>
+          <button class="link-btn" id="resetRequestBtn" type="button" title="Restore temperature, top-p/k, min-p, penalties, overthinking penalty, and max tokens to Llama AIO defaults">Reset</button>
+        </div>
+        <div class="mode-strip hidden" id="modeStrip">
+          <span><span class="muted">Model mode</span> <b id="modeStripName">—</b></span>
+          <span id="modeStripValues"></span>
+        </div>
+        <div class="req-grid">
+          <div class="req-cell samp-free"><span class="tip" data-flag="Chat / API request body" data-help="Sampling temperature for completions (extension request default, not a llama-server load flag).">Temperature</span><input type="number" id="temperature" min="0" max="2" step="0.05" /></div>
+          <div class="req-cell samp-free"><span class="tip" data-flag="Chat / API request body" data-help="Nucleus sampling top-p (extension request default).">Top P</span><input type="number" id="topP" min="0" max="1" step="0.01" /></div>
+          <div class="req-cell samp-free"><span class="tip" data-flag="--top-k / request body" data-help="Top-k sampling (extension request default).">Top K</span><input type="number" id="topK" min="0" step="1" /></div>
+          <div class="req-cell"><span class="tip" data-flag="--min-p / request body" data-help="Min-p sampling (0 = disabled). llama-server's built-in default of 0.05 is wrong for most current instruct/coder families — keep 0 unless a model card recommends otherwise. Also shipped as a server CLI default at start, so raw API clients inherit it.">Min P</span><input type="number" id="minP" min="0" max="1" step="0.01" /></div>
+          <div class="req-cell"><span class="tip" data-flag="--repeat-penalty / request body" data-help="Repetition penalty (llama.cpp style; 1.0 = disabled). Values above 1 discourage repeating earlier tokens — useful for prose, harmful for code (breaks exact repetition like closing tags).">Repeat</span><input type="number" id="repeatPenalty" min="0.5" max="2" step="0.01" /></div>
+          <div class="req-cell"><span class="tip" data-flag="--presence-penalty / request body" data-help="Presence penalty (OpenAI-style; 0 = disabled). Positive values push the model toward new topics. Qwen3 No-Think mode recommends 1.5.">Presence</span><input type="number" id="presencePenalty" min="-2" max="2" step="0.05" /></div>
+          <div class="req-cell"><span class="tip" data-flag="--frequency-penalty / request body" data-help="Frequency penalty (OpenAI-style; 0 = disabled). Scaled by how often a token already appeared.">Frequency</span><input type="number" id="frequencyPenalty" min="-2" max="2" step="0.05" /></div>
+        </div>
+
+        <div class="sec-label"><span>Prompt &amp; tools</span></div>
         <div class="opt-list">
           <div class="opt-row">
             <span>Prompt replacements <span class="hint" id="replacementStats">—</span></span>
@@ -2026,48 +2865,12 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             <input type="checkbox" id="duplicateToolCallGuardEnabled" title="Skip a tool that already ran with the same arguments in this turn. Off by default — can block a legitimate retry." />
           </div>
         </div>
-        <div class="btn-row" style="margin:8px 0 4px">
-          <button class="secondary" id="viewContextBtn" disabled title="Open the last Copilot → llama.cpp request (messages + tools) in an editor">Last call</button>
-          <button class="secondary" id="viewResponseBtn" disabled title="Open the last llama.cpp assistant stream (helps debug empty Chat replies)">Last response</button>
-        </div>
-  <details class="fold" id="requestFold">
-    <summary><span>Request defaults</span><span class="sum">temperature, top-p/k, min-p, penalties, max tokens</span></summary>
-  <div class="fold-body">
-  <div class="hint hidden" id="modeOverrideHint" style="margin-bottom:10px"></div>
-  <div class="row">
-    <div class="label"><span class="name tip" data-flag="Chat / API request body" data-help="Sampling temperature for completions (extension request default, not a llama-server load flag).">Temperature</span><input type="number" id="temperature" min="0" max="2" step="0.05" /></div>
-  </div>
-  <div class="row">
-    <div class="label"><span class="name tip" data-flag="Chat / API request body" data-help="Nucleus sampling top-p (extension request default).">Top P</span><input type="number" id="topP" min="0" max="1" step="0.01" /></div>
-  </div>
-  <div class="row">
-    <div class="label"><span class="name tip" data-flag="--top-k / request body" data-help="Top-k sampling (extension request default).">Top K</span><input type="number" id="topK" min="0" step="1" /></div>
-  </div>
-  <div class="row">
-    <div class="label"><span class="name tip" data-flag="--min-p / request body" data-help="Min-p sampling (0 = disabled). llama-server's built-in default of 0.05 is wrong for most current instruct/coder families — keep 0 unless a model card recommends otherwise.">Min P</span><input type="number" id="minP" min="0" max="1" step="0.01" /></div>
-    <div class="hint">Also shipped as a server CLI default at start, so raw API clients inherit it.</div>
-  </div>
-  <div class="row">
-    <div class="label"><span class="name tip" data-flag="--repeat-penalty / request body" data-help="Repetition penalty (llama.cpp style; 1.0 = disabled). Values above 1 discourage repeating earlier tokens — useful for prose, harmful for code (breaks exact repetition like closing tags).">Repeat penalty</span><input type="number" id="repeatPenalty" min="0.5" max="2" step="0.01" /></div>
-  </div>
-  <div class="row">
-    <div class="label"><span class="name tip" data-flag="--presence-penalty / request body" data-help="Presence penalty (OpenAI-style; 0 = disabled). Positive values push the model toward new topics. Qwen3 No-Think mode recommends 1.5.">Presence penalty</span><input type="number" id="presencePenalty" min="-2" max="2" step="0.05" /></div>
-  </div>
-  <div class="row">
-    <div class="label"><span class="name tip" data-flag="--frequency-penalty / request body" data-help="Frequency penalty (OpenAI-style; 0 = disabled). Scaled by how often a token already appeared.">Frequency penalty</span><input type="number" id="frequencyPenalty" min="-2" max="2" step="0.05" /></div>
-  </div>
-  <div class="row">
-    <div class="label"><span class="name tip" data-flag="Chat / API request body" data-help="Max tokens to generate per reply (extension request default / n_predict-style cap).">Max tokens</span><input type="number" id="maxTokens" min="16" step="16" /></div>
-  </div>
-
-  <div class="btn-col" style="margin:12px 0 8px">
-    <button class="secondary" id="resetRequestBtn" title="Restore temperature, top-p/k, min-p, penalties, and max tokens to Llama AIO defaults">Reset request defaults</button>
-  </div>
-  </div>
-  </details>
-
       </div>
     </details>
+    <div class="opt-row ot-quick">
+      <label for="overthinkingQuick">Overthinking penalty</label>
+      <span class="ot-quick-ctl"><span class="hint" id="overthinkingQuickState">off</span><input type="checkbox" id="overthinkingQuick" /></span>
+    </div>
   </div>
 
   <div class="card" id="backendCard">
@@ -2100,6 +2903,370 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
     const $ = (id) => document.getElementById(id);
+
+    let libraryPayload = { groups: [], hiddenGroups: [], partials: [], partialSizeLabel: '', serverStarting: false };
+    let librarySelected = '';
+    let libraryDialogPath = '';
+    let libraryDialogChecks = {};
+    let libraryFits = {};
+    let libraryHfMode = 'local';
+    let libraryHfBusy = false;
+    let libraryHfError = '';
+    let libraryHfRepos = [];
+    let libraryHfFiles = null;
+    let libraryDownloads = [];
+    let libraryCountLabel = '';
+    let libraryRatios = {};
+    let libraryDrafts = {};
+    let libraryBudgetLabel = '';
+    let libraryFilterMode = 'all';
+    let librarySort = 'recent';
+    let libraryMenuPath = '';
+    function libraryStats() {
+      const stats = { total: 0, fits: 0, drafts: 0, vision: 0, hidden: 0 };
+      (libraryPayload.groups || []).forEach(function (g) {
+        const vision = groupHasVision(g);
+        (g.quants || []).forEach(function (q) {
+          stats.total++;
+          if (libraryFits[q.path] === 'fits') stats.fits++;
+          if (libraryDrafts[q.path]) stats.drafts++;
+          if (vision) stats.vision++;
+        });
+      });
+      (libraryPayload.hiddenGroups || []).forEach(function (g) { stats.hidden += (g.quants || []).length; });
+      return stats;
+    }
+    function refreshLibrarySum() {
+      const el = $('librarySum');
+      if (!el) return;
+      const n = libraryDownloads.length;
+      const dl = n ? (n + ' downloading') : '';
+      const fold = $('libraryFold');
+      let label = libraryCountLabel;
+      if (fold && !fold.open && libraryCountLabel) {
+        const st = libraryStats();
+        const bits = [st.total + ' GGUF'];
+        if (Object.keys(libraryFits).length) bits.push(st.fits + ' fit');
+        if (st.drafts) bits.push(st.drafts + ' draft' + (st.drafts === 1 ? '' : 's'));
+        label = bits.join(' · ');
+      } else if (libraryBudgetLabel && libraryCountLabel) {
+        label = libraryCountLabel + ' · ' + libraryBudgetLabel;
+      }
+      el.textContent = dl && label ? dl + ' · ' + label : (dl || label || '—');
+    }
+    function groupHasVision(g) {
+      return (g.companions || []).some(function (c) { return c.role === 'mmproj'; });
+    }
+
+    function escAttr(v) {
+      return String(v).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+    }
+    function escText(v) {
+      return String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;');
+    }
+    function allLibraryGroups() {
+      const groups = (libraryPayload.groups || []).map(function (g) {
+        return Object.assign({ hidden: false }, g);
+      });
+      (libraryPayload.hiddenGroups || []).forEach(function (g) {
+        groups.push(Object.assign({ hidden: true }, g));
+      });
+      return groups;
+    }
+    function findLibraryQuant(filePath) {
+      const groups = allLibraryGroups();
+      for (let i = 0; i < groups.length; i++) {
+        const quants = groups[i].quants || [];
+        for (let j = 0; j < quants.length; j++) {
+          if (quants[j].path === filePath) return { group: groups[i], quant: quants[j] };
+        }
+      }
+      return null;
+    }
+    function fitText(fit) {
+      return fit === 'wont-fit' ? 'will not fit' : fit === 'tight' ? 'tight (under 1.5 GiB left)' : fit === 'fits' ? 'fits' : '';
+    }
+    function fitBarHtml(filePath) {
+      const fit = libraryFits[filePath] || '';
+      const ratio = libraryRatios[filePath];
+      const pct = typeof ratio === 'number' ? Math.max(2, Math.min(100, Math.round(ratio * 100))) : 0;
+      const tip = fit ? fitText(fit) + (typeof ratio === 'number' ? ' · ~' + Math.round(ratio * 100) + '% of ' + (libraryBudgetLabel || 'memory') : '') : 'Estimating…';
+      return '<span class="fit-bar ' + fit + '" title="' + escAttr(tip) + '"><i style="width:' + pct + '%"></i></span>';
+    }
+    function librarySortKey(g) {
+      if (librarySort === 'name') return g.title.toLowerCase() + ' ' + (g.detail || '').toLowerCase();
+      if (librarySort === 'size') return Math.min.apply(null, (g.quants || []).map(function (q) { return q.sizeBytes || 0; }).concat([Infinity]));
+      const recent = libraryPayload.recent || [];
+      let best = recent.length + 1;
+      (g.quants || []).forEach(function (q) {
+        const i = recent.indexOf(q.path);
+        if (i !== -1 && i < best) best = i;
+      });
+      return best;
+    }
+    function sortLibraryGroups(groups) {
+      return groups
+        .map(function (g, i) { return { g: g, i: i, k: librarySortKey(g) }; })
+        .sort(function (a, b) {
+          if (a.k < b.k) return -1;
+          if (a.k > b.k) return 1;
+          return a.i - b.i;
+        })
+        .map(function (x) { return x.g; });
+    }
+    function passesLibraryFilter(g, quant) {
+      if (libraryFilterMode === 'hidden') return g.hidden;
+      if (g.hidden) return false;
+      if (libraryFilterMode === 'fits') return libraryFits[quant.path] === 'fits';
+      if (libraryFilterMode === 'draft') return !!libraryDrafts[quant.path];
+      if (libraryFilterMode === 'vision') return groupHasVision(g);
+      return true;
+    }
+    function renderLibraryFilters() {
+      const root = $('libraryFilters');
+      if (!root) return;
+      const st = libraryStats();
+      if (libraryFilterMode === 'hidden' && !st.hidden) libraryFilterMode = 'all';
+      const items = [
+        ['all', 'All', st.total],
+        ['fits', 'Fits', st.fits],
+        ['draft', 'Drafts', st.drafts],
+        ['vision', 'Vision', st.vision],
+        ['hidden', 'Hidden', st.hidden],
+      ];
+      root.innerHTML = items
+        .filter(function (it) { return it[0] === 'all' || it[0] === 'fits' || it[2] > 0; })
+        .map(function (it) {
+          return '<button type="button" class="chip' + (libraryFilterMode === it[0] ? ' active' : '') + '" data-lib-filter="' + it[0] + '">' +
+            it[1] + '<span class="n">' + it[2] + '</span></button>';
+        }).join('');
+    }
+    function shortModelLabel(found) {
+      return found.group.title + ' · ' + found.quant.label;
+    }
+    function renderLibraryQuick() {
+      const root = $('libraryQuick');
+      if (!root) return;
+      const picks = (libraryPayload.recent || [])
+        .map(function (p) { return findLibraryQuant(p); })
+        .filter(function (f) { return f && !f.group.hidden; })
+        .slice(0, 3);
+      if (picks.length < 2) {
+        root.classList.add('hidden');
+        root.innerHTML = '';
+        return;
+      }
+      root.classList.remove('hidden');
+      root.innerHTML = '<span class="qlabel">Recent</span>' + picks.map(function (f) {
+        return '<button type="button" class="chip' + (f.quant.current ? ' active' : '') + '" data-quick-path="' + escAttr(f.quant.path) + '" title="' + escAttr(f.quant.path) + '">' +
+          (f.quant.loaded ? '<span class="lib-dot live"></span>' : '') + escText(shortModelLabel(f)) + '</button>';
+      }).join('');
+    }
+    function fmtBytes(n) {
+      n = Number(n) || 0;
+      if (n >= 1073741824) return (n / 1073741824).toFixed(2) + ' GB';
+      if (n >= 1048576) return (n / 1048576).toFixed(1) + ' MB';
+      if (n >= 1024) return Math.round(n / 1024) + ' KB';
+      return n + ' B';
+    }
+    function fmtEta(s) {
+      s = Number(s) || 0;
+      if (s <= 0) return '';
+      if (s < 60) return s + 's left';
+      if (s < 3600) return Math.round(s / 60) + ' min left';
+      return (s / 3600).toFixed(1) + ' h left';
+    }
+    function fmtCount(n) {
+      n = Number(n) || 0;
+      if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M downloads';
+      if (n >= 1000) return Math.round(n / 1000) + 'k downloads';
+      return n + ' downloads';
+    }
+    function renderLibraryJobs() {
+      const root = $('libraryJobs');
+      if (!root) return;
+      if (!libraryDownloads.length) {
+        root.innerHTML = '';
+        return;
+      }
+      let html = '';
+      libraryDownloads.forEach(function (job) {
+        const pct = job.total > 0 ? Math.min(100, Math.round((job.received / job.total) * 100)) : (job.state === 'verifying' ? 100 : 8);
+        const right = job.state === 'paused' ? 'paused' : job.state === 'gated' ? 'gated' : job.state === 'error' ? 'error' : pct + '%';
+        html += '<div class="lib-job">';
+        html += '<div class="lib-job-top"><span>' + escText(job.label) + '</span><span class="lib-meta">' + escText(right) + '</span></div>';
+        if (job.state !== 'gated' && job.state !== 'error') {
+          html += '<div class="lib-bar' + (job.state === 'paused' ? ' paused' : '') + '"><span style="width:' + pct + '%"></span></div>';
+        }
+        html += '<div class="lib-job-meta"><span>';
+        if (job.state === 'running' || job.state === 'verifying' || job.state === 'queued') {
+          const bits = [];
+          if (job.bytesPerSec) bits.push(fmtBytes(job.bytesPerSec) + '/s');
+          if (job.etaSeconds) bits.push(fmtEta(job.etaSeconds));
+          if (job.total) bits.push(fmtBytes(job.received) + ' / ' + fmtBytes(job.total));
+          html += escText(bits.join(' · ') || job.state);
+        } else if (job.state === 'paused') {
+          html += escText('Resumable' + (job.total ? ' · ' + fmtBytes(job.received) + ' / ' + fmtBytes(job.total) : ''));
+        } else if (job.state === 'gated') {
+          html += escText(job.error || 'Accept the license on Hugging Face, then set a token.');
+        } else {
+          html += escText(job.error || job.state);
+        }
+        html += '</span><span class="lib-actions" style="padding:0">';
+        if (job.state === 'running' || job.state === 'queued' || job.state === 'verifying') {
+          html += '<button type="button" class="secondary small" data-act="dl-pause" data-job="' + escAttr(job.id) + '">Pause</button>';
+          html += '<button type="button" class="secondary small" data-act="dl-cancel" data-job="' + escAttr(job.id) + '">Cancel</button>';
+        } else if (job.state === 'paused' || job.state === 'error') {
+          html += '<button type="button" class="secondary small" data-act="dl-resume" data-job="' + escAttr(job.id) + '">Resume</button>';
+          html += '<button type="button" class="secondary small" data-act="dl-cancel" data-job="' + escAttr(job.id) + '">Cancel</button>';
+        } else if (job.state === 'gated') {
+          if (job.pageUrl) html += '<button type="button" class="secondary small" data-act="dl-page" data-url="' + escAttr(job.pageUrl) + '">Open page</button>';
+          html += '<button type="button" class="secondary small" data-act="dl-token">Set token</button>';
+        }
+        html += '</span></div></div>';
+      });
+      root.innerHTML = html;
+      refreshLibrarySum();
+    }
+    function renderLibraryList() {
+      const root = $('libraryList');
+      if (!root) return;
+      renderLibraryJobs();
+      const raw = (($('libraryFilter') && $('libraryFilter').value) || '').trim();
+      const q = raw.toLowerCase();
+      let html = '';
+      if (libraryHfBusy) {
+        html += '<div class="hint">' + (libraryHfMode === 'files' ? 'Listing GGUF files…' : 'Searching Hugging Face…') + '</div>';
+      }
+      if (libraryHfError) html += '<div class="hint">' + escText(libraryHfError) + '</div>';
+      if (libraryHfMode === 'license' && libraryHfFiles && libraryHfFiles.license) {
+        const lic = libraryHfFiles.license;
+        html += '<div class="lib-job"><div class="lib-job-top"><span>' + escText(lic.id) + '</span></div>';
+        html += '<div class="hint">' + escText(lic.summary || 'Review this license before downloading.') + ' This is not legal advice.</div>';
+        html += '<div class="lib-actions">';
+        if (lic.licenseUrl) html += '<button type="button" class="secondary small" data-act="hf-license-view" data-url="' + escAttr(lic.licenseUrl) + '">View license</button>';
+        html += '<button type="button" class="secondary small" data-act="hf-back">Cancel</button>';
+        html += '<button type="button" class="secondary small" data-act="hf-license-ok" data-repo="' + escAttr(lic.id) + '">Download anyway</button>';
+        html += '</div></div>';
+      } else if (libraryHfMode === 'files' && libraryHfFiles) {
+        html += '<div class="lib-detail" style="padding:0 2px 6px">' + escText(libraryHfFiles.modelId) + '</div>';
+        if (libraryHfFiles.companionHint) {
+          html += '<div class="hint">Also fetches ' + escText(libraryHfFiles.companionHint) + '</div>';
+        }
+        (libraryHfFiles.files || []).forEach(function (file) {
+          html += '<div class="lib-file"><span class="grow"><b>' + escText(file.label) + '</b>';
+          if (file.detail) html += '<span class="lib-detail">' + escText(file.detail) + '</span>';
+          html += '</span><button type="button" class="secondary small" data-act="hf-download" data-model="' + escAttr(libraryHfFiles.modelId) + '" data-file="' + escAttr(file.path) + '">Download</button></div>';
+        });
+        html += '<button type="button" class="secondary lib-wide" data-act="hf-back">Back to search</button>';
+      } else if (libraryHfMode === 'search') {
+        if (!libraryHfRepos.length && !libraryHfBusy && !libraryHfError) html += '<div class="hint">No GGUF repos for “' + escText(raw) + '”.</div>';
+        libraryHfRepos.forEach(function (repo) {
+          html += '<button type="button" class="secondary lib-wide" data-act="hf-repo" data-repo="' + escAttr(repo.id) + '">';
+          html += '<b>' + escText(repo.id) + '</b><br><span class="lib-detail">' + escText((repo.badge || '') + (repo.downloads ? ' · ' + fmtCount(repo.downloads) : '')) + '</span></button>';
+        });
+        html += '<button type="button" class="secondary lib-wide" data-act="hf-back">Back to local models</button>';
+      } else {
+        const groups = sortLibraryGroups(allLibraryGroups()).map(function (g) {
+          const blob = (g.title + ' ' + g.detail + ' ' + g.source).toLowerCase();
+          const quants = (g.quants || []).filter(function (x) {
+            if (!passesLibraryFilter(g, x)) return false;
+            return !q || (blob + ' ' + x.label.toLowerCase()).indexOf(q) !== -1;
+          });
+          return { g: g, quants: quants };
+        }).filter(function (x) { return x.quants.length; });
+        if (!groups.length) {
+          html += '<div class="hint" style="margin:0 0 8px">' + (q || libraryFilterMode !== 'all' ? 'No local model matches.' : 'No models in the library yet.') + '</div>';
+        } else {
+          html += '<div class="lib-list">';
+          groups.forEach(function (x) {
+            const g = x.g;
+            const vision = groupHasVision(g);
+            const sub = [g.detail || '', g.source && g.source !== 'Llama AIO' ? g.source : '', g.hidden ? 'hidden' : ''].filter(Boolean).join(' · ');
+            html += '<div class="lib-grp" title="' + escAttr(g.title + (g.detail ? ' — ' + g.detail : '') + ' · ' + g.source) + '"><span class="lib-title">' + escText(g.title) + '</span>' + (vision ? '<span class="lib-tag vision" title="A vision projector (mmproj) sits next to these files">vision</span>' : '') + '<span class="lib-detail">' + escText(sub) + '</span></div>';
+            x.quants.forEach(function (quant) {
+              const sel = quant.path === librarySelected;
+              const draft = !!libraryDrafts[quant.path];
+              const fit = libraryFits[quant.path] || '';
+              const tip = quant.path + (quant.shardCount > 1 ? '\\n' + quant.shardCount + ' shards' : '') + (fit ? '\\n' + fitText(fit) : '');
+              html += '<div class="lib-quant' + (sel ? ' selected' : '') + (fit === 'wont-fit' ? ' nofit' : '') + '" role="button" tabindex="0" title="' + escAttr(tip) + '" data-path="' + escAttr(quant.path) + '" data-current="' + (quant.current ? '1' : '0') + '">';
+              html += '<span class="lib-dot' + (quant.loaded ? ' live' : '') + '"' + (quant.loaded ? ' title="Running on the server"' : '') + '></span>';
+              html += '<span class="lib-label">' + escText(quant.label);
+              if (draft) html += '<span class="lib-tag draft" title="DFlash draft model: use it for speculative decoding, not as the main model">draft</span>';
+              if (quant.loaded) html += '<span class="sub">running</span>';
+              html += '</span>';
+              html += '<span class="lib-meta">' + escText(quant.sizeLabel || '') + '</span>';
+              html += fitBarHtml(quant.path);
+              html += '<button type="button" class="lib-more" data-menu-path="' + escAttr(quant.path) + '" title="More actions" aria-haspopup="menu">⋯</button>';
+              if (libraryMenuPath === quant.path) {
+                html += '<div class="lib-menu" role="menu">';
+                if (draft) html += '<button type="button" role="menuitem" data-act="use-draft" data-path="' + escAttr(quant.path) + '">Use as draft for current model</button><div class="menu-sep"></div>';
+                html += '<button type="button" role="menuitem" data-act="reveal" data-path="' + escAttr(quant.path) + '">Reveal in file manager</button>';
+                html += '<button type="button" role="menuitem" data-act="copy-path" data-path="' + escAttr(quant.path) + '">Copy path</button>';
+                html += '<button type="button" role="menuitem" data-act="' + (g.hidden ? 'unhide' : 'hide') + '" data-path="' + escAttr(quant.path) + '">' + (g.hidden ? 'Unhide' : 'Hide from library') + '</button>';
+                if (quant.owned) {
+                  html += '<div class="menu-sep"></div><button type="button" role="menuitem" class="danger-item" data-act="remove" data-path="' + escAttr(quant.path) + '">Remove from disk…</button>';
+                }
+                html += '</div>';
+              }
+              html += '</div>';
+            });
+          });
+          html += '</div>';
+        }
+        if (q.length >= 2) {
+          html += '<button type="button" class="secondary lib-wide" data-act="hf-search">Search Hugging Face for “' + escText(raw) + '”</button>';
+        }
+      }
+      root.innerHTML = html;
+      renderLibraryFilters();
+      renderLibraryQuick();
+      refreshLibrarySum();
+    }
+    function renderLibraryPartials() {
+      const el = $('libraryPartials');
+      if (!el) return;
+      const n = (libraryPayload.partials || []).length;
+      if (!n) {
+        el.classList.add('hidden');
+        el.textContent = '';
+        return;
+      }
+      el.classList.remove('hidden');
+      const label = libraryPayload.partialSizeLabel || '';
+      el.innerHTML = '<span>' + n + ' partial download' + (n === 1 ? '' : 's') + (label ? ' · ' + escText(label) : '') + '</span><button type="button" class="secondary small" data-act="clean-partials">Clean</button>';
+    }
+    function renderLibraryDialog() {
+      const el = $('libraryDialog');
+      if (!el) return;
+      const found = libraryDialogPath ? findLibraryQuant(libraryDialogPath) : null;
+      if (!found || !found.quant.owned) {
+        libraryDialogPath = '';
+        el.classList.add('hidden');
+        el.innerHTML = '';
+        return;
+      }
+      const quant = found.quant;
+      const companions = found.group.companions || [];
+      let html = '<div class="lib-dialog-title">' + (quant.loaded ? 'Stop and remove' : 'Remove') + ' ' + escText(quant.label) + '</div>';
+      if (libraryPayload.serverStarting) {
+        html += '<div class="hint">The server is still starting. Wait, then remove this model.</div>';
+      } else if (quant.loaded) {
+        html += '<div class="hint">The server has this file mapped. It will stop before the files are removed.</div>';
+      } else {
+        html += '<div class="hint">Removes this quant from the Llama AIO models folder.</div>';
+      }
+      html += '<div class="hint">Files go to the trash when the system allows it.</div>';
+      companions.forEach(function (c) {
+        const checked = Object.prototype.hasOwnProperty.call(libraryDialogChecks, c.path) ? libraryDialogChecks[c.path] : !c.shared;
+        html += '<label class="lib-check"><input type="checkbox" data-companion="' + escAttr(c.path) + '"' + (checked ? ' checked' : '') + ' /> ';
+        html += escText(c.name) + ' · ' + escText(c.sizeLabel || '') + (c.shared ? ' · still used by other quants' : '') + '</label>';
+      });
+      html += '<div class="lib-actions"><button type="button" class="secondary small" data-act="cancel-remove">Cancel</button>';
+      html += '<button type="button" class="danger small" data-act="confirm-remove"' + (libraryPayload.serverStarting ? ' disabled' : '') + '>' + (quant.loaded ? 'Stop and remove' : 'Remove') + '</button></div>';
+      el.classList.remove('hidden');
+      el.innerHTML = html;
+    }
 
     let memInputs = null;
     let gpuInfos = [];
@@ -2325,6 +3492,81 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       }
       perfEl.textContent = perfBits.join(' · ');
       perfEl.classList.toggle('hidden', !perfBits.length);
+      renderModelStatus();
+    }
+
+    /** "Name · QUANT" with the quant dimmed. */
+    function modelTitleHtml(name) {
+      const i = String(name).lastIndexOf(' · ');
+      if (i <= 0) return escText(name);
+      return escText(name.slice(0, i)) + ' <span class="q">· ' + escText(name.slice(i + 3)) + '</span>';
+    }
+
+    /** Model card: running / not loaded pill, reload prompt, and the collapsed summary line. */
+    function renderModelStatus() {
+      const p = lastPayload;
+      if (!p) return;
+      const hasModel = !!(p.state && p.state.selectedModelPath);
+      const modelPending = serverRunning && pendingChanges.some(function (c) { return c.key === 'model'; });
+      let cls = '';
+      let text = '';
+      if (hasModel) {
+        if (serverStarting) { cls = 'starting'; text = 'starting…'; }
+        else if (modelPending) { cls = 'pending'; text = 'not loaded'; }
+        else if (serverRunning) { cls = 'running'; text = 'running'; }
+        else { text = 'stopped'; }
+      }
+      ['modelStatus', 'modelClosedStatus'].forEach(function (id) {
+        const el = $(id);
+        if (!el) return;
+        el.className = 'model-status' + (cls ? ' ' + cls : '') + (text ? '' : ' hidden');
+        el.textContent = text;
+        el.title = modelPending ? 'The server is still running ' + (pendingModelChange().from || 'another model') + '.' : '';
+      });
+      const bar = $('modelReloadBar');
+      if (bar) {
+        bar.classList.toggle('hidden', !modelPending);
+        const t = $('modelReloadText');
+        if (t && modelPending) {
+          t.innerHTML = 'Server runs <b>' + escText(pendingModelChange().from || 'another model') + '</b>. Switch to the selection?';
+        }
+      }
+      const closedReload = $('modelClosedReload');
+      if (closedReload) closedReload.classList.toggle('hidden', !modelPending);
+
+      const line = $('modelClosedLine');
+      if (!line) return;
+      line.classList.toggle('has-model', hasModel);
+      const sel = p.state && p.state.selectedModelPath;
+      const found = sel ? findLibraryQuant(sel) : null;
+      const bits = [];
+      if (found && found.quant.sizeLabel) bits.push(found.quant.sizeLabel);
+      const L = (p.state && p.state.loadSettings) || {};
+      if (L.mmprojPath) bits.push('vision');
+      const caps = p.capabilities || {};
+      if (caps.nextnPredictLayers > 0 || p.mtpSidecarPath) bits.push('MTP');
+      else if (L.speculativeMode && L.speculativeMode !== 'off') bits.push(String(L.speculativeMode));
+      const fit = sel ? libraryFits[sel] : '';
+      if (fit) bits.push(fitText(fit));
+      $('modelClosedMeta').textContent = bits.join(' · ');
+      const barEl = $('modelClosedBar');
+      if (barEl) {
+        const ratio = sel ? libraryRatios[sel] : undefined;
+        barEl.classList.toggle('hidden', typeof ratio !== 'number');
+        if (typeof ratio === 'number') {
+          barEl.className = 'fit-bar' + (fit ? ' ' + fit : '');
+          barEl.title = fitText(fit) + ' · ~' + Math.round(ratio * 100) + '% of ' + (libraryBudgetLabel || 'memory');
+          barEl.firstElementChild.style.width = Math.max(2, Math.min(100, Math.round(ratio * 100))) + '%';
+        }
+      }
+    }
+    function pendingModelChange() {
+      const change = pendingChanges.find(function (c) { return c.key === 'model'; });
+      if (!change) return {};
+      const running = allLibraryGroups().reduce(function (hit, g) {
+        return hit || ((g.quants || []).find(function (q) { return q.loaded; }) ? { group: g, quant: g.quants.find(function (q) { return q.loaded; }) } : null);
+      }, null);
+      return { from: running ? shortModelLabel(running) : change.from, to: change.to };
     }
 
     function markDirtyIfRunning() {
@@ -2692,7 +3934,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     }
 
     function isLegacyGpu0FirstSplit(raw) {
-      const n = String(raw || '').replace(/\s+/g, '');
+      const n = String(raw || '').replace(/\\s+/g, '');
       return n === '3,1' || n === '2,1' || n === '4,1' || n === '3,2';
     }
 
@@ -3173,37 +4415,43 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       }
     }
 
-    /** Say when a curated model mode replaces the sampling values below. */
+    /** A curated model mode owns temperature / top_p / top_k: show what it sends instead of inert inputs. */
     function renderModeOverrideHint(mode) {
-      const hint = $('modeOverrideHint');
-      if (!hint) return;
+      const strip = $('modeStrip');
+      if (!strip) return;
+      document.querySelectorAll('#copilotCard .samp-free').forEach((el) => el.classList.toggle('hidden', !!mode));
       if (!mode) {
-        hint.classList.add('hidden');
-        hint.textContent = '';
+        strip.classList.add('hidden');
+        strip.title = '';
         return;
       }
-      hint.classList.remove('hidden');
-      hint.textContent =
-        mode.familyLabel + ' model detected — the Model Mode picker in Copilot Chat sets sampling per request, ' +
-        'so Temperature, Top P and Top K below are not used. "' + mode.defaultMode + '" sends temperature ' +
-        mode.temperature + ', top_p ' + mode.topP + ', top_k ' + mode.topK + '. Max tokens still applies.';
+      strip.classList.remove('hidden');
+      $('modeStripName').textContent = mode.defaultMode;
+      const values = $('modeStripValues');
+      values.textContent = '';
+      for (const text of ['T ' + mode.temperature, 'p ' + mode.topP, 'k ' + mode.topK]) {
+        const chip = document.createElement('span');
+        chip.className = 'chip';
+        chip.textContent = text;
+        values.appendChild(chip);
+      }
+      strip.title =
+        mode.familyLabel + ' model detected — the Model Mode picker in Copilot Chat sets temperature, top_p and top_k per request. "' +
+        mode.defaultMode + '" is the default and sends temperature ' + mode.temperature + ', top_p ' + mode.topP +
+        ', top_k ' + mode.topK + '. Max tokens, the penalties below, and the overthinking penalty still apply.';
     }
 
     function syncMmprojOffloadUi(cpuOnly) {
       const el = $('mmprojOffloadToGpu');
       if (!el) return;
-      const hint = $('mmprojPathHint');
-      const projPath = (hint && (hint.dataset.path || '').trim()) || '';
+      const row = $('mmprojAttach');
+      const projPath = (row && (row.dataset.path || '').trim()) || '';
       el.disabled = !!cpuOnly || !projPath;
-      // The offload toggle does nothing without a projector, so it only shows with one.
-      const row = $('mmprojOffloadRow');
-      if (row) row.classList.toggle('hidden', !projPath);
-      const sum = $('visionSum');
-      if (sum) {
-        sum.textContent = projPath
-          ? (projPath.split(/[/\\\\]/).pop() + (el.checked && !cpuOnly ? ' · GPU' : ' · RAM'))
-          : 'none · text only';
-      }
+      const onGpu = el.checked && !cpuOnly;
+      document.querySelectorAll('#mmprojSeg .seg-btn').forEach(function (b) {
+        b.classList.toggle('active', (b.dataset.mm === 'gpu') === onGpu);
+        b.disabled = !!cpuOnly;
+      });
     }
 
     function applyCpuOnlyUi(cpuOnly) {
@@ -3748,14 +4996,22 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     const savedUi = vscode.getState() || {};
     let scrollRestored = false;
     function saveUiState() {
-      const open = [...document.querySelectorAll('details[id]')]
-        .filter((d) => d.open && d.id !== 'srvMenu')
-        .map((d) => d.id);
-      vscode.setState({ open: open, scrollY: window.scrollY });
+      const folds = [...document.querySelectorAll('details[id]')].filter((d) => d.id !== 'srvMenu');
+      const open = folds.filter((d) => d.open).map((d) => d.id);
+      // Folds that start open are remembered by being closed instead.
+      const closed = folds.filter((d) => !d.open && d.hasAttribute('data-default-open')).map((d) => d.id);
+      vscode.setState({ open: open, closed: closed, scrollY: window.scrollY, librarySort: librarySort });
     }
     for (const id of Array.isArray(savedUi.open) ? savedUi.open : []) {
       const d = $(id);
       if (d && d.tagName === 'DETAILS') d.open = true;
+    }
+    for (const id of Array.isArray(savedUi.closed) ? savedUi.closed : []) {
+      const d = $(id);
+      if (d && d.tagName === 'DETAILS' && d.hasAttribute('data-default-open')) d.open = false;
+    }
+    if (savedUi.librarySort === 'name' || savedUi.librarySort === 'size' || savedUi.librarySort === 'recent') {
+      librarySort = savedUi.librarySort;
     }
     document.querySelectorAll('details[id]').forEach((d) => d.addEventListener('toggle', saveUiState));
     let scrollSaveTimer = null;
@@ -3772,12 +5028,65 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         vscode.postMessage({ type: 'saveRequest', payload: readRequest() });
       }, 250);
     }
+    function syncOverthinkingStrength() {
+      const box = $('overthinkingPenalty');
+      const strength = $('overthinkingPenaltyStrength');
+      const on = !!(box && box.checked);
+      const strengthText = (strength && strength.value) || '2';
+      document.querySelectorAll('#otStrengthSeg .seg-btn').forEach((b) => {
+        b.classList.toggle('active', Number(b.dataset.v) === Number(strengthText));
+      });
+      const panel = $('overthinkingBox');
+      if (panel) panel.classList.toggle('on', on);
+      const quick = $('overthinkingQuick');
+      if (quick) quick.checked = on;
+      const quickState = $('overthinkingQuickState');
+      if (quickState) quickState.textContent = on ? '−' + strengthText : 'off';
+      const hint = $('overthinkingHint');
+      if (hint) {
+        hint.textContent = on
+          ? 'On. The next chat message subtracts ' + strengthText + ' from Wait, maybe, But and similar words. No server reload.'
+          : 'Off. Strength is remembered, but chat requests do not send it.';
+      }
+      const sum = $('copilotSum');
+      if (sum) {
+        let text = (sum.textContent || '').replace(/\\s*·\\s*overthink −[\\d.]+/g, '').replace(/^overthink −[\\d.]+(?:\\s*·\\s*)?/, '').trim();
+        if (on) text = text && text !== '—' ? text + ' · overthink −' + strengthText : 'overthink −' + strengthText;
+        sum.textContent = text || '—';
+      }
+    }
     for (const id of ['temperature', 'topP', 'topK', 'minP', 'repeatPenalty', 'presencePenalty', 'frequencyPenalty', 'maxTokens']) {
       const el = $(id);
       if (!el) continue;
       el.addEventListener('change', scheduleSaveRequest);
       el.addEventListener('input', scheduleSaveRequest);
     }
+    const overthinkingBox = $('overthinkingPenalty');
+    if (overthinkingBox) {
+      overthinkingBox.addEventListener('change', () => {
+        syncOverthinkingStrength();
+        scheduleSaveRequest();
+      });
+    }
+    const overthinkingQuick = $('overthinkingQuick');
+    if (overthinkingQuick && overthinkingBox) {
+      overthinkingQuick.addEventListener('change', () => {
+        overthinkingBox.checked = overthinkingQuick.checked;
+        overthinkingBox.dispatchEvent(new Event('change'));
+      });
+    }
+    document.querySelectorAll('#otStrengthSeg .seg-btn').forEach((b) => {
+      b.addEventListener('click', () => {
+        const strength = $('overthinkingPenaltyStrength');
+        if (!strength || strength.value === b.dataset.v) return;
+        strength.value = b.dataset.v;
+        syncOverthinkingStrength();
+        scheduleSaveRequest();
+      });
+    });
+    // Header buttons sit inside <summary>; keep a click on them (or on a disabled one) from folding the card.
+    const copilotDebugBtns = $('copilotDebugBtns');
+    if (copilotDebugBtns) copilotDebugBtns.addEventListener('click', (e) => e.preventDefault());
 
     function readLoad() {
       const ropeBaseAuto = $('ropeBaseAuto').checked;
@@ -3848,17 +5157,25 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     }
 
     function setMmprojHint(mmprojPath) {
-      const hint = $('mmprojPathHint');
-      if (!hint) return;
+      const row = $('mmprojAttach');
+      if (!row) return;
       const p = (mmprojPath || '').trim();
-      hint.dataset.path = p;
-      if (!p) {
-        hint.textContent = 'No mmproj — text only. A sibling mmproj-*.gguf is attached automatically when you select a multimodal GGUF.';
-        syncMmprojOffloadUi(cpuOnlyLive());
-        return;
+      row.dataset.path = p;
+      row.classList.toggle('hidden', !p);
+      const attach = $('attachMmprojBtn');
+      const hasModel = !!(lastPayload && lastPayload.state && lastPayload.state.selectedModelPath);
+      if (attach) attach.classList.toggle('hidden', !!p || !hasModel);
+      const name = $('mmprojName');
+      if (name) {
+        const base = p ? (p.split(/[/\\\\]/).pop() || p).replace(/\\.gguf$/i, '') : '';
+        const inputs = lastPayload && lastPayload.memInputs;
+        const sameFile = !!(lastPayload && lastPayload.state && lastPayload.state.loadSettings.mmprojPath === p);
+        const size = p && sameFile && inputs && inputs.mmprojFileSizeBytes
+          ? ' <span class="sub">· ' + escText(fmtBytes(inputs.mmprojFileSizeBytes)) + '</span>'
+          : '';
+        name.innerHTML = escText(base) + size;
+        name.title = p ? p + '\\nCopilot Chat can send images. Reload the server to apply changes.' : '';
       }
-      const base = p.split(/[/\\\\]/).pop() || p;
-      hint.textContent = base + '  ·  Copilot Chat can send images. Reload the server to apply.';
       syncMmprojOffloadUi(cpuOnlyLive());
     }
 
@@ -3872,6 +5189,8 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         repeatPenalty: $('repeatPenalty') ? Number($('repeatPenalty').value) : 1,
         presencePenalty: $('presencePenalty') ? Number($('presencePenalty').value) : 0,
         frequencyPenalty: $('frequencyPenalty') ? Number($('frequencyPenalty').value) : 0,
+        overthinkingPenalty: !!($('overthinkingPenalty') && $('overthinkingPenalty').checked),
+        overthinkingPenaltyStrength: $('overthinkingPenaltyStrength') ? Number($('overthinkingPenaltyStrength').value) : 2,
       };
     }
 
@@ -3912,19 +5231,20 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           ffnHintDefault = $('ffnHint').textContent;
         }
         const capBits = [
-          caps.architecture || '?',
-          isMoe ? ('MoE ' + (caps.expertCount || '?') + ' experts') : 'dense',
-          blocks + ' layers',
-          'max ctx ' + fmtTokShort(maxCtx),
+          [(caps.architecture || '?') + ' · ' + (isMoe ? ('MoE ' + (caps.expertCount || '?') + ' experts') : 'dense'), ''],
+          [blocks + ' layers', ''],
+          [fmtTokShort(maxCtx) + ' ctx', 'Model max ' + Number(maxCtx).toLocaleString() + ' tokens'],
         ];
-        if (caps.fullAttentionInterval > 1) capBits.push('full attn every ' + caps.fullAttentionInterval);
-        if (caps.pleShare > 0) capBits.push('PLE ~' + Math.round(caps.pleShare * 100) + '%');
-        if (caps.nextnPredictLayers > 0) capBits.push('MTP ✓');
-        else if (mtpSidecarPath) capBits.push('MTP sidecar');
+        if (caps.fullAttentionInterval > 1) capBits.push(['full attn every ' + caps.fullAttentionInterval, 'Hybrid attention: one full-attention layer every ' + caps.fullAttentionInterval + ' layers']);
+        if (caps.pleShare > 0) capBits.push(['PLE ~' + Math.round(caps.pleShare * 100) + '%', 'Per-layer embeddings share of the weights']);
+        if (caps.nextnPredictLayers > 0) capBits.push(['MTP ✓', 'Multi-token prediction layers baked into the GGUF', 'ok']);
+        else if (mtpSidecarPath) capBits.push(['MTP sidecar', 'MTP sidecar: ' + String(mtpSidecarPath).split(/[/\\\\]/).pop(), 'ok']);
         const modelCaps = $('modelCaps');
         modelCaps.classList.remove('hidden');
-        modelCaps.textContent = capBits.join(' · ');
-        modelCaps.title = mtpSidecarPath ? 'MTP sidecar: ' + String(mtpSidecarPath).split(/[/\\\\]/).pop() : '';
+        modelCaps.innerHTML = capBits.map(function (b) {
+          return '<span class="cap-chip' + (b[2] ? ' ' + b[2] : '') + '"' + (b[1] ? ' title="' + escAttr(b[1]) + '"' : '') + '>' + escText(b[0]) + '</span>';
+        }).join('');
+        modelCaps.title = '';
         applySpecUi(!!(caps.nextnPredictLayers > 0), sidecarMtpAvailable());
       } else {
         $('modelCaps').classList.add('hidden');
@@ -4295,20 +5615,26 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       const showStarter = !hasModel;
       const starterBtn = $('starterModelBtn');
       const starterHint = $('starterModelHint');
-      const changeBtn = $('changeModelBtn');
       $('starterCol').classList.toggle('hidden', !showStarter);
       if (starterBtn) starterBtn.classList.toggle('hidden', !showStarter);
       if (starterHint) starterHint.classList.toggle('hidden', !showStarter);
-      if (changeBtn) {
-        changeBtn.textContent = hasModel ? 'Change…' : 'Choose…';
-        changeBtn.className = (showStarter && localCount > 0 ? 'primary' : 'secondary') + ' small';
-      }
-      $('modelTitle').textContent = hasModel ? (payload.modelName || 'model') : 'No model selected';
-      $('modelTitle').title = hasModel && payload.modelNameRaw ? 'general.name: ' + payload.modelNameRaw : '';
+      const titleHtml = modelTitleHtml(hasModel ? (payload.modelName || 'model') : 'No model selected');
+      $('modelTitle').innerHTML = titleHtml;
+      $('modelClosedName').innerHTML = hasModel ? titleHtml : 'No model selected';
+      $('modelTitle').title = hasModel
+        ? [s.selectedModelPath, payload.modelNameRaw ? 'general.name: ' + payload.modelNameRaw : ''].filter(Boolean).join('\\n')
+        : '';
       const libSum = $('librarySum');
       if (libSum) {
-        const sources = (Array.isArray(payload.localSourceDirs) ? payload.localSourceDirs : []).map((d) => d.source);
-        libSum.textContent = localCount + ' GGUF' + (sources.length ? ' · ' + sources.slice(0, 3).join(', ') + (sources.length > 3 ? '…' : '') : '');
+        const lib = payload.library;
+        const visible = lib && Array.isArray(lib.groups)
+          ? lib.groups.reduce(function (n, g) { return n + ((g.quants && g.quants.length) || 0); }, 0)
+          : localCount;
+        const hidden = lib && Array.isArray(lib.hiddenGroups)
+          ? lib.hiddenGroups.reduce(function (n, g) { return n + ((g.quants && g.quants.length) || 0); }, 0)
+          : 0;
+        libraryCountLabel = visible + ' GGUF' + (hidden ? ' · ' + hidden + ' hidden' : '');
+        refreshLibrarySum();
       }
       function escAttr(v) {
         return String(v).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
@@ -4330,35 +5656,36 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         });
       }
 
-      if (hasModel && s.selectedModelPath) {
-        // Middle-ellipsis keeps the folder and the file name; the full path is the tooltip.
-        const p = String(s.selectedModelPath);
-        const parts = p.split(/[/\\\\]/);
-        const file = parts.pop() || p;
-        const dir = parts.pop() || '';
-        const short = (dir ? '…/' + (dir.length > 28 ? dir.slice(0, 26) + '…' : dir) + '/' : '') + file;
-        $('modelPath').innerHTML =
-          '<a class="model-path-link" href="#" data-path="' + escAttr(p) +
-          '" title="' + escAttr(p) + ' — reveal in file manager">' + escText(short) + '</a>';
-        bindFolderLinks($('modelPath'));
-      } else {
-        $('modelPath').textContent = 'Pick a downloaded GGUF, open a file, or download one from Hugging Face.';
-      }
+      // The path lives in the title tooltip and the row menu; the line only guides first-time users.
+      $('modelPath').textContent = hasModel ? '' : 'Open the library to pick a model, or search Hugging Face.';
+      $('modelPath').classList.toggle('hidden', hasModel);
 
       const modelsDir = payload.modelsDir || '';
-      const sourceDirs = Array.isArray(payload.localSourceDirs) ? payload.localSourceDirs : [];
-      const sourceHtml = sourceDirs.length
-        ? ' · sources: ' + sourceDirs.map((src) =>
-            folderLink(src.source, src.dir, 'Open ' + src.source + ' folder')
-          ).join(', ')
-        : '';
+      const sourceDirs = (Array.isArray(payload.localSourceDirs) ? payload.localSourceDirs : [])
+        .filter((src) => src.source !== 'Llama AIO');
+      const shortDir = modelsDir.replace(/^(\\/home\\/[^/]+|\\/Users\\/[^/]+)(?=\\/)/, '~');
       $('modelsDirMeta').innerHTML =
-        'Downloads go to ' +
-        (modelsDir ? folderLink(modelsDir, modelsDir, 'Open downloads folder') : '—') +
-        ' · ' + (payload.localModelCount || 0) + ' GGUF found' +
-        sourceHtml +
-        ' (also scans LM Studio, Unsloth, HF cache, …)';
+        'Saves to ' +
+        (modelsDir ? folderLink(shortDir, modelsDir, 'Open downloads folder: ' + modelsDir) : '—') +
+        (sourceDirs.length
+          ? ' · also scans ' + sourceDirs.map((src) => folderLink(src.source, src.dir, 'Open ' + src.source + ' folder')).join(', ')
+          : ' · also scans LM Studio, Unsloth, HF cache');
+      $('modelsDirMeta').title = 'Downloads go to ' + (modelsDir || '—') + '. The library also scans LM Studio, Unsloth, the Hugging Face cache and extra model folders.';
       bindFolderLinks($('modelsDirMeta'));
+      libraryPayload = payload.library || { groups: [], hiddenGroups: [], partials: [], partialSizeLabel: '', serverStarting: false };
+      if (librarySelected && !findLibraryQuant(librarySelected)) librarySelected = '';
+      if (!librarySelected) {
+        const groups = allLibraryGroups();
+        for (let i = 0; i < groups.length && !librarySelected; i++) {
+          const quants = groups[i].quants || [];
+          for (let j = 0; j < quants.length; j++) {
+            if (quants[j].current) librarySelected = quants[j].path;
+          }
+        }
+      }
+      renderLibraryList();
+      renderLibraryPartials();
+      renderLibraryDialog();
 
       const maxCtx = (caps && caps.maxContextLength) ? caps.maxContextLength : 131072;
       const blocks = (caps && caps.blockCount) ? caps.blockCount : 128;
@@ -4449,6 +5776,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       setField('repeatPenalty', R.repeatPenalty ?? 1);
       setField('presencePenalty', R.presencePenalty ?? 0);
       setField('frequencyPenalty', R.frequencyPenalty ?? 0);
+      setChecked('overthinkingPenalty', !!R.overthinkingPenalty);
+      setField('overthinkingPenaltyStrength', R.overthinkingPenaltyStrength ?? 2);
+      syncOverthinkingStrength();
       renderModeOverrideHint(payload.modeSampling);
       syncFlashAttentionWarning();
 
@@ -4481,9 +5811,13 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       const bits = [];
       if (payload.modeSampling) bits.push(payload.modeSampling.familyLabel + ' modes');
       else if (typeof R.temperature === 'number') bits.push('temp ' + R.temperature);
+      if (typeof R.maxTokens === 'number' && R.maxTokens > 0) {
+        bits.push((R.maxTokens % 1024 === 0 ? R.maxTokens / 1024 + 'k' : fmtTokK(R.maxTokens)) + ' max');
+      }
       bits.push('replacements ' + (payload.promptReplacementsEnabled ? 'on' : 'off'));
       if (payload.wikipediaLookupEnabled) bits.push('wiki on');
       if (payload.duplicateToolCallGuardEnabled) bits.push('dup-guard on');
+      if (R.overthinkingPenalty) bits.push('overthink −' + (R.overthinkingPenaltyStrength ?? 2));
       el.textContent = bits.join(' · ');
     }
 
@@ -4578,11 +5912,6 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       });
     }
 
-    $('downloadModelBtn').addEventListener('click', () => vscode.postMessage({ type: 'downloadModel' }));
-    const showDownloadsBtn = $('showDownloadsBtn');
-    if (showDownloadsBtn) {
-      showDownloadsBtn.addEventListener('click', () => vscode.postMessage({ type: 'showDownloads' }));
-    }
     const viewContextBtn = $('viewContextBtn');
     if (viewContextBtn) {
       viewContextBtn.addEventListener('click', () => vscode.postMessage({ type: 'viewLastCall' }));
@@ -4635,7 +5964,6 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       setupStarterBtn.addEventListener('click', () => vscode.postMessage({ type: 'downloadStarter' }));
     }
     $('openFileBtn').addEventListener('click', () => vscode.postMessage({ type: 'openModelFile' }));
-    $('changeModelBtn').addEventListener('click', () => vscode.postMessage({ type: 'changeModel' }));
     $('installLlamaBtn').addEventListener('click', () => {
       const action = $('installLlamaBtn').dataset.action;
       if (action === 'check') {
@@ -4755,9 +6083,285 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       vscode.postMessage({ type: 'setLaunchMode', payload: mode });
     });
 
+    function startLibrarySearch() {
+      const raw = (($('libraryFilter') && $('libraryFilter').value) || '').trim();
+      if (raw.length < 2) return;
+      libraryHfMode = 'search';
+      libraryHfBusy = true;
+      libraryHfError = '';
+      libraryHfRepos = [];
+      renderLibraryList();
+      vscode.postMessage({ type: 'searchLibraryHf', query: raw });
+    }
+    function openLibraryMenu(filePath) {
+      libraryMenuPath = libraryMenuPath === filePath ? '' : filePath;
+      renderLibraryList();
+      const first = libraryMenuPath && document.querySelector('.lib-menu button');
+      if (first) first.focus();
+    }
+    function closeLibraryMenu() {
+      if (!libraryMenuPath) return;
+      libraryMenuPath = '';
+      renderLibraryList();
+    }
+    function onLibraryClick(e) {
+      const more = e.target.closest ? e.target.closest('[data-menu-path]') : null;
+      if (more) {
+        e.stopPropagation();
+        openLibraryMenu(more.getAttribute('data-menu-path') || '');
+        return;
+      }
+      const btn = e.target.closest ? e.target.closest('[data-act]') : null;
+      if (btn) {
+        const act = btn.getAttribute('data-act');
+        const filePath = btn.getAttribute('data-path') || '';
+        if (btn.closest('.lib-menu')) libraryMenuPath = '';
+        if (act === 'reveal') vscode.postMessage({ type: 'revealInOs', path: filePath });
+        else if (act === 'copy-path') vscode.postMessage({ type: 'copyPath', path: filePath });
+        else if (act === 'use-draft') vscode.postMessage({ type: 'useLibraryDraft', path: filePath });
+        else if (act === 'hide') vscode.postMessage({ type: 'hideLibraryModel', path: filePath });
+        else if (act === 'unhide') vscode.postMessage({ type: 'unhideLibraryModel', path: filePath });
+        else if (act === 'remove') {
+          librarySelected = filePath;
+          libraryDialogPath = filePath;
+          libraryDialogChecks = {};
+          renderLibraryList();
+          renderLibraryDialog();
+        } else if (act === 'hf-search') {
+          startLibrarySearch();
+        } else if (act === 'hf-back') {
+          libraryHfMode = libraryHfMode === 'files' || libraryHfMode === 'license' ? 'search' : 'local';
+          libraryHfError = '';
+          libraryHfBusy = false;
+          renderLibraryList();
+        } else if (act === 'hf-repo') {
+          const id = btn.getAttribute('data-repo') || '';
+          const repo = libraryHfRepos.find(function (item) { return item.id === id; });
+          if (repo && repo.needsConfirm) {
+            libraryHfFiles = { license: repo };
+            libraryHfMode = 'license';
+            renderLibraryList();
+          } else if (id) {
+            libraryHfBusy = true;
+            libraryHfError = '';
+            libraryHfMode = 'files';
+            libraryHfFiles = { modelId: id, files: [] };
+            renderLibraryList();
+            vscode.postMessage({ type: 'listLibraryHfFiles', modelId: id });
+          }
+        } else if (act === 'hf-license-view') {
+          const url = btn.getAttribute('data-url') || '';
+          if (url) vscode.postMessage({ type: 'openExternal', url: url });
+        } else if (act === 'hf-license-ok') {
+          const id = btn.getAttribute('data-repo') || '';
+          libraryHfBusy = true;
+          libraryHfError = '';
+          libraryHfMode = 'files';
+          libraryHfFiles = { modelId: id, files: [] };
+          renderLibraryList();
+          vscode.postMessage({ type: 'listLibraryHfFiles', modelId: id });
+        } else if (act === 'hf-download') {
+          libraryHfMode = 'local';
+          libraryHfBusy = false;
+          libraryHfError = '';
+          if ($('libraryFilter')) $('libraryFilter').value = '';
+          renderLibraryList();
+          vscode.postMessage({
+            type: 'downloadLibraryHf',
+            modelId: btn.getAttribute('data-model') || '',
+            filePath: btn.getAttribute('data-file') || ''
+          });
+        }         else if (act === 'dl-pause') vscode.postMessage({ type: 'pauseDownload', id: btn.getAttribute('data-job') || '' });
+        else if (act === 'dl-resume') vscode.postMessage({ type: 'resumeDownload', id: btn.getAttribute('data-job') || '' });
+        else if (act === 'dl-cancel') vscode.postMessage({ type: 'cancelDownload', id: btn.getAttribute('data-job') || '' });
+        else if (act === 'dl-page') {
+          const url = btn.getAttribute('data-url') || '';
+          if (url) vscode.postMessage({ type: 'openExternal', url: url });
+        } else if (act === 'dl-token') vscode.postMessage({ type: 'setHfToken' });
+        if (btn.closest('.lib-menu')) renderLibraryList();
+        return;
+      }
+      if (e.target.closest && e.target.closest('.lib-menu')) return;
+      const row = e.target.closest ? e.target.closest('.lib-quant') : null;
+      if (!row) return;
+      selectLibraryPath(row.getAttribute('data-path') || '');
+    }
+    function selectLibraryPath(filePath) {
+      if (!filePath) return;
+      const found = findLibraryQuant(filePath);
+      librarySelected = filePath;
+      libraryMenuPath = '';
+      renderLibraryList();
+      if (!(found && found.quant.current)) vscode.postMessage({ type: 'useLibraryModel', path: filePath });
+    }
+    $('libraryFilter').addEventListener('input', function () {
+      libraryHfMode = 'local';
+      libraryHfError = '';
+      libraryHfBusy = false;
+      renderLibraryList();
+    });
+    $('libraryFilter').addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') startLibrarySearch();
+    });
+    $('libraryFilters').addEventListener('click', function (e) {
+      const chip = e.target.closest ? e.target.closest('[data-lib-filter]') : null;
+      if (!chip) return;
+      libraryFilterMode = chip.getAttribute('data-lib-filter') || 'all';
+      libraryMenuPath = '';
+      renderLibraryList();
+      renderLibraryDialog();
+    });
+    $('librarySort').value = librarySort;
+    $('librarySort').addEventListener('change', function () {
+      librarySort = $('librarySort').value || 'recent';
+      renderLibraryList();
+      saveUiState();
+    });
+    $('libraryList').addEventListener('keydown', function (e) {
+      const row = e.target.classList && e.target.classList.contains('lib-quant') ? e.target : null;
+      if (!row) return;
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        selectLibraryPath(row.getAttribute('data-path') || '');
+      } else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        e.preventDefault();
+        const rows = [...document.querySelectorAll('#libraryList .lib-quant')];
+        const next = rows[rows.indexOf(row) + (e.key === 'ArrowDown' ? 1 : -1)];
+        if (next) next.focus();
+      }
+    });
+    $('libraryList').addEventListener('contextmenu', function (e) {
+      const row = e.target.closest ? e.target.closest('.lib-quant') : null;
+      if (!row) return;
+      e.preventDefault();
+      libraryMenuPath = '';
+      openLibraryMenu(row.getAttribute('data-path') || '');
+    });
+    document.addEventListener('click', function (e) {
+      if (libraryMenuPath && !(e.target.closest && e.target.closest('.lib-menu'))) closeLibraryMenu();
+    });
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape') closeLibraryMenu();
+    });
+    $('libraryQuick').addEventListener('click', function (e) {
+      const chip = e.target.closest ? e.target.closest('[data-quick-path]') : null;
+      if (chip) selectLibraryPath(chip.getAttribute('data-quick-path') || '');
+    });
+    $('libraryFold').addEventListener('toggle', refreshLibrarySum);
+    document.querySelectorAll('[data-model-reload]').forEach(function (b) {
+      b.addEventListener('click', function (e) {
+        e.stopPropagation();
+        launch('reload');
+      });
+    });
+    document.querySelectorAll('#mmprojSeg .seg-btn').forEach(function (b) {
+      b.addEventListener('click', function () {
+        const el = $('mmprojOffloadToGpu');
+        const want = b.dataset.mm === 'gpu';
+        if (!el || el.disabled || el.checked === want) return;
+        el.checked = want;
+        el.dispatchEvent(new Event('change'));
+        syncMmprojOffloadUi(cpuOnlyLive());
+      });
+    });
+    $('attachMmprojBtn').addEventListener('click', () => vscode.postMessage({ type: 'pickMmproj' }));
+    $('libraryList').addEventListener('click', onLibraryClick);
+    $('libraryJobs').addEventListener('click', onLibraryClick);
+    $('libraryPartials').addEventListener('click', function (e) {
+      const btn = e.target.closest ? e.target.closest('[data-act]') : null;
+      if (btn && btn.getAttribute('data-act') === 'clean-partials') {
+        vscode.postMessage({ type: 'cleanPartialDownloads' });
+      }
+    });
+    $('libraryDialog').addEventListener('change', function (e) {
+      const input = e.target;
+      if (!input || !input.getAttribute) return;
+      const companion = input.getAttribute('data-companion');
+      if (!companion) return;
+      libraryDialogChecks[companion] = !!input.checked;
+    });
+    $('libraryDialog').addEventListener('click', function (e) {
+      const btn = e.target.closest ? e.target.closest('[data-act]') : null;
+      if (!btn) return;
+      const act = btn.getAttribute('data-act');
+      if (act === 'cancel-remove') {
+        libraryDialogPath = '';
+        libraryDialogChecks = {};
+        renderLibraryDialog();
+        return;
+      }
+      if (act !== 'confirm-remove') return;
+      const found = findLibraryQuant(libraryDialogPath);
+      if (!found) return;
+      const companions = [];
+      (found.group.companions || []).forEach(function (c) {
+        const checked = Object.prototype.hasOwnProperty.call(libraryDialogChecks, c.path) ? libraryDialogChecks[c.path] : !c.shared;
+        if (checked) companions.push(c.path);
+      });
+      const filePath = libraryDialogPath;
+      libraryDialogPath = '';
+      libraryDialogChecks = {};
+      renderLibraryDialog();
+      vscode.postMessage({ type: 'removeLibraryQuant', path: filePath, companionPaths: companions });
+    });
+
     window.addEventListener('message', (event) => {
       const msg = event.data;
       if (msg.type === 'state') applyState(msg.payload);
+      if (msg.type === 'libraryFits') {
+        libraryFits = msg.fits || {};
+        libraryRatios = msg.ratios || {};
+        libraryDrafts = msg.drafts || {};
+        libraryBudgetLabel = msg.budgetLabel || '';
+        if (libraryHfMode === 'local') renderLibraryList();
+        else renderLibraryFilters();
+        renderModelStatus();
+      }
+      if (msg.type === 'libraryDownloads') {
+        libraryDownloads = msg.jobs || [];
+        renderLibraryJobs();
+      }
+      if (msg.type === 'libraryHfResults') {
+        const raw = (($('libraryFilter') && $('libraryFilter').value) || '').trim().toLowerCase();
+        if ((msg.query || '').toLowerCase() !== raw) return;
+        libraryHfBusy = false;
+        libraryHfError = '';
+        libraryHfRepos = msg.repos || [];
+        libraryHfMode = 'search';
+        renderLibraryList();
+      }
+      if (msg.type === 'libraryHfFiles') {
+        libraryHfBusy = false;
+        libraryHfError = '';
+        libraryHfFiles = msg;
+        libraryHfMode = 'files';
+        renderLibraryList();
+      }
+      if (msg.type === 'libraryHfError') {
+        const raw = (($('libraryFilter') && $('libraryFilter').value) || '').trim().toLowerCase();
+        if (msg.query && msg.query.toLowerCase() !== raw) return;
+        libraryHfBusy = false;
+        libraryHfError = msg.message || 'Search failed.';
+        renderLibraryList();
+      }
+      if (msg.type === 'focusLibrary') {
+        const modelFold = $('modelFold');
+        if (modelFold) modelFold.open = true;
+        const fold = $('libraryFold');
+        if (fold) fold.open = true;
+        const filter = $('libraryFilter');
+        if (msg.query && filter) filter.value = msg.query;
+        if (msg.search && msg.query) startLibrarySearch();
+        else {
+          libraryHfMode = 'local';
+          renderLibraryList();
+        }
+        if (msg.filter && filter) filter.focus();
+        if (msg.downloads) {
+          const row = document.querySelector('.lib-job');
+          if (row && row.scrollIntoView) row.scrollIntoView({ block: 'nearest' });
+        }
+      }
       if (msg.type === 'memoryEstimate') {
         // Drop replies to superseded requests (typing or dragging fires many).
         if (typeof msg.seq === 'number' && msg.seq >= renderedSeq && msg.seq === estimateSeq) {

@@ -2,7 +2,6 @@
  * VS Code UI around the shared HuggingFaceClient (QuickPick / notifications).
  */
 import * as vscode from "vscode";
-import { DownloadPanel } from "./downloadPanel";
 import {
   attachDownloadedCompanion,
   companionDownloadHint,
@@ -61,7 +60,6 @@ async function enqueueModelAndCompanions(
   languagePath: string,
   files?: HfFileHit[]
 ): Promise<string> {
-  DownloadPanel.show(store, downloadManager);
   const parts = remoteShardPaths(languagePath);
   const jobs = parts.map((part) => enqueueHfFile(hf, store, modelId, part, files));
   const listing = files ?? (await hf.listGgufFiles(modelId).catch(() => undefined));
@@ -76,6 +74,30 @@ async function enqueueModelAndCompanions(
   }
   const dests = await Promise.all([...jobs, ...extras].map((j) => j.done));
   return dests[0] || hf.localDestFor(modelId, parts[0]!);
+}
+
+/**
+ * Download a GGUF chosen in the library. Progress stays on the library rows.
+ * Returns the language-model path, or undefined when the file was a companion.
+ */
+export async function downloadGgufSelection(
+  hf: HuggingFaceClient,
+  store: SettingsStore,
+  modelId: string,
+  filePath: string
+): Promise<string | undefined> {
+  const files = await hf.listGgufFiles(modelId);
+  const picker = downloadPickerFiles(files);
+  const picked = picker.files.find((f) => f.path === filePath);
+  if (!picked) {
+    throw new Error("That GGUF is no longer listed in the repo.");
+  }
+  if (picker.companionOnly) {
+    const dest = await enqueueHfFile(hf, store, modelId, picked.path, files).done;
+    await attachDownloadedCompanion(store, dest, picked.path, files);
+    return undefined;
+  }
+  return enqueueModelAndCompanions(hf, store, modelId, picked.path, files);
 }
 
 /**
@@ -205,7 +227,6 @@ export async function browseAndDownloadModel(
   }
 
   if (picker.companionOnly) {
-    DownloadPanel.show(store, downloadManager);
     const dest = await enqueueHfFile(
       hf,
       store,

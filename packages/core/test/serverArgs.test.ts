@@ -293,6 +293,8 @@ describe("buildServerArgs", () => {
           presencePenalty: 0,
           frequencyPenalty: 0,
           repeatPenalty: 1,
+          overthinkingPenalty: false,
+          overthinkingPenaltyStrength: 2,
         },
       });
       assert.equal(argValue(args, "--temp"), "0.5");

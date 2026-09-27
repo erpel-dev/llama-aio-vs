@@ -287,6 +287,8 @@ describe("normalizeRequestSettings", () => {
     assert.equal(d.presencePenalty, 0);
     assert.equal(d.frequencyPenalty, 0);
     assert.equal(d.repeatPenalty, 1);
+    assert.equal(d.overthinkingPenalty, false);
+    assert.equal(d.overthinkingPenaltyStrength, 2);
   });
 
   it("clamps min-p and the penalties into legal ranges", () => {
@@ -307,5 +309,14 @@ describe("normalizeRequestSettings", () => {
     } as never);
     assert.equal(junk.minP, 0);
     assert.equal(junk.repeatPenalty, 1);
+  });
+
+  it("keeps the overthinking penalty off unless asked, and clamps its strength", () => {
+    const on = normalizeRequestSettings({ overthinkingPenalty: true, overthinkingPenaltyStrength: 9 });
+    assert.equal(on.overthinkingPenalty, true);
+    assert.equal(on.overthinkingPenaltyStrength, 4);
+    const low = normalizeRequestSettings({ overthinkingPenaltyStrength: 0 });
+    assert.equal(low.overthinkingPenalty, false);
+    assert.equal(low.overthinkingPenaltyStrength, 0.5);
   });
 });

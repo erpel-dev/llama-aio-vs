@@ -659,6 +659,15 @@ export function activate(context: vscode.ExtensionContext): void {
       installLlamaCppFromArchive,
       switchBackend,
       showDownloads,
+      selectModel: async (filePath: string) => {
+        const selected = filePath.trim();
+        if (!selected) {
+          return;
+        }
+        await store.applySelectedModel(selected);
+        await settingsView.pushState();
+        chatProvider?.notifyChanged();
+      },
     },
     () => chatProvider?.notifyChanged(),
     context.globalState
@@ -700,7 +709,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   const downloadBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 90);
   downloadBar.command = "llamaAio.showDownloads";
-  downloadBar.tooltip = "Llama AIO downloads";
+  downloadBar.tooltip = "Show the download in the model library";
   context.subscriptions.push(downloadBar);
   context.subscriptions.push({
     dispose: downloadManager.subscribe((jobs) => {
@@ -813,12 +822,24 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("llamaAio.installLlamaCpp", installLlamaCpp),
     vscode.commands.registerCommand("llamaAio.installLlamaCppByTag", installLlamaCppByTag),
     vscode.commands.registerCommand("llamaAio.installLlamaCppFromArchive", installLlamaCppFromArchive),
-    vscode.commands.registerCommand("llamaAio.browseModels", (query?: string) =>
-      downloadFromHuggingFace(typeof query === "string" ? query : undefined)
+    vscode.commands.registerCommand("llamaAio.browseModels", (query?: string) => {
+      const q = typeof query === "string" ? query.trim() : "";
+      settingsView.focusLibrary({ filter: true, query: q, search: q.length >= 2 });
+    }),
+    vscode.commands.registerCommand("llamaAio.showDownloads", () =>
+      settingsView.focusLibrary({ downloads: true })
     ),
-    vscode.commands.registerCommand("llamaAio.showDownloads", showDownloads),
     vscode.commands.registerCommand("llamaAio.openModelFile", openGgufFile),
-    vscode.commands.registerCommand("llamaAio.selectLocalModel", pickDownloaded),
+    vscode.commands.registerCommand("llamaAio.selectLocalModel", () =>
+      settingsView.focusLibrary({ filter: true })
+    ),
+    vscode.commands.registerCommand("llamaAio.removeSelectedModel", () =>
+      settingsView.removeSelectedModel()
+    ),
+    vscode.commands.registerCommand("llamaAio.hideModel", () => settingsView.hideSelectedModel()),
+    vscode.commands.registerCommand("llamaAio.cleanPartialDownloads", () =>
+      settingsView.cleanPartialDownloads()
+    ),
     vscode.commands.registerCommand("llamaAio.selectDraftModel", pickDraftModel),
     vscode.commands.registerCommand("llamaAio.selectMmproj", pickMmproj),
 

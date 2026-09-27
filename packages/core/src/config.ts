@@ -40,6 +40,14 @@ export interface AppPreferences {
    * same arguments in this turn. Can block a legitimate retry (e.g. Wikipedia).
    */
   duplicateToolCallGuardEnabled: boolean;
+  /**
+   * Real paths omitted from the model library and the quick pick.
+   * The files stay on disk. Discovered models (LM Studio, HF cache) are hidden
+   * this way instead of deleted.
+   */
+  hiddenModels: string[];
+  /** Most recently selected model paths, newest first (quick switch in the sidebar). */
+  recentModels: string[];
 }
 
 /** Model selection plus the tuning that gets turned into llama-server flags. */
@@ -71,6 +79,8 @@ export const DEFAULT_APP_PREFERENCES: AppPreferences = {
   promptReplacementsFile: "",
   wikipediaLookupEnabled: false,
   duplicateToolCallGuardEnabled: false,
+  hiddenModels: [],
+  recentModels: [],
 };
 
 /**
@@ -106,6 +116,12 @@ function normalizePreferences(raw: Partial<AppPreferences> | undefined): AppPref
     promptReplacementsFile: str(src.promptReplacementsFile, ""),
     wikipediaLookupEnabled: src.wikipediaLookupEnabled === true,
     duplicateToolCallGuardEnabled: src.duplicateToolCallGuardEnabled === true,
+    hiddenModels: Array.isArray(src.hiddenModels)
+      ? src.hiddenModels.filter((p): p is string => typeof p === "string" && p.trim().length > 0)
+      : [],
+    recentModels: Array.isArray(src.recentModels)
+      ? src.recentModels.filter((p): p is string => typeof p === "string" && p.trim().length > 0)
+      : [],
   };
 }
 
