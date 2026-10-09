@@ -1989,7 +1989,11 @@ export async function runApp(services: AppServices): Promise<void> {
           ? `Version: ${info.binaryVersion.split("\n")[0]!.slice(0, 80)}`
           : "",
       info.binaryRunnable === false
-        ? `Not runnable${info.nixOs ? " (NixOS / FHS)" : ""}${info.binaryRunError ? `: ${info.binaryRunError.slice(0, 80)}` : ""}`
+        ? info.activeBackend === "sycl"
+          ? `Not runnable (oneAPI / Intel driver)${info.binaryRunError ? `: ${info.binaryRunError.slice(0, 80)}` : ""}`
+          : info.activeBackend === "rocm"
+            ? `Not runnable (ROCm / HIP runtime)${info.binaryRunError ? `: ${info.binaryRunError.slice(0, 80)}` : ""}`
+            : `Not runnable${info.nixOs ? " (NixOS / FHS)" : ""}${info.binaryRunError ? `: ${info.binaryRunError.slice(0, 80)}` : ""}`
         : "",
       info.pathBinary ? `PATH: ${info.pathBinary}` : "",
       statusMessage,

@@ -14,6 +14,8 @@ import * as fs from "fs";
 import * as path from "path";
 import { spawnSync } from "child_process";
 import { findLlamaServerOnPath, whichOnPath, withBinaryDirEnv } from "./paths";
+import { formatRocmLaunchFailure } from "./rocmRuntime";
+import { formatSyclLaunchFailure } from "./syclRuntime";
 
 export function isNixOS(): boolean {
   if (process.platform !== "linux") {
@@ -272,6 +274,13 @@ export interface ResolveLaunchOptions {
   installedBinary?: string;
   /** Force the system `llama-server` from PATH (explicit “System (PATH)” backend). */
   usePath?: boolean;
+  /**
+   * Env for the runnable probe. When set, replaces the default binary-dir env
+   * (the caller already merged DLL / oneAPI paths).
+   */
+  env?: NodeJS.ProcessEnv;
+  /** Skip PATH and steam-run fallbacks. SYCL and ROCm must run as the installed binary. */
+  runtime?: "sycl" | "rocm";
 }
 
 /**
@@ -285,7 +294,9 @@ export function resolveLaunchPlan(options: ResolveLaunchOptions = {}): LaunchPla
 
   const installedBinary = (options.installedBinary || "").trim();
   const installedExists = !!installedBinary && fs.existsSync(installedBinary);
-  const baseEnv = installedExists ? withBinaryDirEnv(installedBinary) : { ...process.env };
+  const baseEnv =
+    options.env ??
+    (installedExists ? withBinaryDirEnv(installedBinary) : { ...process.env });
 
   if (installedExists) {
     const direct = probeLlamaServerRunnable(installedBinary, { env: baseEnv });
@@ -297,6 +308,14 @@ export function resolveLaunchPlan(options: ResolveLaunchOptions = {}): LaunchPla
         env: baseEnv,
         method: "direct",
       };
+    }
+
+    // A SYCL or ROCm binary that cannot see its runtime must not silently become the PATH server.
+    if (options.runtime === "sycl") {
+      throw new Error(formatSyclLaunchFailure(installedBinary, direct.detail));
+    }
+    if (options.runtime === "rocm") {
+      throw new Error(formatRocmLaunchFailure(installedBinary, direct.detail));
     }
 
     const steamRun = findSteamRun();

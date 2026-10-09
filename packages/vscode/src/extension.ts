@@ -11,6 +11,8 @@ import {
   LAUNCH_IN_PROGRESS_MSG,
   LlamaInstaller,
   nixOsIncompatibilityHint,
+  rocmRuntimeMissingReason,
+  syclRuntimeMissingReason,
   PerfStats,
   ProcessManager,
   SettingsStore,
@@ -310,9 +312,14 @@ export function activate(context: vscode.ExtensionContext): void {
     void refreshStatusBar(true);
     const label = info.binaryVersion || info.tag || processManager.resolveBinary();
     if (info.binaryRunnable === false) {
+      const hint =
+        info.activeBackend === "sycl"
+          ? syclRuntimeMissingReason()
+          : info.activeBackend === "rocm"
+            ? rocmRuntimeMissingReason()
+            : nixOsIncompatibilityHint().replace(/\n+/g, " ");
       void vscode.window.showWarningMessage(
-        `llama.cpp installed (${label}) but the binary cannot run on this system yet. ` +
-          nixOsIncompatibilityHint().replace(/\n+/g, " ")
+        `llama.cpp installed (${label}) but the binary cannot run on this system yet. ${hint}`
       );
     } else {
       vscode.window.showInformationMessage(

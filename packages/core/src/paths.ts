@@ -3,7 +3,7 @@ import * as os from "os";
 import * as path from "path";
 import type { ConfigAccessor } from "./config";
 
-export type InstallBackendId = "vulkan" | "cuda" | "cpu";
+export type InstallBackendId = "vulkan" | "cuda" | "cpu" | "sycl" | "rocm";
 
 /**
  * Shared data directory. Everything the extension and the TUI have in common

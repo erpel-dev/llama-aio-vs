@@ -375,6 +375,20 @@ describe("iGPU / APU guidance", () => {
       }),
       false
     );
+    assert.equal(
+      isIntegratedGpu({
+        totalBytes: 512 * MiB,
+        name: "Intel(R) Arc(TM) Graphics",
+      }),
+      true
+    );
+    assert.equal(
+      isIntegratedGpu({
+        totalBytes: 16 * GiB,
+        name: "Intel(R) Arc(TM) A770 Graphics",
+      }),
+      false
+    );
   });
 
   it("replaces Tight/ReBAR banners when offload is 0", () => {
@@ -771,6 +785,7 @@ describe("computeOverheadBytes", () => {
       "vulkan"
     );
     assert.equal(inferComputeBackend(false, [{ llamaDeviceId: "CUDA0" }]), "cuda");
+    assert.equal(inferComputeBackend(false, [{ llamaDeviceId: "SYCL0" }]), "sycl");
     assert.equal(inferComputeBackend(false, []), "unknown");
   });
 

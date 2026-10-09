@@ -307,7 +307,7 @@ function buildGpuBarChart(
 }
 
 /** Backend used to size compute/graph slop (Vulkan heaps are much fatter than CUDA). */
-export type ComputeBackend = "vulkan" | "cuda" | "metal" | "cpu" | "unknown";
+export type ComputeBackend = "vulkan" | "cuda" | "sycl" | "metal" | "cpu" | "unknown";
 
 export interface ComputeOverheadOptions {
   contextLength?: number;
@@ -352,6 +352,9 @@ const BACKEND_OVERHEAD: Record<
     deviceReservedBytes: 2.5 * GiB,
   },
   cuda: { driverBytes: 384 * MiB, peerBytes: 256 * MiB, graphElemBytes: 8, deviceReservedBytes: 0 },
+  // No measured SYCL heap yet. Intel Level Zero does not use the RADV reserve
+  // that dominates the Vulkan tax, so this tracks the CUDA row until calibrated.
+  sycl: { driverBytes: 384 * MiB, peerBytes: 256 * MiB, graphElemBytes: 8, deviceReservedBytes: 0 },
   metal: { driverBytes: 384 * MiB, peerBytes: 256 * MiB, graphElemBytes: 8, deviceReservedBytes: 0 },
   cpu: { driverBytes: 0, peerBytes: 0, graphElemBytes: 0, deviceReservedBytes: 0 },
   unknown: {
@@ -375,6 +378,9 @@ export function inferComputeBackend(
   }
   if (ids.some((id) => /^(cuda|rocm|hip)/.test(id))) {
     return "cuda";
+  }
+  if (ids.some((id) => id.startsWith("sycl"))) {
+    return "sycl";
   }
   if (ids.some((id) => id.startsWith("metal"))) {
     return "metal";
@@ -483,7 +489,7 @@ export function computeOverheadBytes(
     ? 6 * GiB
     : backend === "vulkan"
       ? 2.5 * GiB
-      : backend === "cuda"
+      : backend === "cuda" || backend === "sycl"
         ? 1.75 * GiB
         : 2 * GiB;
   const graph = Math.min(graphRaw, graphCap);

@@ -34,6 +34,8 @@ export * from "./promptReplacer";
 export * from "./recommendSettings";
 export * from "./serverArgs";
 export * from "./settings";
+export * from "./rocmRuntime";
+export * from "./syclRuntime";
 export * from "./sseStream";
 export * from "./toolResultText";
 export * from "./streamTextGate";

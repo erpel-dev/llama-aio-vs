@@ -551,7 +551,7 @@ export const DEFAULT_REQUEST_SETTINGS: RequestSettings = {
   temperature: 0.5,
   topP: 0.95,
   topK: 20,
-  maxTokens: 8192,
+  maxTokens: 16384,
   // Off by default: llama.cpp's built-in server defaults (min_p 0.05,
   // repeat-last-n 64) are tuned for generic prose, not current instruct/coder
   // families — official guidance for those is min_p 0 and no penalties.

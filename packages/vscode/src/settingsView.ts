@@ -3604,6 +3604,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       const hint = $('backendHint');
       const reinstallBtn = $('reinstallLlamaBtn');
       if (!sel || !installBtn || !hint) return;
+      syncSplitSeg();
       const selectedOpt = backendOptionsCache.find((o) => o.id === sel.value);
       const anyInstalled = backendOptionsCache.some((o) => o.installed);
       const installedTag = (selectedOpt && selectedOpt.installedTag) || updateCheck.installedTag;
@@ -3995,9 +3996,14 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
 
     function syncSplitSeg() {
       const mode = ($('splitMode') && $('splitMode').value) || 'layer';
+      const backendSel = $('backendSelect');
+      const sycl = (backendSel && backendSel.value === 'sycl') || activeBackendId === 'sycl';
       document.querySelectorAll('#splitSeg .seg-btn').forEach((b) => {
+        b.classList.toggle('hidden', b.dataset.split === 'row' && sycl);
         b.classList.toggle('active', b.dataset.split === mode);
       });
+      const rowOpt = document.querySelector('#splitMode option[value="row"]');
+      if (rowOpt) rowOpt.disabled = !!sycl;
     }
 
     /** One-line state of the Multi-GPU & CPU offload fold, visible while collapsed. */

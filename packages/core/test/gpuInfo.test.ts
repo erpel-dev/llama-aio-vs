@@ -4,6 +4,7 @@ import {
   adapterRamLooksCapped,
   decodeRegistryQueryOutput,
   gpuModelTokens,
+  gpusFromListedDevices,
   orderGpusLikeLlama,
   parseLlamaListDevices,
   parseQwMemorySizeField,
@@ -31,6 +32,18 @@ describe("parseLlamaListDevices", () => {
     assert.match(d[0]?.name || "", /9070/);
     assert.equal(d[1]?.id, "Vulkan1");
     assert.match(d[1]?.name || "", /9060/);
+  });
+
+  it("reads SYCL device ids and their shared-memory size", () => {
+    const d = parseLlamaListDevices(
+      "Available devices:\n  SYCL0: Intel(R) Arc(TM) Graphics (32768 MiB, 28000 MiB free)\n"
+    );
+    assert.equal(d[0]?.id, "SYCL0");
+    assert.equal(d[0]?.totalBytes, 32768 * 1024 * 1024);
+    const gpus = gpusFromListedDevices(d);
+    assert.equal(gpus[0]?.llamaDeviceId, "SYCL0");
+    assert.equal(gpus[0]?.source, "llama-list-devices");
+    assert.ok((gpus[0]?.totalBytes || 0) > 16 * 1024 ** 3);
   });
 });
 
@@ -106,6 +119,13 @@ describe("preferStableGpuList", () => {
     const kept = preferStableGpuList(next, two);
     assert.equal(kept[0]?.llamaDeviceId, "Vulkan0");
     assert.equal(kept[1]?.llamaDeviceId, "Vulkan1");
+  });
+
+  it("accepts a ROCm or HIP list in place of a Vulkan cache", () => {
+    const hip = [{ totalBytes: 16e9, name: "Radeon RX 7900 XTX", source: "llama-list-devices", llamaDeviceId: "CUDA0" }];
+    assert.equal(preferStableGpuList(hip, two)[0]?.llamaDeviceId, "CUDA0");
+    const rocm = [{ totalBytes: 16e9, name: "Radeon RX 7900 XTX", source: "llama-list-devices", llamaDeviceId: "ROCm0" }];
+    assert.equal(preferStableGpuList(rocm, two)[0]?.llamaDeviceId, "ROCm0");
   });
 });
 

@@ -81,6 +81,24 @@ describe("candidateAssetNames", () => {
       assert.ok(candidateAssetNames("b10297", backend).length > 0, backend);
     }
   });
+
+  it("names the official SYCL archives for this platform", () => {
+    const names = candidateAssetNames("b11533", "sycl");
+    if (process.platform === "linux" && process.arch === "x64") {
+      assert.deepEqual(names, [
+        "llama-b11533-bin-ubuntu-sycl-fp16-x64.tar.gz",
+        "llama-b11533-bin-ubuntu-sycl-fp32-x64.tar.gz",
+      ]);
+    } else if (process.platform === "win32" && process.arch === "x64") {
+      assert.deepEqual(names, ["llama-b11533-bin-win-sycl-x64.zip"]);
+    } else {
+      assert.deepEqual(names, []);
+    }
+  });
+
+  it("does not guess a ROCm filename, because the toolkit version moves", () => {
+    assert.deepEqual(candidateAssetNames("b11533", "rocm"), []);
+  });
 });
 
 describe("pickAsset", () => {
@@ -95,6 +113,46 @@ describe("pickAsset", () => {
         ? ["llama-b1-bin-win-cuda-12.4-x64.zip", "llama-b1-bin-macos-arm64.zip"]
         : ["llama-b1-bin-ubuntu-x64.tar.gz"];
     assert.equal(pickAsset(foreign.map(asset), "cpu"), undefined);
+  });
+
+  it("prefers the fp16 SYCL archive and ignores other backends", () => {
+    const assets = [
+      asset("llama-b11533-bin-ubuntu-sycl-fp32-x64.tar.gz"),
+      asset("llama-b11533-bin-ubuntu-vulkan-x64.tar.gz"),
+      asset("llama-b11533-bin-ubuntu-sycl-fp16-x64.tar.gz"),
+      asset("llama-b11533-bin-win-sycl-x64.zip"),
+    ];
+    const picked = pickAsset(assets, "sycl");
+    if (process.platform === "linux" && process.arch === "x64") {
+      assert.equal(picked?.name, "llama-b11533-bin-ubuntu-sycl-fp16-x64.tar.gz");
+    } else if (process.platform === "win32" && process.arch === "x64") {
+      assert.equal(picked?.name, "llama-b11533-bin-win-sycl-x64.zip");
+    } else {
+      assert.equal(picked, undefined);
+    }
+  });
+
+  it("prefers the newest rocm archive over hip-radeon and over Vulkan", () => {
+    const assets = [
+      asset("llama-b11533-bin-ubuntu-rocm-7.2-x64.tar.gz"),
+      asset("llama-b11533-bin-win-hip-radeon-x64.zip"),
+      asset("llama-b11533-bin-ubuntu-vulkan-x64.tar.gz"),
+      asset("llama-b11533-bin-ubuntu-rocm-10.0-x64.tar.gz"),
+      asset("llama-b11533-bin-win-rocm-10.0-x64.zip"),
+      asset("llama-b11533-bin-win-vulkan-x64.zip"),
+    ];
+    const picked = pickAsset(assets, "rocm");
+    if (process.platform === "linux" && process.arch === "x64") {
+      assert.equal(picked?.name, "llama-b11533-bin-ubuntu-rocm-10.0-x64.tar.gz");
+    } else if (process.platform === "win32" && process.arch === "x64") {
+      assert.equal(picked?.name, "llama-b11533-bin-win-rocm-10.0-x64.zip");
+    } else {
+      assert.equal(picked, undefined);
+    }
+    const auto = pickAsset(assets, "auto");
+    if (process.platform === "linux" && process.arch === "x64") {
+      assert.equal(auto?.name, "llama-b11533-bin-ubuntu-vulkan-x64.tar.gz");
+    }
   });
 });
 

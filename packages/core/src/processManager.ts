@@ -18,7 +18,7 @@ import {
 } from "./externalTerminal";
 import { clampLoadSettingsToModel, readModelCapabilities } from "./ggufMetadata";
 import { detectGpus } from "./gpuInfo";
-import { LlamaInstaller } from "./llamaInstaller";
+import { envForInstalledBinary, LlamaInstaller } from "./llamaInstaller";
 import {
   hasUsableFhsDynamicLinker,
   isNixOS,
@@ -38,6 +38,8 @@ import { formatCommandDisplay, normalizeLoadSettingsForCpuBackend } from "./serv
 import { LlamaLoadSettings, ServerStatus } from "./types";
 import { activeInstallLock } from "./installSwap";
 import { acquireLaunchLock, activeLaunchLock, LaunchLockHandle } from "./launchLock";
+import { rocmRuntimeMissingReason } from "./rocmRuntime";
+import { syclRuntimeMissingReason } from "./syclRuntime";
 
 interface LockFile {
   pid: number;
@@ -417,11 +419,17 @@ export class ProcessManager {
   /** How the current backend setting should launch llama-server. */
   resolveLaunch(): LaunchPlan {
     const installer = new LlamaInstaller(this.store);
-    const usePath = installer.resolveActiveUiBackend() === "path";
-    const installed = usePath
-      ? undefined
-      : getLlamaServerBinary(installer.getActiveInstallDir());
-    return resolveLaunchPlan({ installedBinary: installed, usePath });
+    const backend = installer.resolveActiveUiBackend();
+    const usePath = backend === "path";
+    const installed = usePath ? undefined : getLlamaServerBinary(installer.getActiveInstallDir());
+    const env =
+      installed && fs.existsSync(installed) ? envForInstalledBinary(installed, backend) : undefined;
+    return resolveLaunchPlan({
+      installedBinary: installed,
+      usePath,
+      env,
+      runtime: backend === "sycl" ? "sycl" : backend === "rocm" ? "rocm" : undefined,
+    });
   }
 
   /**
@@ -806,6 +814,17 @@ export class ProcessManager {
         "• Turn off Try mmap()\n" +
         "• Use a smaller quant (Q4_K_M) or denser/smaller model\n" +
         "Then Reload.";
+    } else if (/libsycl\.so|libze_loader/i.test(blob)) {
+      hint = `\n\n${syclRuntimeMissingReason()}`;
+    } else if (/libhipblas|libamdhip64|librocblas/i.test(blob)) {
+      hint = `\n\n${rocmRuntimeMissingReason()}`;
+    } else if (
+      /UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY|can't allocate \d+ Bytes of memory on device|failed to allocate SYCL/i.test(
+        blob
+      )
+    ) {
+      hint =
+        "\n\nSYCL ran out of GPU memory. Lower Context Length or GPU Offload, or use a smaller quant, then Reload.";
     } else if (/openvino/i.test(blob)) {
       hint =
         "\n\nInstalled build looks like OpenVINO — set backend to Vulkan (AMD) or CPU, then re-run Install / Upgrade llama.cpp.";

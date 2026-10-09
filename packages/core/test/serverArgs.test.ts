@@ -288,7 +288,7 @@ describe("buildServerArgs", () => {
           temperature: 0.5,
           topP: 0.95,
           topK: 20,
-          maxTokens: 8192,
+          maxTokens: 16384,
           minP: 0,
           presencePenalty: 0,
           frequencyPenalty: 0,
@@ -371,6 +371,17 @@ describe("buildServerArgs", () => {
       const args = build({ splitMode: "row" });
       assert.equal(argValue(args, "--split-mode"), "row");
       assert.ok(!args.includes("--tensor-split"));
+    });
+
+    it("rewrites split-mode row to layer on a SYCL device", () => {
+      const args = buildServerArgs(
+        MODEL,
+        "127.0.0.1",
+        8742,
+        loadSettings({ splitMode: "row", gpuOffload: 99 }),
+        { gpus: [{ totalBytes: 8 * 1024 ** 3, name: "Intel Arc Graphics", source: "llama-list-devices", llamaDeviceId: "SYCL0" }] }
+      );
+      assert.equal(argValue(args, "--split-mode"), "layer");
     });
 
     it("emits split-mode tensor with tensor-split and main-gpu", () => {

@@ -2,6 +2,8 @@ import * as fs from "fs";
 import { execFileSync, spawnSync } from "child_process";
 import * as path from "path";
 import { activeInstallLock } from "./installSwap";
+import { withRocmRuntimeEnv } from "./rocmRuntime";
+import { withSyclRuntimeEnv } from "./syclRuntime";
 
 export interface GpuMemoryInfo {
   /** Total VRAM in bytes for this GPU. */
@@ -501,6 +503,18 @@ export function preferStableGpuList(
   if (!previous?.length) {
     return next;
   }
+  const idFamily = (id: string | undefined) =>
+    (/^(vulkan|sycl|rocm|hip|cuda|metal)/i.exec(id || "")?.[1] || "").toLowerCase();
+  const nextFamily = idFamily(next.find((g) => g.llamaDeviceId)?.llamaDeviceId);
+  const prevFamily = idFamily(previous.find((g) => g.llamaDeviceId)?.llamaDeviceId);
+  // HIP builds sometimes label devices CUDA0. A Vulkan cache must not replace that list.
+  if (nextFamily && prevFamily && nextFamily !== prevFamily) {
+    return next;
+  }
+  // A SYCL or ROCm `--list-devices` result is this binary's devices, not the Vulkan/CUDA set.
+  if (next.some((g) => /^(sycl|rocm|hip)/i.test(g.llamaDeviceId || ""))) {
+    return next;
+  }
   if (previous.length >= 2 && next.length < previous.length) {
     return previous;
   }
@@ -550,6 +564,28 @@ export function parseLlamaListDevices(text: string): LlamaListedDevice[] {
     out.push({ id, index, name: rawName, totalBytes, usedBytes });
   }
   return out.sort((a, b) => a.index - b.index);
+}
+
+/**
+ * GPU list taken from `llama-server --list-devices`. SYCL iGPUs report shared
+ * memory here; sysfs/WMI only see the small stolen carve-out.
+ */
+export function gpusFromListedDevices(devices: LlamaListedDevice[]): GpuMemoryInfo[] {
+  const out: GpuMemoryInfo[] = [];
+  for (const dev of devices) {
+    if (!dev.totalBytes || dev.totalBytes < MIN_VRAM) {
+      continue;
+    }
+    out.push({
+      totalBytes: dev.totalBytes,
+      usedBytes: dev.usedBytes,
+      name: dev.name,
+      source: "llama-list-devices",
+      index: out.length,
+      llamaDeviceId: dev.id,
+    });
+  }
+  return out;
 }
 
 /** Distinctive model tokens (`rx9070`, `rtx4090`) used to pair sysfs names with llama.cpp. */
@@ -747,12 +783,21 @@ function readLlamaListDevices(binary: string): LlamaListedDevice[] | undefined {
     const dir = path.dirname(bin);
     const lib = path.join(dir, "..", "lib");
     const ld = [dir, lib, process.env.LD_LIBRARY_PATH].filter(Boolean).join(path.delimiter);
+    let env: NodeJS.ProcessEnv = { ...process.env, LD_LIBRARY_PATH: ld };
+    if (process.platform === "win32") {
+      env.PATH = `${dir}${path.delimiter}${process.env.PATH || ""}`;
+    }
+    if (/[/\\]sycl[/\\]/.test(bin)) {
+      env = withSyclRuntimeEnv(env);
+    } else if (/[/\\]rocm[/\\]/.test(bin)) {
+      env = withRocmRuntimeEnv(env);
+    }
     const result = spawnSync(bin, ["--list-devices"], {
       encoding: "utf8",
       timeout: 8000,
       windowsHide: true,
       cwd: dir,
-      env: { ...process.env, LD_LIBRARY_PATH: ld },
+      env,
     });
     const text = `${result.stdout || ""}\n${result.stderr || ""}`;
     const listed = parseLlamaListDevices(text);
@@ -786,11 +831,17 @@ export function detectGpus(force = false, llamaServerBinary?: string): GpuMemory
       (wmi || []).some((g) => adapterRamLooksCapped(g.totalBytes)));
   // `--list-devices` maps the vulkan\bin exe; skip while an install holds it.
   // One Windows GPU still needs it: WMI AdapterRAM cannot report past 4 GiB.
+  const runtimeBuild = /[/\\](sycl|rocm)[/\\]/.test(binKey);
   let listed: LlamaListedDevice[] | undefined;
-  if (binKey && !activeInstallLock() && (gpus.length >= 2 || windowsNeedsList)) {
+  if (binKey && !activeInstallLock() && (gpus.length >= 2 || windowsNeedsList || runtimeBuild)) {
     listed = readLlamaListDevices(binKey);
   }
-  if (windowsVram) {
+  if (runtimeBuild && listed?.length) {
+    const fromList = gpusFromListedDevices(listed);
+    if (fromList.length) {
+      gpus = fromList;
+    }
+  } else if (windowsVram) {
     const registry = windowsVramNeedsRegistry(wmi || [], listed)
       ? readWindowsRegistryGpus()
       : undefined;
@@ -832,6 +883,11 @@ export function isIntegratedGpu(
       name
     )
   ) {
+    return true;
+  }
+  // Meteor Lake / Lunar Lake "Arc Graphics" has no A###/B### model number.
+  // Discrete Arc A770 / B580 stays a discrete card.
+  if (/arc(?:\(tm\))? graphics/.test(name) && !/arc(?:\(tm\))?\s*[ab]\d{2,4}/.test(name)) {
     return true;
   }
   const gtt = gpu.gttTotalBytes || 0;

@@ -25,11 +25,43 @@ import {
 } from "./paths";
 import { stopLlamaServersUsingDir, isPidAlive, executableIsUnderDir } from "./processIdentity";
 import { SettingsStore } from "./settings";
+import { rocmSupport, withRocmRuntimeEnv } from "./rocmRuntime";
+import { syclSupport, withSyclRuntimeEnv } from "./syclRuntime";
 
 const execFileAsync = promisify(execFile);
 
 /** Backends that download into `~/.llama-aio-vs/llama.cpp/<id>/`. */
-const UI_BACKENDS: Array<Exclude<UiBackend, "path">> = ["vulkan", "cuda", "cpu"];
+const UI_BACKENDS: Array<Exclude<UiBackend, "path">> = ["vulkan", "cuda", "cpu", "sycl", "rocm"];
+
+function installBlockReason(backend: UiBackend): string | undefined {
+  const support = backend === "sycl" ? syclSupport() : backend === "rocm" ? rocmSupport() : undefined;
+  if (support && !support.available) {
+    return support.reason || `${backend} is not available on this system.`;
+  }
+  return undefined;
+}
+
+function isManagedBackend(backend: string): backend is Exclude<UiBackend, "path"> {
+  return (
+    backend === "vulkan" ||
+    backend === "cuda" ||
+    backend === "cpu" ||
+    backend === "sycl" ||
+    backend === "rocm"
+  );
+}
+
+/** Env used to probe and launch an installed binary. SYCL and ROCm add their runtimes. */
+export function envForInstalledBinary(binary: string, backend: UiBackend): NodeJS.ProcessEnv {
+  const env = withBinaryDirEnv(binary);
+  if (backend === "sycl") {
+    return withSyclRuntimeEnv(env);
+  }
+  if (backend === "rocm") {
+    return withRocmRuntimeEnv(env);
+  }
+  return env;
+}
 
 /**
  * Progress sink for long installs. Structurally compatible with
@@ -349,6 +381,24 @@ async function tryReadNightlyPointerTag(stableTag: string): Promise<string | und
 export function candidateAssetNames(tag: string, backend: UiBackend): string[] {
   const t = normalizeReleaseTag(tag);
   const arch = process.arch === "arm64" ? "arm64" : "x64";
+  // Official SYCL nightlies are Windows x64 and Ubuntu x64 (fp16 preferred).
+  // ROCm filenames embed the toolkit version (`rocm-10.0`), which moves, so the
+  // release asset list is the only reliable source. Direct URL guesses stay empty.
+  if (backend === "rocm") {
+    return [];
+  }
+  if (backend === "sycl") {
+    if (process.platform === "win32" && arch === "x64") {
+      return [`llama-${t}-bin-win-sycl-x64.zip`];
+    }
+    if (process.platform === "linux" && arch === "x64") {
+      return [
+        `llama-${t}-bin-ubuntu-sycl-fp16-${arch}.tar.gz`,
+        `llama-${t}-bin-ubuntu-sycl-fp32-${arch}.tar.gz`,
+      ];
+    }
+    return [];
+  }
   if (process.platform === "darwin") {
     return [`llama-${t}-bin-macos-${arch}.tar.gz`];
   }
@@ -533,7 +583,7 @@ export type LlamaBackend =
   | "path";
 
 /** Backends offered in the sidebar / TUI switcher. */
-export type UiBackend = "vulkan" | "cuda" | "cpu" | "path";
+export type UiBackend = "vulkan" | "cuda" | "cpu" | "sycl" | "rocm" | "path";
 
 export interface BackendOption {
   id: UiBackend;
@@ -767,6 +817,26 @@ function scoreAsset(name: string, platform: NodeJS.Platform, arch: string, backe
           score += 25;
         } else if (n.includes("cuda-11")) {
           score += 10;
+        }
+      }
+      // fp16 is upstream's recommended Ubuntu SYCL build. Asset order must not flip it.
+      if (b === "sycl") {
+        if (n.includes("sycl-fp16")) {
+          score += 40;
+        } else if (n.includes("sycl-fp32")) {
+          score += 10;
+        }
+      }
+      // The ROCm version is part of the filename and changes between nightlies.
+      // Prefer the highest `rocm-N` over an older `hip-radeon` zip in the same release.
+      if (b === "rocm") {
+        const ver = /rocm-(\d+)(?:\.(\d+))?/.exec(n);
+        if (ver) {
+          // Stay under the 100-point gap between wanted backends, so a newer
+          // ROCm archive cannot outscore Vulkan when the picker is on auto.
+          score += Math.min(80, Number(ver[1]) * 2 + Math.min(9, Number(ver[2] || 0)));
+        } else if (n.includes("hip-radeon")) {
+          score += 1;
         }
       }
       return score;
@@ -1024,12 +1094,7 @@ export class LlamaInstaller {
   /** Map config / auto to a concrete UI backend folder name. */
   resolveActiveUiBackend(configured = this.getBackend()): UiBackend {
     this.migrateLegacyInstallIfNeeded();
-    if (
-      configured === "vulkan" ||
-      configured === "cuda" ||
-      configured === "cpu" ||
-      configured === "path"
-    ) {
+    if (configured === "path" || isManagedBackend(configured)) {
       return configured;
     }
     // auto / other: prefer an already-installed backend, else hardware preference.
@@ -1121,10 +1186,11 @@ export class LlamaInstaller {
     const info = readVersionFile(legacyVersion);
     let backend: UiBackend = "vulkan";
     const resolved = (info.resolved || inferBackendFromAsset(info.asset) || "").toLowerCase();
-    if (resolved === "cpu" || resolved === "cuda" || resolved === "vulkan") {
+    const configured = this.getBackend();
+    if (isManagedBackend(resolved)) {
       backend = resolved;
-    } else if (this.getBackend() === "cpu" || this.getBackend() === "cuda" || this.getBackend() === "vulkan") {
-      backend = this.getBackend() as UiBackend;
+    } else if (isManagedBackend(configured)) {
+      backend = configured;
     }
 
     const dest = getBackendInstallDir(this.store.getConfig(), backend as InstallBackendId);
@@ -1145,7 +1211,7 @@ export class LlamaInstaller {
     }
   }
 
-  /** Sidebar options: Vulkan / CUDA (if HW) / CPU / System (PATH). */
+  /** Sidebar options: Vulkan / CUDA (if HW) / SYCL (Win+Linux x64) / CPU / System (PATH). */
   getUiBackendOptions(): BackendOption[] {
     this.migrateLegacyInstallIfNeeded();
     const archLabel = process.arch === "arm64" ? "arm64" : "x64";
@@ -1153,6 +1219,8 @@ export class LlamaInstaller {
     const vulkanOk = detectVulkanHardware();
     const cudaAssetLikely =
       (process.platform === "win32" || process.platform === "linux") && process.arch !== "arm64";
+    const sycl = syclSupport();
+    const rocm = rocmSupport();
     const active = this.resolveActiveUiBackend();
     const pathBinary = findLlamaServerOnPath();
 
@@ -1164,6 +1232,12 @@ export class LlamaInstaller {
         reason: vulkanOk ? undefined : "Not available on this platform",
       },
       {
+        id: "rocm",
+        label: "ROCm",
+        available: rocm.available,
+        reason: rocm.reason,
+      },
+      {
         id: "cuda",
         label: "CUDA",
         available: cudaHw && cudaAssetLikely,
@@ -1172,6 +1246,12 @@ export class LlamaInstaller {
           : cudaHw
             ? undefined
             : "No NVIDIA GPU detected (nvidia-smi / CUDA)",
+      },
+      {
+        id: "sycl",
+        label: "SYCL",
+        available: sycl.available,
+        reason: sycl.reason,
       },
       {
         id: "cpu",
@@ -1256,7 +1336,7 @@ export class LlamaInstaller {
     // Other windows exec llama-server --version every few seconds; skip that
     // while an install holds the lock so Windows can rename vulkan\bin.
     if (fs.existsSync(binary) && !activeInstallLock()) {
-      const env = withBinaryDirEnv(binary);
+      const env = envForInstalledBinary(binary, activeBackend);
       let probe = probeLlamaServerRunnable(binary, { env });
       let viaSteamRun = false;
       if (!probe.ok) {
@@ -1387,7 +1467,7 @@ export class LlamaInstaller {
     if (backendSetting === "path" || (!backendOverride && this.resolveActiveUiBackend() === "path")) {
       throw new Error(
         "The System (PATH) backend uses a llama-server already on your PATH. " +
-          "Switch to Vulkan, CUDA, or CPU to download an official llama.cpp build."
+          "Switch to Vulkan, ROCm, CUDA, SYCL, or CPU to download an official llama.cpp build."
       );
     }
 
@@ -1404,10 +1484,9 @@ export class LlamaInstaller {
     }
     progress?.report({ message: `Latest release: ${tag}` });
 
-    const uiBackend =
-      backendSetting === "vulkan" || backendSetting === "cuda" || backendSetting === "cpu"
-        ? backendSetting
-        : this.resolveActiveUiBackend(backendSetting);
+    const uiBackend = isManagedBackend(backendSetting)
+      ? backendSetting
+      : this.resolveActiveUiBackend(backendSetting);
     const current = this.readBackendVersion(uiBackend).tag;
     const cmp = current ? compareReleaseTags(tag, current) : undefined;
     if (!options?.force && current && cmp !== undefined && cmp <= 0) {
@@ -1464,10 +1543,15 @@ export class LlamaInstaller {
       tag = normalizeReleaseTag(tagInput);
     }
     const backendSetting = backendOverride || this.getBackend();
-    const uiBackend =
-      backendSetting === "vulkan" || backendSetting === "cuda" || backendSetting === "cpu"
-        ? backendSetting
-        : this.resolveActiveUiBackend(backendSetting);
+    const uiBackend = isManagedBackend(backendSetting)
+      ? backendSetting
+      : this.resolveActiveUiBackend(backendSetting);
+    if (uiBackend === "sycl" || uiBackend === "rocm") {
+      const blocked = installBlockReason(uiBackend);
+      if (blocked) {
+        throw new Error(blocked);
+      }
+    }
 
     progress?.report({ message: `Looking up ${tag} assets for ${uiBackend}…` });
 
@@ -1591,18 +1675,20 @@ export class LlamaInstaller {
     const inferred = inferBackendFromAsset(assetName);
     let uiBackend: UiBackend =
       options.uiBackend ||
-      (inferred === "vulkan" || inferred === "cuda" || inferred === "cpu"
-        ? inferred
-        : this.resolveActiveUiBackend());
+      (inferred && isManagedBackend(inferred) ? inferred : this.resolveActiveUiBackend());
 
     // Prefer explicit folder when user already selected a UI backend and asset is ambiguous.
     if (options.uiBackend) {
       uiBackend = options.uiBackend;
     }
-    if (uiBackend === "path") {
+    if (!isManagedBackend(uiBackend)) {
       throw new Error(
-        "Cannot install an archive into the System (PATH) backend. Switch to Vulkan, CUDA, or CPU first."
+        "Cannot install an archive into the System (PATH) backend. Switch to Vulkan, ROCm, CUDA, SYCL, or CPU first."
       );
+    }
+    const blocked = installBlockReason(uiBackend);
+    if (blocked) {
+      throw new Error(blocked);
     }
 
     const tag =

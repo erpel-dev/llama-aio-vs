@@ -249,8 +249,12 @@ export function buildServerArgs(
   // llama.cpp device ids are known, pass --device so the other GPUs stay free.
   if (settings.gpuOffload > 0) {
     const split = parseTensorSplit(settings.tensorSplit);
-    if (settings.splitMode === "none") {
-      const gpus = (options?.gpus || []).filter((g) => g.totalBytes > 0);
+    const listed = options?.gpus || [];
+    // llama.cpp SYCL does not implement --split-mode row.
+    const sycl = listed.some((g) => /^sycl/i.test((g.llamaDeviceId || "").trim()));
+    const splitMode = sycl && settings.splitMode === "row" ? "layer" : settings.splitMode;
+    if (splitMode === "none") {
+      const gpus = listed.filter((g) => g.totalBytes > 0);
       const main = gpus.length
         ? Math.min(Math.max(0, settings.mainGpu || 0), gpus.length - 1)
         : Math.max(0, settings.mainGpu || 0);
@@ -263,10 +267,15 @@ export function buildServerArgs(
       }
     } else if (split.length >= 2) {
       args.push("--tensor-split", settings.tensorSplit);
-      args.push("--split-mode", settings.splitMode || "layer");
+      args.push("--split-mode", splitMode || "layer");
       args.push("--main-gpu", String(settings.mainGpu || 0));
-    } else if (settings.splitMode && settings.splitMode !== "layer") {
-      args.push("--split-mode", settings.splitMode);
+    } else if (sycl && settings.splitMode === "row") {
+      args.push("--split-mode", "layer");
+      if (settings.mainGpu !== 0) {
+        args.push("--main-gpu", String(settings.mainGpu));
+      }
+    } else if (splitMode && splitMode !== "layer") {
+      args.push("--split-mode", splitMode);
       if (settings.mainGpu !== 0) {
         args.push("--main-gpu", String(settings.mainGpu));
       }
