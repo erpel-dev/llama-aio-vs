@@ -107,6 +107,30 @@ describe("normalizeLoadSettings", () => {
     assert.equal(s.lazyMode, "auto");
     assert.equal(s.reasoningFormat, "deepseek-legacy");
     assert.equal(s.speculativeMode, "off");
+    assert.equal(s.chatTemplateSource, "model");
+  });
+
+  it("keeps a built-in chat template and forces Jinja on", () => {
+    const s = normalizeLoadSettings({
+      chatTemplateSource: "builtin",
+      chatTemplateName: "gemma",
+      chatTemplateJinja: false,
+      chatTemplateFile: "/tmp/other.jinja",
+    });
+    assert.equal(s.chatTemplateSource, "builtin");
+    assert.equal(s.chatTemplateName, "gemma");
+    assert.equal(s.chatTemplateFile, "");
+    assert.equal(s.chatTemplateJinja, true);
+  });
+
+  it("drops an unknown built-in chat template name back to the GGUF template", () => {
+    const s = normalizeLoadSettings({
+      chatTemplateSource: "builtin",
+      chatTemplateName: "not-a-real-template",
+    });
+    assert.equal(s.chatTemplateSource, "model");
+    assert.equal(s.chatTemplateName, "");
+    assert.equal(s.chatTemplateJinja, true);
   });
 
   it("accepts every cache type llama.cpp supports", () => {

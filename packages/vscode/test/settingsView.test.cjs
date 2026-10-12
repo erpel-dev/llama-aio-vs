@@ -84,6 +84,15 @@ function setup(loadOverrides = {}) {
     isWikipediaLookupEnabled: () => false,
     isDuplicateToolCallGuardEnabled: () => false,
     getEndpoint: () => "http://127.0.0.1:8742",
+    isRemote: () => false,
+    getServerPreferences: () => ({
+      mode: "local",
+      remoteUrl: "",
+      remoteLabel: "",
+      lastRemoteModelId: "",
+      plainHttpConfirmed: [],
+    }),
+    getServerTarget: () => ({ mode: "local", baseUrl: "http://127.0.0.1:8742", label: "this machine" }),
   };
   const pm = {
     getStatus: () => ({ running: true, starting: false, pid: 1, endpoint: "http://127.0.0.1:8742", message: "Running", configDirty: JSON.stringify(state.loadSettings) !== JSON.stringify(launched.loadSettings) }),

@@ -1,5 +1,6 @@
 import * as os from "os";
 import type { ModelCapabilities } from "./ggufMetadata";
+import type { RemoteServerInfo } from "./remoteServer";
 import {
   type GpuSplitMode,
   normalizeGpuSplitMode,
@@ -83,6 +84,145 @@ export function normalizeReasoningFormat(
   return typeof value === "string" && (REASONING_FORMATS as readonly string[]).includes(value)
     ? (value as ReasoningFormat)
     : fallback;
+}
+
+/**
+ * Where llama-server's chat template comes from.
+ * `model` = the Jinja string embedded in the GGUF (no extra flag).
+ */
+export type ChatTemplateSource = "model" | "builtin" | "file";
+
+export const CHAT_TEMPLATE_SOURCES: readonly ChatTemplateSource[] = ["model", "builtin", "file"];
+
+/** Reject a picked template above this size so a GGUF cannot be passed as Jinja. */
+export const CHAT_TEMPLATE_FILE_MAX_BYTES = 256 * 1024;
+
+/**
+ * Built-in names `llama-server --chat-template` accepts.
+ * Refresh when the bundled llama.cpp is bumped (tools/server README).
+ */
+export const BUILTIN_CHAT_TEMPLATES: readonly string[] = [
+  "bailing",
+  "bailing-think",
+  "bailing2",
+  "chatglm3",
+  "chatglm4",
+  "chatml",
+  "command-r",
+  "deepseek",
+  "deepseek-ocr",
+  "deepseek2",
+  "deepseek3",
+  "exaone-moe",
+  "exaone3",
+  "exaone4",
+  "falcon3",
+  "gemma",
+  "gigachat",
+  "glmedge",
+  "gpt-oss",
+  "granite",
+  "granite-4.0",
+  "granite-4.1",
+  "grok-2",
+  "hunyuan-dense",
+  "hunyuan-moe",
+  "hunyuan-vl",
+  "kimi-k2",
+  "llama2",
+  "llama2-sys",
+  "llama2-sys-bos",
+  "llama2-sys-strip",
+  "llama3",
+  "llama4",
+  "megrez",
+  "minicpm",
+  "mistral-v1",
+  "mistral-v3",
+  "mistral-v3-tekken",
+  "mistral-v7",
+  "mistral-v7-tekken",
+  "monarch",
+  "openchat",
+  "orion",
+  "pangu-embedded",
+  "phi3",
+  "phi4",
+  "rwkv-world",
+  "seed_oss",
+  "smolvlm",
+  "solar-open",
+  "vicuna",
+  "vicuna-orca",
+  "yandex",
+  "zephyr",
+];
+
+/** Names shown first in the sidebar. All of them are also in {@link BUILTIN_CHAT_TEMPLATES}. */
+export const COMMON_CHAT_TEMPLATES: readonly string[] = [
+  "chatml",
+  "llama3",
+  "gemma",
+  "deepseek3",
+  "mistral-v7",
+  "phi4",
+  "command-r",
+  "gpt-oss",
+];
+
+export interface ChatTemplateChoice {
+  source: ChatTemplateSource;
+  /** Built-in name when `source` is `builtin`; otherwise empty. */
+  name: string;
+  /** Absolute path when `source` is `file`; otherwise empty. */
+  file: string;
+  /** False only for `source: "model"` with `--no-jinja`. */
+  jinja: boolean;
+}
+
+export const DEFAULT_CHAT_TEMPLATE: ChatTemplateChoice = {
+  source: "model",
+  name: "",
+  file: "",
+  jinja: true,
+};
+
+export function isDefaultChatTemplate(choice: ChatTemplateChoice): boolean {
+  return choice.source === "model" && choice.jinja && !choice.name && !choice.file;
+}
+
+export function normalizeBuiltinChatTemplateName(value: unknown): string {
+  const name = typeof value === "string" ? value.trim() : "";
+  return (BUILTIN_CHAT_TEMPLATES as readonly string[]).includes(name) ? name : "";
+}
+
+/**
+ * Coerce a stored choice. Unknown names and an empty file path fall back to
+ * the GGUF template. A name or a file always keeps the Jinja engine on.
+ */
+export function normalizeChatTemplate(raw: unknown): ChatTemplateChoice {
+  const src = (raw && typeof raw === "object" ? raw : {}) as Partial<ChatTemplateChoice>;
+  let source: ChatTemplateSource =
+    src.source === "builtin" || src.source === "file" ? src.source : "model";
+  let name = normalizeBuiltinChatTemplateName(src.name);
+  let file = typeof src.file === "string" ? src.file.trim() : "";
+  let jinja = src.jinja === false ? false : true;
+  if (source === "builtin" && !name) {
+    source = "model";
+  }
+  if (source === "file" && !file) {
+    source = "model";
+  }
+  if (source !== "model") {
+    jinja = true;
+  }
+  if (source !== "builtin") {
+    name = "";
+  }
+  if (source !== "file") {
+    file = "";
+  }
+  return { source, name, file, jinja };
 }
 
 /** llama.cpp -fa / --flash-attn */
@@ -331,6 +471,17 @@ export interface LlamaLoadSettings {
    * The settings UI also puts this card’s share of weights + KV first.
    */
   mainGpu: number;
+  /** `model` uses the GGUF template. `builtin` / `file` override it at launch. */
+  chatTemplateSource: ChatTemplateSource;
+  /** Built-in llama.cpp template name when {@link chatTemplateSource} is `builtin`. */
+  chatTemplateName: string;
+  /** Jinja file path when {@link chatTemplateSource} is `file`. */
+  chatTemplateFile: string;
+  /**
+   * Jinja engine. False sends `--no-jinja` and is only valid for the GGUF template.
+   * A built-in name or a file forces this on.
+   */
+  chatTemplateJinja: boolean;
 }
 
 export interface RequestSettings {
@@ -412,6 +563,10 @@ export const DEFAULT_LOAD_SETTINGS: LlamaLoadSettings = {
   tensorSplit: "",
   splitMode: "layer",
   mainGpu: 0,
+  chatTemplateSource: "model",
+  chatTemplateName: "",
+  chatTemplateFile: "",
+  chatTemplateJinja: true,
 };
 
 /**
@@ -522,6 +677,27 @@ export function normalizeLoadSettings(raw: Partial<LlamaLoadSettings> | undefine
     tensorSplit: normalizeTensorSplit(s.tensorSplit),
     splitMode: normalizeGpuSplitMode(s.splitMode),
     mainGpu: int(s.mainGpu, 0, 7, d.mainGpu),
+    ...chatTemplateLoadFields(s),
+  };
+}
+
+function chatTemplateLoadFields(
+  raw: Partial<LlamaLoadSettings>
+): Pick<
+  LlamaLoadSettings,
+  "chatTemplateSource" | "chatTemplateName" | "chatTemplateFile" | "chatTemplateJinja"
+> {
+  const choice = normalizeChatTemplate({
+    source: raw.chatTemplateSource,
+    name: raw.chatTemplateName,
+    file: raw.chatTemplateFile,
+    jinja: raw.chatTemplateJinja,
+  });
+  return {
+    chatTemplateSource: choice.source,
+    chatTemplateName: choice.name,
+    chatTemplateFile: choice.file,
+    chatTemplateJinja: choice.jinja,
   };
 }
 
@@ -578,6 +754,10 @@ export interface ServerStatus {
   starting?: boolean;
   /** Latest boot progress line for the sidebar (e.g. "Loading model into memory… 12s"). */
   startMessage?: string;
+  /** "remote": a server Llama AIO did not start; no lock, pid, or local probes. */
+  mode?: "local" | "remote";
+  /** Last probe of the remote server (remote mode only). */
+  remote?: RemoteServerInfo;
 }
 
 /**

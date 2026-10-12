@@ -1,3 +1,5 @@
+import * as fs from "fs";
+import * as path from "path";
 import { parseTensorSplit } from "./gpuSplit";
 import type { GpuMemoryInfo } from "./gpuInfo";
 import {
@@ -8,6 +10,7 @@ import {
 } from "./ggufMetadata";
 import { usesSidecarMtp } from "./modelLibrary";
 import {
+  CHAT_TEMPLATE_FILE_MAX_BYTES,
   LlamaLoadSettings,
   lazyModeReadsFromDisk,
   normalizeLoadSettings,
@@ -195,6 +198,10 @@ export function buildServerArgs(
   if (reasoningBudget >= 0) {
     args.push("--reasoning-budget", String(reasoningBudget));
   }
+
+  // `--jinja` must come immediately before a custom template. The default
+  // (GGUF template, engine on) adds nothing, so untouched launches stay stable.
+  appendChatTemplateArgs(args, settings);
 
   // Server-side sampling defaults (see doc comment above). Only shipped when a
   // caller provides request sampling, so older call sites keep working.
@@ -424,5 +431,56 @@ export function serverConfigFingerprint(
     tensorSplit: settings.tensorSplit || "",
     splitMode: settings.splitMode || "layer",
     mainGpu: settings.mainGpu || 0,
+    chatTemplateSource: settings.chatTemplateSource || "model",
+    chatTemplateName: settings.chatTemplateSource === "builtin" ? settings.chatTemplateName || "" : "",
+    chatTemplateFile: settings.chatTemplateSource === "file" ? settings.chatTemplateFile || "" : "",
+    chatTemplateJinja: settings.chatTemplateSource === "model" ? settings.chatTemplateJinja !== false : true,
   });
+}
+
+/**
+ * Why this template choice cannot be launched, or undefined when it can.
+ * A missing or oversized file is refused so the server does not silently
+ * fall back to the GGUF template.
+ */
+export function chatTemplateFileProblem(rawSettings: LlamaLoadSettings): string | undefined {
+  const settings = normalizeLoadSettings(rawSettings);
+  if (settings.chatTemplateSource !== "file") {
+    return undefined;
+  }
+  const file = settings.chatTemplateFile;
+  if (!file) {
+    return "Chat template file is not set. Pick a file or switch back to From model.";
+  }
+  const ext = path.extname(file).toLowerCase();
+  if (ext !== ".jinja" && ext !== ".txt") {
+    return `Chat template file must be .jinja or .txt: ${file}`;
+  }
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(file);
+  } catch {
+    return `Chat template file is missing: ${file}. Pick another file or switch back to From model.`;
+  }
+  if (!stat.isFile()) {
+    return `Chat template path is not a file: ${file}`;
+  }
+  if (stat.size > CHAT_TEMPLATE_FILE_MAX_BYTES) {
+    return `Chat template file is too large (${stat.size} bytes, limit ${CHAT_TEMPLATE_FILE_MAX_BYTES}): ${file}`;
+  }
+  return undefined;
+}
+
+function appendChatTemplateArgs(args: string[], settings: LlamaLoadSettings): void {
+  if (settings.chatTemplateSource === "builtin" && settings.chatTemplateName) {
+    args.push("--jinja", "--chat-template", settings.chatTemplateName);
+    return;
+  }
+  if (settings.chatTemplateSource === "file" && settings.chatTemplateFile) {
+    args.push("--jinja", "--chat-template-file", settings.chatTemplateFile);
+    return;
+  }
+  if (settings.chatTemplateJinja === false) {
+    args.push("--no-jinja");
+  }
 }

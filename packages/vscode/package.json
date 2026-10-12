@@ -2,7 +2,7 @@
   "name": "llama-aio-vs",
   "displayName": "Llama AIO",
   "description": "All-in-one local llama.cpp for VS Code: install, HF models, LM Studio-style settings, shared server, Copilot Chat provider.",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "publisher": "erpel-dev",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -93,6 +93,10 @@
         "title": "Llama AIO: Choose Vision Projector (mmproj)…"
       },
       {
+        "command": "llamaAio.selectChatTemplate",
+        "title": "Llama AIO: Choose Jinja Chat Template…"
+      },
+      {
         "command": "llamaAio.startServer",
         "title": "Llama AIO: Start Server"
       },
@@ -123,6 +127,26 @@
       {
         "command": "llamaAio.viewLastCall",
         "title": "Llama AIO: View Last Call"
+      },
+      {
+        "command": "llamaAio.connectRemote",
+        "title": "Llama AIO: Connect to a Server…"
+      },
+      {
+        "command": "llamaAio.switchToLocal",
+        "title": "Llama AIO: Switch to This Machine"
+      },
+      {
+        "command": "llamaAio.setApiKey",
+        "title": "Llama AIO: Set Remote API Key…"
+      },
+      {
+        "command": "llamaAio.forgetApiKey",
+        "title": "Llama AIO: Forget Remote API Key"
+      },
+      {
+        "command": "llamaAio.copyConnectionDiagnostics",
+        "title": "Llama AIO: Copy Connection Diagnostics"
       },
       {
         "command": "llamaAio.viewLastResponse",
@@ -181,7 +205,9 @@
               "description": "Search query or article title, e.g. Ada Lovelace"
             }
           },
-          "required": ["query"]
+          "required": [
+            "query"
+          ]
         }
       }
     ]

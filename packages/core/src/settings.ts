@@ -1,5 +1,14 @@
 import * as path from "path";
-import { AppConfig, ConfigAccessor, ConfigFile, toExtensionState } from "./config";
+import {
+  AppConfig,
+  ConfigAccessor,
+  ConfigFile,
+  DEFAULT_SERVER_PREFERENCES,
+  ServerMode,
+  ServerPreferences,
+  toExtensionState,
+} from "./config";
+import { isLoopbackHost, isWildcardHost, urlHostname } from "./serverHttp";
 import { Event } from "./events";
 import { clampLoadSettingsToModel, isQwen4expArchitecture, readModelCapabilities } from "./ggufMetadata";
 import { detectGpuMemory, detectGpus } from "./gpuInfo";
@@ -12,8 +21,12 @@ import {
   getLlamaServerBinary,
 } from "./paths";
 import {
+  ChatTemplateChoice,
+  DEFAULT_CHAT_TEMPLATE,
   ExtensionState,
+  isDefaultChatTemplate,
   LlamaLoadSettings,
+  normalizeChatTemplate,
   normalizeLoadSettings,
   normalizeRequestSettings,
   RequestSettings,
@@ -116,7 +129,11 @@ export class SettingsStore {
     if (state.modelCapabilities) {
       loadSettings = clampLoadSettingsToModel(loadSettings, state.modelCapabilities);
     }
-    return this.setState({ loadSettings });
+    const next = await this.setState({ loadSettings });
+    if (patchTouchesChatTemplate(patch) && next.selectedModelPath) {
+      await this.writeChatTemplateForModel(next.selectedModelPath, next.loadSettings);
+    }
+    return this.getState();
   }
 
   async updateRequestSettings(patch: Partial<RequestSettings>): Promise<ExtensionState> {
@@ -167,6 +184,16 @@ export class SettingsStore {
       });
     }
     loadSettings = clampLoadSettingsToModel(loadSettings, caps);
+    if (pathChanged) {
+      const choice = this.savedChatTemplate(modelPath);
+      loadSettings = {
+        ...loadSettings,
+        chatTemplateSource: choice.source,
+        chatTemplateName: choice.name,
+        chatTemplateFile: choice.file,
+        chatTemplateJinja: choice.jinja,
+      };
+    }
 
     const next = await this.setState({
       selectedModelPath: modelPath,
@@ -178,6 +205,34 @@ export class SettingsStore {
       await this.rememberRecentModels([modelPath, prev.selectedModelPath]);
     }
     return next;
+  }
+
+  private savedChatTemplate(modelPath: string): ChatTemplateChoice {
+    const map = this.config.get().app.chatTemplates || {};
+    const key = path.resolve(modelPath);
+    const raw = map[key] ?? map[modelPath];
+    return raw ? normalizeChatTemplate(raw) : { ...DEFAULT_CHAT_TEMPLATE };
+  }
+
+  /** Remember the active choice for this model file. Default choices are removed. */
+  private async writeChatTemplateForModel(
+    modelPath: string,
+    loadSettings: LlamaLoadSettings
+  ): Promise<void> {
+    const key = path.resolve(modelPath);
+    const map = { ...(this.config.get().app.chatTemplates || {}) };
+    const choice = normalizeChatTemplate({
+      source: loadSettings.chatTemplateSource,
+      name: loadSettings.chatTemplateName,
+      file: loadSettings.chatTemplateFile,
+      jinja: loadSettings.chatTemplateJinja,
+    });
+    if (isDefaultChatTemplate(choice)) {
+      delete map[key];
+    } else {
+      map[key] = choice;
+    }
+    await this.getConfig().update("chatTemplates", map);
   }
 
   /** Newest first, one entry per file. */
@@ -207,8 +262,87 @@ export class SettingsStore {
     return this.getConfig().get<string>("host", "127.0.0.1");
   }
 
+  getServerPreferences(): ServerPreferences {
+    return this.getConfig().get<ServerPreferences>("server", DEFAULT_SERVER_PREFERENCES);
+  }
+
+  isRemote(): boolean {
+    return this.getServerTarget().mode === "remote";
+  }
+
+  /** The one switch every request goes through: which server, and how to label it. */
+  getServerTarget(): ServerTarget {
+    const server = this.getServerPreferences();
+    if (server.mode === "remote" && server.remoteUrl) {
+      return {
+        mode: "remote",
+        baseUrl: server.remoteUrl,
+        label: server.remoteLabel || urlHostname(server.remoteUrl) || server.remoteUrl,
+      };
+    }
+    return { mode: "local", baseUrl: localEndpoint(this.getHost(), this.getPort()), label: "this machine" };
+  }
+
   getEndpoint(): string {
-    return `http://${this.getHost()}:${this.getPort()}`;
+    return this.getServerTarget().baseUrl;
+  }
+
+  private async updateServer(patch: Partial<ServerPreferences>): Promise<void> {
+    await this.getConfig().update("server", { ...this.getServerPreferences(), ...patch });
+  }
+
+  /** Switch to a remote server. `url` must already be normalized. */
+  async setRemoteServer(url: string, label = ""): Promise<void> {
+    const prev = this.getServerPreferences();
+    await this.updateServer({
+      mode: "remote",
+      remoteUrl: url,
+      remoteLabel: label.trim(),
+      lastRemoteModelId: prev.remoteUrl === url ? prev.lastRemoteModelId : "",
+    });
+  }
+
+  async setServerMode(mode: ServerMode): Promise<void> {
+    const prev = this.getServerPreferences();
+    await this.updateServer({ mode: mode === "remote" && prev.remoteUrl ? "remote" : "local" });
+  }
+
+  async setLastRemoteModelId(id: string): Promise<void> {
+    if (id && this.getServerPreferences().lastRemoteModelId !== id) {
+      await this.updateServer({ lastRemoteModelId: id });
+    }
+  }
+
+  isPlainHttpConfirmed(url: string): boolean {
+    return this.getServerPreferences().plainHttpConfirmed.includes(url);
+  }
+
+  async confirmPlainHttp(url: string): Promise<void> {
+    if (!this.isPlainHttpConfirmed(url)) {
+      const prev = this.getServerPreferences();
+      await this.updateServer({ plainHttpConfirmed: [...prev.plainHttpConfirmed, url] });
+    }
+  }
+
+  /**
+   * Older configs pointed `host` at another machine to reach a remote server.
+   * Turn that into remote mode once. Returns the remote URL when it migrated.
+   */
+  async migrateLegacyRemoteHost(localAddresses: string[]): Promise<string | undefined> {
+    const remoteUrl = legacyRemoteHostUrl(this.getHost(), this.getPort(), localAddresses);
+    if (!remoteUrl || this.getServerPreferences().remoteUrl) {
+      return undefined;
+    }
+    await this.getConfig().update("host", "127.0.0.1");
+    await this.updateServer({ mode: "remote", remoteUrl, remoteLabel: "" });
+    return remoteUrl;
+  }
+
+  /** Put `host` back after the user chose Undo on the migration toast. */
+  async undoLegacyRemoteHostMigration(remoteUrl: string): Promise<void> {
+    const u = new URL(remoteUrl);
+    await this.updateServer({ ...DEFAULT_SERVER_PREFERENCES });
+    await this.getConfig().update("host", u.hostname.replace(/^\[|\]$/g, ""));
   }
 
   isPromptReplacementsEnabled(): boolean {
@@ -230,4 +364,55 @@ export class SettingsStore {
   }
 }
 
-export { buildServerArgs, serverConfigFingerprint, normalizeLoadSettingsForCpuBackend } from "./serverArgs";
+export interface ServerTarget {
+  mode: ServerMode;
+  /** Base URL without a trailing slash (may carry a path prefix). */
+  baseUrl: string;
+  /** "gpu-box" for remotes, "this machine" locally. */
+  label: string;
+}
+
+function bracketIpv6(host: string): string {
+  return host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
+}
+
+/** Where to connect for a local server bound to `host`. A wildcard bind is reached via loopback. */
+export function localEndpoint(host: string, port: number): string {
+  const h = host.trim().replace(/^\[|\]$/g, "");
+  const connect = h === "::" ? "::1" : isWildcardHost(h) ? "127.0.0.1" : h;
+  return `http://${bracketIpv6(connect)}:${port}`;
+}
+
+/**
+ * Remote URL implied by a legacy `host`, or undefined when that host is this
+ * machine (loopback, wildcard bind, or one of `localAddresses`).
+ */
+export function legacyRemoteHostUrl(host: string, port: number, localAddresses: string[]): string | undefined {
+  const h = (host || "").trim().replace(/^\[|\]$/g, "").toLowerCase();
+  if (!h || isLoopbackHost(h) || isWildcardHost(h)) {
+    return undefined;
+  }
+  const local = new Set(localAddresses.map((a) => a.toLowerCase().replace(/%.*$/, "")));
+  if (local.has(h)) {
+    return undefined;
+  }
+  return `http://${bracketIpv6(h)}:${port}`;
+}
+
+export {
+  buildServerArgs,
+  chatTemplateFileProblem,
+  serverConfigFingerprint,
+  normalizeLoadSettingsForCpuBackend,
+} from "./serverArgs";
+
+const CHAT_TEMPLATE_PATCH_KEYS = [
+  "chatTemplateSource",
+  "chatTemplateName",
+  "chatTemplateFile",
+  "chatTemplateJinja",
+] as const;
+
+function patchTouchesChatTemplate(patch: Partial<LlamaLoadSettings>): boolean {
+  return CHAT_TEMPLATE_PATCH_KEYS.some((key) => Object.prototype.hasOwnProperty.call(patch, key));
+}

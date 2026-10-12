@@ -1,9 +1,12 @@
 import {
+  clearOverthinkingTokenCacheForEndpoint,
   ConfigFile,
+  connectionHint,
   DownloadAbortError,
   downloadManager,
   describeConfigLocation,
   ensureDirs,
+  formatRemoteDiagnostics,
   getInstallDir,
   getLockDir,
   getModelsDir,
@@ -11,16 +14,23 @@ import {
   LAUNCH_IN_PROGRESS_MSG,
   LlamaInstaller,
   nixOsIncompatibilityHint,
+  remoteLifecycleMessage,
+  remoteStateLabel,
+  remoteStateUsable,
   rocmRuntimeMissingReason,
+  setServerApiKeyProvider,
+  shortBuild,
   syclRuntimeMissingReason,
   PerfStats,
   ProcessManager,
   SettingsStore,
+  chatTemplateFileProblem,
   recommendedMaxDraftTokens,
   speculativeUsesMtp,
   speculativeUsesNgram,
   UiBackend,
 } from "@llama-aio/core";
+import * as os from "os";
 import { DownloadPanel, formatDownloadStatusLine } from "./downloadPanel";
 import { openModelFileDialog, pickDownloadedModel, pickDraftModelFromLibrary, pickMmprojFromLibrary } from "./modelPicker";
 import { SettingsViewProvider } from "./settingsView";
@@ -49,7 +59,7 @@ async function afterModelSelected(
 ): Promise<void> {
   await settingsView.pushState();
   chatProvider?.notifyChanged();
-  if (!selected) {
+  if (!selected || store.isRemote()) {
     return;
   }
 
@@ -112,10 +122,12 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(initServerDiagnostics(processManager));
   const perf = new PerfStats();
   perf.setSpeculativeMode(
-    (() => {
-      const mode = store.getState().loadSettings.speculativeMode;
-      return mode === "off" ? "off" : mode;
-    })()
+    store.isRemote()
+      ? undefined
+      : (() => {
+          const mode = store.getState().loadSettings.speculativeMode;
+          return mode === "off" ? "off" : mode;
+        })()
   );
   context.subscriptions.push(perf);
   // Refresh GGUF capability limits for the already-selected model.
@@ -307,6 +319,48 @@ export function activate(context: vscode.ExtensionContext): void {
     }
   };
 
+  const pickChatTemplate = async () => {
+    try {
+      const modelsDir = getModelsDir(store.getConfig());
+      const uris = await vscode.window.showOpenDialog({
+        canSelectMany: false,
+        canSelectFiles: true,
+        canSelectFolders: false,
+        openLabel: "Use template",
+        title: "Select a Jinja chat template",
+        filters: {
+          "Jinja templates": ["jinja", "txt"],
+          "All files": ["*"],
+        },
+        defaultUri: vscode.Uri.file(modelsDir || os.homedir()),
+      });
+      const selected = uris?.[0]?.fsPath;
+      if (!selected) {
+        return;
+      }
+      const problem = chatTemplateFileProblem({
+        ...store.getState().loadSettings,
+        chatTemplateSource: "file",
+        chatTemplateFile: selected,
+      });
+      if (problem) {
+        void vscode.window.showErrorMessage(problem);
+        return;
+      }
+      await store.updateLoadSettings({
+        chatTemplateSource: "file",
+        chatTemplateFile: selected,
+        chatTemplateJinja: true,
+      });
+      await settingsView.pushState();
+      void vscode.window.showInformationMessage(`Chat template set to ${path.basename(selected)}`);
+    } catch (e) {
+      vscode.window.showErrorMessage(
+        `Select chat template failed: ${e instanceof Error ? e.message : String(e)}`
+      );
+    }
+  };
+
   const afterBackendInstall = async (wasReady: boolean) => {
     const info = installer.getInstalledInfo();
     void refreshStatusBar(true);
@@ -385,7 +439,7 @@ export function activate(context: vscode.ExtensionContext): void {
         await settingsView.pushState();
         return;
       }
-      const wasReady = await processManager.isHttpReady();
+      const wasReady = await (store.isRemote() ? Promise.resolve(false) : processManager.isHttpReady());
       // Keep the server up during the download. The installer takes a cross-window
       // lock, then stops llama-server immediately before replacing vulkan\bin.
       await vscode.window.withProgress(
@@ -420,7 +474,7 @@ export function activate(context: vscode.ExtensionContext): void {
         await installLlamaCpp(backend);
         return;
       }
-      const wasReady = await processManager.isHttpReady();
+      const wasReady = await (store.isRemote() ? Promise.resolve(false) : processManager.isHttpReady());
       await vscode.window.withProgress(
         {
           location: vscode.ProgressLocation.Notification,
@@ -464,7 +518,7 @@ export function activate(context: vscode.ExtensionContext): void {
         return;
       }
 
-      const wasReady = await processManager.isHttpReady();
+      const wasReady = await (store.isRemote() ? Promise.resolve(false) : processManager.isHttpReady());
       await vscode.window.withProgress(
         {
           location: vscode.ProgressLocation.Notification,
@@ -525,7 +579,7 @@ export function activate(context: vscode.ExtensionContext): void {
         }
       }
 
-      const wasReady = await processManager.isHttpReady();
+      const wasReady = await (store.isRemote() ? Promise.resolve(false) : processManager.isHttpReady());
       await vscode.window.withProgress(
         {
           location: vscode.ProgressLocation.Notification,
@@ -563,7 +617,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
     await installer.setBackend(backend);
     void refreshStatusBar(true);
-    const wasReady = await processManager.isHttpReady();
+    const wasReady = await (store.isRemote() ? Promise.resolve(false) : processManager.isHttpReady());
 
     if (backend === "path") {
       chatProvider?.notifyChanged();
@@ -660,6 +714,7 @@ export function activate(context: vscode.ExtensionContext): void {
       pickDownloaded,
       pickDraftModel,
       pickMmproj,
+      pickChatTemplate,
       installLlamaCpp: (backend?: UiBackend) => installLlamaCpp(backend),
       reinstallLlamaCpp,
       installLlamaCppByTag,
@@ -744,7 +799,48 @@ export function activate(context: vscode.ExtensionContext): void {
     }
     return buildInfo;
   };
+  const remoteModelLabel = () =>
+    (processManager.remote.current()?.modelId || store.getServerPreferences().lastRemoteModelId || "")
+      .split(/[/\\]/)
+      .pop()
+      ?.replace(/\.gguf$/i, "") || "";
+  const paintRemoteStatusBar = () => {
+    const info = processManager.remote.current();
+    const target = store.getServerTarget();
+    const usable = remoteStateUsable(info?.state);
+    const model = remoteModelLabel();
+    const rate = perf.get().genTokPerSec;
+    const rateText = typeof rate === "number" && rate > 0 ? `${rate.toFixed(1)} tok/s` : "";
+    statusBar.text = usable
+      ? ["$(remote)", target.label, model, rateText].filter(Boolean).join(" · ")
+      : `$(remote) ${target.label} · ${remoteStateLabel(info?.state)}`;
+    const slots =
+      typeof info?.slotsTotal === "number" && info.slotsTotal > 0
+        ? `${info.slotsBusy ?? 0}/${info.slotsTotal} slots busy${info.requestsDeferred ? ` · ${info.requestsDeferred} queued` : ""}`
+        : "";
+    statusBar.tooltip = [
+      info?.isLlamaCpp === false
+        ? `OpenAI-compatible server at ${target.baseUrl}`
+        : `Remote llama.cpp at ${target.baseUrl}`,
+      [model, info?.buildInfo ? shortBuild(info.buildInfo) : "", info?.rttMs != null ? `${info.rttMs} ms` : ""]
+        .filter(Boolean)
+        .join(" · "),
+      slots,
+      info?.error ? `${info.error.message} ${connectionHint(info.error.kind, target.baseUrl)}` : "",
+      "Click to open the sidebar",
+    ]
+      .filter(Boolean)
+      .join("\n");
+    return usable;
+  };
   const refreshStatusBar = async (forceBuildInfo = false) => {
+    if (store.isRemote()) {
+      await processManager.remote.refresh();
+      serverReadyCache = paintRemoteStatusBar();
+      await settingsView.postStatusNow(serverReadyCache);
+      statusBar.show();
+      return;
+    }
     const status = processManager.getStatus();
     serverReadyCache = status.running || (await processManager.isHttpReady());
     const build = currentBuildInfo(forceBuildInfo);
@@ -765,14 +861,78 @@ export function activate(context: vscode.ExtensionContext): void {
       .join("\n");
     statusBar.show();
   };
-  void refreshStatusBar();
+  const API_PREFIX = "llama-aio.apiKey:";
+  const keyCache = new Map<string, string>();
+  setServerApiKeyProvider((origin) => keyCache.get(origin));
+  settingsView.attachApiKeyStore({
+    get(origin) {
+      return keyCache.get(origin);
+    },
+    async set(origin, value) {
+      keyCache.set(origin, value);
+      await context.secrets.store(API_PREFIX + origin, value);
+    },
+    async delete(origin) {
+      keyCache.delete(origin);
+      await context.secrets.delete(API_PREFIX + origin);
+    },
+  });
+  const preloadKey = async (url: string) => {
+    try {
+      const origin = new URL(url).origin;
+      const stored = await context.secrets.get(API_PREFIX + origin);
+      if (stored) {
+        keyCache.set(origin, stored);
+      }
+    } catch {
+      // Secret Storage can be unavailable in some hosts.
+    }
+  };
+  let seenRemoteModel = store.getServerPreferences().lastRemoteModelId;
+  context.subscriptions.push(
+    processManager.remote.onDidChange((info) => {
+      if (info.modelId && seenRemoteModel && info.modelId !== seenRemoteModel) {
+        clearOverthinkingTokenCacheForEndpoint(info.url);
+      }
+      if (info.modelId && info.modelId !== seenRemoteModel) {
+        seenRemoteModel = info.modelId;
+        void store.setLastRemoteModelId(info.modelId);
+      }
+      chatProvider?.notifyChanged();
+      void settingsView.pushState();
+    })
+  );
+  void (async () => {
+    const configured = store.getServerPreferences().remoteUrl;
+    if (configured) {
+      await preloadKey(configured);
+    }
+    const migrated = await store.migrateLegacyRemoteHost(machineAddresses());
+    if (migrated) {
+      const choice = await vscode.window.showInformationMessage(
+        `Llama AIO now treats ${migrated} as a remote server. The local host was reset to 127.0.0.1.`,
+        "Undo"
+      );
+      if (choice === "Undo") {
+        await store.undoLegacyRemoteHostMigration(migrated);
+        processManager.remote.reset();
+        chatProvider?.notifyChanged();
+        await settingsView.pushState();
+      }
+    }
+    void refreshStatusBar();
+  })();
   const interval = setInterval(() => void refreshStatusBar(), 5000);
   context.subscriptions.push({ dispose: () => clearInterval(interval) });
 
   let sidebarPerfTimer: NodeJS.Timeout | undefined;
   context.subscriptions.push(
     perf.onDidChange(() => {
-      statusBar.text = perf.statusBarText(serverReadyCache);
+      if (store.isRemote()) {
+        paintRemoteStatusBar();
+      } else {
+        statusBar.text = perf.statusBarText(serverReadyCache);
+      }
       const p = perf.get();
       statusBar.backgroundColor =
         p.contextLevel === "critical"
@@ -780,17 +940,21 @@ export function activate(context: vscode.ExtensionContext): void {
           : p.contextLevel === "warn"
             ? new vscode.ThemeColor("statusBarItem.warningBackground")
             : undefined;
-      statusBar.tooltip = [
-        "Llama AIO",
-        `Endpoint: ${store.getEndpoint()}`,
-        ...perf.detailLines(),
-      ].join("\n");
+      if (!store.isRemote()) {
+        statusBar.tooltip = [
+          "Llama AIO",
+          `Endpoint: ${store.getEndpoint()}`,
+          ...perf.detailLines(),
+        ].join("\n");
+      }
 
       const alert = perf.consumeContextAlert();
       if (alert) {
         const msg =
           alert.level === "critical"
-            ? `Llama AIO context nearly full: ${alert.used.toLocaleString()} / ${alert.limit.toLocaleString()} tokens (${alert.pct}%). The next large request may fail — start a new chat or raise Context Length.`
+            ? store.isRemote()
+            ? `Llama AIO context nearly full: ${alert.used.toLocaleString()} / ${alert.limit.toLocaleString()} tokens (${alert.pct}%). The next large request may fail — start a new chat. A larger slot needs a server restart with a bigger --ctx-size.`
+            : `Llama AIO context nearly full: ${alert.used.toLocaleString()} / ${alert.limit.toLocaleString()} tokens (${alert.pct}%). The next large request may fail — start a new chat or raise Context Length.`
             : `Llama AIO context running low: ${alert.used.toLocaleString()} / ${alert.limit.toLocaleString()} tokens (${alert.pct}%).`;
         if (alert.level === "critical") {
           void vscode.window.showWarningMessage(msg, "Open settings").then((c) => {
@@ -815,6 +979,20 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
     { dispose: () => clearTimeout(sidebarPerfTimer) }
   );
+
+  const offerSwitchIfRemote = async (action: string): Promise<boolean> => {
+    if (!store.isRemote()) {
+      return false;
+    }
+    const choice = await vscode.window.showWarningMessage(
+      remoteLifecycleMessage(action, store.getServerTarget().label),
+      "Switch to this machine"
+    );
+    if (choice === "Switch to this machine") {
+      await settingsView.switchToLocal();
+    }
+    return true;
+  };
 
   context.subscriptions.push(
     vscode.commands.registerCommand("llamaAio.openSettings", async () => {
@@ -849,8 +1027,12 @@ export function activate(context: vscode.ExtensionContext): void {
     ),
     vscode.commands.registerCommand("llamaAio.selectDraftModel", pickDraftModel),
     vscode.commands.registerCommand("llamaAio.selectMmproj", pickMmproj),
+    vscode.commands.registerCommand("llamaAio.selectChatTemplate", pickChatTemplate),
 
     vscode.commands.registerCommand("llamaAio.startServer", async () => {
+      if (await offerSwitchIfRemote("start")) {
+        return;
+      }
       const token = processManager.claimLaunch("start", "Starting llama-server…");
       if (!token) {
         void vscode.window.showWarningMessage(LAUNCH_IN_PROGRESS_MSG);
@@ -885,6 +1067,9 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
 
     vscode.commands.registerCommand("llamaAio.stopServer", async () => {
+      if (await offerSwitchIfRemote("stop")) {
+        return;
+      }
       await processManager.stop(true);
       chatProvider?.notifyChanged();
       await settingsView.pushState();
@@ -893,6 +1078,9 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
 
     vscode.commands.registerCommand("llamaAio.reloadServer", async () => {
+      if (await offerSwitchIfRemote("reload")) {
+        return;
+      }
       const token = processManager.claimLaunch("reload", "Reloading llama-server…");
       if (!token) {
         void vscode.window.showWarningMessage(LAUNCH_IN_PROGRESS_MSG);
@@ -928,7 +1116,28 @@ export function activate(context: vscode.ExtensionContext): void {
       showServerOutput();
     }),
 
+    vscode.commands.registerCommand("llamaAio.connectRemote", async () => {
+      await vscode.commands.executeCommand("llamaAio.settingsView.focus");
+      settingsView.openConnectForm();
+    }),
+    vscode.commands.registerCommand("llamaAio.switchToLocal", () => settingsView.switchToLocal()),
+    vscode.commands.registerCommand("llamaAio.setApiKey", () => settingsView.promptApiKey()),
+    vscode.commands.registerCommand("llamaAio.forgetApiKey", () => settingsView.forgetApiKey()),
+    vscode.commands.registerCommand("llamaAio.copyConnectionDiagnostics", () => settingsView.copyDiagnostics()),
+
     vscode.commands.registerCommand("llamaAio.showStatus", async () => {
+      if (store.isRemote()) {
+        await processManager.remote.refresh(true);
+        const target = store.getServerTarget();
+        const text = formatRemoteDiagnostics(processManager.remote.current(), {
+          url: target.baseUrl,
+          label: target.label,
+          hasApiKey: !!keyCache.get(new URL(target.baseUrl).origin),
+        });
+        void vscode.window.showInformationMessage(text.split("\n").filter(Boolean).slice(0, 8).join(" | "));
+        await settingsView.pushState();
+        return;
+      }
       const status = processManager.getStatus();
       const ready = await processManager.isHttpReady();
       const state = store.getState();
@@ -965,7 +1174,11 @@ export function activate(context: vscode.ExtensionContext): void {
     })
   );
 
-  if (store.getConfig().get<boolean>("autoStart", false) && store.getState().selectedModelPath) {
+  if (
+    !store.isRemote() &&
+    store.getConfig().get<boolean>("autoStart", false) &&
+    store.getState().selectedModelPath
+  ) {
     void processManager
       .start()
       .then(async (status) => {
@@ -978,6 +1191,18 @@ export function activate(context: vscode.ExtensionContext): void {
         void reportLaunchFailure("Auto-start failed", err);
       });
   }
+}
+
+function machineAddresses(): string[] {
+  const out = ["127.0.0.1", "::1", "localhost"];
+  for (const infos of Object.values(os.networkInterfaces())) {
+    for (const info of infos || []) {
+      if (info.address) {
+        out.push(info.address);
+      }
+    }
+  }
+  return out;
 }
 
 export async function deactivate(): Promise<void> {

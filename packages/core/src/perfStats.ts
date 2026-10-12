@@ -455,8 +455,11 @@ export class PerfStats {
     return lines.join("\n");
   }
 
-  /** Keep speculative label in sync with Load settings (clears stale drafts when off). */
-  setSpeculativeMode(mode: SpeculativeMode): void {
+  /**
+   * Keep speculative label in sync with Load settings (clears stale drafts when off).
+   * `undefined` = not known (remote server): draft stats show only when timings carry them.
+   */
+  setSpeculativeMode(mode: SpeculativeMode | undefined): void {
     const clearDrafts = mode === "off";
     const hadDrafts =
       this.current.draftTokens !== undefined ||
@@ -483,7 +486,7 @@ export class PerfStats {
     contextLimit?: number;
     estimatedPromptTokens?: number;
     promptReplacements?: PromptReplacementStats;
-    speculativeMode?: SpeculativeMode;
+    speculativeMode?: SpeculativeMode | undefined;
     contextBreakdown?: ContextBreakdown;
   }): void {
     const prev = this.current;
@@ -851,6 +854,14 @@ export class PerfStats {
 
   private mtpDetailLine(p: GenerationPerf): string | undefined {
     if (p.speculativeMode === undefined) {
+      if (typeof p.draftTokens === "number" && p.draftTokens > 0) {
+        const accepted = p.draftTokensAccepted ?? 0;
+        const pct =
+          typeof p.draftAcceptancePct === "number"
+            ? p.draftAcceptancePct
+            : Math.round((accepted / p.draftTokens) * 1000) / 10;
+        return `draft: ${pct.toFixed(1)}% accepted (${accepted.toLocaleString()}/${p.draftTokens.toLocaleString()})`;
+      }
       return undefined;
     }
     const label =

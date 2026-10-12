@@ -2,8 +2,9 @@
  * Minimal OpenAI-compatible chat streaming client for llama-server.
  * Used by the TUI (and any non-VS Code frontend). Abort with AbortSignal.
  */
-import * as http from "http";
+import type * as http from "http";
 import { ratesFromTimings, type LlamaTimings } from "./llamaTimings";
+import { ConnectionError, joinServerUrl, serverStream } from "./serverHttp";
 import {
   decodeSseLines,
   errorMessageFromSseJson,
@@ -70,8 +71,6 @@ function formatHttpError(status: number, body: string): string {
 export async function* streamChatCompletion(
   options: ChatCompletionOptions
 ): AsyncGenerator<ChatStreamEvent> {
-  const endpoint = options.endpoint.replace(/\/$/, "");
-  const u = new URL(`${endpoint}/v1/chat/completions`);
   const body = {
     model: options.model || "llama-aio",
     messages: options.messages,
@@ -91,54 +90,23 @@ export async function* streamChatCompletion(
     stream: true,
     stream_options: { include_usage: true },
   };
-  const payload = JSON.stringify(body);
   const signal = options.signal;
 
-  const stream = await new Promise<http.IncomingMessage>((resolve, reject) => {
-    const req = http.request(
-      {
-        hostname: u.hostname,
-        port: u.port,
-        path: u.pathname,
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Content-Length": Buffer.byteLength(payload),
-          Accept: "text/event-stream",
-        },
-        timeout: 600_000,
-      },
-      (res) => {
-        if (!res.statusCode || res.statusCode >= 400) {
-          const chunks: Buffer[] = [];
-          res.on("data", (c) => chunks.push(c));
-          res.on("end", () =>
-            reject(new Error(formatHttpError(res.statusCode || 0, Buffer.concat(chunks).toString("utf8"))))
-          );
-          return;
-        }
-        resolve(res);
-      }
-    );
-    req.on("error", reject);
-    if (signal) {
-      if (signal.aborted) {
-        req.destroy();
-        reject(new Error("Cancelled"));
-        return;
-      }
-      signal.addEventListener(
-        "abort",
-        () => {
-          req.destroy();
-          reject(new Error("Cancelled"));
-        },
-        { once: true }
-      );
+  let stream: http.IncomingMessage;
+  try {
+    stream = await serverStream(joinServerUrl(options.endpoint, "/v1/chat/completions"), {
+      method: "POST",
+      body,
+      headers: { Accept: "text/event-stream" },
+      timeoutMs: 600_000,
+      signal,
+    });
+  } catch (err) {
+    if (err instanceof ConnectionError && err.status) {
+      throw new Error(formatHttpError(err.status, err.body || ""));
     }
-    req.write(payload);
-    req.end();
-  });
+    throw err instanceof ConnectionError && err.kind === "cancelled" ? new Error("Cancelled") : err;
+  }
 
   let lastTimings: LlamaTimings | undefined;
   let lastUsage: LlamaUsage | undefined;

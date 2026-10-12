@@ -1,5 +1,4 @@
 import * as fs from "fs";
-import * as http from "http";
 import * as path from "path";
 import { execFileSync, spawn } from "child_process";
 import {
@@ -33,7 +32,21 @@ import {
   stopProcessTree,
   uniquePids,
 } from "./processIdentity";
-import { buildServerArgs, serverConfigFingerprint, SettingsStore } from "./settings";
+import {
+  buildServerArgs,
+  chatTemplateFileProblem,
+  localEndpoint,
+  serverConfigFingerprint,
+  SettingsStore,
+} from "./settings";
+import {
+  probeHealth,
+  remoteStateLabel,
+  remoteStateUsable,
+  RemoteServerMonitor,
+  REMOTE_HEALTH_TIMEOUT_MS,
+} from "./remoteServer";
+import { joinServerUrl, serverJson, serverRequest } from "./serverHttp";
 import { formatCommandDisplay, normalizeLoadSettingsForCpuBackend } from "./serverArgs";
 import { LlamaLoadSettings, ServerStatus } from "./types";
 import { activeInstallLock } from "./installSwap";
@@ -136,6 +149,14 @@ export type LaunchToken = { readonly id: number };
 
 export const LAUNCH_IN_PROGRESS_MSG = "A server start/reload is already in progress.";
 
+/** Why start/stop/reload refuse while connected to a remote server. */
+export function remoteLifecycleMessage(action: string, label: string): string {
+  return (
+    `Llama AIO is connected to the remote server ${label}, so it cannot ${action} llama-server. ` +
+    `Manage that server on its own machine, or switch the sidebar to “This machine”.`
+  );
+}
+
 export class ProcessManager {
   /** In-flight start/reload — drives sidebar "Loading model…" until HTTP ready. */
   private boot:
@@ -162,7 +183,19 @@ export class ProcessManager {
    */
   private readonly pidIdentity = new Map<number, { startedAt: string; ours: boolean }>();
 
-  constructor(private readonly store: SettingsStore) {}
+  /** Probe state of the remote server; only polls while the store is in remote mode. */
+  readonly remote: RemoteServerMonitor;
+
+  constructor(private readonly store: SettingsStore) {
+    this.remote = new RemoteServerMonitor(() => (this.store.isRemote() ? this.store.getEndpoint() : undefined));
+  }
+
+  /** Lifecycle calls refuse in remote mode: the server belongs to another machine. */
+  private assertLocal(action: string): void {
+    if (this.store.isRemote()) {
+      throw new Error(remoteLifecycleMessage(action, this.store.getServerTarget().label));
+    }
+  }
 
   /**
    * True when `lock.pid` is (still) a llama-server — or a launcher we spawned —
@@ -269,9 +302,13 @@ export class ProcessManager {
   }
 
   getStatus(): ServerStatus {
+    const target = this.store.getServerTarget();
+    if (target.mode === "remote") {
+      return this.remoteStatus(target.baseUrl, target.label);
+    }
     const host = this.store.getHost();
     const port = this.store.getPort();
-    const endpoint = this.store.getEndpoint();
+    const endpoint = target.baseUrl;
     const lock = this.readLock();
     const bootFields = this.boot
       ? { starting: true as const, startMessage: this.boot.message }
@@ -284,7 +321,7 @@ export class ProcessManager {
         port: lock.port,
         host: lock.host,
         modelPath: lock.modelPath,
-        endpoint: `http://${lock.host}:${lock.port}`,
+        endpoint: localEndpoint(lock.host, lock.port),
         ownedByThisExtension: true,
         message: this.boot?.message || `Running (pid ${lock.pid})`,
         // Don't show dirty while a reload/start is applying the new fingerprint.
@@ -308,7 +345,7 @@ export class ProcessManager {
           port: lock.port,
           host: lock.host,
           modelPath: lock.modelPath,
-          endpoint: `http://${lock.host}:${lock.port}`,
+          endpoint: localEndpoint(lock.host, lock.port),
           ownedByThisExtension: true,
           message: this.boot?.message || `Running (pid ${pid})`,
           configDirty: this.boot ? false : this.isConfigDirty(lock),
@@ -333,6 +370,33 @@ export class ProcessManager {
       message: this.boot?.message || "Not running",
       configDirty: false,
       ...bootFields,
+    };
+  }
+
+  private remoteStatus(endpoint: string, label: string): ServerStatus {
+    const info = this.remote.current();
+    let host = "";
+    let port = 0;
+    try {
+      const u = new URL(endpoint);
+      host = u.hostname;
+      port = Number(u.port) || (u.protocol === "https:" ? 443 : 80);
+    } catch {
+      // keep empty
+    }
+    return {
+      mode: "remote",
+      running: remoteStateUsable(info?.state),
+      port,
+      host,
+      endpoint,
+      modelPath: info?.modelPath,
+      ownedByThisExtension: false,
+      message: `${remoteStateLabel(info?.state)} · ${label}`,
+      configDirty: false,
+      starting: false,
+      startMessage: undefined,
+      remote: info,
     };
   }
 
@@ -397,23 +461,24 @@ export class ProcessManager {
     );
   }
 
+  /**
+   * True when the server answers and can take a chat request. Remote servers
+   * without `/health` (some OpenAI-compatible servers) count when `/v1/models` answers.
+   */
   async isHttpReady(endpoint?: string): Promise<boolean> {
+    const remote = !endpoint && this.store.isRemote();
     const base = endpoint || this.store.getEndpoint();
-    return new Promise((resolve) => {
-      const req = http.get(`${base}/health`, { timeout: 1500 }, (res) => {
+    try {
+      const health = await probeHealth(base, { timeoutMs: remote ? REMOTE_HEALTH_TIMEOUT_MS : 1500 });
+      if (remote && health.status === 404) {
+        const res = await serverRequest(joinServerUrl(base, "/v1/models"), { timeoutMs: REMOTE_HEALTH_TIMEOUT_MS });
         res.resume();
-        resolve((res.statusCode || 500) < 500);
-      });
-      req.setTimeout(1500, () => {
-        req.destroy();
-        resolve(false);
-      });
-      req.on("error", () => resolve(false));
-      req.on("timeout", () => {
-        req.destroy();
-        resolve(false);
-      });
-    });
+        return (res.statusCode || 500) < 400;
+      }
+      return remote ? health.status >= 200 && health.status < 300 : health.status < 500;
+    } catch {
+      return false;
+    }
   }
 
   /** How the current backend setting should launch llama-server. */
@@ -495,6 +560,7 @@ export class ProcessManager {
     onProgress?: StartProgress,
     token?: LaunchToken
   ): Promise<ServerStatus> {
+    this.assertLocal("start");
     const owned = this.takeLaunch("start", token);
     const report = (msg: string) => {
       this.updateBootMessage(msg);
@@ -530,6 +596,10 @@ export class ProcessManager {
     if (!fs.existsSync(model)) {
       throw new Error(`Model file not found: ${model}`);
     }
+    const templateProblem = chatTemplateFileProblem(state.loadSettings);
+    if (templateProblem) {
+      throw new Error(templateProblem);
+    }
 
     // Reuse only when the live process matches the fingerprint we would start
     // with. Slot-ctx heuristics miss KV type, ngl, and speculative flags.
@@ -564,7 +634,7 @@ export class ProcessManager {
         let becameReady = false;
         for (let i = 0; i < 20; i++) {
           await sleep(250);
-          if (await this.isHttpReady(`http://${lock.host}:${lock.port}`)) {
+          if (await this.isHttpReady(localEndpoint(lock.host, lock.port))) {
             becameReady = true;
             break;
           }
@@ -764,7 +834,7 @@ export class ProcessManager {
           port,
           host,
           modelPath: model,
-          endpoint: `http://${host}:${port}`,
+          endpoint: localEndpoint(host, port),
           ownedByThisExtension: true,
           configDirty: false,
           message:
@@ -863,6 +933,7 @@ export class ProcessManager {
   }
 
   async stop(force = false): Promise<void> {
+    this.assertLocal("stop");
     const lock = this.readLock();
     const port = lock?.port ?? this.store.getPort();
     const pids = new Set<number>();
@@ -980,23 +1051,11 @@ export class ProcessManager {
     { nCtx: number; slots: number; modelPath?: string } | undefined
   > {
     try {
-      const data = await new Promise<string>((resolve, reject) => {
-        const req = http.get(`${this.store.getEndpoint()}/props`, { timeout: 2000 }, (res) => {
-          const chunks: Buffer[] = [];
-          res.on("data", (c) => chunks.push(c));
-          res.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
-        });
-        req.on("error", reject);
-        req.on("timeout", () => {
-          req.destroy();
-          reject(new Error("timeout"));
-        });
-      });
-      const props = JSON.parse(data) as {
+      const props = await serverJson<{
         default_generation_settings?: { n_ctx?: number };
         total_slots?: number;
         model_path?: string;
-      };
+      }>(joinServerUrl(this.store.getEndpoint(), "/props"), { timeoutMs: 2000 });
       const nCtx = props.default_generation_settings?.n_ctx;
       if (!nCtx) {
         return undefined;
@@ -1012,6 +1071,7 @@ export class ProcessManager {
   }
 
   async reload(onProgress?: StartProgress, token?: LaunchToken): Promise<ServerStatus> {
+    this.assertLocal("reload");
     const owned = this.takeLaunch("reload", token);
     const report = (msg: string) => {
       this.updateBootMessage(msg);

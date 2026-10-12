@@ -9,8 +9,7 @@
  * word that splits (for example "re" + "consider") is skipped so the penalty
  * does not hit the first piece on its own.
  */
-import * as http from "http";
-import * as https from "https";
+import { joinServerUrl, serverJson } from "./serverHttp";
 
 /** Words, without a leading space. Each is also tokenized with a leading space. */
 export const OVERTHINKING_MARKERS = [
@@ -120,6 +119,21 @@ export function clearOverthinkingTokenCache(): void {
   inflight.clear();
 }
 
+/** Drop cached ids for one server. Call this when that server's model changes. */
+export function clearOverthinkingTokenCacheForEndpoint(endpoint: string): void {
+  const prefix = `${endpoint.replace(/\/$/, "")}\n`;
+  for (const key of cache.keys()) {
+    if (key.startsWith(prefix)) {
+      cache.delete(key);
+    }
+  }
+  for (const key of inflight.keys()) {
+    if (key.startsWith(prefix)) {
+      inflight.delete(key);
+    }
+  }
+}
+
 function cacheKey(endpoint: string, modelKey: string): string {
   return `${endpoint.replace(/\/$/, "")}\n${modelKey}`;
 }
@@ -198,60 +212,18 @@ export async function overthinkingLogitBias(
   }
 }
 
-function postJson(url: string, body: unknown, timeoutMs: number): Promise<unknown> {
-  return new Promise((resolve, reject) => {
-    const u = new URL(url);
-    const payload = JSON.stringify(body);
-    const lib = u.protocol === "https:" ? https : http;
-    const req = lib.request(
-      {
-        hostname: u.hostname,
-        port: u.port,
-        path: `${u.pathname}${u.search}`,
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Content-Length": Buffer.byteLength(payload),
-        },
-        timeout: timeoutMs,
-      },
-      (res) => {
-        const chunks: Buffer[] = [];
-        res.on("data", (c: Buffer) => chunks.push(c));
-        res.on("end", () => {
-          const text = Buffer.concat(chunks).toString("utf8");
-          if (!res.statusCode || res.statusCode >= 400) {
-            reject(new Error(`tokenize HTTP ${res.statusCode || 0}: ${text.slice(0, 200)}`));
-            return;
-          }
-          try {
-            resolve(JSON.parse(text) as unknown);
-          } catch (err) {
-            reject(err);
-          }
-        });
-      }
-    );
-    req.on("error", reject);
-    req.on("timeout", () => {
-      req.destroy(new Error("tokenize timed out"));
-    });
-    req.end(payload);
-  });
-}
-
 /** POST /tokenize. Accepts `{id, piece}` objects or bare id numbers. */
 export async function tokenizePieces(endpoint: string, text: string): Promise<TokenizerToken[]> {
-  const data = (await postJson(
-    `${endpoint.replace(/\/$/, "")}/tokenize`,
-    {
+  const data = await serverJson<{ tokens?: unknown }>(joinServerUrl(endpoint, "/tokenize"), {
+    method: "POST",
+    body: {
       content: text,
       add_special: false,
       parse_special: false,
       with_pieces: true,
     },
-    8000
-  )) as { tokens?: unknown };
+    timeoutMs: 8000,
+  });
   if (!Array.isArray(data.tokens)) {
     return [];
   }

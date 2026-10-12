@@ -3,8 +3,11 @@ import * as path from "path";
 import { Emitter } from "./events";
 import { getConfigPath, getDataRoot } from "./paths";
 import {
+  ChatTemplateChoice,
   ExtensionState,
+  isDefaultChatTemplate,
   LlamaLoadSettings,
+  normalizeChatTemplate,
   normalizeLoadSettings,
   normalizeRequestSettings,
   RequestSettings,
@@ -12,6 +15,29 @@ import {
 import type { ModelCapabilities } from "./ggufMetadata";
 
 export const CONFIG_VERSION = 1;
+
+export type ServerMode = "local" | "remote";
+
+/** Which llama-server the frontends talk to. Local `host`/`port` stay the bind address. */
+export interface ServerPreferences {
+  mode: ServerMode;
+  /** Normalized `http(s)://host[:port][/prefix]`; empty until a remote is set. */
+  remoteUrl: string;
+  /** Short name shown in the sidebar and status bar; empty = URL host. */
+  remoteLabel: string;
+  /** Last model id the remote reported, so the Copilot picker stays stable while offline. */
+  lastRemoteModelId: string;
+  /** Plain-http URLs to public addresses the user confirmed once. */
+  plainHttpConfirmed: string[];
+}
+
+export const DEFAULT_SERVER_PREFERENCES: ServerPreferences = {
+  mode: "local",
+  remoteUrl: "",
+  remoteLabel: "",
+  lastRemoteModelId: "",
+  plainHttpConfirmed: [],
+};
 
 /**
  * Frontend-agnostic preferences. These used to live in VS Code settings under
@@ -48,6 +74,12 @@ export interface AppPreferences {
   hiddenModels: string[];
   /** Most recently selected model paths, newest first (quick switch in the sidebar). */
   recentModels: string[];
+  /**
+   * Chat-template override per model file (`path.resolve` key).
+   * Missing entry means the GGUF's own Jinja template.
+   */
+  chatTemplates: Record<string, ChatTemplateChoice>;
+  server: ServerPreferences;
 }
 
 /** Model selection plus the tuning that gets turned into llama-server flags. */
@@ -81,7 +113,24 @@ export const DEFAULT_APP_PREFERENCES: AppPreferences = {
   duplicateToolCallGuardEnabled: false,
   hiddenModels: [],
   recentModels: [],
+  chatTemplates: {},
+  server: DEFAULT_SERVER_PREFERENCES,
 };
+
+function normalizeServerPreferences(raw: unknown): ServerPreferences {
+  const src = (raw && typeof raw === "object" ? raw : {}) as Partial<ServerPreferences>;
+  const str = (v: unknown) => (typeof v === "string" ? v.trim() : "");
+  const remoteUrl = str(src.remoteUrl);
+  return {
+    mode: src.mode === "remote" && remoteUrl ? "remote" : "local",
+    remoteUrl,
+    remoteLabel: str(src.remoteLabel),
+    lastRemoteModelId: str(src.lastRemoteModelId),
+    plainHttpConfirmed: Array.isArray(src.plainHttpConfirmed)
+      ? [...new Set(src.plainHttpConfirmed.filter((u): u is string => typeof u === "string" && !!u.trim()))]
+      : [],
+  };
+}
 
 /**
  * Read/write access to {@link AppPreferences}, shaped like
@@ -122,7 +171,29 @@ function normalizePreferences(raw: Partial<AppPreferences> | undefined): AppPref
     recentModels: Array.isArray(src.recentModels)
       ? src.recentModels.filter((p): p is string => typeof p === "string" && p.trim().length > 0)
       : [],
+    chatTemplates: normalizeChatTemplateMap(src.chatTemplates),
+    server: normalizeServerPreferences(src.server),
   };
+}
+
+/** Drop default and invalid entries. Keys are absolute paths. */
+function normalizeChatTemplateMap(raw: unknown): Record<string, ChatTemplateChoice> {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return {};
+  }
+  const out: Record<string, ChatTemplateChoice> = {};
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    const trimmed = key.trim();
+    if (!trimmed) {
+      continue;
+    }
+    const choice = normalizeChatTemplate(value);
+    if (isDefaultChatTemplate(choice)) {
+      continue;
+    }
+    out[path.resolve(trimmed)] = choice;
+  }
+  return out;
 }
 
 export function normalizeConfig(raw: Partial<AppConfig> | undefined): AppConfig {

@@ -46,6 +46,10 @@ const LABELS: Partial<Record<keyof LlamaLoadSettings, string>> = {
   tensorSplit: "tensor split",
   splitMode: "split mode",
   mainGpu: "main GPU",
+  chatTemplateSource: "chat template",
+  chatTemplateName: "chat template name",
+  chatTemplateFile: "chat template file",
+  chatTemplateJinja: "jinja",
 };
 
 function baseName(p: string): string {
@@ -66,8 +70,13 @@ function fmtValue(key: keyof LlamaLoadSettings, v: unknown): string {
   if (key === "gpuOffload" && typeof v === "number" && v >= 99) {
     return "all";
   }
-  if ((key === "draftModelPath" || key === "mmprojPath") && typeof v === "string") {
+  if ((key === "draftModelPath" || key === "mmprojPath" || key === "chatTemplateFile") && typeof v === "string") {
     return baseName(v);
+  }
+  if (key === "chatTemplateSource") {
+    if (v === "builtin") return "builtin";
+    if (v === "file") return "file";
+    return "from model";
   }
   return String(v);
 }

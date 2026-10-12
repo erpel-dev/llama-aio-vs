@@ -104,6 +104,57 @@ function snapshot() {
   };
 }
 
+const REMOTE_URL = "https://gpu-box.lan:8443";
+let remoteMode = false;
+let openConnectOnLoad = false;
+let remoteInfo = null;
+let remoteLabel = "gpu-box";
+
+function remoteFixture(kind) {
+  const model = {
+    url: kind === "unreachable" ? "http://192.168.0.5:8282" : kind === "loading" ? "http://10.0.4.9:8080" : REMOTE_URL,
+    checkedAt: Date.now(),
+    rttMs: kind === "unreachable" ? undefined : 6,
+    isLlamaCpp: kind !== "limited",
+    modelId: "qwythos-9b-mythos-5-1m-mtp-Q8_0.gguf",
+    modelSizeBytes: Math.round(9.5 * 1024 ** 3),
+    modelParams: 9e9,
+    trainedContext: 1048576,
+    slotContext: kind === "limited" || kind === "auth" || kind === "loading" ? undefined : 65536,
+    totalSlots: kind === "limited" || kind === "auth" || kind === "loading" ? undefined : 2,
+    modelPath: kind === "loading" || kind === "auth" ? undefined : "/srv/models/qwythos-9b-mythos-5-1m-mtp-Q8_0.gguf",
+    buildInfo: kind === "auth" || kind === "limited" || kind === "loading" ? undefined : "b10517-abc",
+    vision: kind === "connected",
+    state: kind === "connected" ? "ready" : kind === "busy" ? "busy" : kind,
+    probes: [{ path: "/health", ok: kind !== "unreachable", detail: kind }],
+    error:
+      kind === "auth"
+        ? { kind: "auth", message: "The server rejected the request (401). It needs an API key." }
+        : kind === "unreachable"
+          ? { kind: "refused", message: "Connection refused." }
+          : kind === "loading"
+            ? { kind: "loading", message: "The server is still loading the model." }
+            : undefined,
+  };
+  if (kind === "busy") {
+    model.url = "https://llm.team.example";
+    model.modelId = "Granid-3.1-32B-Q4_K_M.gguf";
+    model.modelPath = "/srv/models/Granid-3.1-32B-Q4_K_M.gguf";
+    model.slotContext = 32768;
+    model.totalSlots = 4;
+    model.buildInfo = "b10488";
+    model.vision = false;
+    model.rttMs = 21;
+    model.slotsBusy = 4;
+    model.slotsTotal = 4;
+    model.requestsProcessing = 4;
+    model.requestsDeferred = 3;
+    model.serverGenTokPerSec = 61;
+    model.serverPromptTokPerSec = 1900;
+  }
+  return model;
+}
+
 const store = {
   getState: () => state,
   getConfig: () => ({ get: (k) => config.get(k), update: async (k, v) => void config.set(k, v) }),
@@ -122,8 +173,29 @@ const store = {
   isPromptReplacementsEnabled: () => true,
   isWikipediaLookupEnabled: () => false,
   isDuplicateToolCallGuardEnabled: () => false,
-  getEndpoint: () => "http://127.0.0.1:8742",
+  getEndpoint: () => (remoteMode ? (remoteInfo && remoteInfo.url) || REMOTE_URL : "http://127.0.0.1:8742"),
   getSlotContextSize: (l) => l.contextLength,
+  isRemote: () => remoteMode,
+  getServerPreferences: () => ({
+    mode: remoteMode ? "remote" : "local",
+    remoteUrl: remoteMode ? (remoteInfo && remoteInfo.url) || REMOTE_URL : "",
+    remoteLabel: remoteMode ? remoteLabel : "",
+    lastRemoteModelId: remoteInfo && remoteInfo.modelId ? remoteInfo.modelId : "",
+    plainHttpConfirmed: [],
+  }),
+  getServerTarget: () =>
+    remoteMode
+      ? { mode: "remote", baseUrl: (remoteInfo && remoteInfo.url) || REMOTE_URL, label: remoteLabel }
+      : { mode: "local", baseUrl: "http://127.0.0.1:8742", label: "this machine" },
+  setServerMode: async (mode) => {
+    remoteMode = mode === "remote";
+  },
+  setRemoteServer: async () => {
+    remoteMode = true;
+  },
+  setLastRemoteModelId: async () => undefined,
+  isPlainHttpConfirmed: () => true,
+  confirmPlainHttp: async () => undefined,
 };
 
 const sameConfig = () =>
@@ -132,15 +204,31 @@ const sameConfig = () =>
   launched.modelPath === state.selectedModelPath;
 
 const processManager = {
-  getStatus: () => ({
-    running,
-    starting: false,
-    pid: running ? 8992 : undefined,
-    endpoint: "http://127.0.0.1:8742",
-    message: running ? "Running (pid 8992)" : "Stopped",
-    modelPath: running ? launched.modelPath : undefined,
-    configDirty: running && !sameConfig(),
-  }),
+  getStatus: () =>
+    remoteMode
+      ? {
+          mode: "remote",
+          running: !!(remoteInfo && (remoteInfo.state === "ready" || remoteInfo.state === "busy" || remoteInfo.state === "limited")),
+          endpoint: remoteInfo ? remoteInfo.url : REMOTE_URL,
+          message: "remote",
+          configDirty: false,
+          remote: remoteInfo,
+        }
+      : {
+          running,
+          starting: false,
+          pid: running ? 8992 : undefined,
+          endpoint: "http://127.0.0.1:8742",
+          message: running ? "Running (pid 8992)" : "Stopped",
+          modelPath: running ? launched.modelPath : undefined,
+          configDirty: running && !sameConfig(),
+        },
+  remote: {
+    current: () => (remoteMode ? remoteInfo : undefined),
+    nextRetryAt: () => (remoteInfo && remoteInfo.state === "unreachable" ? Date.now() + 30_000 : undefined),
+    reset() {},
+    refresh: async () => remoteInfo,
+  },
   isHttpReady: async () => running,
   // The real binary gives llama.cpp's device order via --list-devices (read-only probe).
   resolveBinary: () => realBinary,
@@ -237,6 +325,7 @@ const modelActions = new Proxy(
 
 const log = [];
 const clients = new Set();
+let lastStateMessage = null;
 let handler = async () => undefined;
 const webview = {
   options: {},
@@ -244,6 +333,7 @@ const webview = {
   cspSource: "",
   asWebviewUri: (u) => u,
   postMessage: (m) => {
+    if (m.type === "state") lastStateMessage = m;
     log.push({ dir: "toWebview", type: m.type, seq: m.seq });
     const data = `data: ${JSON.stringify(m)}\n\n`;
     for (const res of clients) {
@@ -284,13 +374,31 @@ const shim = `<script>
   });
   window.__received = [];
   const es = new EventSource('/events');
-  es.onmessage = (e) => { const data = JSON.parse(e.data); window.__received.push(data.type); window.dispatchEvent(new MessageEvent('message', { data })); };
+  es.onmessage = (e) => {
+    const data = JSON.parse(e.data);
+    window.__received.push(data.type);
+    window.dispatchEvent(new MessageEvent('message', { data }));
+    if (location.search.indexOf('shot=1') >= 0) es.close();
+  };
+  if (location.search.indexOf('shot=1') >= 0) setTimeout(() => es.close(), 400);
 </script>`;
 
 function pageHtml() {
   let html = webview.html;
   html = html.replace(/<meta http-equiv="Content-Security-Policy"[^>]*>/, "");
   html = html.replace("<head>", `<head>${shim}<style>body{max-width:${argOf("--width", "360")}px;margin:0 auto;border-left:1px solid #333;border-right:1px solid #333;min-height:100vh}</style>`);
+  const boot = [];
+  if (lastStateMessage) boot.push(lastStateMessage);
+  if (openConnectOnLoad) boot.push({ type: "openConnect" });
+  if (boot.length) {
+    const calls = boot
+      .map((m) => `window.dispatchEvent(new MessageEvent('message', { data: ${JSON.stringify(m)} }));`)
+      .join("");
+    html = html.replace(
+      "</body>",
+      `<script>document.addEventListener('DOMContentLoaded', () => { ${calls} });</script></body>`
+    );
+  }
   // VS Code theme variables the webview relies on.
   html = html.replace(
     "<style>",
@@ -301,10 +409,22 @@ function pageHtml() {
 
 function applyScenario(name) {
   cpuBackend = false;
+  remoteMode = false;
+  remoteInfo = null;
+  remoteLabel = "gpu-box";
+  openConnectOnLoad = name === "connect";
   config.set("launchMode", "externalTerminal");
   state = freshState();
-  running = name !== "stopped";
+  running = name !== "stopped" && !name.startsWith("remote") && name !== "connect";
   launched = snapshot();
+  if (name.startsWith("remote-")) {
+    remoteMode = true;
+    if (name === "remote-busy") remoteLabel = "team box";
+    remoteInfo = remoteFixture(name.slice("remote-".length));
+    perfSnap.speculativeMode = undefined;
+  } else {
+    perfSnap.speculativeMode = "mtp";
+  }
   if (name === "dirty") {
     state = { ...state, loadSettings: { ...state.loadSettings, contextLength: 65536, cacheTypeV: "q4_0" } };
   } else if (name === "spill") {

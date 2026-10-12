@@ -1,6 +1,16 @@
-import * as http from "http";
+import type * as http from "http";
 import * as path from "path";
 import * as vscode from "vscode";
+import {
+  ConnectionError,
+  connectionHint,
+  joinServerUrl,
+  remoteSlotContext,
+  remoteStateUsable,
+  serverJson,
+  serverStream,
+  type RemoteServerInfo,
+} from "@llama-aio/core";
 import { PerfStats } from "@llama-aio/core";
 import { ProcessManager } from "@llama-aio/core";
 import {
@@ -60,6 +70,7 @@ interface ServerProps {
   total_slots?: number;
   model_path?: string;
   model_alias?: string;
+  modalities?: { vision?: boolean };
 }
 
 type OpenAiContentPart =
@@ -164,58 +175,36 @@ function statsFromTimings(timings?: LlamaTimings, usage?: LlamaUsage, chars = 0)
   };
 }
 
-function httpJson<T>(
-  url: string,
-  options: { method?: string; body?: unknown; timeoutMs?: number } = {}
-): Promise<T> {
-  return new Promise((resolve, reject) => {
-    const u = new URL(url);
-    const bodyStr = options.body !== undefined ? JSON.stringify(options.body) : undefined;
-    const req = http.request(
-      {
-        hostname: u.hostname,
-        port: u.port,
-        path: u.pathname + u.search,
-        method: options.method || "GET",
-        headers: {
-          "Content-Type": "application/json",
-          ...(bodyStr ? { "Content-Length": Buffer.byteLength(bodyStr) } : {}),
-        },
-        timeout: options.timeoutMs ?? 120_000,
-      },
-      (res) => {
-        const chunks: Buffer[] = [];
-        res.on("data", (c) => chunks.push(c));
-        res.on("end", () => {
-          const text = Buffer.concat(chunks).toString("utf8");
-          if (!res.statusCode || res.statusCode >= 400) {
-            reject(new Error(formatHttpError(res.statusCode || 0, text)));
-            return;
-          }
-          try {
-            resolve(JSON.parse(text) as T);
-          } catch (e) {
-            reject(e);
-          }
-        });
-      }
+/** Chat error text for a failed request: HTTP bodies are parsed, network errors get one hint. */
+function describeRequestError(
+  err: unknown,
+  endpoint: string,
+  extras?: { maxContext?: number; hasImages?: boolean; operatorLabel?: string }
+): Error {
+  if (!(err instanceof ConnectionError)) {
+    return err instanceof Error ? err : new Error(String(err));
+  }
+  if (err.kind === "cancelled") {
+    return new Error("Cancelled");
+  }
+  if (err.kind === "auth") {
+    return new Error(
+      `${err.message} ${connectionHint("auth", endpoint)} Use “Set API key…” in the Llama AIO sidebar.`
     );
-    req.on("error", reject);
-    req.on("timeout", () => {
-      req.destroy();
-      reject(new Error("Request timed out"));
-    });
-    if (bodyStr) {
-      req.write(bodyStr);
-    }
-    req.end();
-  });
+  }
+  if (err.kind === "loading") {
+    return new Error(`${err.message} ${connectionHint("loading", endpoint)} Send the chat again when the sidebar shows Connected.`);
+  }
+  if (err.status) {
+    return new Error(formatHttpError(err.status, err.body || "", extras));
+  }
+  return new Error(`${err.message} ${connectionHint(err.kind, endpoint)}`);
 }
 
 function formatHttpError(
   status: number,
   text: string,
-  extras?: { maxContext?: number; hasImages?: boolean }
+  extras?: { maxContext?: number; hasImages?: boolean; operatorLabel?: string }
 ): string {
   try {
     const json = JSON.parse(text) as {
@@ -235,6 +224,7 @@ function formatHttpError(
         nCtx: typeof nCtx === "number" ? nCtx : undefined,
         maxContext: extras?.maxContext,
         hasImages: extras?.hasImages,
+        operatorLabel: extras?.operatorLabel,
         serverMessage: msg,
       });
     }
@@ -402,50 +392,28 @@ async function* streamChatCompletions(
   endpoint: string,
   body: Record<string, unknown>,
   token: vscode.CancellationToken,
-  extras?: { maxContext?: number; hasImages?: boolean }
+  extras?: { maxContext?: number; hasImages?: boolean; operatorLabel?: string }
 ): AsyncGenerator<StreamEvent> {
-  const u = new URL(`${endpoint}/v1/chat/completions`);
   const payload = JSON.stringify({ ...body, stream: true });
   const toolsEnabled = Array.isArray(body.tools) && (body.tools as unknown[]).length > 0;
 
-  const stream = await new Promise<http.IncomingMessage>((resolve, reject) => {
-    const req = http.request(
-      {
-        hostname: u.hostname,
-        port: u.port,
-        path: u.pathname,
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Content-Length": Buffer.byteLength(payload),
-          Accept: "text/event-stream",
-        },
-        timeout: 600_000,
-      },
-      (res) => {
-        if (!res.statusCode || res.statusCode >= 400) {
-          const chunks: Buffer[] = [];
-          res.on("data", (c) => chunks.push(c));
-          res.on("end", () =>
-            reject(
-              new Error(
-                formatHttpError(res.statusCode || 0, Buffer.concat(chunks).toString("utf8"), extras)
-              )
-            )
-          );
-          return;
-        }
-        resolve(res);
-      }
-    );
-    req.on("error", reject);
-    token.onCancellationRequested(() => {
-      req.destroy();
-      reject(new Error("Cancelled"));
+  const abort = new AbortController();
+  const cancelSub = token.onCancellationRequested(() => abort.abort());
+  let stream: http.IncomingMessage;
+  try {
+    stream = await serverStream(joinServerUrl(endpoint, "/v1/chat/completions"), {
+      method: "POST",
+      body: payload,
+      headers: { Accept: "text/event-stream" },
+      // Prompt processing of a long agent context can be silent for minutes.
+      timeoutMs: 600_000,
+      signal: abort.signal,
     });
-    req.write(payload);
-    req.end();
-  });
+  } catch (err) {
+    cancelSub.dispose();
+    throw describeRequestError(err, endpoint, extras);
+  }
+  stream.once("close", () => cancelSub.dispose());
 
   let assembledText = "";
   let assembledReasoning = "";
@@ -772,8 +740,13 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
     if (hit && hit.endpoint === endpoint && Date.now() - hit.at < LlamaAioChatProvider.PROBE_TTL_MS) {
       return hit.props;
     }
+    if (this.store.isRemote() && this.processManager.remote.current()?.isLlamaCpp === false) {
+      return undefined;
+    }
     try {
-      const props = await httpJson<ServerProps>(`${endpoint}/props`, { timeoutMs: 3000 });
+      const props = await serverJson<ServerProps>(joinServerUrl(endpoint, "/props"), {
+        timeoutMs: this.store.isRemote() ? 5000 : 3000,
+      });
       if (props) {
         this.propsProbe = { endpoint, at: Date.now(), props };
       }
@@ -783,6 +756,11 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
     }
   }
 
+  /** Last probe of the remote server, or undefined in local mode. */
+  private remoteInfo(): RemoteServerInfo | undefined {
+    return this.store.isRemote() ? this.processManager.remote.current() : undefined;
+  }
+
   /** One successful /health probe is reused for a short window (P-12). */
   private async serverReady(): Promise<boolean> {
     const endpoint = this.store.getEndpoint();
@@ -790,11 +768,61 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
     if (hit && hit.endpoint === endpoint && Date.now() - hit.at < LlamaAioChatProvider.PROBE_TTL_MS) {
       return true;
     }
-    const ready = await this.processManager.isHttpReady();
+    let ready: boolean;
+    if (this.store.isRemote()) {
+      const info = await this.processManager.remote.refresh();
+      ready = remoteStateUsable(info?.state);
+    } else {
+      ready = await this.processManager.isHttpReady();
+    }
     if (ready) {
       this.readyProbe = { endpoint, at: Date.now() };
     }
     return ready;
+  }
+
+  /** Why a remote chat cannot be sent right now, with one targeted hint. */
+  private remoteNotReadyMessage(): string {
+    const target = this.store.getServerTarget();
+    const info = this.processManager.remote.current();
+    switch (info?.state) {
+      case "loading":
+        return `${target.label} is still loading the model. Send the chat again when the Llama AIO sidebar shows Connected.`;
+      case "auth":
+        return `${target.label} rejected the request (401): it needs an API key. Use “Set API key…” in the Llama AIO sidebar.`;
+      case "unreachable":
+        return `Llama AIO cannot reach ${target.label} (${info.error?.message || "no answer"}). ${connectionHint(info.error?.kind, target.baseUrl)}`;
+      default:
+        return `Llama AIO is still connecting to ${target.label}. Send the chat again in a moment.`;
+    }
+  }
+
+  /**
+   * Per-request context for the current server. Remote: what the server says,
+   * never this machine's load settings.
+   */
+  private slotContext(props: ServerProps | undefined): number {
+    const fromServer = props?.default_generation_settings?.n_ctx;
+    if (fromServer) {
+      return fromServer;
+    }
+    if (this.store.isRemote()) {
+      return remoteSlotContext(this.remoteInfo());
+    }
+    return this.store.getSlotContextSize(this.store.getState().loadSettings);
+  }
+
+  /**
+   * Model-mode lookup. Remote servers match on the served id and model file
+   * name only; the local GGUF selection describes a different model.
+   */
+  private modeSetFor(modelId: string, props: ServerProps | undefined) {
+    if (!this.store.isRemote()) {
+      return resolveModelModes(this.store.getState().modelCapabilities, modelId);
+    }
+    const file = props?.model_path || this.remoteInfo()?.modelPath;
+    const hay = [modelId, file ? path.basename(file) : ""].filter(Boolean).join(" ");
+    return resolveModelModes(undefined, hay);
   }
 
   private async cachedModelId(fallback: string): Promise<string> {
@@ -804,7 +832,9 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
       return hit.modelId;
     }
     try {
-      const models = await httpJson<OpenAiModelsResponse>(`${endpoint}/v1/models`, { timeoutMs: 3000 });
+      const models = await serverJson<OpenAiModelsResponse>(joinServerUrl(endpoint, "/v1/models"), {
+        timeoutMs: this.store.isRemote() ? 5000 : 3000,
+      });
       const modelId = models.data?.[0]?.id;
       if (modelId) {
         this.modelProbe = { endpoint, at: Date.now(), modelId };
@@ -820,20 +850,34 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
     options: { silent: boolean },
     _token: vscode.CancellationToken
   ): Promise<vscode.LanguageModelChatInformation[]> {
+    const target = this.store.getServerTarget();
+    const remote = target.mode === "remote";
     const ready = await this.serverReady();
-    const selected = this.store.getState().selectedModelPath;
-    const fallback = selected ? selected.split(/[/\\]/).pop() || "local-model" : "local-model";
-    const modelId = ready ? await this.cachedModelId(fallback) : fallback;
-
     const state = this.store.getState();
-    const props = await this.fetchServerProps();
-    const serverSlotCtx =
-      props?.default_generation_settings?.n_ctx || this.store.getSlotContextSize(state.loadSettings);
+    const remoteInfo = this.remoteInfo();
+    const selected = state.selectedModelPath;
+    const fallback = remote
+      ? remoteInfo?.modelId || this.store.getServerPreferences().lastRemoteModelId || "remote-model"
+      : selected
+        ? selected.split(/[/\\]/).pop() || "local-model"
+        : "local-model";
+    const modelId = ready ? await this.cachedModelId(fallback) : fallback;
+    if (remote && ready && modelId !== "remote-model") {
+      void this.store.setLastRemoteModelId(modelId).catch(() => undefined);
+    }
+
+    const props = ready ? await this.fetchServerProps() : undefined;
+    const serverSlotCtx = this.slotContext(props);
     const maxOutput = Math.min(state.requestSettings.maxTokens, Math.floor(serverSlotCtx / 4));
     const maxInput = Math.max(1024, serverSlotCtx - maxOutput);
     const shortName = modelId.split(/[/\\]/).pop() || modelId;
-    const vision = !!(state.loadSettings.mmprojPath || "").trim();
-    const modeSet = resolveModelModes(state.modelCapabilities, modelId);
+    const vision = remote
+      ? !!(props?.modalities?.vision ?? remoteInfo?.vision)
+      : !!(state.loadSettings.mmprojPath || "").trim();
+    const modeSet = this.modeSetFor(modelId, props);
+    const where = remote
+      ? `${remoteInfo?.isLlamaCpp === false ? "OpenAI-compatible server" : "llama.cpp"} on ${target.label} · ${target.baseUrl}`
+      : `Local llama.cpp at ${target.baseUrl}`;
     const info: vscode.LanguageModelChatInformation & {
       configurationSchema?: { properties: Record<string, unknown> };
       statusIcon?: vscode.ThemeIcon;
@@ -846,9 +890,11 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
       maxOutputTokens: maxOutput,
       statusIcon: new vscode.ThemeIcon("llama-aio-model"),
       tooltip: modeSet
-        ? `Local llama.cpp at ${this.store.getEndpoint()} · slot context ${serverSlotCtx} · modes: ${Object.keys(modeSet.modes).join(", ")}${vision ? " · vision" : ""}`
-        : `Local llama.cpp at ${this.store.getEndpoint()} · slot context ${serverSlotCtx}${vision ? " · vision" : ""}`,
-      detail: `${serverSlotCtx} ctx/slot · ${state.selectedModelPath || this.store.getEndpoint()}`,
+        ? `${where} · slot context ${serverSlotCtx} · modes: ${Object.keys(modeSet.modes).join(", ")}${vision ? " · vision" : ""}`
+        : `${where} · slot context ${serverSlotCtx}${vision ? " · vision" : ""}`,
+      detail: remote
+        ? `${serverSlotCtx} ctx/slot · ${target.label}`
+        : `${serverSlotCtx} ctx/slot · ${state.selectedModelPath || target.baseUrl}`,
       capabilities: {
         toolCalling: true,
         imageInput: vision,
@@ -867,7 +913,11 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
     progress: vscode.Progress<vscode.LanguageModelResponsePart>,
     token: vscode.CancellationToken
   ): Promise<void> {
+    const remote = this.store.isRemote();
     if (!(await this.serverReady())) {
+      if (remote) {
+        throw new vscode.LanguageModelError(this.remoteNotReadyMessage());
+      }
       const starting = this.processManager.getStatus().starting;
       throw new vscode.LanguageModelError(
         starting
@@ -875,16 +925,17 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
           : "Llama AIO server is not running. Start it from the Llama AIO sidebar, then send the chat again."
       );
     }
-    if (this.processManager.getStatus().configDirty) {
+    if (!remote && this.processManager.getStatus().configDirty) {
       throw new vscode.LanguageModelError(
         "Llama AIO load settings changed. Reload the server from the sidebar before chatting. A chat request will not restart it."
       );
     }
 
     const state = this.store.getState();
+    const remoteInfo = this.remoteInfo();
+    const serverLabel = this.store.getServerTarget().label;
     const props = await this.fetchServerProps();
-    const slotCtx =
-      props?.default_generation_settings?.n_ctx || this.store.getSlotContextSize(state.loadSettings);
+    const slotCtx = this.slotContext(props);
 
     const convertedRaw = toOpenAiMessages(messages);
     let tools =
@@ -947,7 +998,7 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
       body.tool_choice = "auto";
     }
 
-    const modeSet = resolveModelModes(state.modelCapabilities, model.id);
+    const modeSet = this.modeSetFor(model.id, props);
     const modelConfiguration = (options as { modelConfiguration?: Record<string, unknown> })
       .modelConfiguration;
     let appliedModeName: string | undefined;
@@ -977,15 +1028,21 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
     const estimatedPromptTokens = tokensAfter;
     if (estimatedPromptTokens >= slotCtx) {
       throw new vscode.LanguageModelError(
-        `This prompt is about ${estimatedPromptTokens} tokens and the server slot is ${slotCtx}. ` +
-          `It does not fit. Raise Context Length or set Max Concurrent Predictions to 1, then Reload.`
+        remote
+          ? `This prompt is about ${estimatedPromptTokens} tokens and ${serverLabel}'s slot is ${slotCtx}. ` +
+              `The server must be restarted with a larger --ctx-size or fewer -np slots.`
+          : `This prompt is about ${estimatedPromptTokens} tokens and the server slot is ${slotCtx}. ` +
+              `It does not fit. Raise Context Length or set Max Concurrent Predictions to 1, then Reload.`
       );
     }
     if (slotCtx < 16384 && !this.warnedSmallSlot) {
       this.warnedSmallSlot = true;
       void vscode.window.showWarningMessage(
-        `Llama AIO slot context is ${slotCtx} tokens (under 16k). This prompt fits, but Copilot agent turns often need more. ` +
-          `Set Context Length ≥ 65536 and Max Concurrent Predictions = 1, then Reload.`
+        remote
+          ? `${serverLabel}'s slot context is ${slotCtx} tokens (under 16k). This prompt fits, but Copilot agent turns often need more. ` +
+              `The server must be restarted with a larger --ctx-size and fewer parallel slots.`
+          : `Llama AIO slot context is ${slotCtx} tokens (under 16k). This prompt fits, but Copilot agent turns often need more. ` +
+              `Set Context Length ≥ 65536 and Max Concurrent Predictions = 1, then Reload.`
       );
     }
     const contextBreakdown = estimateContextBreakdown(
@@ -1007,7 +1064,7 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
       contextLimit: slotCtx,
       estimatedPromptTokens,
       promptReplacements: replacementStats,
-      speculativeMode: state.loadSettings.speculativeMode || "off",
+      speculativeMode: remote ? undefined : state.loadSettings.speculativeMode || "off",
       contextBreakdown,
     });
     let lastServerStats: StatsEvent | undefined;
@@ -1033,19 +1090,23 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
       | undefined;
     // After mode sampling, so a Copilot mode that rewrites temperature does not
     // drop the penalty. Ids are resolved once per model from /tokenize.
-    const markerBias = await overthinkingLogitBias(
-      this.store.getEndpoint(),
-      state.selectedModelPath || "",
-      state.requestSettings.overthinkingPenalty,
-      state.requestSettings.overthinkingPenaltyStrength
-    );
+    const skipBias = remote && remoteInfo?.isLlamaCpp === false;
+    const markerBias = skipBias
+      ? undefined
+      : await overthinkingLogitBias(
+          this.store.getEndpoint(),
+          remote ? model.id || remoteInfo?.modelId || "" : state.selectedModelPath || "",
+          state.requestSettings.overthinkingPenalty,
+          state.requestSettings.overthinkingPenaltyStrength
+        );
     if (markerBias) {
       body.logit_bias = markerBias;
     }
     try {
       for await (const event of streamChatCompletions(this.store.getEndpoint(), body, token, {
-        maxContext: state.modelCapabilities?.maxContextLength,
+        maxContext: remote ? remoteInfo?.trainedContext : state.modelCapabilities?.maxContextLength,
         hasImages: messagesHaveImageParts(converted),
+        operatorLabel: remote ? serverLabel : undefined,
       })) {
         if (event.kind === "text") {
           emittedTextChars += event.text.length;

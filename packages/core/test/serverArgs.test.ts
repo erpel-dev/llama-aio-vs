@@ -119,6 +119,46 @@ describe("buildServerArgs", () => {
     });
   });
 
+  describe("chat template", () => {
+    it("omits template flags when the GGUF template is used", () => {
+      const args = build();
+      assert.ok(!args.includes("--jinja"));
+      assert.ok(!args.includes("--no-jinja"));
+      assert.ok(!args.includes("--chat-template"));
+      assert.ok(!args.includes("--chat-template-file"));
+    });
+
+    it("emits --jinja immediately before a built-in name", () => {
+      const args = build({ chatTemplateSource: "builtin", chatTemplateName: "chatml" });
+      const i = args.indexOf("--jinja");
+      assert.equal(args[i + 1], "--chat-template");
+      assert.equal(args[i + 2], "chatml");
+      assert.ok(!args.includes("--chat-template-file"));
+      assert.ok(!args.includes("--no-jinja"));
+    });
+
+    it("emits a template file as one argv, quoted when the path has spaces", () => {
+      const file = "/models/my template.jinja";
+      const args = build({
+        chatTemplateSource: "file",
+        chatTemplateFile: file,
+        chatTemplateJinja: false,
+      });
+      const i = args.indexOf("--jinja");
+      assert.equal(args[i + 1], "--chat-template-file");
+      assert.equal(args[i + 2], file);
+      assert.ok(!args.includes("--no-jinja"));
+      assert.ok(!args.includes("--chat-template"));
+      assert.match(formatCommandDisplay(args), /"\/models\/my template\.jinja"/);
+    });
+
+    it("emits --no-jinja only for the embedded template", () => {
+      const args = build({ chatTemplateJinja: false });
+      assert.ok(args.includes("--no-jinja"));
+      assert.ok(!args.includes("--chat-template"));
+    });
+  });
+
   it("keeps deepseek-legacy as the reasoning format by default", () => {
     assert.equal(argValue(build(), "--reasoning-format"), "deepseek-legacy");
     assert.equal(
@@ -470,6 +510,8 @@ describe("serverConfigFingerprint", () => {
       ["tensorSplit", { tensorSplit: "3,1" }],
       ["splitMode", { splitMode: "row" }],
       ["mainGpu", { mainGpu: 1 }],
+      ["chatTemplateSource", { chatTemplateSource: "builtin", chatTemplateName: "chatml" }],
+      ["chatTemplateJinja", { chatTemplateJinja: false }],
     ];
     for (const [label, patch] of changed) {
       assert.notEqual(

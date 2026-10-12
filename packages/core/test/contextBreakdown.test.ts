@@ -61,4 +61,16 @@ describe("formatExceedContextError", () => {
     assert.match(msg, /Reload to apply/);
     assert.doesNotMatch(msg, /will not fit/i);
   });
+
+  it("tells the server operator to restart when this client cannot reload", () => {
+    const msg = formatExceedContextError({
+      nPrompt: 41000,
+      nCtx: 32768,
+      maxContext: 262144,
+      operatorLabel: "gpu-box",
+    });
+    assert.match(msg, /gpu-box's slot is 32768/);
+    assert.match(msg, /--ctx-size/);
+    assert.doesNotMatch(msg, /Reload to apply/);
+  });
 });

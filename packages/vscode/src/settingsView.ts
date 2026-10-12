@@ -4,7 +4,18 @@ import * as path from "path";
 import * as vscode from "vscode";
 import { promptUseInCopilotChat } from "./copilotChatPrompt";
 import { copyServerCommandLine, openServerLog, reportLaunchFailure } from "./serverDiagnostics";
-import { detectGpus, activeInstallLock, type GpuMemoryInfo } from "@llama-aio/core";
+import {
+  connectionHint,
+  detectGpus,
+  discoverLoopbackLlamaServersOnThisMachine,
+  activeInstallLock,
+  formatRemoteDiagnostics,
+  isPublicPlainHttp,
+  normalizeServerUrl,
+  probeRemoteServer,
+  remoteLifecycleMessage,
+  type GpuMemoryInfo,
+} from "@llama-aio/core";
 import { LlamaInstaller, UiBackend } from "@llama-aio/core";
 import { clampLoadSettingsToModel, computeMemoryView, diffLoadSettings, fittingContextLength, memoryEstimateInputs, mmprojFileSize, resolveDraftCapabilities, shortGpuName, type SettingChange } from "@llama-aio/core";
 import { resolveModelModes } from "@llama-aio/core";
@@ -34,7 +45,7 @@ import { PerfStats } from "@llama-aio/core";
 import { LaunchToken, LAUNCH_IN_PROGRESS_MSG, ProcessManager } from "@llama-aio/core";
 import { SettingsStore } from "@llama-aio/core";
 import { resolveLaunchMode } from "@llama-aio/core";
-import { capsMissDefaultSwaPattern, DEFAULT_LOAD_SETTINGS, DEFAULT_REQUEST_SETTINGS, effectiveServerUiState, isQwen4expArchitecture, LlamaLoadSettings, normalizeSpeculativeMode, RequestSettings } from "@llama-aio/core";
+import { BUILTIN_CHAT_TEMPLATES, capsMissDefaultSwaPattern, chatTemplateFileProblem, COMMON_CHAT_TEMPLATES, DEFAULT_LOAD_SETTINGS, DEFAULT_REQUEST_SETTINGS, effectiveServerUiState, isQwen4expArchitecture, LlamaLoadSettings, normalizeSpeculativeMode, RequestSettings } from "@llama-aio/core";
 import { isDflashDraftArchitecture, recommendedMaxDraftTokens, speculativeUsesMtp, speculativeUsesNgram } from "@llama-aio/core";
 import {
   companionDownloadHint,
@@ -57,6 +68,7 @@ export type ModelActions = {
   pickDownloaded: () => Promise<void>;
   pickDraftModel: () => Promise<void>;
   pickMmproj: () => Promise<void>;
+  pickChatTemplate: () => Promise<void>;
   installLlamaCpp: (backend?: UiBackend) => Promise<void>;
   reinstallLlamaCpp: () => Promise<void>;
   installLlamaCppByTag: () => Promise<void>;
@@ -71,6 +83,20 @@ export type ModelActions = {
  * Request defaults below them are inert for those models. Describe the active
  * mode set so the panel can say so instead of showing numbers that never ship.
  */
+function chatTemplateNameOptions(): string {
+  const common = new Set<string>(COMMON_CHAT_TEMPLATES);
+  const opt = (name: string) => `<option value="${name}">${name}</option>`;
+  const other = BUILTIN_CHAT_TEMPLATES.filter((name) => !common.has(name))
+    .slice()
+    .sort((a, b) => a.localeCompare(b))
+    .map(opt)
+    .join("");
+  return (
+    `<optgroup label="Common">${COMMON_CHAT_TEMPLATES.map(opt).join("")}</optgroup>` +
+    `<optgroup label="Other">${other}</optgroup>`
+  );
+}
+
 function describeModeSampling(
   caps: Parameters<typeof resolveModelModes>[0],
   modelPath: string
@@ -105,6 +131,23 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
   private downloadPostTimer: ReturnType<typeof setTimeout> | undefined;
   private libraryFocus: { filter?: boolean; downloads?: boolean; query?: string; search?: boolean } | null = null;
   private libraryReady = false;
+  private wantConnectForm = false;
+  /** Last loopback scan. The 5s status poll reuses this instead of running `ss` every tick. */
+  private localServerScan?: { at: number; servers: { url: string; port: number; pid: number }[] };
+  private apiKeys?: {
+    get(origin: string): string | undefined;
+    set(origin: string, value: string): Promise<void>;
+    delete(origin: string): Promise<void>;
+  };
+
+  /** Secret Storage cache owned by the extension. Keys never go in config.json. */
+  attachApiKeyStore(store: {
+    get(origin: string): string | undefined;
+    set(origin: string, value: string): Promise<void>;
+    delete(origin: string): Promise<void>;
+  }): void {
+    this.apiKeys = store;
+  }
 
   constructor(
     private readonly extensionUri: vscode.Uri,
@@ -144,6 +187,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             await this.pushState();
             this.flushDownloadPost();
             this.flushLibraryFocus();
+            if (this.wantConnectForm) {
+              this.wantConnectForm = false;
+              this.view?.webview.postMessage({ type: "openConnect" });
+            }
             break;
           case "saveLoad":
             await this.store.updateLoadSettings(msg.payload as Partial<LlamaLoadSettings>);
@@ -178,6 +225,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               cacheReuse: d.cacheReuse,
               reasoningFormat: d.reasoningFormat,
               reasoningBudget: d.reasoningBudget,
+              chatTemplateSource: d.chatTemplateSource,
+              chatTemplateName: d.chatTemplateName,
+              chatTemplateFile: d.chatTemplateFile,
+              chatTemplateJinja: d.chatTemplateJinja,
               ropeFreqBase: d.ropeFreqBase,
               ropeFreqScale: d.ropeFreqScale,
               seed: d.seed,
@@ -241,6 +292,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             await this.pushState();
             break;
           case "reload": {
+            if (await this.refuseRemote("reload")) {
+              break;
+            }
             const token = this.processManager.claimLaunch("reload", "Reloading llama-server…");
             if (!token) {
               void vscode.window.showWarningMessage(LAUNCH_IN_PROGRESS_MSG);
@@ -267,6 +321,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             break;
           }
           case "start": {
+            if (await this.refuseRemote("start")) {
+              break;
+            }
             const token = this.processManager.claimLaunch("start", "Starting llama-server…");
             if (!token) {
               void vscode.window.showWarningMessage(LAUNCH_IN_PROGRESS_MSG);
@@ -311,6 +368,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             break;
           }
           case "stop":
+            if (await this.refuseRemote("stop")) {
+              break;
+            }
             await this.processManager.stop(true);
             await this.pushState();
             break;
@@ -319,6 +379,30 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             break;
           case "copyCommandLine":
             await copyServerCommandLine();
+            break;
+          case "refreshRemote":
+            await this.processManager.remote.refresh(true);
+            this.rememberRemoteModel();
+            this.notifyChatModels();
+            await this.pushState();
+            break;
+          case "testRemote":
+            await this.testRemote(String(msg.url || ""), String(msg.apiKey || ""));
+            break;
+          case "connectRemote":
+            await this.connectRemote(String(msg.url || ""), String(msg.label || ""), String(msg.apiKey || ""));
+            break;
+          case "switchToLocal":
+            await this.switchToLocal();
+            break;
+          case "setApiKey":
+            await this.promptApiKey();
+            break;
+          case "forgetApiKey":
+            await this.forgetApiKey();
+            break;
+          case "copyDiagnostics":
+            await this.copyDiagnostics();
             break;
           case "refresh":
             invalidateModelLibraryCache();
@@ -379,6 +463,23 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             await this.store.updateLoadSettings({ mmprojPath: "" });
             this.view?.webview.postMessage({ type: "mmprojSelected", path: "" });
             this.notifyChatModels();
+            await this.pushState();
+            break;
+          case "pickChatTemplate":
+            try {
+              await vscode.commands.executeCommand("llamaAio.selectChatTemplate");
+            } catch {
+              await this.modelActions.pickChatTemplate();
+            }
+            await this.pushState();
+            break;
+          case "clearChatTemplate":
+            await this.store.updateLoadSettings({
+              chatTemplateSource: "model",
+              chatTemplateName: "",
+              chatTemplateFile: "",
+              chatTemplateJinja: true,
+            });
             await this.pushState();
             break;
           case "installLlamaCpp":
@@ -626,8 +727,229 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
 
   /** Keep sidebar speculative line in sync with Load settings (clears stale % when off). */
   syncSpeculativeMode(): void {
+    if (this.store.isRemote()) {
+      this.perf.setSpeculativeMode(undefined);
+      return;
+    }
     const mode = this.store.getState().loadSettings.speculativeMode || "off";
     this.perf.setSpeculativeMode(normalizeSpeculativeMode(mode));
+  }
+
+  /** Ask to switch back when a local lifecycle action arrives in remote mode. */
+  private async refuseRemote(action: string): Promise<boolean> {
+    if (!this.store.isRemote()) {
+      return false;
+    }
+    const choice = await vscode.window.showWarningMessage(
+      remoteLifecycleMessage(action, this.store.getServerTarget().label),
+      "Switch to this machine"
+    );
+    if (choice === "Switch to this machine") {
+      await this.switchToLocal();
+    }
+    return true;
+  }
+
+  /**
+   * Hand-started llama-server processes on loopback, while this machine's own
+   * server is stopped. Empty while a server we own is running or remote mode is on.
+   * Cached for 20s so status polling does not rescan.
+   */
+  private localServersForSidebar(httpReady = false): { url: string; port: number; pid: number }[] {
+    const status = this.processManager.getStatus();
+    if (this.store.isRemote() || status.running || status.starting || httpReady) {
+      this.localServerScan = undefined;
+      return [];
+    }
+    const now = Date.now();
+    if (this.localServerScan && now - this.localServerScan.at < 20_000) {
+      return this.localServerScan.servers;
+    }
+    const skip = status.ownedByThisExtension && status.pid ? [status.pid] : [];
+    const servers = discoverLoopbackLlamaServersOnThisMachine(skip);
+    this.localServerScan = { at: now, servers };
+    return servers;
+  }
+
+  /** Fields the sidebar needs to draw remote mode. Included in state and status patches. */
+  private remoteFields(): Record<string, unknown> {
+    const remote = this.store.isRemote();
+    const target = this.store.getServerTarget();
+    const info = remote ? this.processManager.remote.current() : undefined;
+    return {
+      serverMode: remote ? "remote" : "local",
+      remoteUrl: this.store.getServerPreferences().remoteUrl,
+      remoteLabel: remote ? target.label : "",
+      hasApiKey: this.currentHasApiKey(),
+      remote: info,
+      nextRetryAt: remote ? this.processManager.remote.nextRetryAt() : undefined,
+      remoteHint: info?.error ? connectionHint(info.error.kind, target.baseUrl) : "",
+    };
+  }
+
+  private currentHasApiKey(): boolean {
+    if (!this.apiKeys || !this.store.isRemote()) {
+      return false;
+    }
+    try {
+      return !!this.apiKeys.get(new URL(this.store.getEndpoint()).origin);
+    } catch {
+      return false;
+    }
+  }
+
+  private rememberRemoteModel(): void {
+    const id = this.processManager.remote.current()?.modelId;
+    if (id) {
+      void this.store.setLastRemoteModelId(id).catch(() => undefined);
+    }
+  }
+
+  /** Show the connect form. If the sidebar is not open yet, it opens on the next ready. */
+  openConnectForm(): void {
+    if (this.view) {
+      this.view.webview.postMessage({ type: "openConnect" });
+    } else {
+      this.wantConnectForm = true;
+    }
+  }
+
+  private async testRemote(rawUrl: string, apiKey: string): Promise<void> {
+    let url: string;
+    try {
+      url = normalizeServerUrl(rawUrl);
+    } catch (e) {
+      this.view?.webview.postMessage({
+        type: "remoteProbe",
+        error: e instanceof Error ? e.message : String(e),
+      });
+      return;
+    }
+    const key = apiKey.trim() || this.apiKeys?.get(new URL(url).origin);
+    try {
+      const info = await probeRemoteServer(url, { apiKey: key });
+      this.view?.webview.postMessage({ type: "remoteProbe", payload: info });
+    } catch (e) {
+      this.view?.webview.postMessage({
+        type: "remoteProbe",
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+
+  /** Save a remote URL and probe it. Confirms plain HTTP to a public address once. */
+  async connectRemote(rawUrl: string, label: string, apiKey: string): Promise<void> {
+    let url: string;
+    try {
+      url = normalizeServerUrl(rawUrl);
+    } catch (e) {
+      void vscode.window.showErrorMessage(e instanceof Error ? e.message : String(e));
+      return;
+    }
+    if (isPublicPlainHttp(url) && !this.store.isPlainHttpConfirmed(url)) {
+      const choice = await vscode.window.showWarningMessage(
+        `${url} is plain HTTP on a public address. The API key and chat will travel unencrypted. Connect anyway?`,
+        { modal: true },
+        "Connect"
+      );
+      if (choice !== "Connect") {
+        return;
+      }
+      await this.store.confirmPlainHttp(url);
+    }
+    const typedKey = apiKey.trim();
+    if (typedKey) {
+      if (!this.apiKeys) {
+        void vscode.window.showWarningMessage("API key storage is not available in this window.");
+      } else {
+        await this.apiKeys.set(new URL(url).origin, typedKey);
+      }
+    }
+    if (!this.store.isRemote() && this.processManager.getStatus().running) {
+      const choice = await vscode.window.showWarningMessage(
+        "A local llama-server is still running. Stop it, or leave it running in the background?",
+        { modal: true },
+        "Stop",
+        "Keep running"
+      );
+      if (!choice) {
+        return;
+      }
+      if (choice === "Stop") {
+        await this.processManager.stop(true);
+      }
+    }
+    await this.store.setRemoteServer(url, label);
+    this.processManager.remote.reset();
+    this.perf.setSpeculativeMode(undefined);
+    await this.processManager.remote.refresh(true);
+    this.rememberRemoteModel();
+    this.notifyChatModels();
+    await this.pushState();
+  }
+
+  async switchToLocal(): Promise<void> {
+    await this.store.setServerMode("local");
+    this.processManager.remote.reset();
+    this.syncSpeculativeMode();
+    this.notifyChatModels();
+    await this.pushState();
+  }
+
+  async promptApiKey(): Promise<void> {
+    if (!this.store.isRemote()) {
+      return;
+    }
+    const target = this.store.getServerTarget();
+    const value = await vscode.window.showInputBox({
+      title: `API key for ${target.label}`,
+      prompt: "Stored in VS Code Secret Storage. Leave empty to forget the key. It is never written to config.json.",
+      password: true,
+      ignoreFocusOut: true,
+    });
+    if (value === undefined) {
+      return;
+    }
+    const origin = new URL(target.baseUrl).origin;
+    if (!value.trim()) {
+      await this.apiKeys?.delete(origin);
+    } else if (this.apiKeys) {
+      await this.apiKeys.set(origin, value.trim());
+    } else {
+      void vscode.window.showWarningMessage("API key storage is not available in this window.");
+      return;
+    }
+    this.processManager.remote.reset();
+    await this.processManager.remote.refresh(true);
+    this.rememberRemoteModel();
+    this.notifyChatModels();
+    await this.pushState();
+  }
+
+  async forgetApiKey(): Promise<void> {
+    if (!this.store.isRemote()) {
+      return;
+    }
+    try {
+      await this.apiKeys?.delete(new URL(this.store.getEndpoint()).origin);
+    } catch {
+      return;
+    }
+    this.processManager.remote.reset();
+    await this.processManager.remote.refresh(true);
+    this.notifyChatModels();
+    await this.pushState();
+  }
+
+  async copyDiagnostics(): Promise<void> {
+    const target = this.store.getServerTarget();
+    const text = formatRemoteDiagnostics(this.processManager.remote.current(), {
+      url: target.baseUrl,
+      label: target.label,
+      hasApiKey: this.currentHasApiKey(),
+    });
+    await vscode.env.clipboard.writeText(text);
+    void vscode.window.showInformationMessage("Connection diagnostics copied. The API key is not included.");
   }
 
   /**
@@ -661,9 +983,11 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     // that probe below instead of a second /health round-trip.
     const httpReady = await this.postStatusNow();
     this.syncSpeculativeMode();
+    const remoteMode = this.store.isRemote();
     let state = this.store.getState();
     // Refresh GGUF caps when older state lacks size / arch dims needed for estimates.
     if (
+      !remoteMode &&
       state.selectedModelPath &&
       (!state.modelCapabilities?.fileSizeBytes ||
         state.modelCapabilities.path !== state.selectedModelPath ||
@@ -695,9 +1019,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     const status = this.processManager.getStatus();
     const binary = this.processManager.resolveBinary();
     const modelsDir = getModelsDir(this.store.getConfig());
-    const localEntries = listLocalModelEntries(this.store.getConfig());
+    const localEntries = remoteMode ? [] : listLocalModelEntries(this.store.getConfig());
     const localModelCount = localEntries.length;
-    const library = this.libraryPayload(state.selectedModelPath, status);
+    const library = remoteMode ? null : this.libraryPayload(state.selectedModelPath, status);
     const localSourceDirs = listActiveModelSourceDirs(this.store.getConfig(), localEntries);
     const localSources = localSourceDirs.map((s) => s.source);
 
@@ -710,7 +1034,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       build.resolvedBackend ||
       (build.configuredBackend === "auto" ? "vulkan" : build.configuredBackend)) as string;
     const cpuOnly = selectedUiBackend === "cpu";
-    const { gpus, view: memoryView } = this.memoryForSaved(cpuOnly);
+    const { gpus, view: memoryView } = remoteMode
+      ? { gpus: [] as GpuMemoryInfo[], view: undefined }
+      : this.memoryForSaved(cpuOnly);
     const draftCaps = resolveDraftCapabilities(state.loadSettings);
     const launched = this.processManager.getLaunchedConfig();
     const updateCheck = this.installer.peekUpdateCheck();
@@ -728,6 +1054,8 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         wikipediaLookupEnabled: this.store.isWikipediaLookupEnabled(),
         duplicateToolCallGuardEnabled: this.store.isDuplicateToolCallGuardEnabled(),
         endpoint: this.store.getEndpoint(),
+        localServers: this.localServersForSidebar(httpReady),
+        ...this.remoteFields(),
         binary,
         binaryExists: fs.existsSync(binary),
         modelsDir,
@@ -741,6 +1069,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         startedAt: launched?.startedAt,
         launchedSettings: launched?.loadSettings ?? null,
         defaults: DEFAULT_LOAD_SETTINGS,
+        chatTemplateProblem: chatTemplateFileProblem(state.loadSettings) || "",
         build,
         backendOptions,
         selectedUiBackend,
@@ -748,7 +1077,19 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         launchMode: resolveLaunchMode(this.store.getConfig().get<string>("launchMode")),
         updateCheck,
         memoryView: memoryView ?? null,
-        modeSampling: describeModeSampling(caps, state.selectedModelPath),
+        modeSampling: remoteMode
+          ? describeModeSampling(
+              undefined,
+              [
+                this.processManager.remote.current()?.modelId,
+                this.processManager.remote.current()?.modelPath
+                  ? path.basename(this.processManager.remote.current()?.modelPath || "")
+                  : "",
+              ]
+                .filter(Boolean)
+                .join(" ")
+            )
+          : describeModeSampling(caps, state.selectedModelPath),
         memInputs: memoryEstimateInputs(
           caps,
           draftCaps,
@@ -800,10 +1141,12 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           : null,
       },
     });
-    void this.postLibraryFits(
-      [...library.groups, ...library.hiddenGroups].flatMap((group) => group.quants.map((quant) => quant.path)),
-      cpuOnly
-    );
+    if (library) {
+      void this.postLibraryFits(
+        [...library.groups, ...library.hiddenGroups].flatMap((group) => group.quants.map((quant) => quant.path)),
+        cpuOnly
+      );
+    }
 
     // Resolve latest tag in the background when cache is cold (no GitHub API).
     // Patch the hint immediately — a full pushState re-probes the binary and
@@ -860,8 +1203,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         pid: status.pid,
         startMessage: status.startMessage || status.message,
         message: status.message,
+        localServers: this.localServersForSidebar(httpReady),
         perf: this.perf.get(),
         perfLines: this.perf.detailLines(),
+        ...this.remoteFields(),
       },
     });
     return httpReady;
@@ -2051,6 +2396,59 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       color: var(--vscode-textLink-activeForeground);
     }
     .hidden { display: none !important; }
+    body.remote-mode #modelCard,
+    body.remote-mode #memCard,
+    body.remote-mode #backendCard,
+    body.remote-mode #setupBox,
+    body.remote-mode #stopBtn,
+    body.remote-mode .local-only { display: none !important; }
+    body:not(.remote-mode) .remote-only { display: none !important; }
+    body.connect-open #statusLine,
+    body.connect-open #srvModel,
+    body.connect-open #srvSummary,
+    body.connect-open #srvPerf,
+    body.connect-open #dirtyHint,
+    body.connect-open #primaryRow,
+    body.connect-open #foundServers,
+    body.connect-open #remoteLoad,
+    body.connect-open #remoteStrip,
+    body.connect-open #remoteActions,
+    body.connect-open .srv-icons { display: none !important; }
+    body:not(.remote-mode) #remoteLoad { display: none !important; }
+    .remote-chip { font-size: 10px; font-weight: 700; letter-spacing: .04em; color: var(--starting); border: 1px solid color-mix(in srgb, var(--starting) 45%, var(--border)); border-radius: 99px; padding: 0 6px; margin-left: 6px; }
+    .found-servers { margin-top: 8px; display: flex; flex-direction: column; gap: 6px; }
+    .found-server {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      font-size: 11px;
+      line-height: 1.35;
+      padding: 6px 8px;
+      border-radius: 6px;
+      background: color-mix(in srgb, var(--starting) 12%, transparent);
+      border: 1px solid color-mix(in srgb, var(--starting) 35%, var(--border));
+    }
+    .found-server button { flex: none; padding: 3px 10px; }
+    .remote-strip { margin-top: 8px; padding: 8px 10px; border-radius: 6px; line-height: 1.4; }
+    .remote-strip.warn { background: var(--warn-bg); border: 1px solid color-mix(in srgb, var(--warn) 45%, var(--border)); }
+    .remote-strip .lead { color: var(--warn); font-weight: 650; }
+    .load-head { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; }
+    .load-head .count { font-variant-numeric: tabular-nums; }
+    .load-bar { height: 8px; border-radius: 99px; background: color-mix(in srgb, var(--muted) 28%, transparent); overflow: hidden; margin: 6px 0; }
+    .load-bar > span { display: block; height: 100%; width: 0; background: var(--ok); border-radius: 99px; }
+    .load-bar.warn > span { background: var(--warn); }
+    .remote-strip.bad { background: color-mix(in srgb, var(--bad) 16%, transparent); }
+    .remote-strip.info { background: color-mix(in srgb, var(--starting) 14%, transparent); }
+    .connect-form label { display: block; margin: 8px 0 3px; color: var(--muted); font-size: 11px; }
+    .connect-form input { width: 100%; box-sizing: border-box; }
+    .probe-row { display: flex; gap: 8px; align-items: baseline; margin: 3px 0; font-size: 11px; }
+    .probe-row .mark { width: 1em; flex: none; font-weight: 700; }
+    .probe-row .mark.ok { color: var(--ok); }
+    .probe-row .mark.no { color: var(--muted); }
+    .probe-row .mark.bad { color: var(--bad); }
+    .probe-row .grow { flex: 1; min-width: 0; }
+    .probe-row .path { color: var(--muted); flex: none; }
     .ok { color: var(--ok); }
     .caps {
       margin: 0 0 8px;
@@ -2290,6 +2688,12 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     .cap-chips { display: flex; flex-wrap: wrap; gap: 4px; margin: 0 0 8px; }
     .cap-chip { font-size: 10.5px; line-height: 1.6; padding: 0 6px; border-radius: 3px; border: 1px solid var(--border); background: color-mix(in srgb, var(--fg) 5%, transparent); color: var(--fg); white-space: nowrap; }
     .cap-chip.ok { color: var(--ok); }
+    .cap-chip.override { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 50%, transparent); background: color-mix(in srgb, var(--warn) 10%, transparent); cursor: pointer; }
+    .tpl-file { display: flex; align-items: center; gap: 6px; margin-top: 6px; padding: 4px 8px; border: 1px solid var(--border); border-radius: 5px; background: color-mix(in srgb, var(--fg) 3%, transparent); font-size: 11px; }
+    .tpl-file .tpl-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .tpl-file .tpl-name.missing { color: var(--bad); }
+    .row.locked, .toggle.locked { opacity: 0.55; }
+    .tpl-problem { margin-top: 6px; padding: 6px 8px; border-radius: 5px; font-size: 11px; line-height: 1.4; border: 1px solid color-mix(in srgb, var(--bad) 45%, var(--border)); background: color-mix(in srgb, var(--bad) 9%, transparent); color: var(--bad); }
     .mm-attach { display: flex; align-items: center; gap: 6px; padding: 4px 6px 4px 8px; margin: 0 0 4px; border: 1px solid var(--border); border-radius: 5px; background: color-mix(in srgb, var(--fg) 3%, transparent); font-size: 11px; }
     .mm-attach .mm-label { color: var(--muted); flex: none; }
     .mm-attach .mm-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -2379,6 +2783,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           <span class="dot stopped" id="statusDot"></span>
           <span id="statusText">Loading…</span>
         </span>
+        <span class="remote-chip remote-only" id="remoteChip">REMOTE</span>
         <span class="meta-row" id="statusMeta">—</span>
       </div>
       <div class="srv-icons">
@@ -2387,15 +2792,22 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         <details class="menu" id="srvMenu">
           <summary class="icon-btn" title="More server actions" aria-label="More server actions">⋯</summary>
           <div class="menu-body">
-            <button class="menu-item" id="openLogBtn" type="button">Open log</button>
-            <button class="menu-item" id="copyCmdBtn" type="button">Copy command line</button>
+            <button class="menu-item local-only" id="openLogBtn" type="button">Open log</button>
+            <button class="menu-item local-only" id="copyCmdBtn" type="button">Copy command line</button>
             <button class="menu-item" id="openWebUiBtn" type="button">Open llama.cpp web UI</button>
-            <div class="menu-sep"></div>
-            <label class="menu-label" for="launchMode">Launch mode</label>
-            <select id="launchMode" class="wide" title="How llama-server is started">
+            <button class="menu-item remote-only" id="copyDiagBtn" type="button">Copy connection diagnostics</button>
+            <div class="menu-sep local-only"></div>
+            <label class="menu-label local-only" for="launchMode">Launch mode</label>
+            <select id="launchMode" class="wide local-only" title="How llama-server is started">
               <option value="externalTerminal">External terminal (logs visible)</option>
               <option value="background">Background (hidden process)</option>
             </select>
+            <div class="menu-sep"></div>
+            <button class="menu-item remote-only" id="editConnectionBtn" type="button">Edit connection…</button>
+            <button class="menu-item remote-only" id="setApiKeyBtn" type="button">Set API key…</button>
+            <button class="menu-item remote-only" id="forgetApiKeyBtn" type="button">Forget API key</button>
+            <button class="menu-item remote-only" id="switchLocalBtn" type="button">Switch to this machine</button>
+            <button class="menu-item local-only" id="connectRemoteBtn" type="button">Connect to a server…</button>
           </div>
         </details>
       </div>
@@ -2403,6 +2815,16 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     <div class="srv-model" id="srvModel">No model selected</div>
     <div class="srv-sub" id="srvSummary"></div>
     <div class="srv-sub" id="srvPerf"></div>
+    <div class="hidden" id="remoteLoad">
+      <details class="fold" id="remoteLoadFold" open>
+        <summary><span>Server load</span><span class="sum" id="remoteLoadSum">all clients · /metrics</span></summary>
+        <div class="fold-body">
+          <div class="load-head"><span id="remoteLoadLabel">Slots busy</span><span class="count" id="remoteLoadCount"></span></div>
+          <div class="load-bar" id="remoteLoadBar"><span id="remoteLoadFill"></span></div>
+          <div class="meta-row" id="remoteLoadRates"></div>
+        </div>
+      </details>
+    </div>
     <div class="dirty-hint hidden" id="dirtyHint">
       <span class="label">Not applied yet:</span> <span id="dirtyList">load settings or launch mode changed.</span>
     </div>
@@ -2410,6 +2832,38 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       <button class="primary" id="primaryBtn" data-action="start">Start</button>
       <button class="secondary hidden" id="discardBtn" type="button" title="Put the settings back to what the running server uses">Discard</button>
     </div>
+    <div class="found-servers hidden local-only" id="foundServers"></div>
+    <div class="connect-form hidden" id="connectForm">
+      <div class="card-title" style="margin-bottom:4px">Connect to a server</div>
+      <label for="remoteUrlInput">Server URL</label>
+      <input type="text" id="remoteUrlInput" placeholder="https://gpu-box.lan:8080" spellcheck="false" />
+      <label for="remoteLabelInput">Name <span style="opacity:.7">(optional)</span></label>
+      <input type="text" id="remoteLabelInput" placeholder="gpu-box" />
+      <label for="remoteKeyInput">API key <span style="opacity:.7">(optional · Secret Storage)</span></label>
+      <input type="password" id="remoteKeyInput" placeholder="only if the server uses --api-key" autocomplete="off" />
+      <div id="probeList" style="margin-top:8px"></div>
+      <div class="actions-row">
+        <button class="primary" id="connectBtn" type="button">Connect</button>
+        <button class="secondary" id="connectCancelBtn" type="button">Cancel</button>
+      </div>
+      <div class="hint">Your local model and load settings stay saved. Switch to this machine brings them back.</div>
+    </div>
+    <div class="remote-strip hidden" id="remoteStrip"></div>
+    <div class="actions-row hidden" id="remoteActions">
+      <button class="primary" id="remotePrimaryBtn" type="button">Retry now</button>
+      <button class="secondary" id="remoteSecondaryBtn" type="button">Edit connection</button>
+    </div>
+  </div>
+
+  <div class="card hidden" id="remoteModelCard">
+    <div class="card-head">
+      <span class="card-title">Model on server</span>
+      <span class="sub" id="remoteModelSub">—</span>
+    </div>
+    <div class="model-title" id="remoteModelName">—</div>
+    <div class="cap-chips" id="remoteChips"></div>
+    <div class="model-path" id="remoteModelPath"></div>
+    <div class="hint" id="remoteModelHint"></div>
   </div>
 
   <div class="setup hidden" id="setupBox">
@@ -2675,6 +3129,40 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       </span>
     </div>
     <div class="hint">Caps how many tokens a think model may spend before answering. Set <strong>0</strong> to skip thinking entirely.</div>
+  </div>
+
+  <div class="subgroup-title" id="chatTemplateTitle">Chat template</div>
+  <div class="row" id="chatTemplateSourceRow">
+    <div class="label"><span class="name tip" data-flag="--jinja, --chat-template, --chat-template-file" data-help="Which Jinja chat template llama-server uses. From model keeps the template embedded in the GGUF. Built-in picks a llama.cpp name. File loads a .jinja or .txt template. A change reloads the server.">Source</span>
+      <select id="chatTemplateSource">
+        <option value="model">From model</option>
+        <option value="builtin">Built-in</option>
+        <option value="file">File</option>
+      </select>
+    </div>
+    <div class="hint" id="chatTemplateHint">Uses the Jinja template embedded in the GGUF. llama-server’s Jinja engine is already on.</div>
+    <div class="hint hidden" id="chatTemplateRemoteHint">The remote server owns its chat template. This setting applies the next time you run locally.</div>
+  </div>
+  <div class="row hidden" id="chatTemplateNameRow">
+    <div class="label"><span class="name tip" data-flag="--chat-template" data-help="Built-in llama.cpp chat template name. Sent as --jinja --chat-template NAME, which replaces the template stored in the GGUF.">Template</span>
+      <select id="chatTemplateName">
+        ${chatTemplateNameOptions()}
+      </select>
+    </div>
+  </div>
+  <div class="row hidden" id="chatTemplateFileRow">
+    <div class="label"><span class="name tip" data-flag="--chat-template-file" data-help="Path to a Jinja chat template file. Sent as --jinja --chat-template-file. The file is not copied; a missing file blocks server start.">Template file</span></div>
+    <input type="hidden" id="chatTemplateFile" />
+    <div class="tpl-file"><span class="tpl-name" id="chatTemplateFileName">No template file selected.</span></div>
+    <div class="btn-row" style="margin:6px 0 0;gap:8px;flex-wrap:wrap">
+      <button class="secondary" id="pickChatTemplateBtn" type="button">Choose template…</button>
+      <button class="secondary" id="clearChatTemplateBtn" type="button">Clear</button>
+    </div>
+    <div class="tpl-problem hidden" id="chatTemplateProblem"></div>
+  </div>
+  <div class="toggle" id="chatTemplateJinjaRow">
+    <span class="tip" data-flag="--jinja, --no-jinja" data-help="llama.cpp’s Jinja engine is on by default. Turn this off only to send --no-jinja and ignore the GGUF Jinja template. A built-in name or a file always keeps Jinja on.">Jinja engine</span>
+    <input type="checkbox" id="chatTemplateJinja" checked />
   </div>
 
   <div class="subgroup-title">Positional &amp; seed</div>
@@ -3280,6 +3768,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     let suppressBackendChange = false;
     let activeBackendId = '';
     let serverRunning = false;
+    let foundServers = [];
     let configDirty = false;
     let serverStarting = false;
     let lastEndpoint = '';
@@ -3297,13 +3786,353 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     /** "Custom" GPU layers stays open while the user works with the slider. */
     let nglCustomOpen = false;
 
+    let remoteMode = false;
+    let connectOpen = false;
+    let remoteInfo = null;
+    let remoteHint = '';
+    let nextRetryAt = 0;
+    let probeTimer = null;
+
+    function fmtParams(n) {
+      if (!(n > 0)) return '';
+      if (n >= 1e9) {
+        const b = n / 1e9;
+        return (b >= 10 ? Math.round(b) : Math.round(b * 10) / 10) + 'B params';
+      }
+      if (n >= 1e6) return Math.round(n / 1e6) + 'M params';
+      return String(n) + ' params';
+    }
+
+    function setConnectOpen(open, prefill) {
+      connectOpen = !!open;
+      document.body.classList.toggle('connect-open', connectOpen);
+      const form = $('connectForm');
+      if (form) form.classList.toggle('hidden', !connectOpen);
+      if (connectOpen && prefill) {
+        const url = $('remoteUrlInput');
+        const label = $('remoteLabelInput');
+        if (url && prefill.url && document.activeElement !== url) url.value = prefill.url;
+        if (label && prefill.label != null && document.activeElement !== label) label.value = prefill.label;
+      }
+      const card = $('remoteModelCard');
+      if (card) card.classList.toggle('hidden', !remoteMode || connectOpen);
+      if (!connectOpen) {
+        const list = $('probeList');
+        if (list) list.textContent = '';
+      }
+    }
+
+    function renderProbeList(info, error) {
+      const list = $('probeList');
+      if (!list) return;
+      list.textContent = '';
+      if (error) {
+        const row = document.createElement('div');
+        row.className = 'probe-row';
+        row.textContent = error;
+        list.appendChild(row);
+        return;
+      }
+      const probes = (info && info.probes) || [];
+      probes.forEach(function (p) {
+        const row = document.createElement('div');
+        row.className = 'probe-row';
+        const mark = document.createElement('span');
+        mark.className = 'mark ' + (p.ok === true ? 'ok' : p.ok === false ? 'bad' : 'no');
+        mark.textContent = p.ok === true ? '✓' : p.ok === false ? '✕' : '–';
+        const grow = document.createElement('span');
+        grow.className = 'grow';
+        grow.textContent = p.detail || '';
+        const pathEl = document.createElement('span');
+        pathEl.className = 'path';
+        pathEl.textContent = p.path || '';
+        row.appendChild(mark);
+        row.appendChild(grow);
+        row.appendChild(pathEl);
+        list.appendChild(row);
+      });
+    }
+
+    function renderRemoteModel() {
+      const card = $('remoteModelCard');
+      if (!card) return;
+      card.classList.toggle('hidden', !remoteMode || connectOpen);
+      const info = remoteInfo || {};
+      const name = info.modelId || (lastPayload && lastPayload.remoteUrl ? 'Waiting for the server…' : '—');
+      const nameEl = $('remoteModelName');
+      if (nameEl) nameEl.textContent = name;
+      const sub = $('remoteModelSub');
+      if (sub) {
+        sub.textContent = info.state === 'auth' ? 'partial' : (lastPayload && lastPayload.remoteLabel) || '';
+      }
+      const chips = $('remoteChips');
+      if (chips) {
+        chips.textContent = '';
+        const bits = [];
+        if (info.modelParams) bits.push(fmtParams(info.modelParams));
+        if (info.modelSizeBytes) bits.push(fmtBytes(info.modelSizeBytes));
+        if (info.trainedContext) bits.push('trained ' + fmtTokShort(info.trainedContext) + ' ctx');
+        if (info.vision) bits.push('vision');
+        bits.forEach(function (text) {
+          const chip = document.createElement('span');
+          chip.className = 'chip';
+          chip.textContent = text;
+          chips.appendChild(chip);
+        });
+      }
+      const pathEl = $('remoteModelPath');
+      if (pathEl) pathEl.textContent = info.modelPath || '';
+      const hint = $('remoteModelHint');
+      if (hint) {
+        if (info.isLlamaCpp === false && (info.state === 'ready' || info.state === 'limited')) {
+          hint.textContent = 'This server is not llama.cpp. Chat works; slots, vision, and the overthinking penalty stay off.';
+        } else if (info.state === 'auth') {
+          hint.textContent = 'Slots, context, and vision need the API key (/props).';
+        } else if (info.state === 'unreachable') {
+          hint.textContent = info.modelId ? 'Last model this server reported.' : '';
+        } else if (lastPayload && lastPayload.remoteLabel) {
+          hint.textContent = 'Context, GPU layers, and KV cache are set by whoever starts llama-server on ' + lastPayload.remoteLabel + '.';
+        } else {
+          hint.textContent = '';
+        }
+      }
+    }
+
+    function renderRemoteStatus() {
+      const info = remoteInfo || {};
+      const state = info.state || 'connecting';
+      let kind = 'starting';
+      let label = 'Connecting…';
+      if (state === 'ready') { kind = 'ok'; label = 'Connected'; }
+      else if (state === 'busy') { kind = 'ok'; label = 'Connected · busy'; }
+      else if (state === 'limited') { kind = 'ok'; label = 'Connected · limited'; }
+      else if (state === 'loading') { kind = 'starting'; label = 'Loading model'; }
+      else if (state === 'auth') { kind = 'dirty'; label = 'API key required'; }
+      else if (state === 'unreachable') { kind = 'error'; label = 'Not reachable'; }
+      setServerCardKind(kind);
+      const line = $('statusLine');
+      const dot = $('statusDot');
+      const text = $('statusText');
+      if (line) line.className = 'status-line ' + kind;
+      if (dot) dot.className = 'dot ' + (state === 'loading' || state === 'connecting' ? 'starting' : kind);
+      if (text) text.textContent = label;
+      const meta = $('statusMeta');
+      const endpoint = (info.url || (lastPayload && lastPayload.endpoint) || '');
+      if (meta) {
+        meta.innerHTML = '';
+        if (endpoint) {
+          const a = document.createElement('a');
+          a.className = 'endpoint';
+          a.href = endpoint;
+          a.setAttribute('data-url', endpoint);
+          a.textContent = endpoint;
+          a.addEventListener('click', function (e) {
+            e.preventDefault();
+            vscode.postMessage({ type: 'openExternal', url: endpoint });
+          });
+          meta.appendChild(a);
+        }
+        const bits = [];
+        if (lastPayload && lastPayload.remoteLabel && lastPayload.remoteLabel !== endpoint) bits.push(lastPayload.remoteLabel);
+        if (typeof info.rttMs === 'number') bits.push(info.rttMs + ' ms');
+        else if (state === 'unreachable' && nextRetryAt) {
+          const sec = Math.max(0, Math.round((nextRetryAt - Date.now()) / 1000));
+          bits.push(sec ? 'next try in ' + sec + ' s' : 'retrying…');
+        }
+        if (bits.length) meta.appendChild(document.createTextNode((endpoint ? ' · ' : '') + bits.join(' · ')));
+      }
+      const modelEl = $('srvModel');
+      if (modelEl) {
+        modelEl.textContent = state === 'loading'
+          ? 'Waiting for ' + ((lastPayload && lastPayload.remoteLabel) || 'the server') + '…'
+          : (info.modelId || 'No model reported yet');
+        modelEl.title = info.modelPath || '';
+      }
+      const sumEl = $('srvSummary');
+      if (sumEl) {
+        const bits = [];
+        if (info.slotContext) bits.push('ctx ' + fmtTokShort(info.slotContext) + ' per slot');
+        if (info.totalSlots) bits.push(info.totalSlots + (info.totalSlots === 1 ? ' slot' : ' slots'));
+        if (info.vision) bits.push('vision');
+        if (info.buildInfo) bits.push('llama.cpp ' + String(info.buildInfo).split('-')[0]);
+        if (state === 'auth') bits.push('model name from public /v1/models');
+        if (state === 'limited') bits.push('OpenAI-compatible · not llama.cpp');
+        sumEl.textContent = bits.join(' · ');
+        sumEl.classList.toggle('hidden', !bits.length);
+      }
+      const perfEl = $('srvPerf');
+      const hasSlots = typeof info.slotsTotal === 'number' && info.slotsTotal > 0 && typeof info.slotsBusy === 'number';
+      const hasMetrics = typeof info.requestsProcessing === 'number'
+        || typeof info.requestsDeferred === 'number'
+        || typeof info.serverGenTokPerSec === 'number'
+        || typeof info.serverPromptTokPerSec === 'number';
+      const perfBits = [];
+      if (hasSlots) perfBits.push(info.slotsBusy + '/' + info.slotsTotal + ' slots busy');
+      else if (typeof info.requestsProcessing === 'number') perfBits.push(info.requestsProcessing + ' running');
+      if (info.requestsDeferred > 0) perfBits.push(info.requestsDeferred + ' queued');
+      if (perfEl) {
+        perfEl.textContent = perfBits.join(' · ');
+        perfEl.classList.toggle('hidden', !perfBits.length);
+      }
+      const load = $('remoteLoad');
+      if (load) load.classList.toggle('hidden', !(hasSlots || hasMetrics));
+      const loadSum = $('remoteLoadSum');
+      if (loadSum) loadSum.textContent = hasMetrics ? 'all clients · /metrics' : 'all clients · /slots';
+      const loadLabel = $('remoteLoadLabel');
+      const loadCount = $('remoteLoadCount');
+      const loadBar = $('remoteLoadBar');
+      const loadFill = $('remoteLoadFill');
+      if (loadLabel) {
+        loadLabel.textContent = hasSlots ? 'Slots busy' : 'Requests running';
+        if (loadLabel.parentElement) loadLabel.parentElement.classList.toggle('hidden', !(hasSlots || typeof info.requestsProcessing === 'number'));
+      }
+      if (hasSlots) {
+        if (loadCount) loadCount.textContent = info.slotsBusy + ' / ' + info.slotsTotal;
+        if (loadBar) {
+          loadBar.classList.toggle('hidden', false);
+          loadBar.classList.toggle('warn', info.slotsBusy >= info.slotsTotal);
+        }
+        if (loadFill) {
+          const pct = Math.max(0, Math.min(100, (info.slotsBusy / info.slotsTotal) * 100));
+          loadFill.style.width = pct + '%';
+        }
+      } else {
+        if (loadCount) loadCount.textContent = typeof info.requestsProcessing === 'number' ? String(info.requestsProcessing) : '';
+        if (loadBar) loadBar.classList.add('hidden');
+      }
+      const rates = $('remoteLoadRates');
+      if (rates) {
+        const bits = [];
+        const gen = fmtServerRate(info.serverGenTokPerSec);
+        const prompt = fmtServerRate(info.serverPromptTokPerSec);
+        if (gen) bits.push('gen ' + gen + ' tok/s');
+        if (prompt) bits.push('prompt ' + prompt + ' tok/s');
+        if (info.requestsDeferred > 0) bits.push(info.requestsDeferred + ' waiting');
+        rates.textContent = bits.length ? (gen || prompt ? 'Server-wide ' : '') + bits.join(' · ') : '';
+      }
+      const strip = $('remoteStrip');
+      const actions = $('remoteActions');
+      const primary = $('remotePrimaryBtn');
+      const secondary = $('remoteSecondaryBtn');
+      let stripText = '';
+      let stripKind = '';
+      let stripLead = '';
+      if (state === 'auth') {
+        stripKind = 'warn';
+        stripText = (info.error && info.error.message) || 'The server rejected the request (401).';
+        if (remoteHint) stripText += ' ' + remoteHint;
+      } else if (state === 'loading') {
+        stripKind = 'info';
+        stripText = 'The server is up but still loading a model (/health 503). Copilot requests fail fast until it is ready.';
+      } else if (state === 'unreachable') {
+        stripKind = 'bad';
+        stripText = ((info.error && info.error.message) || 'Not reachable.') + (remoteHint ? ' ' + remoteHint : '');
+      } else if (state === 'limited') {
+        stripKind = 'info';
+        stripText = 'Chat works. llama.cpp extras (slot size, vision, overthinking penalty) are off because /props did not answer.';
+      } else if (state === 'busy') {
+        stripKind = 'warn';
+        stripLead = 'Shared server.';
+        const full = hasSlots && info.slotsBusy >= info.slotsTotal;
+        stripText = full
+          ? 'Other clients are using every slot. Your next request waits in the server\\'s queue, so expect slower first tokens.'
+          : 'Requests are waiting in the server\\'s queue, so expect slower first tokens.';
+      }
+      if (strip) {
+        strip.className = 'remote-strip' + (stripKind ? ' ' + stripKind : '') + (stripText ? '' : ' hidden');
+        strip.textContent = '';
+        if (stripText) {
+          if (stripLead) {
+            const lead = document.createElement('span');
+            lead.className = 'lead';
+            lead.textContent = stripLead + ' ';
+            strip.appendChild(lead);
+          }
+          strip.appendChild(document.createTextNode(stripText));
+        }
+      }
+      if (actions && primary && secondary) {
+        const show = state === 'auth' || state === 'unreachable';
+        actions.classList.toggle('hidden', !show);
+        if (state === 'auth') {
+          primary.textContent = 'Set API key…';
+          primary.dataset.action = 'setApiKey';
+          secondary.textContent = 'Edit connection';
+          secondary.dataset.action = 'edit';
+        } else if (state === 'unreachable') {
+          primary.textContent = 'Retry now';
+          primary.dataset.action = 'retry';
+          secondary.textContent = 'Edit connection';
+          secondary.dataset.action = 'edit';
+        }
+      }
+      const hint = $('dirtyHint');
+      if (hint) hint.classList.add('hidden');
+      renderRemoteModel();
+    }
+
+    function applyRemoteChrome(payload) {
+      remoteMode = !!(payload && payload.serverMode === 'remote');
+      document.body.classList.toggle('remote-mode', remoteMode);
+      if (remoteMode && connectOpen) setConnectOpen(false);
+      if (typeof syncChatTemplateUi === 'function') syncChatTemplateUi();
+      if (payload && payload.remote) remoteInfo = payload.remote;
+      else if (!remoteMode) remoteInfo = null;
+      remoteHint = (payload && payload.remoteHint) || '';
+      nextRetryAt = (payload && payload.nextRetryAt) || 0;
+      const card = $('remoteModelCard');
+      if (card) card.classList.toggle('hidden', !remoteMode || connectOpen);
+      if (remoteMode && !connectOpen) renderRemoteStatus();
+    }
+
     function setServerCardKind(kind) {
       const card = $('serverCard');
       if (!card) return;
       card.className = 'card server' + (kind && kind !== 'ok' ? ' ' + kind : '');
     }
 
+    function listenHost(url) {
+      try {
+        const u = new URL(url);
+        const host = u.hostname.indexOf(':') >= 0 ? '[' + u.hostname + ']' : u.hostname;
+        return host + ':' + (u.port || '');
+      } catch (e) {
+        return String(url || '');
+      }
+    }
+
+    function renderFoundServers() {
+      const box = $('foundServers');
+      if (!box) return;
+      const show = !remoteMode && !connectOpen && !serverRunning && !serverStarting && foundServers.length;
+      box.classList.toggle('hidden', !show);
+      box.textContent = '';
+      if (!show) return;
+      foundServers.forEach(function (srv) {
+        if (!srv || !srv.url) return;
+        const row = document.createElement('div');
+        row.className = 'found-server';
+        const text = document.createElement('span');
+        text.textContent = (srv.name || 'llama-server') + ' is listening on ' + listenHost(srv.url);
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'secondary';
+        btn.textContent = 'Connect';
+        btn.addEventListener('click', function () {
+          vscode.postMessage({ type: 'connectRemote', url: srv.url, label: 'localhost', apiKey: '' });
+        });
+        row.appendChild(text);
+        row.appendChild(btn);
+        box.appendChild(row);
+      });
+    }
+
     function renderStatusUi(opts) {
+      if (remoteMode && !connectOpen) {
+        renderRemoteStatus();
+        renderFoundServers();
+        return;
+      }
       const ready = !!opts.ready;
       const dirty = !!opts.dirty;
       const starting = !!opts.starting;
@@ -3380,6 +4209,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       const hint = $('dirtyHint');
       // Hide dirty while loading — settings are being applied right now.
       if (hint) hint.classList.toggle('hidden', starting || !(ready && dirty));
+      renderFoundServers();
     }
 
     /**
@@ -3387,10 +4217,26 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
      * Loading…, or Reload to apply. A clean running server gets the small ⟳.
      */
     function updatePrimaryAction() {
+      const reloadIcon = $('reloadIconBtn');
+      if (remoteMode) {
+        const row = $('primaryRow');
+        if (row) row.classList.add('hidden');
+        const stop = $('stopBtn');
+        if (stop) stop.disabled = true;
+        if (reloadIcon) {
+          reloadIcon.classList.toggle('hidden', connectOpen);
+          reloadIcon.title = 'Re-probe the remote server';
+          reloadIcon.setAttribute('aria-label', 'Re-probe the remote server');
+        }
+        return;
+      }
+      if (reloadIcon) {
+        reloadIcon.title = 'Reload llama-server (restart with the same settings)';
+        reloadIcon.setAttribute('aria-label', 'Reload server');
+      }
       const primary = $('primaryBtn');
       const stop = $('stopBtn');
       const row = $('primaryRow');
-      const reloadIcon = $('reloadIconBtn');
       const discard = $('discardBtn');
       if (!primary || !stop) return;
       stop.disabled = !serverRunning && !serverStarting;
@@ -3432,8 +4278,18 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         : 'load settings or launch mode changed.';
     }
 
+    function fmtServerRate(n) {
+      if (!(n > 0)) return '';
+      if (n >= 1000) {
+        const k = n / 1000;
+        return (k >= 10 ? String(Math.round(k)) : String(Math.round(k * 10) / 10)) + 'k';
+      }
+      return n >= 10 ? String(Math.round(n)) : String(Math.round(n * 10) / 10);
+    }
+
     function fmtTokShort(n) {
       if (!(n > 0)) return '—';
+      if (n >= 1048576 && n % 1048576 === 0) return (n / 1048576) + 'M';
       if (n >= 1024 && n % 1024 === 0) return (n / 1024) + 'k';
       return n >= 1000 ? Math.round(n / 1000) + 'k' : String(n);
     }
@@ -3449,6 +4305,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
 
     /** Header: what is loaded, with which settings, and how it is doing. */
     function renderHeader() {
+      if (remoteMode) {
+        if (!connectOpen) renderRemoteStatus();
+        return;
+      }
       const p = lastPayload;
       const modelEl = $('srvModel');
       const sumEl = $('srvSummary');
@@ -3543,6 +4403,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       if (found && found.quant.sizeLabel) bits.push(found.quant.sizeLabel);
       const L = (p.state && p.state.loadSettings) || {};
       if (L.mmprojPath) bits.push('vision');
+      if (L.chatTemplateSource === 'builtin' && L.chatTemplateName) bits.push('template ' + L.chatTemplateName);
+      else if (L.chatTemplateSource === 'file') bits.push('template file');
+      else if (L.chatTemplateJinja === false) bits.push('jinja off');
       const caps = p.capabilities || {};
       if (caps.nextnPredictLayers > 0 || p.mtpSidecarPath) bits.push('MTP');
       else if (L.speculativeMode && L.speculativeMode !== 'off') bits.push(String(L.speculativeMode));
@@ -4134,6 +4997,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     }
 
     function specAcceptLabel(mode) {
+      if (!mode) return 'draft';
       if (mode === 'dflash') return 'DFlash';
       if (mode === 'ngram-dflash') return 'N-gram+DFlash';
       if (mode === 'ngram') return 'N-gram';
@@ -4395,12 +5259,19 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       setKpi('kpiGen', fmtRate(genNow) || '—', stale);
       setKpi('kpiPrompt', fmtRate(promptNow) || '—', stale);
       setKpi('kpiReuse', typeof cacheHitPct === 'number' ? Math.round(cacheHitPct) + '%' : '—', stale);
-      const specOn = !!(p.speculativeMode && p.speculativeMode !== 'off');
+      const specOn = p.speculativeMode
+        ? p.speculativeMode !== 'off'
+        : typeof draftAcceptancePct === 'number';
       setKpi('kpiSpec', specOn && typeof draftAcceptancePct === 'number' ? Math.round(draftAcceptancePct) + '%' : (specOn ? '—' : 'off'), stale);
       const specLabel = $('kpiSpecLabel');
       if (specLabel) specLabel.textContent = specOn ? specAcceptLabel(p.speculativeMode) + ' accept' : 'speculative';
       const windowEl = $('perfWindow');
-      if (windowEl) windowEl.textContent = rows.length ? 'last ' + rows.length + ' request' + (rows.length === 1 ? '' : 's') : '';
+      if (windowEl) {
+        const base = rows.length ? 'last ' + rows.length + ' request' + (rows.length === 1 ? '' : 's') : '';
+        windowEl.textContent = remoteMode
+          ? (base ? base + ' · incl. network' : 'this window · incl. network')
+          : base;
+      }
       const histSum = $('perfHistSum');
       if (histSum) histSum.textContent = rows.length ? rows.length + ' request' + (rows.length === 1 ? '' : 's') : 'per-request table';
 
@@ -4924,6 +5795,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       'keepModelInMemory', 'tryMmap', 'lazyMode', 'unifiedKvCache', 'flashAttention',
       'contextCheckpoints', 'cacheReuse',
       'reasoningFormat', 'reasoningBudgetUnlimited', 'reasoningBudget',
+      'chatTemplateName', 'chatTemplateJinja',
       'ropeBaseAuto', 'ropeFreqBase', 'ropeScaleAuto', 'ropeFreqScale',
       'seedRandom', 'seed', 'speculativeMode', 'maxDraftTokens', 'minDraftTokens',
       'draftProbability', 'draftGpuOffload',
@@ -4942,6 +5814,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       'cpuThreads', 'evalBatchSize', 'physicalBatchSize', 'maxConcurrentPredictions', 'flashAttention',
       'offloadKvCacheToGpu', 'cacheTypeK', 'cacheTypeV', 'keepModelInMemory', 'tryMmap', 'lazyMode',
       'unifiedKvCache', 'contextCheckpoints', 'cacheReuse', 'reasoningFormat', 'reasoningBudget',
+      'chatTemplateSource', 'chatTemplateName', 'chatTemplateFile', 'chatTemplateJinja',
       'ropeFreqBase', 'ropeFreqScale', 'seed', 'speculativeMode', 'ngramVariant', 'ngramSizeN',
       'ngramSizeM', 'ngramMinHits', 'maxDraftTokens', 'minDraftTokens', 'draftProbability', 'draftGpuOffload',
     ]);
@@ -5043,21 +5916,28 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         b.classList.toggle('active', Number(b.dataset.v) === Number(strengthText));
       });
       const panel = $('overthinkingBox');
-      if (panel) panel.classList.toggle('on', on);
+      if (panel) panel.classList.toggle('on', on && !(remoteMode && remoteInfo && remoteInfo.isLlamaCpp === false));
+      const limitedRemote = remoteMode && remoteInfo && remoteInfo.isLlamaCpp === false;
+      if (box) box.disabled = limitedRemote;
       const quick = $('overthinkingQuick');
-      if (quick) quick.checked = on;
+      if (quick) {
+        quick.disabled = limitedRemote;
+        quick.checked = limitedRemote ? false : on;
+      }
       const quickState = $('overthinkingQuickState');
-      if (quickState) quickState.textContent = on ? '−' + strengthText : 'off';
+      if (quickState) quickState.textContent = !limitedRemote && on ? '−' + strengthText : 'off';
       const hint = $('overthinkingHint');
       if (hint) {
-        hint.textContent = on
-          ? 'On. The next chat message subtracts ' + strengthText + ' from Wait, maybe, But and similar words. No server reload.'
-          : 'Off. Strength is remembered, but chat requests do not send it.';
+        hint.textContent = limitedRemote
+          ? 'Off for this server. It is not llama.cpp, so token ids are not looked up.'
+          : on
+            ? 'On. The next chat message subtracts ' + strengthText + ' from Wait, maybe, But and similar words. No server reload.'
+            : 'Off. Strength is remembered, but chat requests do not send it.';
       }
       const sum = $('copilotSum');
       if (sum) {
         let text = (sum.textContent || '').replace(/\\s*·\\s*overthink −[\\d.]+/g, '').replace(/^overthink −[\\d.]+(?:\\s*·\\s*)?/, '').trim();
-        if (on) text = text && text !== '—' ? text + ' · overthink −' + strengthText : 'overthink −' + strengthText;
+        if (on && !limitedRemote) text = text && text !== '—' ? text + ' · overthink −' + strengthText : 'overthink −' + strengthText;
         sum.textContent = text || '—';
       }
     }
@@ -5129,6 +6009,12 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         cacheReuse: Number($('cacheReuse').value),
         reasoningFormat: $('reasoningFormat').value || 'deepseek-legacy',
         reasoningBudget: reasoningUnlimited ? -1 : Number($('reasoningBudget').value),
+        chatTemplateSource: ($('chatTemplateSource') && $('chatTemplateSource').value) || 'model',
+        chatTemplateName: ($('chatTemplateName') && $('chatTemplateName').value) || '',
+        chatTemplateFile: ($('chatTemplateFile') && $('chatTemplateFile').value) || '',
+        chatTemplateJinja: (($('chatTemplateSource') && $('chatTemplateSource').value) || 'model') === 'model'
+          ? !!($('chatTemplateJinja') && $('chatTemplateJinja').checked)
+          : true,
         ropeFreqBase: ropeBaseAuto ? null : Number($('ropeFreqBase').value),
         ropeFreqScale: ropeScaleAuto ? null : Number($('ropeFreqScale').value),
         seed: seedRandom ? null : Number($('seed').value),
@@ -5245,6 +6131,15 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         if (caps.pleShare > 0) capBits.push(['PLE ~' + Math.round(caps.pleShare * 100) + '%', 'Per-layer embeddings share of the weights']);
         if (caps.nextnPredictLayers > 0) capBits.push(['MTP ✓', 'Multi-token prediction layers baked into the GGUF', 'ok']);
         else if (mtpSidecarPath) capBits.push(['MTP sidecar', 'MTP sidecar: ' + String(mtpSidecarPath).split(/[/\\\\]/).pop(), 'ok']);
+        const loadForTemplate = (lastPayload && lastPayload.state && lastPayload.state.loadSettings) || {};
+        if (loadForTemplate.chatTemplateSource === 'builtin' && loadForTemplate.chatTemplateName) {
+          capBits.push(['template: ' + loadForTemplate.chatTemplateName, 'Overrides the GGUF chat template with a built-in llama.cpp template', 'override']);
+        } else if (loadForTemplate.chatTemplateSource === 'file' && loadForTemplate.chatTemplateFile) {
+          const base = String(loadForTemplate.chatTemplateFile).split(/[/\\\\]/).pop();
+          capBits.push(['template: ' + base, loadForTemplate.chatTemplateFile, 'override']);
+        } else if (loadForTemplate.chatTemplateJinja === false) {
+          capBits.push(['jinja off', 'llama-server is started with --no-jinja', 'override']);
+        }
         const modelCaps = $('modelCaps');
         modelCaps.classList.remove('hidden');
         modelCaps.innerHTML = capBits.map(function (b) {
@@ -5430,6 +6325,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       const caps = payload.capabilities;
       mtpSidecarPath = payload.mtpSidecarPath || '';
       lastPayload = payload;
+      applyRemoteChrome(payload);
       pendingChanges = Array.isArray(payload.changes) ? payload.changes : [];
       loadDefaults = payload.defaults || {};
       gpuInfos = Array.isArray(payload.gpus) ? payload.gpus : [];
@@ -5458,6 +6354,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       serverStarting = starting;
       serverRunning = ready;
       configDirty = starting ? false : !!status.configDirty;
+      if (Array.isArray(payload.localServers)) foundServers = payload.localServers;
       renderStatusUi({
         ready,
         dirty: configDirty,
@@ -5733,6 +6630,11 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       setField('contextCheckpoints', L.contextCheckpoints);
       setField('cacheReuse', L.cacheReuse ?? 0);
       setField('reasoningFormat', L.reasoningFormat || 'deepseek-legacy');
+      if (!fieldFocused('chatTemplateSource')) setField('chatTemplateSource', L.chatTemplateSource || 'model');
+      if (!fieldFocused('chatTemplateName')) setField('chatTemplateName', L.chatTemplateName || 'chatml');
+      if (!fieldFocused('chatTemplateFile')) setField('chatTemplateFile', L.chatTemplateFile || '');
+      if (!fieldFocused('chatTemplateJinja')) setChecked('chatTemplateJinja', L.chatTemplateJinja !== false);
+      syncChatTemplateUi();
       const budget = L.reasoningBudget ?? -1;
       const budgetFocused = fieldFocused('reasoningBudget') || fieldFocused('reasoningBudgetUnlimited');
       if (!budgetFocused) {
@@ -5836,6 +6738,95 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     $('seedRandom').addEventListener('change', () => {
       $('seed').disabled = $('seedRandom').checked;
     });
+    function syncChatTemplateUi() {
+      const sourceEl = $('chatTemplateSource');
+      const source = (sourceEl && sourceEl.value) || 'model';
+      const nameRow = $('chatTemplateNameRow');
+      const fileRow = $('chatTemplateFileRow');
+      const jinjaRow = $('chatTemplateJinjaRow');
+      if (nameRow) nameRow.classList.toggle('hidden', source !== 'builtin');
+      if (fileRow) fileRow.classList.toggle('hidden', source !== 'file');
+      if (jinjaRow) jinjaRow.classList.toggle('hidden', source !== 'model');
+      const hint = $('chatTemplateHint');
+      if (hint) {
+        hint.textContent = source === 'model'
+          ? 'Uses the Jinja template embedded in the GGUF. llama-server’s Jinja engine is already on.'
+          : 'Overrides the template stored in this GGUF. Tool calls follow the chosen template. Thinking modes still send chat_template_kwargs; a template that does not read those keys ignores the mode picker.';
+      }
+      const file = ($('chatTemplateFile') && $('chatTemplateFile').value) || '';
+      const nameEl = $('chatTemplateFileName');
+      const problem = (lastPayload && lastPayload.chatTemplateProblem) || '';
+      if (nameEl) {
+        if (!file) {
+          nameEl.textContent = 'No template file selected.';
+          nameEl.classList.add('missing');
+          nameEl.title = '';
+        } else {
+          nameEl.textContent = file.split(/[/\\\\]/).pop() || file;
+          nameEl.classList.toggle('missing', !!problem);
+          nameEl.title = file;
+        }
+      }
+      const problemEl = $('chatTemplateProblem');
+      if (problemEl) {
+        problemEl.textContent = problem;
+        problemEl.classList.toggle('hidden', !problem || source !== 'file');
+      }
+      const remoteHint = $('chatTemplateRemoteHint');
+      if (remoteHint) remoteHint.classList.toggle('hidden', !remoteMode);
+      ['chatTemplateSource', 'chatTemplateName', 'chatTemplateJinja', 'pickChatTemplateBtn', 'clearChatTemplateBtn'].forEach(function (id) {
+        const el = $(id);
+        if (el) el.disabled = !!remoteMode;
+      });
+      ['chatTemplateSourceRow', 'chatTemplateNameRow', 'chatTemplateFileRow', 'chatTemplateJinjaRow'].forEach(function (id) {
+        const el = $(id);
+        if (el) el.classList.toggle('locked', !!remoteMode);
+      });
+    }
+    const chatTemplateSourceEl = $('chatTemplateSource');
+    if (chatTemplateSourceEl) {
+      chatTemplateSourceEl.addEventListener('change', () => {
+        if (remoteMode) return;
+        if (chatTemplateSourceEl.value === 'file' && !String(($('chatTemplateFile') && $('chatTemplateFile').value) || '').trim()) {
+          vscode.postMessage({ type: 'pickChatTemplate' });
+          return;
+        }
+        syncChatTemplateUi();
+        scheduleSaveLoad();
+        refreshAdvancedMarks();
+      });
+    }
+    const pickChatTemplateBtn = $('pickChatTemplateBtn');
+    if (pickChatTemplateBtn) {
+      pickChatTemplateBtn.addEventListener('click', () => {
+        if (remoteMode) return;
+        vscode.postMessage({ type: 'pickChatTemplate' });
+      });
+    }
+    const clearChatTemplateBtn = $('clearChatTemplateBtn');
+    if (clearChatTemplateBtn) {
+      clearChatTemplateBtn.addEventListener('click', () => {
+        if (remoteMode) return;
+        if ($('chatTemplateSource')) $('chatTemplateSource').value = 'model';
+        if ($('chatTemplateFile')) $('chatTemplateFile').value = '';
+        if ($('chatTemplateJinja')) $('chatTemplateJinja').checked = true;
+        syncChatTemplateUi();
+        scheduleSaveLoad();
+        refreshAdvancedMarks();
+      });
+    }
+    const modelCapsEl = $('modelCaps');
+    if (modelCapsEl) {
+      modelCapsEl.addEventListener('click', (e) => {
+        const chip = e.target && e.target.closest ? e.target.closest('.cap-chip.override') : null;
+        if (!chip) return;
+        const fold = $('advancedFold');
+        if (fold) fold.open = true;
+        const row = $('chatTemplateSourceRow');
+        if (row && row.scrollIntoView) row.scrollIntoView({ block: 'nearest' });
+      });
+    }
+
     $('reasoningBudgetUnlimited').addEventListener('change', () => {
       $('reasoningBudget').disabled = $('reasoningBudgetUnlimited').checked;
     });
@@ -6023,7 +7014,13 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       vscode.postMessage({ type: 'saveRequest', payload: readRequest() });
     }
     $('primaryBtn').addEventListener('click', () => launch($('primaryBtn').dataset.action));
-    $('reloadIconBtn').addEventListener('click', () => launch('reload'));
+    $('reloadIconBtn').addEventListener('click', () => {
+      if (remoteMode) {
+        vscode.postMessage({ type: 'refreshRemote' });
+        return;
+      }
+      launch('reload');
+    });
     $('discardBtn').addEventListener('click', () => {
       if (saveLoadTimer) {
         clearTimeout(saveLoadTimer);
@@ -6042,6 +7039,50 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       closeMenu();
       if (lastEndpoint) vscode.postMessage({ type: 'openExternal', url: lastEndpoint });
     });
+    function scheduleProbe() {
+      if (probeTimer) clearTimeout(probeTimer);
+      const url = ($('remoteUrlInput') && $('remoteUrlInput').value || '').trim();
+      if (url.length < 4) return;
+      probeTimer = setTimeout(function () {
+        vscode.postMessage({
+          type: 'testRemote',
+          url: url,
+          apiKey: ($('remoteKeyInput') && $('remoteKeyInput').value) || '',
+        });
+      }, 600);
+    }
+    function openConnectForm(prefill) {
+      const payload = lastPayload || {};
+      setConnectOpen(true, prefill || {
+        url: payload.remoteUrl || payload.endpoint || '',
+        label: payload.serverMode === 'remote' ? (payload.remoteLabel || '') : '',
+      });
+    }
+    $('connectRemoteBtn').addEventListener('click', () => { closeMenu(); openConnectForm({ url: '', label: '' }); });
+    $('editConnectionBtn').addEventListener('click', () => { closeMenu(); openConnectForm(); });
+    $('copyDiagBtn').addEventListener('click', () => { closeMenu(); vscode.postMessage({ type: 'copyDiagnostics' }); });
+    $('setApiKeyBtn').addEventListener('click', () => { closeMenu(); vscode.postMessage({ type: 'setApiKey' }); });
+    $('forgetApiKeyBtn').addEventListener('click', () => { closeMenu(); vscode.postMessage({ type: 'forgetApiKey' }); });
+    $('switchLocalBtn').addEventListener('click', () => { closeMenu(); vscode.postMessage({ type: 'switchToLocal' }); });
+    $('connectCancelBtn').addEventListener('click', () => setConnectOpen(false));
+    $('connectBtn').addEventListener('click', () => {
+      vscode.postMessage({
+        type: 'connectRemote',
+        url: ($('remoteUrlInput') && $('remoteUrlInput').value) || '',
+        label: ($('remoteLabelInput') && $('remoteLabelInput').value) || '',
+        apiKey: ($('remoteKeyInput') && $('remoteKeyInput').value) || '',
+      });
+      const key = $('remoteKeyInput');
+      if (key) key.value = '';
+    });
+    $('remoteUrlInput').addEventListener('input', scheduleProbe);
+    $('remoteKeyInput').addEventListener('input', scheduleProbe);
+    $('remotePrimaryBtn').addEventListener('click', () => {
+      const action = $('remotePrimaryBtn').dataset.action;
+      if (action === 'setApiKey') vscode.postMessage({ type: 'setApiKey' });
+      else vscode.postMessage({ type: 'refreshRemote' });
+    });
+    $('remoteSecondaryBtn').addEventListener('click', () => openConnectForm());
     document.addEventListener('click', (e) => {
       const menu = $('srvMenu');
       if (menu && menu.open && !menu.contains(e.target)) menu.open = false;
@@ -6314,6 +7355,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     window.addEventListener('message', (event) => {
       const msg = event.data;
       if (msg.type === 'state') applyState(msg.payload);
+      if (msg.type === 'openConnect') {
+        openConnectForm(lastPayload && lastPayload.serverMode === 'remote' ? undefined : { url: '', label: '' });
+      }
+      if (msg.type === 'remoteProbe') renderProbeList(msg.payload, msg.error || '');
       if (msg.type === 'libraryFits') {
         libraryFits = msg.fits || {};
         libraryRatios = msg.ratios || {};
@@ -6432,6 +7477,17 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       }
       if (msg.type === 'statusPatch' && msg.payload) {
         const p = msg.payload;
+        if (p.serverMode) {
+          if (lastPayload) {
+            lastPayload.serverMode = p.serverMode;
+            lastPayload.remote = p.remote;
+            lastPayload.remoteLabel = p.remoteLabel;
+            lastPayload.remoteHint = p.remoteHint;
+            lastPayload.nextRetryAt = p.nextRetryAt;
+            lastPayload.endpoint = p.endpoint || lastPayload.endpoint;
+          }
+          applyRemoteChrome(p);
+        }
         const httpUp = !!(p.running || p.httpReady);
         const starting = !!p.starting && !httpUp;
         if (p.endpoint) lastEndpoint = p.endpoint;
@@ -6439,6 +7495,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         serverStarting = starting;
         serverRunning = httpUp;
         configDirty = starting ? false : !!p.configDirty;
+        if (Array.isArray(p.localServers)) foundServers = p.localServers;
         pendingChanges = Array.isArray(p.changes) ? p.changes : [];
         updatePrimaryAction();
         renderStatusUi({

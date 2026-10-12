@@ -100,6 +100,8 @@ export function formatExceedContextError(opts: {
   maxContext?: number;
   hasImages?: boolean;
   serverMessage?: string;
+  /** When set, the fix is for the server operator. This client cannot reload it. */
+  operatorLabel?: string;
 }): string {
   const nPrompt = opts.nPrompt && opts.nPrompt > 0 ? opts.nPrompt : undefined;
   const nCtx = opts.nCtx && opts.nCtx > 0 ? opts.nCtx : undefined;
@@ -112,11 +114,12 @@ export function formatExceedContextError(opts: {
   const overHardCap = !!(nPrompt && nPrompt > 262144 && (!maxContext || nPrompt > maxContext));
   const cannotFitByRaising = overModelMax || overHardCap;
 
+  const raise = opts.operatorLabel ? "Raising the server's --ctx-size" : "Raising Context Length";
   if (cannotFitByRaising) {
     lines.push(
       nPrompt && maxContext
-        ? `This prompt is ${nPrompt} tokens; the model maximum is ${maxContext}. Raising Context Length will not fit it.`
-        : `This prompt is larger than a llama.cpp context window can take. Raising Context Length will not fit it.`
+        ? `This prompt is ${nPrompt} tokens; the model maximum is ${maxContext}. ${raise} will not fit it.`
+        : `This prompt is larger than a llama.cpp context window can take. ${raise} will not fit it.`
     );
     lines.push("");
     lines.push("Shrink the request:");
@@ -127,6 +130,10 @@ export function formatExceedContextError(opts: {
     }
     lines.push("• Start a new chat to drop Copilot history and tool results.");
     lines.push("• Turn off tools you do not need for this turn.");
+  } else if (nPrompt && nCtx && nPrompt > nCtx && opts.operatorLabel) {
+    lines.push(
+      `This prompt is about ${nPrompt} tokens and ${opts.operatorLabel}'s slot is ${nCtx}. The server must be restarted with a larger --ctx-size or fewer -np slots.`
+    );
   } else if (nPrompt && nCtx && nPrompt > nCtx) {
     lines.push(`This prompt needs about ${nPrompt} tokens; the server slot is ${nCtx}.`);
     lines.push("");
@@ -139,6 +146,10 @@ export function formatExceedContextError(opts: {
       lines.push("");
       lines.push("If you attached pictures, shrinking them often helps more than raising context.");
     }
+  } else if (opts.operatorLabel) {
+    lines.push(
+      `${opts.operatorLabel} must be restarted with a larger --ctx-size or fewer -np slots.`
+    );
   } else {
     lines.push("Fix in Llama AIO sidebar:");
     lines.push("1. Raise Context Length (Copilot Chat usually needs 65536 or more)");
