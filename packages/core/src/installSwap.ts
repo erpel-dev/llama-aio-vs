@@ -8,6 +8,7 @@
  * on Windows even for a running .exe.
  */
 
+import { AsyncLocalStorage } from "async_hooks";
 import * as fs from "fs";
 import * as path from "path";
 import { ensureDirs, getInstallLockPath } from "./paths";
@@ -112,13 +113,44 @@ function stealStaleLock(lockPath: string): void {
   }
 }
 
-/** Depth so installByTag → installFromArchive does not deadlock on the same pid. */
-let lockDepth = 0;
+/**
+ * Nested `installByTag` → `installFromArchive` runs on this async context and
+ * must not take the lock again. A second top-level call (another button click)
+ * is a different context, so it waits instead of downloading in parallel.
+ */
+const installAsync = new AsyncLocalStorage<true>();
+
+/** Same-process queue. The file lock alone is stolen for our own pid. */
+let installMutexHeld = false;
+const installWaiters: Array<() => void> = [];
+
+function acquireInstallMutex(): Promise<void> {
+  if (!installMutexHeld) {
+    installMutexHeld = true;
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    installWaiters.push(() => {
+      installMutexHeld = true;
+      resolve();
+    });
+  });
+}
+
+function releaseInstallMutex(): void {
+  const next = installWaiters.shift();
+  if (next) {
+    next();
+    return;
+  }
+  installMutexHeld = false;
+}
 
 /**
  * Exclusive cross-window lock around llama.cpp install/replace.
  * Other windows skip `--version` probes and refuse to start llama-server
- * while this file exists.
+ * while this file exists. A second install in this process waits until the
+ * first finishes.
  */
 export async function withInstallLock<T>(
   fn: () => Promise<T>,
@@ -131,15 +163,11 @@ export async function withInstallLock<T>(
     sleep?: (ms: number) => Promise<void>;
   }
 ): Promise<T> {
-  if (lockDepth > 0) {
-    lockDepth += 1;
-    try {
-      return await fn();
-    } finally {
-      lockDepth -= 1;
-    }
+  if (installAsync.getStore()) {
+    return fn();
   }
 
+  await acquireInstallMutex();
   const lockPath = options?.lockPath || getInstallLockPath();
   const waitMs = options?.waitMs ?? INSTALL_LOCK_WAIT_MS;
   const now = options?.now ?? Date.now;
@@ -147,44 +175,45 @@ export async function withInstallLock<T>(
   const deadline = now() + waitMs;
   let acquired = false;
 
-  while (!acquired) {
-    stealStaleLock(lockPath);
-    try {
-      writeInstallLock(lockPath, {
-        pid: process.pid,
-        startedAt: new Date(now()).toISOString(),
-        binDir: options?.binDir,
-      });
-      acquired = true;
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException)?.code;
-      if (code !== "EEXIST") {
-        throw err;
-      }
-      if (now() >= deadline) {
-        const holder = readInstallLock(lockPath);
-        throw new Error(
-          `Another Llama AIO window is installing llama.cpp` +
-            (holder?.pid ? ` (pid ${holder.pid})` : "") +
-            `. Wait for it to finish, or delete ${lockPath} if that window is gone.`
-        );
-      }
-      const holder = activeInstallLock(lockPath);
-      options?.progress?.report({
-        message: holder?.pid
-          ? `Waiting for install in another window (pid ${holder.pid})…`
-          : "Waiting for another Llama AIO install to finish…",
-      });
-      await wait(250);
-    }
-  }
-
-  lockDepth = 1;
   try {
-    return await fn();
+    while (!acquired) {
+      stealStaleLock(lockPath);
+      try {
+        writeInstallLock(lockPath, {
+          pid: process.pid,
+          startedAt: new Date(now()).toISOString(),
+          binDir: options?.binDir,
+        });
+        acquired = true;
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException)?.code;
+        if (code !== "EEXIST") {
+          throw err;
+        }
+        if (now() >= deadline) {
+          const holder = readInstallLock(lockPath);
+          throw new Error(
+            `Another Llama AIO window is installing llama.cpp` +
+              (holder?.pid ? ` (pid ${holder.pid})` : "") +
+              `. Wait for it to finish, or delete ${lockPath} if that window is gone.`
+          );
+        }
+        const holder = activeInstallLock(lockPath);
+        options?.progress?.report({
+          message: holder?.pid
+            ? `Waiting for install in another window (pid ${holder.pid})…`
+            : "Waiting for another Llama AIO install to finish…",
+        });
+        await wait(250);
+      }
+    }
+
+    return await installAsync.run(true, fn);
   } finally {
-    lockDepth = 0;
-    removeInstallLock(lockPath);
+    if (acquired) {
+      removeInstallLock(lockPath);
+    }
+    releaseInstallMutex();
   }
 }
 

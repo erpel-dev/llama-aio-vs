@@ -73,6 +73,8 @@ export type ModelActions = {
   reinstallLlamaCpp: () => Promise<void>;
   installLlamaCppByTag: () => Promise<void>;
   installLlamaCppFromArchive: () => Promise<void>;
+  cancelLlamaInstall: () => void;
+  retryLlamaInstall: () => Promise<void>;
   switchBackend: (backend: UiBackend) => Promise<void>;
   showDownloads: () => Promise<void>;
   selectModel: (filePath: string) => Promise<void>;
@@ -526,6 +528,15 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           case "installLlamaCppFromArchive":
             await this.modelActions.installLlamaCppFromArchive();
             await this.pushState();
+            break;
+          case "cancelLlamaInstall":
+            this.modelActions.cancelLlamaInstall();
+            break;
+          case "retryLlamaInstall":
+            await this.modelActions.retryLlamaInstall();
+            await this.pushState();
+            break;
+          case "dismissLlamaInstall":
             break;
           case "switchBackend":
             await this.modelActions.switchBackend(msg.payload as UiBackend);
@@ -1161,6 +1172,25 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           this.updateCheckInFlight = false;
         });
     }
+  }
+
+  /** Live llama.cpp install/upgrade progress for the sidebar card. */
+  postLlamaInstall(payload: {
+    status: "idle" | "running" | "done" | "error" | "cancelled";
+    phase?: string;
+    message?: string;
+    error?: string;
+    percent?: number;
+    received?: number;
+    total?: number;
+    bytesPerSec?: number;
+    etaSeconds?: number;
+    fileIndex?: number;
+    fileCount?: number;
+    assetName?: string;
+    releaseTag?: string;
+  }): void {
+    this.view?.webview.postMessage({ type: "llamaInstall", payload });
   }
 
   /** Push live start/reload progress into the Server card without a full state rebuild. */
@@ -2762,7 +2792,12 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     .lib-job-top { display: flex; justify-content: space-between; gap: 8px; font-weight: 600; }
     .lib-bar { height: 6px; margin: 6px 0; border-radius: 99px; background: color-mix(in srgb, var(--fg) 12%, transparent); overflow: hidden; }
     .lib-bar > span { display: block; height: 100%; background: var(--accent); }
-    .lib-bar.paused > span { background: var(--muted); }
+    .lib-bar.paused > span, .lib-bar > span.indeterminate { background: var(--muted); }
+    .install-box { margin: 8px 0 2px; }
+    .install-step { display: flex; justify-content: space-between; gap: 8px; font-size: 11px; color: var(--muted); margin: 2px 0; }
+    .install-step.now { color: var(--fg); font-weight: 600; }
+    .install-step span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 62%; text-align: right; }
+    .install-err { color: var(--vscode-errorForeground, #f14c4c); font-weight: 600; font-size: 12px; margin-bottom: 2px; }
     .lib-job-meta { display: flex; justify-content: space-between; gap: 8px; align-items: center; color: var(--muted); font-size: 11px; }
     .lib-file { display: flex; gap: 8px; align-items: center; padding: 6px 2px; border-top: 1px solid var(--border); }
     .lib-file .grow { flex: 1; min-width: 0; }
@@ -3367,6 +3402,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       <button class="secondary small hidden" id="installLlamaBtn" type="button">Upgrade to latest</button>
     </div>
     <div class="hint" id="backendHint"></div>
+    <div id="llamaInstallBox" class="install-box hidden"></div>
     <details class="fold" id="backendFold">
       <summary><span>Backends &amp; install options</span><span class="sum" id="backendSum">—</span></summary>
       <div class="fold-body">
@@ -3778,6 +3814,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     let lastChartPrompt = [];
     let perfChartRO = null;
     let updateCheck = { latestTag: undefined, installedTag: undefined, updateAvailable: false, checkFailed: false, pending: true };
+    let llamaInstall = null;
     /** Settings the running server has not picked up yet ({ label, from, to }). */
     let pendingChanges = [];
     let lastPayload = null;
@@ -4461,12 +4498,114 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       renderBackendLine();
     }
 
+    function llamaInstallRunning() {
+      return !!(llamaInstall && llamaInstall.status === 'running');
+    }
+    function noteInstallStarting(message) {
+      if (llamaInstallRunning()) return false;
+      llamaInstall = { status: 'running', phase: 'resolve', message: message || 'Starting…' };
+      renderLlamaInstall();
+      return true;
+    }
+    function renderLlamaInstall() {
+      const root = $('llamaInstallBox');
+      if (!root) return;
+      const job = llamaInstall;
+      if (!job || job.status === 'idle' || job.status === 'done') {
+        root.classList.add('hidden');
+        root.innerHTML = '';
+        return;
+      }
+      root.classList.remove('hidden');
+      if (job.status === 'error' || job.status === 'cancelled') {
+        const installed = (updateCheck && updateCheck.installedTag) || '';
+        const title = job.status === 'cancelled' ? 'Install cancelled' : 'Download failed';
+        const detail = job.status === 'cancelled'
+          ? ('The previous build is unchanged' + (installed ? (' (' + installed + ')') : '') + '.')
+          : String(job.error || job.message || 'Install failed').split('\\n')[0];
+        let html = '<div class="install-err">' + escText(title) + '</div>';
+        html += '<div class="hint">' + escText(detail) + '</div>';
+        html += '<div class="lib-job-meta"><span></span><span class="lib-actions" style="padding:0">';
+        if (job.status === 'error') {
+          html += '<button type="button" class="secondary small" data-act="install-retry">Retry</button>';
+        }
+        html += '<button type="button" class="secondary small" data-act="install-dismiss">Dismiss</button>';
+        html += '</span></div>';
+        root.innerHTML = html;
+        return;
+      }
+      const phase = job.phase || 'resolve';
+      const stepIndex = phase === 'download' ? 1 : (phase === 'extract' || phase === 'replace' ? 2 : 0);
+      const steps = [
+        {
+          label: 'Resolve release',
+          detail: stepIndex > 0 ? (job.releaseTag || 'Done') : 'Asking GitHub…',
+        },
+        {
+          label: 'Download archive',
+          detail: phase === 'download'
+            ? (job.assetName || 'Downloading…')
+            : (stepIndex > 1 ? (job.assetName || 'Done') : 'Waiting'),
+        },
+        {
+          label: 'Extract and replace',
+          detail: stepIndex < 2
+            ? 'Server stays up until here'
+            : (job.message || 'Replacing binaries…'),
+        },
+      ];
+      let html = '';
+      steps.forEach(function (step, index) {
+        const state = index < stepIndex ? 'done' : (index === stepIndex ? 'now' : 'next');
+        html += '<div class="install-step ' + state + '"><span>' + escText(step.label) + '</span><span>' + escText(step.detail) + '</span></div>';
+      });
+      if (phase === 'download' && job.percent != null && job.total > 0) {
+        const pct = Math.max(0, Math.min(100, Math.round(job.percent)));
+        html += '<div class="lib-bar"><span style="width:' + pct + '%"></span></div>';
+        const bits = [];
+        if (job.fileCount > 1) bits.push((job.fileIndex || 1) + ' of ' + job.fileCount);
+        if (job.total) bits.push(fmtBytes(job.received || 0) + ' / ' + fmtBytes(job.total));
+        if (job.bytesPerSec) bits.push(fmtBytes(job.bytesPerSec) + '/s');
+        if (job.etaSeconds) bits.push(fmtEta(job.etaSeconds));
+        html += '<div class="lib-job-meta"><span>' + escText(bits.join(' · ')) + '</span>';
+      } else if (phase === 'download') {
+        html += '<div class="lib-bar"><span class="indeterminate" style="width:35%"></span></div>';
+        const received = job.received ? (fmtBytes(job.received) + ' received') : (job.message || 'Downloading…');
+        html += '<div class="lib-job-meta"><span>' + escText(received) + '</span>';
+      } else {
+        html += '<div class="lib-bar"><span class="indeterminate" style="width:35%"></span></div>';
+        html += '<div class="lib-job-meta"><span>' + escText(job.message || '') + '</span>';
+      }
+      if (phase === 'resolve' || phase === 'download') {
+        html += '<span class="lib-actions" style="padding:0"><button type="button" class="secondary small" data-act="install-cancel">Cancel</button></span>';
+      }
+      html += '</div>';
+      root.innerHTML = html;
+    }
+    function applyInstallLock() {
+      const running = llamaInstallRunning();
+      const installBtn = $('installLlamaBtn');
+      const hint = $('backendHint');
+      const sel = $('backendSelect');
+      ['reinstallLlamaBtn', 'installByTagBtn', 'installArchiveBtn', 'checkUpdatesBtn'].forEach(function (id) {
+        const el = $(id);
+        if (el) el.disabled = running;
+      });
+      if (sel) sel.disabled = running;
+      if (running && installBtn) {
+        installBtn.disabled = true;
+        installBtn.classList.add('hidden');
+      }
+      const boxVisible = !!(llamaInstall && llamaInstall.status && llamaInstall.status !== 'idle' && llamaInstall.status !== 'done');
+      if (hint && boxVisible) hint.classList.add('hidden');
+    }
     function updateBackendControls() {
       const sel = $('backendSelect');
       const installBtn = $('installLlamaBtn');
       const hint = $('backendHint');
       const reinstallBtn = $('reinstallLlamaBtn');
       if (!sel || !installBtn || !hint) return;
+      try {
       syncSplitSeg();
       const selectedOpt = backendOptionsCache.find((o) => o.id === sel.value);
       const anyInstalled = backendOptionsCache.some((o) => o.installed);
@@ -4560,6 +4699,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       hint.textContent = '';
       installBtn.classList.add('hidden');
       installBtn.dataset.action = '';
+      } finally {
+        applyInstallLock();
+      }
     }
 
     /** "Vulkan · b11163" once, plus the alternatives as a summary of the fold. */
@@ -7423,6 +7565,11 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       if (msg.type === 'updateCheck' && msg.payload) {
         updateCheck = msg.payload;
         updateBackendUi();
+      }
+      if (msg.type === 'llamaInstall') {
+        llamaInstall = msg.payload || null;
+        renderLlamaInstall();
+        applyInstallLock();
       }
       if (msg.type === 'perfPatch' && msg.payload) {
         const perf = msg.payload.perf || {};

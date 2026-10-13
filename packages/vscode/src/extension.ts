@@ -10,9 +10,14 @@ import {
   getInstallDir,
   getLockDir,
   getModelsDir,
+  InstallCancelledError,
+  installNotificationPercent,
   LaunchToken,
   LAUNCH_IN_PROGRESS_MSG,
   LlamaInstaller,
+  type InstallPhase,
+  type InstallProgress,
+  type ProgressReporter,
   nixOsIncompatibilityHint,
   remoteLifecycleMessage,
   remoteStateLabel,
@@ -404,11 +409,102 @@ export function activate(context: vscode.ExtensionContext): void {
     }
   };
 
+  let installBusy = false;
+  let installAbort: AbortController | undefined;
+  let replayInstall: (() => Promise<void>) | undefined;
+
+  const postInstall = (payload: InstallProgress & {
+    status: "idle" | "running" | "done" | "error" | "cancelled";
+    error?: string;
+  }) => {
+    settingsView.postLlamaInstall(payload);
+  };
+
+  type InstallOutcome = "ok" | "cancelled" | "error";
+
+  const executeInstall = async (
+    title: string,
+    run: (progress: ProgressReporter, signal: AbortSignal) => Promise<unknown>
+  ): Promise<InstallOutcome> => {
+    const ac = new AbortController();
+    installAbort = ac;
+    let phase: InstallPhase = "resolve";
+    const reporter: ProgressReporter = {
+      report(value) {
+        if (!value.message) {
+          return;
+        }
+        postInstall({ status: "running", phase, message: value.message });
+      },
+      onInstall(update) {
+        if (update.phase) {
+          phase = update.phase;
+        }
+        postInstall({ status: "running", phase, ...update });
+      },
+    };
+    try {
+      postInstall({ status: "running", phase: "resolve", message: "Starting…" });
+      await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title,
+          cancellable: true,
+        },
+        async (progress, token) => {
+          const sub = token.onCancellationRequested(() => ac.abort());
+          let noted = 0;
+          const wrapped: ProgressReporter = {
+            report(value) {
+              reporter.report(value);
+              if (value.message) {
+                progress.report({ message: value.message });
+              }
+            },
+            onInstall(update) {
+              reporter.onInstall?.(update);
+              const pct = installNotificationPercent(update);
+              if (pct != null && pct > noted) {
+                progress.report({ message: update.message, increment: pct - noted });
+                noted = pct;
+              } else if (update.message) {
+                progress.report({ message: update.message });
+              }
+            },
+          };
+          try {
+            await run(wrapped, ac.signal);
+          } finally {
+            sub.dispose();
+          }
+        }
+      );
+      postInstall({ status: "done" });
+      return "ok";
+    } catch (e) {
+      if (ac.signal.aborted || e instanceof InstallCancelledError) {
+        postInstall({ status: "cancelled", message: "Install cancelled." });
+        return "cancelled";
+      }
+      const message = e instanceof Error ? e.message : String(e);
+      postInstall({ status: "error", error: message, message });
+      vscode.window.showErrorMessage(`Install failed: ${message}`);
+      return "error";
+    } finally {
+      installAbort = undefined;
+    }
+  };
+
   const installLlamaCpp = async (backendOverride?: UiBackend) => {
+    if (installBusy) {
+      return;
+    }
+    installBusy = true;
     try {
       if (backendOverride === "path") {
         await installer.setBackend("path");
         await settingsView.pushState();
+        postInstall({ status: "idle" });
         if (!installer.hasBackendInstalled("path")) {
           vscode.window.showErrorMessage(
             "llama-server not found on PATH. Install a system package (e.g. nixpkgs llama-cpp) first."
@@ -437,64 +533,100 @@ export function activate(context: vscode.ExtensionContext): void {
           `Llama AIO: already on ${check.installedTag} (latest ${check.latestTag}).`
         );
         await settingsView.pushState();
+        postInstall({ status: "idle" });
         return;
       }
       const wasReady = await (store.isRemote() ? Promise.resolve(false) : processManager.isHttpReady());
+      const title = backendOverride
+        ? `Llama AIO: Installing ${backendOverride} build…`
+        : "Llama AIO: Installing llama.cpp";
+      replayInstall = () => installLlamaCpp(backendOverride);
       // Keep the server up during the download. The installer takes a cross-window
-      // lock, then stops llama-server immediately before replacing vulkan\bin.
-      await vscode.window.withProgress(
-        {
-          location: vscode.ProgressLocation.Notification,
-          title: backendOverride
-            ? `Llama AIO: Installing ${backendOverride} build…`
-            : "Llama AIO: Installing llama.cpp",
-          cancellable: false,
-        },
-        async (progress) => installer.installOrUpgrade(progress, backendOverride)
+      // lock, then stops llama-server immediately before replacing the bin dir.
+      const outcome = await executeInstall(title, (progress, signal) =>
+        installer.installOrUpgrade(progress, backendOverride, { signal })
       );
-      await afterBackendInstall(wasReady);
+      if (outcome === "ok") {
+        await afterBackendInstall(wasReady);
+      }
     } catch (e) {
-      vscode.window.showErrorMessage(
-        `Install failed: ${e instanceof Error ? e.message : String(e)}`
-      );
+      const message = e instanceof Error ? e.message : String(e);
+      postInstall({ status: "error", error: message, message });
+      vscode.window.showErrorMessage(`Install failed: ${message}`);
+    } finally {
+      installBusy = false;
     }
   };
 
   const reinstallLlamaCpp = async () => {
+    if (installBusy) {
+      return;
+    }
+    const backend = installer.resolveActiveUiBackend();
+    if (backend === "path") {
+      postInstall({ status: "idle" });
+      vscode.window.showInformationMessage(
+        "System (PATH) backend has nothing to reinstall — update llama.cpp via your package manager."
+      );
+      return;
+    }
+    const tag = installer.readBackendVersion(backend).tag;
+    if (!tag) {
+      await installLlamaCpp(backend);
+      return;
+    }
+    installBusy = true;
     try {
-      const backend = installer.resolveActiveUiBackend();
-      if (backend === "path") {
-        vscode.window.showInformationMessage(
-          "System (PATH) backend has nothing to reinstall — update llama.cpp via your package manager."
-        );
-        return;
-      }
-      const tag = installer.readBackendVersion(backend).tag;
-      if (!tag) {
-        await installLlamaCpp(backend);
-        return;
-      }
       const wasReady = await (store.isRemote() ? Promise.resolve(false) : processManager.isHttpReady());
-      await vscode.window.withProgress(
-        {
-          location: vscode.ProgressLocation.Notification,
-          title: `Llama AIO: Reinstalling ${tag} (${backend})…`,
-          cancellable: false,
-        },
-        async (progress) => installer.installByTag(tag, progress, backend)
+      replayInstall = () => reinstallLlamaCpp();
+      const outcome = await executeInstall(
+        `Llama AIO: Reinstalling ${tag} (${backend})…`,
+        (progress, signal) => installer.installByTag(tag, progress, backend, { signal })
       );
-      await afterBackendInstall(wasReady);
+      if (outcome === "ok") {
+        await afterBackendInstall(wasReady);
+      }
     } catch (e) {
-      vscode.window.showErrorMessage(
-        `Reinstall failed: ${e instanceof Error ? e.message : String(e)}`
+      const message = e instanceof Error ? e.message : String(e);
+      postInstall({ status: "error", error: message, message });
+      vscode.window.showErrorMessage(`Reinstall failed: ${message}`);
+    } finally {
+      installBusy = false;
+    }
+  };
+
+  const installTagDirect = async (tagInput: string, backend: UiBackend) => {
+    if (installBusy) {
+      return;
+    }
+    installBusy = true;
+    try {
+      const wasReady = await (store.isRemote() ? Promise.resolve(false) : processManager.isHttpReady());
+      const outcome = await executeInstall(
+        `Llama AIO: Installing ${tagInput} (${backend})…`,
+        (progress, signal) => installer.installByTag(tagInput, progress, backend, { signal })
       );
+      if (outcome === "ok") {
+        await afterBackendInstall(wasReady);
+      }
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      postInstall({ status: "error", error: message, message });
+      vscode.window.showErrorMessage(`Install by tag failed: ${message}`);
+    } finally {
+      installBusy = false;
     }
   };
 
   const installLlamaCppByTag = async () => {
+    if (installBusy) {
+      return;
+    }
+    installBusy = true;
     try {
       const backend = installer.resolveActiveUiBackend();
       if (backend === "path") {
+        postInstall({ status: "idle" });
         vscode.window.showErrorMessage(
           "Switch to Vulkan, CUDA, or CPU before installing a release tag. " +
             "System (PATH) uses a package-managed binary."
@@ -515,30 +647,70 @@ export function activate(context: vscode.ExtensionContext): void {
         },
       });
       if (!tagInput) {
+        postInstall({ status: "idle" });
         return;
       }
-
+      const trimmed = tagInput.trim();
+      replayInstall = () => installTagDirect(trimmed, backend);
       const wasReady = await (store.isRemote() ? Promise.resolve(false) : processManager.isHttpReady());
-      await vscode.window.withProgress(
-        {
-          location: vscode.ProgressLocation.Notification,
-          title: `Llama AIO: Installing ${tagInput.trim()} (${backend})…`,
-          cancellable: false,
-        },
-        async (progress) => installer.installByTag(tagInput, progress, backend)
+      const outcome = await executeInstall(
+        `Llama AIO: Installing ${trimmed} (${backend})…`,
+        (progress, signal) => installer.installByTag(trimmed, progress, backend, { signal })
       );
-      await afterBackendInstall(wasReady);
+      if (outcome === "ok") {
+        await afterBackendInstall(wasReady);
+      }
     } catch (e) {
-      vscode.window.showErrorMessage(
-        `Install by tag failed: ${e instanceof Error ? e.message : String(e)}`
+      const message = e instanceof Error ? e.message : String(e);
+      postInstall({ status: "error", error: message, message });
+      vscode.window.showErrorMessage(`Install by tag failed: ${message}`);
+    } finally {
+      installBusy = false;
+    }
+  };
+
+  const installArchiveDirect = async (
+    archivePath: string,
+    backend: UiBackend,
+    cudartPath?: string
+  ) => {
+    if (installBusy) {
+      return;
+    }
+    installBusy = true;
+    try {
+      const wasReady = await (store.isRemote() ? Promise.resolve(false) : processManager.isHttpReady());
+      const outcome = await executeInstall(
+        `Llama AIO: Installing from ${path.basename(archivePath)}…`,
+        (progress, signal) =>
+          installer.installFromArchive(archivePath, {
+            uiBackend: backend,
+            cudartArchivePath: cudartPath,
+            progress,
+            signal,
+          })
       );
+      if (outcome === "ok") {
+        await afterBackendInstall(wasReady);
+      }
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      postInstall({ status: "error", error: message, message });
+      vscode.window.showErrorMessage(`Install from archive failed: ${message}`);
+    } finally {
+      installBusy = false;
     }
   };
 
   const installLlamaCppFromArchive = async () => {
+    if (installBusy) {
+      return;
+    }
+    installBusy = true;
     try {
       const backend = installer.resolveActiveUiBackend();
       if (backend === "path") {
+        postInstall({ status: "idle" });
         vscode.window.showErrorMessage(
           "Switch to Vulkan, CUDA, or CPU before installing from an archive. " +
             "System (PATH) uses a package-managed binary."
@@ -555,6 +727,7 @@ export function activate(context: vscode.ExtensionContext): void {
         title: `Select llama.cpp binary archive for ${backend}`,
       });
       if (!picked?.length) {
+        postInstall({ status: "idle" });
         return;
       }
       const archivePath = picked[0].fsPath;
@@ -578,32 +751,51 @@ export function activate(context: vscode.ExtensionContext): void {
           }
         }
       }
-
+      replayInstall = () => installArchiveDirect(archivePath, backend, cudartPath);
       const wasReady = await (store.isRemote() ? Promise.resolve(false) : processManager.isHttpReady());
-      await vscode.window.withProgress(
-        {
-          location: vscode.ProgressLocation.Notification,
-          title: `Llama AIO: Installing from ${path.basename(archivePath)}…`,
-          cancellable: false,
-        },
-        async (progress) =>
+      const outcome = await executeInstall(
+        `Llama AIO: Installing from ${path.basename(archivePath)}…`,
+        (progress, signal) =>
           installer.installFromArchive(archivePath, {
             uiBackend: backend,
             cudartArchivePath: cudartPath,
             progress,
+            signal,
           })
       );
-      await afterBackendInstall(wasReady);
+      if (outcome === "ok") {
+        await afterBackendInstall(wasReady);
+      }
     } catch (e) {
-      vscode.window.showErrorMessage(
-        `Install from archive failed: ${e instanceof Error ? e.message : String(e)}`
-      );
+      const message = e instanceof Error ? e.message : String(e);
+      postInstall({ status: "error", error: message, message });
+      vscode.window.showErrorMessage(`Install from archive failed: ${message}`);
+    } finally {
+      installBusy = false;
     }
   };
 
+  const cancelLlamaInstall = () => {
+    installAbort?.abort();
+  };
+
+  const retryLlamaInstall = async () => {
+    if (installBusy || !replayInstall) {
+      if (!replayInstall) {
+        postInstall({ status: "idle" });
+      }
+      return;
+    }
+    await replayInstall();
+  };
+
   const switchBackend = async (backend: UiBackend) => {
+    if (installBusy) {
+      return;
+    }
     const opt = installer.getUiBackendOptions().find((o) => o.id === backend);
     if (opt && !opt.available && backend !== "path") {
+      postInstall({ status: "idle" });
       vscode.window.showErrorMessage(
         `Backend ${backend} is unavailable: ${opt.reason || "not supported on this machine"}`
       );
@@ -611,6 +803,7 @@ export function activate(context: vscode.ExtensionContext): void {
     }
     const previous = installer.resolveActiveUiBackend();
     if (previous === backend && installer.hasBackendInstalled(backend)) {
+      postInstall({ status: "idle" });
       await settingsView.pushState();
       return;
     }
@@ -620,6 +813,7 @@ export function activate(context: vscode.ExtensionContext): void {
     const wasReady = await (store.isRemote() ? Promise.resolve(false) : processManager.isHttpReady());
 
     if (backend === "path") {
+      postInstall({ status: "idle" });
       chatProvider?.notifyChanged();
       await settingsView.pushState();
       if (!installer.hasBackendInstalled("path")) {
@@ -656,6 +850,7 @@ export function activate(context: vscode.ExtensionContext): void {
     }
 
     if (installer.hasBackendInstalled(backend)) {
+      postInstall({ status: "idle" });
       chatProvider?.notifyChanged();
       await settingsView.pushState();
       if (wasReady && store.getState().selectedModelPath) {
@@ -719,6 +914,8 @@ export function activate(context: vscode.ExtensionContext): void {
       reinstallLlamaCpp,
       installLlamaCppByTag,
       installLlamaCppFromArchive,
+      cancelLlamaInstall,
+      retryLlamaInstall,
       switchBackend,
       showDownloads,
       selectModel: async (filePath: string) => {

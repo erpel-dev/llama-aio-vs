@@ -1,7 +1,7 @@
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import { Readable } from "stream";
+import { Readable, Transform } from "stream";
 import { pipeline } from "stream/promises";
 import { execFile, execFileSync } from "child_process";
 import { promisify } from "util";
@@ -25,7 +25,7 @@ import {
 } from "./paths";
 import { stopLlamaServersUsingDir, isPidAlive, executableIsUnderDir } from "./processIdentity";
 import { SettingsStore } from "./settings";
-import { rocmSupport, withRocmRuntimeEnv } from "./rocmRuntime";
+import { resetAmdGpuDetectionCache, rocmSupport, withRocmRuntimeEnv } from "./rocmRuntime";
 import { syclSupport, withSyclRuntimeEnv } from "./syclRuntime";
 
 const execFileAsync = promisify(execFile);
@@ -63,13 +63,72 @@ export function envForInstalledBinary(binary: string, backend: UiBackend): NodeJ
   return env;
 }
 
+/** User aborted an install. The previous llama.cpp build is left in place. */
+export class InstallCancelledError extends Error {
+  constructor() {
+    super("Install cancelled.");
+    this.name = "InstallCancelledError";
+  }
+}
+
+export type InstallPhase = "resolve" | "download" | "extract" | "replace";
+
+/** Sidebar-facing install update. `percent` is 0–100 within the current file. */
+export interface InstallProgress {
+  message?: string;
+  increment?: number;
+  phase?: InstallPhase;
+  percent?: number;
+  received?: number;
+  total?: number;
+  bytesPerSec?: number;
+  etaSeconds?: number;
+  fileIndex?: number;
+  fileCount?: number;
+  assetName?: string;
+  releaseTag?: string;
+}
+
 /**
- * Progress sink for long installs. Structurally compatible with
- * `vscode.Progress<{ message?, increment? }>`, so the extension can pass its
- * notification progress straight through while the TUI supplies its own.
+ * Progress sink for long installs. `report` stays compatible with
+ * `vscode.Progress` and the TUI. `onInstall` carries bytes, speed, and phase
+ * for the sidebar card.
  */
 export interface ProgressReporter {
   report(value: { message?: string; increment?: number }): void;
+  onInstall?(value: InstallProgress): void;
+}
+
+/**
+ * Map a download tick onto one notification bar. Two files (Windows CUDA +
+ * cudart) each take half of 0–100.
+ */
+export function installNotificationPercent(update: InstallProgress): number | undefined {
+  if (update.phase !== "download" || update.percent == null || !Number.isFinite(update.percent)) {
+    return undefined;
+  }
+  const count = Math.max(1, update.fileCount || 1);
+  const index = Math.min(count, Math.max(1, update.fileIndex || 1));
+  const span = 100 / count;
+  const pct = Math.max(0, Math.min(100, update.percent));
+  return Math.round((index - 1) * span + (pct / 100) * span);
+}
+
+function emitInstall(progress: ProgressReporter | undefined, update: InstallProgress): void {
+  if (!progress) {
+    return;
+  }
+  if (progress.onInstall) {
+    progress.onInstall(update);
+    return;
+  }
+  progress.report({ message: update.message });
+}
+
+function throwIfCancelled(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    throw new InstallCancelledError();
+  }
 }
 
 export interface GithubAsset {
@@ -134,6 +193,28 @@ export function createClearableTimeoutSignal(ms: number): { signal: AbortSignal;
  * bodies can take longer than the header wait. Default `"total"` still bounds
  * small JSON / HEAD responses.
  */
+function anySignal(signals: Array<AbortSignal | undefined>): AbortSignal | undefined {
+  const list = signals.filter((signal): signal is AbortSignal => !!signal);
+  if (list.length === 0) {
+    return undefined;
+  }
+  if (list.length === 1) {
+    return list[0];
+  }
+  if (typeof AbortSignal.any === "function") {
+    return AbortSignal.any(list);
+  }
+  const ac = new AbortController();
+  for (const signal of list) {
+    if (signal.aborted) {
+      ac.abort(signal.reason);
+      return ac.signal;
+    }
+    signal.addEventListener("abort", () => ac.abort(signal.reason), { once: true });
+  }
+  return ac.signal;
+}
+
 async function githubFetch(
   url: string,
   init: RequestInit = {},
@@ -142,7 +223,9 @@ async function githubFetch(
 ): Promise<Response> {
   let lastErr: unknown;
   for (let attempt = 1; attempt <= 3; attempt++) {
+    throwIfCancelled(init.signal ?? undefined);
     const timed = timeoutMode === "headers" ? createClearableTimeoutSignal(timeoutMs) : undefined;
+    const timeoutSignal = timed?.signal ?? (init.signal ? undefined : AbortSignal.timeout(timeoutMs));
     try {
       const res = await fetch(url, {
         ...init,
@@ -151,12 +234,15 @@ async function githubFetch(
           ...(init.headers as Record<string, string> | undefined),
         },
         redirect: init.redirect ?? "follow",
-        signal: init.signal ?? timed?.signal ?? AbortSignal.timeout(timeoutMs),
+        signal: anySignal([init.signal ?? undefined, timeoutSignal]),
       });
       timed?.clear();
       return res;
     } catch (err) {
       timed?.clear();
+      if (init.signal?.aborted) {
+        throw new InstallCancelledError();
+      }
       lastErr = err;
       if (attempt === 3 || !isRetryableNetworkError(err)) {
         throw err;
@@ -194,9 +280,14 @@ export function describeGithubHttpError(status: number, res: Response, body: str
   );
 }
 
-async function httpGetJson<T>(url: string, headers: Record<string, string> = {}): Promise<T> {
+async function httpGetJson<T>(
+  url: string,
+  headers: Record<string, string> = {},
+  signal?: AbortSignal
+): Promise<T> {
   const res = await githubFetch(url, {
     headers: { Accept: "application/vnd.github+json", ...headers },
+    signal,
   });
   const body = await res.text();
   if (!res.ok) {
@@ -209,19 +300,36 @@ async function httpGetJson<T>(url: string, headers: Record<string, string> = {})
 const DOWNLOAD_HEADER_TIMEOUT_MS = 60_000;
 const DOWNLOAD_ATTEMPTS = 3;
 
-async function downloadFile(url: string, dest: string, onProgress?: (pct: number) => void): Promise<void> {
+interface DownloadTick {
+  received: number;
+  total: number;
+  percent?: number;
+  bytesPerSec: number;
+  etaSeconds?: number;
+}
+
+async function downloadFile(
+  url: string,
+  dest: string,
+  onProgress?: (tick: DownloadTick) => void,
+  signal?: AbortSignal
+): Promise<void> {
   let lastErr: unknown;
   for (let attempt = 1; attempt <= DOWNLOAD_ATTEMPTS; attempt++) {
+    throwIfCancelled(signal);
     try {
-      await downloadFileOnce(url, dest, onProgress);
+      await downloadFileOnce(url, dest, onProgress, signal);
       return;
     } catch (err) {
-      lastErr = err;
       try {
         fs.rmSync(dest, { force: true });
       } catch {
         // truncated leftover from a dropped connection
       }
+      if (signal?.aborted || err instanceof InstallCancelledError) {
+        throw new InstallCancelledError();
+      }
+      lastErr = err;
       if (attempt === DOWNLOAD_ATTEMPTS || !isRetryableNetworkError(err)) {
         throw err;
       }
@@ -234,11 +342,12 @@ async function downloadFile(url: string, dest: string, onProgress?: (pct: number
 async function downloadFileOnce(
   url: string,
   dest: string,
-  onProgress?: (pct: number) => void
+  onProgress?: (tick: DownloadTick) => void,
+  signal?: AbortSignal
 ): Promise<void> {
   const res = await githubFetch(
     url,
-    { headers: { Accept: "application/octet-stream" } },
+    { headers: { Accept: "application/octet-stream" }, signal },
     DOWNLOAD_HEADER_TIMEOUT_MS,
     "headers"
   );
@@ -250,15 +359,77 @@ async function downloadFileOnce(
   }
   const total = Number(res.headers.get("content-length") || 0);
   let received = 0;
+  const started = Date.now();
+  let lastEmit = 0;
+  let lastPct = -1;
+  const emit = (force = false) => {
+    const elapsed = Math.max(0.001, (Date.now() - started) / 1000);
+    const bytesPerSec = received / elapsed;
+    const percent = total > 0 ? Math.min(100, Math.floor((received / total) * 100)) : undefined;
+    const now = Date.now();
+    if (!force && percent === lastPct && now - lastEmit < 200) {
+      return;
+    }
+    lastPct = percent ?? lastPct;
+    lastEmit = now;
+    onProgress?.({
+      received,
+      total,
+      percent,
+      bytesPerSec,
+      etaSeconds:
+        total > 0 && bytesPerSec > 0 ? Math.max(0, Math.round((total - received) / bytesPerSec)) : undefined,
+    });
+  };
   ensureDirs(path.dirname(dest));
   const src = Readable.fromWeb(res.body as import("stream/web").ReadableStream<Uint8Array>);
-  if (onProgress && total > 0) {
-    src.on("data", (chunk: Buffer | Uint8Array) => {
+  const counter = new Transform({
+    transform(chunk: Buffer | Uint8Array, _enc, cb) {
       received += chunk.length;
-      onProgress(Math.min(100, Math.floor((received / total) * 100)));
-    });
-  }
-  await pipeline(src, fs.createWriteStream(dest));
+      emit();
+      cb(null, chunk);
+    },
+  });
+  await pipeline(src, counter, fs.createWriteStream(dest), { signal });
+  emit(true);
+}
+
+async function downloadReleaseFile(
+  progress: ProgressReporter | undefined,
+  url: string,
+  dest: string,
+  assetName: string,
+  fileIndex: number,
+  fileCount: number,
+  releaseTag: string | undefined,
+  signal?: AbortSignal
+): Promise<void> {
+  const label = fileCount > 1 ? `${assetName} (${fileIndex} of ${fileCount})` : assetName;
+  const base = {
+    phase: "download" as const,
+    assetName,
+    fileIndex,
+    fileCount,
+    releaseTag,
+  };
+  emitInstall(progress, { ...base, message: `Downloading ${label}…` });
+  await downloadFile(
+    url,
+    dest,
+    (tick) => {
+      const pct = tick.percent != null ? ` ${tick.percent}%` : "";
+      emitInstall(progress, {
+        ...base,
+        message: `Downloading ${label}…${pct}`,
+        percent: tick.percent,
+        received: tick.received,
+        total: tick.total,
+        bytesPerSec: tick.bytesPerSec,
+        etaSeconds: tick.etaSeconds,
+      });
+    },
+    signal
+  );
 }
 
 /**
@@ -272,17 +443,20 @@ interface UrlProbe {
   error?: string;
 }
 
-async function probeUrl(url: string): Promise<UrlProbe> {
+async function probeUrl(url: string, signal?: AbortSignal): Promise<UrlProbe> {
   try {
-    const res = await githubFetch(url, { method: "HEAD" }, 15_000);
+    const res = await githubFetch(url, { method: "HEAD", signal }, 15_000);
     return { exists: res.ok, status: res.status };
   } catch (err) {
+    if (signal?.aborted || err instanceof InstallCancelledError) {
+      throw err instanceof InstallCancelledError ? err : new InstallCancelledError();
+    }
     return { exists: false, error: err instanceof Error ? err.message : String(err) };
   }
 }
 
-async function urlExists(url: string): Promise<boolean> {
-  return (await probeUrl(url)).exists;
+async function urlExists(url: string, signal?: AbortSignal): Promise<boolean> {
+  return (await probeUrl(url, signal)).exists;
 }
 
 export const LLAMA_CPP_RELEASES_URL = "https://github.com/ggml-org/llama.cpp/releases";
@@ -450,19 +624,24 @@ export function directAssetUrl(tag: string, assetName: string): string {
  * Newest llama.cpp nightly (`b####`). GitHub's `/releases/latest` is now the
  * stable `vX.Y.Z` tag, which has no binary archives — only `nightly-tag.txt`.
  */
-export async function resolveLatestReleaseTag(): Promise<string> {
+export async function resolveLatestReleaseTag(signal?: AbortSignal): Promise<string> {
+  throwIfCancelled(signal);
   try {
-    const releases = await httpGetJson<GithubRelease[]>(GITHUB_API_RELEASES);
+    const releases = await httpGetJson<GithubRelease[]>(GITHUB_API_RELEASES, {}, signal);
     const tag = pickNewestBuildTag(releases);
     if (tag) {
       return tag;
     }
-  } catch {
+  } catch (err) {
+    throwIfCancelled(signal);
+    if (err instanceof InstallCancelledError) {
+      throw err;
+    }
     // Rate limit or API outage — try the stable pointer, then the HTML list.
   }
 
   try {
-    const latest = await httpGetJson<GithubRelease>(GITHUB_API_LATEST);
+    const latest = await httpGetJson<GithubRelease>(GITHUB_API_LATEST, {}, signal);
     const name = latest?.tag_name?.trim() || "";
     if (BUILD_TAG_RE.test(name)) {
       return normalizeReleaseTag(name);
@@ -473,11 +652,16 @@ export async function resolveLatestReleaseTag(): Promise<string> {
         return pointed;
       }
     }
-  } catch {
+  } catch (err) {
+    throwIfCancelled(signal);
+    if (err instanceof InstallCancelledError) {
+      throw err;
+    }
     // keep falling through
   }
 
-  const res = await githubFetch(LLAMA_CPP_RELEASES_URL);
+  throwIfCancelled(signal);
+  const res = await githubFetch(LLAMA_CPP_RELEASES_URL, { signal });
   if (!res.ok) {
     throw new Error(`HTTP ${res.status} resolving latest llama.cpp nightly from ${res.url}`);
   }
@@ -541,7 +725,8 @@ export function invalidateLatestReleaseTagCache(): void {
 }
 
 /** Cached latest-tag lookup. */
-export async function getLatestReleaseTagCached(force = false): Promise<string> {
+export async function getLatestReleaseTagCached(force = false, signal?: AbortSignal): Promise<string> {
+  throwIfCancelled(signal);
   if (!force) {
     const cached = peekCachedLatestReleaseTag();
     if (cached) {
@@ -549,10 +734,13 @@ export async function getLatestReleaseTagCached(force = false): Promise<string> 
     }
   }
   try {
-    const tag = await resolveLatestReleaseTag();
+    const tag = await resolveLatestReleaseTag(signal);
     latestTagCache = { tag, fetchedAt: Date.now() };
     return tag;
   } catch (err) {
+    if (err instanceof InstallCancelledError) {
+      throw err;
+    }
     // Keep a previously resolved tag so Upgrade still works if GitHub blips.
     if (latestTagCache?.tag) {
       return latestTagCache.tag;
@@ -675,9 +863,10 @@ function cachedDetect(key: string, probe: () => boolean, now = Date.now()): bool
   return value;
 }
 
-/** Forget cached GPU/Vulkan detection (tests, or after a driver install). */
+/** Forget cached GPU/Vulkan/ROCm detection (tests, or after a driver install). */
 export function resetHardwareDetectionCache(): void {
   hardwareCache.clear();
+  resetAmdGpuDetectionCache();
 }
 
 /** True when an NVIDIA GPU / CUDA runtime looks present on this machine. */
@@ -1211,7 +1400,7 @@ export class LlamaInstaller {
     }
   }
 
-  /** Sidebar options: Vulkan / CUDA (if HW) / SYCL (Win+Linux x64) / CPU / System (PATH). */
+  /** Sidebar options: Vulkan / ROCm (AMD GPU) / CUDA (NVIDIA) / SYCL / CPU / System (PATH). */
   getUiBackendOptions(): BackendOption[] {
     this.migrateLegacyInstallIfNeeded();
     const archLabel = process.arch === "arm64" ? "arm64" : "x64";
@@ -1461,7 +1650,7 @@ export class LlamaInstaller {
   async installOrUpgrade(
     progress?: ProgressReporter,
     backendOverride?: LlamaBackend,
-    options?: { force?: boolean }
+    options?: { force?: boolean; signal?: AbortSignal }
   ): Promise<string> {
     const backendSetting = backendOverride || this.getBackend();
     if (backendSetting === "path" || (!backendOverride && this.resolveActiveUiBackend() === "path")) {
@@ -1471,18 +1660,29 @@ export class LlamaInstaller {
       );
     }
 
-    progress?.report({ message: "Resolving latest llama.cpp release tag…" });
+    throwIfCancelled(options?.signal);
+    emitInstall(progress, {
+      phase: "resolve",
+      message: "Resolving latest llama.cpp release tag…",
+    });
     let tag: string;
     try {
-      tag = await getLatestReleaseTagCached(true);
+      tag = await getLatestReleaseTagCached(true, options?.signal);
     } catch (e) {
+      if (e instanceof InstallCancelledError) {
+        throw e;
+      }
       const msg = e instanceof Error ? e.message : String(e);
       throw new Error(
         `${msg}\n\nCould not resolve the latest llama.cpp nightly (b-tag) from GitHub.\n` +
           `Use “Install release tag…” or “Install from archive…” instead.`
       );
     }
-    progress?.report({ message: `Latest release: ${tag}` });
+    emitInstall(progress, {
+      phase: "resolve",
+      message: `Latest release: ${tag}`,
+      releaseTag: tag,
+    });
 
     const uiBackend = isManagedBackend(backendSetting)
       ? backendSetting
@@ -1490,22 +1690,25 @@ export class LlamaInstaller {
     const current = this.readBackendVersion(uiBackend).tag;
     const cmp = current ? compareReleaseTags(tag, current) : undefined;
     if (!options?.force && current && cmp !== undefined && cmp <= 0) {
-      progress?.report({ message: `Already on ${current}` });
+      emitInstall(progress, { phase: "resolve", message: `Already on ${current}`, releaseTag: current });
       return current;
     }
 
-    return this.installByTag(tag, progress, backendOverride);
+    return this.installByTag(tag, progress, backendOverride, { signal: options?.signal });
   }
 
   /**
    * Assets GitHub reports for a release, or undefined when the API is
    * unreachable/rate-limited.
    */
-  private async listReleaseAssets(tag: string): Promise<GithubAsset[] | undefined> {
+  private async listReleaseAssets(tag: string, signal?: AbortSignal): Promise<GithubAsset[] | undefined> {
     try {
-      const release = await httpGetJson<GithubRelease>(githubApiTagUrl(tag));
+      const release = await httpGetJson<GithubRelease>(githubApiTagUrl(tag), {}, signal);
       return Array.isArray(release?.assets) ? release.assets : [];
-    } catch {
+    } catch (err) {
+      if (signal?.aborted || err instanceof InstallCancelledError) {
+        throw err instanceof InstallCancelledError ? err : new InstallCancelledError();
+      }
       return undefined;
     }
   }
@@ -1514,23 +1717,31 @@ export class LlamaInstaller {
   async installByTag(
     tagInput: string,
     progress?: ProgressReporter,
-    backendOverride?: LlamaBackend
+    backendOverride?: LlamaBackend,
+    options?: { signal?: AbortSignal }
   ): Promise<string> {
-    return withInstallLock(() => this.installByTagUnlocked(tagInput, progress, backendOverride), {
-      progress,
-    });
+    return withInstallLock(
+      () => this.installByTagUnlocked(tagInput, progress, backendOverride, options?.signal),
+      { progress }
+    );
   }
 
   private async installByTagUnlocked(
     tagInput: string,
     progress?: ProgressReporter,
-    backendOverride?: LlamaBackend
+    backendOverride?: LlamaBackend,
+    signal?: AbortSignal
   ): Promise<string> {
     this.migrateLegacyInstallIfNeeded();
     const stable = parseStableReleaseTag(tagInput);
     let tag: string;
+    throwIfCancelled(signal);
     if (stable) {
-      progress?.report({ message: `Stable ${stable} — resolving matching nightly…` });
+      emitInstall(progress, {
+        phase: "resolve",
+        message: `Stable ${stable} — resolving matching nightly…`,
+        releaseTag: stable,
+      });
       const pointed = await tryReadNightlyPointerTag(stable);
       if (!pointed) {
         throw new Error(
@@ -1553,13 +1764,17 @@ export class LlamaInstaller {
       }
     }
 
-    progress?.report({ message: `Looking up ${tag} assets for ${uiBackend}…` });
+    emitInstall(progress, {
+      phase: "resolve",
+      message: `Looking up ${tag} assets for ${uiBackend}…`,
+      releaseTag: tag,
+    });
 
     let assetName: string | undefined;
     let assetUrl: string | undefined;
     const probes: Array<{ name: string; probe: UrlProbe }> = [];
 
-    const listed = await this.listReleaseAssets(tag);
+    const listed = await this.listReleaseAssets(tag, signal);
     const picked = listed && pickAsset(listed, uiBackend);
     if (picked) {
       assetName = picked.name;
@@ -1567,9 +1782,15 @@ export class LlamaInstaller {
     } else {
       const candidates = candidateAssetNames(tag, uiBackend);
       for (const name of candidates) {
+        throwIfCancelled(signal);
         const url = directAssetUrl(tag, name);
-        progress?.report({ message: `Checking ${name}…` });
-        const probe = await probeUrl(url);
+        emitInstall(progress, {
+          phase: "resolve",
+          message: `Checking ${name}…`,
+          releaseTag: tag,
+          assetName: name,
+        });
+        const probe = await probeUrl(url, signal);
         probes.push({ name, probe });
         if (probe.exists) {
           assetName = name;
@@ -1586,33 +1807,30 @@ export class LlamaInstaller {
     const tmpDir = path.join(os.tmpdir(), "llama-aio-vs");
     ensureDirs(tmpDir);
     const archivePath = path.join(tmpDir, assetName);
-    progress?.report({ message: `Downloading ${assetName}…` });
-    await downloadFile(assetUrl, archivePath, (pct) => {
-      progress?.report({ message: `Downloading ${assetName}… ${pct}%` });
-    });
+    const cudartPlanned =
+      uiBackend === "cuda" && process.platform === "win32" && listed
+        ? pickCudartAsset(listed, assetName)
+        : undefined;
+    const fileCount = cudartPlanned ? 2 : 1;
+    await downloadReleaseFile(progress, assetUrl, archivePath, assetName, 1, fileCount, tag, signal);
 
     let cudartPath: string | undefined;
     if (uiBackend === "cuda" && process.platform === "win32") {
-      const cudart = listed && pickCudartAsset(listed, assetName);
+      const cudart = cudartPlanned;
       const cudartUrl = cudart?.url || cudart?.browser_download_url;
       const cudartName = cudart?.name;
       if (cudartUrl && cudartName) {
-        progress?.report({ message: `Downloading ${cudartName}…` });
         cudartPath = path.join(tmpDir, cudartName);
-        await downloadFile(cudartUrl, cudartPath, (pct) => {
-          progress?.report({ message: `Downloading ${cudartName}… ${pct}%` });
-        });
+        await downloadReleaseFile(progress, cudartUrl, cudartPath, cudartName, 2, 2, tag, signal);
       } else {
         for (const name of candidateCudartNames(assetName)) {
+          throwIfCancelled(signal);
           const url = directAssetUrl(tag, name);
-          if (!(await urlExists(url))) {
+          if (!(await urlExists(url, signal))) {
             continue;
           }
-          progress?.report({ message: `Downloading ${name}…` });
           cudartPath = path.join(tmpDir, name);
-          await downloadFile(url, cudartPath, (pct) => {
-            progress?.report({ message: `Downloading ${name}… ${pct}%` });
-          });
+          await downloadReleaseFile(progress, url, cudartPath, name, 2, 2, tag, signal);
           break;
         }
       }
@@ -1624,6 +1842,7 @@ export class LlamaInstaller {
       assetName,
       cudartArchivePath: cudartPath,
       progress,
+      signal,
     });
   }
 
@@ -1639,6 +1858,7 @@ export class LlamaInstaller {
       assetName?: string;
       cudartArchivePath?: string;
       progress?: ProgressReporter;
+      signal?: AbortSignal;
     } = {}
   ): Promise<string> {
     return withInstallLock(() => this.installFromArchiveUnlocked(archivePath, options), {
@@ -1654,10 +1874,13 @@ export class LlamaInstaller {
       assetName?: string;
       cudartArchivePath?: string;
       progress?: ProgressReporter;
+      signal?: AbortSignal;
     } = {}
   ): Promise<string> {
     this.migrateLegacyInstallIfNeeded();
     const progress = options.progress;
+    const signal = options.signal;
+    throwIfCancelled(signal);
     if (!archivePath || !fs.existsSync(archivePath)) {
       throw new Error(`Archive not found: ${archivePath}`);
     }
@@ -1700,7 +1923,7 @@ export class LlamaInstaller {
     const tmpDir = path.join(os.tmpdir(), "llama-aio-vs");
     ensureDirs(tmpDir);
 
-    progress?.report({ message: "Extracting…" });
+    emitInstall(progress, { phase: "extract", message: "Extracting…", assetName, releaseTag: tag });
     const extractTo = path.join(tmpDir, `extract-${Date.now()}`);
     ensureDirs(extractTo);
     await extractArchive(archivePath, extractTo);
@@ -1752,7 +1975,17 @@ export class LlamaInstaller {
       );
     }
 
-    progress?.report({ message: "Stopping llama-server so binaries can be replaced…" });
+    if (signal?.aborted) {
+      fs.rmSync(extractTo, { recursive: true, force: true });
+      fs.rmSync(stageDir, { recursive: true, force: true });
+      throw new InstallCancelledError();
+    }
+    emitInstall(progress, {
+      phase: "replace",
+      message: "Stopping llama-server so binaries can be replaced…",
+      assetName,
+      releaseTag: tag,
+    });
     await stopLlamaServersUsingDir(binDir);
     clearServerLockIfUsingDir(binDir);
     if (process.platform === "win32") {
@@ -1772,7 +2005,12 @@ export class LlamaInstaller {
     invalidateLlamaServerProbeCache();
 
     if (options.cudartArchivePath && fs.existsSync(options.cudartArchivePath)) {
-      progress?.report({ message: "Extracting CUDA runtime…" });
+      emitInstall(progress, {
+        phase: "extract",
+        message: "Extracting CUDA runtime…",
+        assetName,
+        releaseTag: tag,
+      });
       const cudartExtract = path.join(tmpDir, `cudart-extract-${Date.now()}`);
       ensureDirs(cudartExtract);
       await extractArchive(options.cudartArchivePath, cudartExtract);
@@ -1814,7 +2052,12 @@ export class LlamaInstaller {
       }
     }
 
-    progress?.report({ message: `Installed ${tag} (${assetName}) → ${uiBackend}` });
+    emitInstall(progress, {
+      phase: "replace",
+      message: `Installed ${tag} (${assetName}) → ${uiBackend}`,
+      assetName,
+      releaseTag: tag,
+    });
     return getLlamaServerBinary(installDir);
   }
 
