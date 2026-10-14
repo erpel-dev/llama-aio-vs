@@ -56,7 +56,7 @@
       <div class="live-chat"><span id="liveChatLabel">This chat</span><span class="sub" id="liveChatSub">send a chat to measure</span></div>
       <div class="ctx-stack thin" id="liveChatStack" role="img" aria-label="This chat's share of the context window"></div>
     </div>
-    <div class="hidden" id="remoteLoad">
+    <div class="remote-only hidden" id="remoteLoad">
       <details class="fold" id="remoteLoadFold" open>
         <summary><span>Server load</span><span class="sum" id="remoteLoadSum">all clients · /metrics</span></summary>
         <div class="fold-body">
@@ -95,8 +95,8 @@
       </div>
       <div class="hint">Your local model and load settings stay saved. Switch to this machine brings them back.</div>
     </div>
-    <div class="remote-strip hidden" id="remoteStrip"></div>
-    <div class="actions-row hidden" id="remoteActions">
+    <div class="remote-strip remote-only hidden" id="remoteStrip"></div>
+    <div class="actions-row remote-only hidden" id="remoteActions">
       <button class="primary" id="remotePrimaryBtn" type="button">Retry now</button>
       <button class="secondary" id="remoteSecondaryBtn" type="button">Edit connection</button>
     </div>

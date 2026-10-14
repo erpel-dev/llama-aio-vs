@@ -356,6 +356,21 @@ function applyRemoteChrome(payload) {
   const card = $('remoteModelCard');
   if (card) card.classList.toggle('hidden', !remoteMode || connectOpen);
   if (remoteMode && !connectOpen) renderRemoteStatus();
+  else if (!remoteMode) clearRemoteStatus();
+}
+
+/**
+ * Only renderRemoteStatus fills the remote error strip, its Retry / Edit
+ * buttons and the server-load fold, so leaving remote mode must empty them;
+ * otherwise a "Connection refused" box outlives the switch to this machine.
+ */
+function clearRemoteStatus() {
+  for (const id of ['remoteStrip', 'remoteActions', 'remoteLoad']) {
+    const el = $(id);
+    if (el) el.classList.add('hidden');
+  }
+  const strip = $('remoteStrip');
+  if (strip) strip.textContent = '';
 }
 
 function setServerCardKind(kind) {
