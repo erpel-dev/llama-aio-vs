@@ -1,28 +1,20 @@
 /**
- * VS Code UI around the shared HuggingFaceClient (QuickPick / notifications).
+ * Hugging Face downloads for the sidebar library and the starter model.
  */
 import * as vscode from "vscode";
 import {
   attachDownloadedCompanion,
-  companionDownloadHint,
-  describeLanguageGgufFile,
-  displayModelTitle,
   downloadManager,
   downloadPickerFiles,
-  formatLicenseQuickPick,
   huggingfaceModelPage,
   huggingfaceUrl,
-  licenseFromTags,
   listingBaseName,
   preferredMmprojFile,
   preferredMtpDraftFile,
-  isMtpSidecarFile,
   remoteShardPaths,
-  resolveLicenseUrl,
   STARTER_MODEL,
   HuggingFaceClient,
   type HfFileHit,
-  type ModelLicenseInfo,
   type SettingsStore,
 } from "@llama-aio/core";
 
@@ -63,7 +55,7 @@ async function enqueueModelAndCompanions(
   const parts = remoteShardPaths(languagePath);
   const jobs = parts.map((part) => enqueueHfFile(hf, store, modelId, part, files));
   const listing = files ?? (await hf.listGgufFiles(modelId).catch(() => undefined));
-  const extras = [];
+  const extras: ReturnType<typeof enqueueHfFile>[] = [];
   const mm = listing ? preferredMmprojFile(listing) : undefined;
   if (mm) {
     extras.push(enqueueHfFile(hf, store, modelId, mm.path, listing));
@@ -72,7 +64,28 @@ async function enqueueModelAndCompanions(
   if (mtp) {
     extras.push(enqueueHfFile(hf, store, modelId, mtp.path, listing));
   }
-  const dests = await Promise.all([...jobs, ...extras].map((j) => j.done));
+  // Companions are optional: a gated or missing mmproj / MTP file must not
+  // throw away a finished language model.
+  const companions = Promise.allSettled(extras.map((j) => j.done));
+  let dests: string[];
+  try {
+    dests = await Promise.all(jobs.map((j) => j.done));
+  } catch (e) {
+    // One shard failed: the model cannot load, so stop spending bandwidth on
+    // the rest. Pause keeps their partial files for a later resume.
+    for (const j of [...jobs, ...extras]) {
+      downloadManager.pause(j.job.id);
+    }
+    throw e;
+  }
+  const failed = (await companions).flatMap((r, i) =>
+    r.status === "rejected" ? [`${extras[i].job.label}: ${r.reason instanceof Error ? r.reason.message : String(r.reason)}`] : []
+  );
+  if (failed.length) {
+    void vscode.window.showWarningMessage(
+      `Model downloaded, but ${failed.length === 1 ? "a companion file" : `${failed.length} companion files`} failed: ${failed.join("; ")}`
+    );
+  }
   return dests[0] || hf.localDestFor(modelId, parts[0]!);
 }
 
@@ -117,193 +130,4 @@ export async function downloadStarterModel(
 
   await store.applySelectedModel(dest, { attachMmproj: true });
   return dest;
-}
-
-export async function browseAndDownloadModel(
-  hf: HuggingFaceClient,
-  store: SettingsStore,
-  initialQuery?: string
-): Promise<string | undefined> {
-  const query =
-    initialQuery !== undefined
-      ? initialQuery
-      : await vscode.window.showInputBox({
-          title: "Download a GGUF model from Hugging Face",
-          prompt: "Search Hugging Face (GGUF). Example: qwen2.5-coder, llama-3.2, gpt-oss",
-          placeHolder: "qwen2.5-coder",
-          ignoreFocusOut: true,
-        });
-  if (query === undefined) {
-    return undefined;
-  }
-
-  const models = await vscode.window.withProgress(
-    {
-      location: vscode.ProgressLocation.Notification,
-      title: "Llama AIO: Searching Hugging Face…",
-      cancellable: false,
-    },
-    async () => hf.searchGgufModels(query)
-  );
-
-  if (!models.length) {
-    vscode.window.showWarningMessage("No GGUF models found for that query.");
-    return undefined;
-  }
-
-  const licenses = await vscode.window.withProgress(
-    {
-      location: vscode.ProgressLocation.Notification,
-      title: "Llama AIO: Resolving model licenses…",
-      cancellable: false,
-    },
-    async () => hf.enrichLicenses(models)
-  );
-
-  const pickedModel = await vscode.window.showQuickPick(
-    models.map((m) => {
-      const license = licenses.get(m.id) || licenseFromTags(m.tags);
-      const row = formatLicenseQuickPick(m.id, m.downloads, license);
-      return {
-        label: row.label,
-        description: row.description,
-        detail: (m.tags || []).filter((t) => !/^license:/i.test(t)).slice(0, 6).join(", "),
-        model: m,
-        license,
-      };
-    }),
-    {
-      title: "Select a Hugging Face model repo  ·  ✓ permissive · ⚠ limited · § custom",
-      matchOnDescription: true,
-      matchOnDetail: true,
-    }
-  );
-  if (!pickedModel) {
-    return undefined;
-  }
-
-  if (!(await confirmLicenseIfNeeded(pickedModel.model.id, pickedModel.license))) {
-    return undefined;
-  }
-
-  const files = await vscode.window.withProgress(
-    {
-      location: vscode.ProgressLocation.Notification,
-      title: "Llama AIO: Listing GGUF files…",
-      cancellable: false,
-    },
-    async () => hf.listGgufFiles(pickedModel.model.id)
-  );
-
-  if (!files.length) {
-    vscode.window.showWarningMessage("No .gguf files found in that repo.");
-    return undefined;
-  }
-
-  const picker = downloadPickerFiles(files);
-  if (!picker.files.length) {
-    vscode.window.showWarningMessage("That repo has no language model or companion GGUF (mmproj / MTP draft).");
-    return undefined;
-  }
-
-  const extras = picker.companionOnly ? "" : companionDownloadHint(files);
-  const pickedFile = await vscode.window.showQuickPick(
-    picker.files.map((f) => ({
-      label: f.path,
-      description: describeLanguageGgufFile(f, files),
-      file: f,
-    })),
-    {
-      title: picker.companionOnly
-        ? "Companion-only repo — select a vision projector or MTP draft to download"
-        : extras
-          ? `Select a GGUF to download  ·  will also fetch ${extras}`
-          : "Select a GGUF file to download",
-      matchOnDescription: true,
-    }
-  );
-  if (!pickedFile) {
-    return undefined;
-  }
-
-  if (picker.companionOnly) {
-    const dest = await enqueueHfFile(
-      hf,
-      store,
-      pickedModel.model.id,
-      pickedFile.file.path,
-      files
-    ).done;
-    const role = await attachDownloadedCompanion(store, dest, pickedFile.file.path, files);
-    const name = listingBaseName(dest);
-    if (role === "mtp-sidecar") {
-      vscode.window.showInformationMessage(`MTP drafter ready: ${name}`);
-    } else {
-      const hasModel = !!store.getState().selectedModelPath;
-      vscode.window.showInformationMessage(
-        hasModel
-          ? `Vision projector ready: ${name}. Reload the server to use it.`
-          : `Vision projector downloaded: ${name}. Select a language model to use it.`
-      );
-    }
-    return undefined;
-  }
-
-  const dest = await enqueueModelAndCompanions(
-    hf,
-    store,
-    pickedModel.model.id,
-    pickedFile.file.path,
-    files
-  );
-
-  const state = await store.applySelectedModel(dest, { attachMmproj: true });
-  const caps = state.modelCapabilities;
-  const vision = state.loadSettings.mmprojPath
-    ? ` · vision ${state.loadSettings.mmprojPath.split(/[/\\]/).pop()}`
-    : "";
-  const mtp =
-    isMtpSidecarFile({ path: state.loadSettings.draftModelPath })
-      ? ` · MTP ${state.loadSettings.draftModelPath.split(/[/\\]/).pop()}`
-      : "";
-  const lic = pickedModel.license.badge;
-  vscode.window.showInformationMessage(
-    `Model ready: ${displayModelTitle(caps?.name, dest) || dest}` +
-      (caps
-        ? ` (${caps.maxContextLength} max ctx, ${caps.blockCount} layers${caps.isMoe ? ", MoE" : ""})`
-        : "") +
-      vision +
-      mtp +
-      ` · ${lic}`
-  );
-  return dest;
-}
-
-/** Warn before download when the license is limited, custom, or unknown. */
-async function confirmLicenseIfNeeded(
-  modelId: string,
-  license: ModelLicenseInfo
-): Promise<boolean> {
-  if (!license.needsConfirm) {
-    return true;
-  }
-  const licenseUrl = resolveLicenseUrl(modelId, license);
-  const choice = await vscode.window.showWarningMessage(
-    `${modelId}\n\n${license.summary}\n\nThis is not legal advice — review the license before commercial use.`,
-    { modal: true },
-    "Download anyway",
-    "View license"
-  );
-  if (choice === "View license") {
-    if (licenseUrl) {
-      await vscode.env.openExternal(vscode.Uri.parse(licenseUrl));
-    }
-    const again = await vscode.window.showWarningMessage(
-      `Continue downloading ${modelId}?`,
-      { modal: true },
-      "Download anyway"
-    );
-    return again === "Download anyway";
-  }
-  return choice === "Download anyway";
 }

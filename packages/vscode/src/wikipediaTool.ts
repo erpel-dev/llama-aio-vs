@@ -16,16 +16,6 @@ export function syncWikipediaLookupContext(store: SettingsStore): void {
   );
 }
 
-function abortSignalFrom(token: vscode.CancellationToken): AbortSignal {
-  const ac = new AbortController();
-  if (token.isCancellationRequested) {
-    ac.abort();
-  } else {
-    token.onCancellationRequested(() => ac.abort());
-  }
-  return ac.signal;
-}
-
 export class WikipediaLookupTool implements vscode.LanguageModelTool<{ query?: string }> {
   constructor(private readonly store: SettingsStore) {}
 
@@ -51,8 +41,18 @@ export class WikipediaLookupTool implements vscode.LanguageModelTool<{ query?: s
       ]);
     }
     const query = wikipediaQueryFromInput(options.input);
-    const text = await lookupWikipedia(query, { signal: abortSignalFrom(token) });
-    return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(text)]);
+    const ac = new AbortController();
+    const sub = token.onCancellationRequested(() => ac.abort());
+    try {
+      if (token.isCancellationRequested) {
+        ac.abort();
+      }
+      const text = await lookupWikipedia(query, { signal: ac.signal });
+      return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(text)]);
+    } finally {
+      // One listener per call; dispose it so long chats do not accumulate them.
+      sub.dispose();
+    }
   }
 }
 

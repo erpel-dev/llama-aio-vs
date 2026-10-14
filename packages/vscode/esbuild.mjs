@@ -24,20 +24,47 @@ const options = {
   logLevel: "info",
 };
 
+/** Sidebar webview script: browser bundle loaded by SettingsViewProvider.getHtml. */
+const webviewOptions = {
+  entryPoints: [join(here, "src", "webview", "sidebar.ts")],
+  bundle: true,
+  outfile: join(here, "out", "webview", "sidebar.js"),
+  platform: "browser",
+  target: "es2022",
+  format: "iife",
+  sourcemap: !watch ? "linked" : "inline",
+  minify: !watch,
+  logLevel: "info",
+};
+
 /** Runtime assets the bundle reads relative to the extension root. */
 function copyAssets() {
   const dest = join(here, "prompt-replacements");
   rmSync(dest, { recursive: true, force: true });
   mkdirSync(dirname(dest), { recursive: true });
   cpSync(join(coreRoot, "prompt-replacements"), dest, { recursive: true });
+  copyWebviewStatic();
 }
 
+/** sidebar.html (template) and sidebar.css ship next to the bundled script. */
+function copyWebviewStatic() {
+  const out = join(here, "out", "webview");
+  mkdirSync(out, { recursive: true });
+  for (const file of ["sidebar.html", "sidebar.css"]) {
+    cpSync(join(here, "src", "webview", file), join(out, file));
+  }
+}
+
+/** `--webview`: only the sidebar (tests and the webview check need it, not the host bundle). */
+const webviewOnly = process.argv.includes("--webview");
 copyAssets();
 
 if (watch) {
-  const ctx = await context(options);
-  await ctx.watch();
-  console.log("watching…");
+  const contexts = await Promise.all([context(options), context(webviewOptions)]);
+  await Promise.all(contexts.map((ctx) => ctx.watch()));
+  console.log("watching… (re-run to pick up sidebar.html / sidebar.css edits)");
+} else if (webviewOnly) {
+  await build(webviewOptions);
 } else {
-  await build(options);
+  await Promise.all([build(options), build(webviewOptions)]);
 }

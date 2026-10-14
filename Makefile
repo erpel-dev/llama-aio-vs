@@ -1,4 +1,4 @@
-.PHONY: all deps compile test package vsix tui clean install
+.PHONY: all deps compile test package vsix tui clean install ovsx-namespace publish-ovsx
 
 # Build both the VS Code .vsix and the relocatable TUI executable under dist/.
 all: package
@@ -25,6 +25,22 @@ tui: compile
 
 install: vsix
 	code --install-extension $$(ls -1t dist/*.vsix | head -n1) --force
+
+# Open VSX (code-server, VSCodium, Gitpod, ...). ovsx reads the token from
+# OVSX_PAT, so it never appears on the command line. One-time setup:
+#   OVSX_PAT=... make ovsx-namespace
+# Each release (publishes the .vsix matching the current version):
+#   OVSX_PAT=... make publish-ovsx
+VSIX_VERSION = $(shell node -p "require('./packages/vscode/package.json').version")
+VSIX_FILE = dist/llama-aio-vs-$(VSIX_VERSION).vsix
+
+ovsx-namespace:
+	@test -n "$$OVSX_PAT" || { echo "OVSX_PAT is not set"; exit 1; }
+	npx --yes ovsx create-namespace erpel-dev
+
+publish-ovsx: vsix
+	@test -n "$$OVSX_PAT" || { echo "OVSX_PAT is not set"; exit 1; }
+	npx --yes ovsx publish $(VSIX_FILE)
 
 clean:
 	rm -rf \

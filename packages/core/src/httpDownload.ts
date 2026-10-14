@@ -78,14 +78,42 @@ function request(
   return url.startsWith("http://") ? http.get(url, options, cb) : https.get(url, options, cb);
 }
 
-function fileSha256(filePath: string): Promise<string> {
+/**
+ * Resolve a redirect `Location` against the URL that sent it. HF answers a
+ * renamed repo with a relative `307 /new-org/model/resolve/…`.
+ * Throws on an HTTPS → HTTP downgrade.
+ */
+export function resolveRedirect(from: string, location: string): string {
+  const next = new URL(location, from);
+  if (new URL(from).protocol === "https:" && next.protocol !== "https:") {
+    throw new Error(`Refusing redirect from HTTPS to ${next.protocol.replace(/:$/, "").toUpperCase()} (${next.host})`);
+  }
+  return next.toString();
+}
+
+/**
+ * The bearer token goes only to the origin it was issued for. HF `/resolve/`
+ * hops to CDN / presigned storage URLs that must not see it.
+ */
+export function sendsTokenTo(originalUrl: string, url: string): boolean {
+  try {
+    return new URL(originalUrl).origin === new URL(url).origin;
+  } catch {
+    return false;
+  }
+}
+
+function hashFile(filePath: string, hash: Hash = createHash("sha256")): Promise<Hash> {
   return new Promise((resolve, reject) => {
-    const hash = createHash("sha256");
     const stream = fs.createReadStream(filePath);
     stream.on("data", (chunk) => hash.update(chunk));
     stream.on("error", reject);
-    stream.on("end", () => resolve(hash.digest("hex")));
+    stream.on("end", () => resolve(hash));
   });
+}
+
+async function fileSha256(filePath: string): Promise<string> {
+  return (await hashFile(filePath)).digest("hex");
 }
 
 async function existingIsComplete(
@@ -155,6 +183,16 @@ export async function downloadHttpFile(options: HttpDownloadOptions): Promise<st
     throw new DownloadAbortError("cancel");
   }
 
+  // Hash the resumed prefix before the request goes out. Doing it after the
+  // ranged response arrived left the socket unread for minutes on big quants.
+  let hash: Hash | undefined;
+  if (expectedSha256) {
+    hash = existing > 0 ? await hashFile(partial) : createHash("sha256");
+    if (signal?.aborted) {
+      throw new DownloadAbortError("cancel");
+    }
+  }
+
   await new Promise<void>((resolve, reject) => {
     let settled = false;
     let idle: NodeJS.Timeout | undefined;
@@ -165,8 +203,6 @@ export async function downloadHttpFile(options: HttpDownloadOptions): Promise<st
     let received = existing;
     let lastTick = startedAt;
     let lastBytes = existing;
-    let hash: Hash | undefined;
-    let hashReady = Promise.resolve();
 
     const fail = (err: Error) => {
       if (settled) {
@@ -209,22 +245,23 @@ export async function downloadHttpFile(options: HttpDownloadOptions): Promise<st
       idle = setTimeout(() => fail(new Error("Download stalled (idle timeout)")), idleMs);
     };
 
-    const armHash = async () => {
-      if (!expectedSha256) {
-        return;
+    /** Drop the partial and start over from byte 0. */
+    const restartFromZero = () => {
+      try {
+        fs.unlinkSync(partial);
+      } catch {
+        // ignore
       }
-      hash = createHash("sha256");
-      if (existing > 0) {
-        await new Promise<void>((res, rej) => {
-          const stream = fs.createReadStream(partial);
-          stream.on("data", (chunk) => hash!.update(chunk));
-          stream.on("error", rej);
-          stream.on("end", () => res());
-        });
-      }
+      existing = 0;
+      received = 0;
+      lastBytes = 0;
+      hash = expectedSha256 ? createHash("sha256") : undefined;
     };
 
     const go = (url: string, hops: number) => {
+      if (settled) {
+        return;
+      }
       if (hops > MAX_REDIRECTS) {
         fail(new Error("Too many redirects"));
         return;
@@ -234,105 +271,100 @@ export async function downloadHttpFile(options: HttpDownloadOptions): Promise<st
         Accept: "*/*",
         ...(options.headers || {}),
       };
-      if (options.token) {
+      if (options.token && sendsTokenTo(options.url, url)) {
         headers.Authorization = `Bearer ${options.token}`;
       }
       if (existing > 0) {
         headers.Range = `bytes=${existing}-`;
       }
-      req = request(url, { headers }, (res) => {
-        const status = res.statusCode || 0;
-        if (status >= 300 && status < 400 && res.headers.location) {
-          res.resume();
-          go(res.headers.location, hops + 1);
-          return;
-        }
-        if (status === 401 || status === 403) {
-          res.resume();
-          fail(new GatedDownloadError(options.gatedPageUrl || url, status));
-          return;
-        }
-        if (status === 416 && existing > 0) {
-          res.resume();
-          try {
-            fs.unlinkSync(partial);
-          } catch {
-            // ignore
+      try {
+        req = request(url, { headers }, (res) => {
+          const status = res.statusCode || 0;
+          if (status >= 300 && status < 400 && res.headers.location) {
+            res.resume();
+            let next: string;
+            try {
+              next = resolveRedirect(url, res.headers.location);
+            } catch (err) {
+              fail(err instanceof Error ? err : new Error(String(err)));
+              return;
+            }
+            go(next, hops + 1);
+            return;
           }
-          existing = 0;
-          received = 0;
-          go(options.url, hops + 1);
-          return;
-        }
-        if (status < 200 || status >= 300) {
-          res.resume();
-          fail(new Error(`Download failed: HTTP ${status}`));
-          return;
-        }
-
-        const restart = status === 200 && existing > 0;
-        if (restart) {
-          try {
-            fs.unlinkSync(partial);
-          } catch {
-            // ignore
+          if (status === 401 || status === 403) {
+            res.resume();
+            fail(new GatedDownloadError(options.gatedPageUrl || url, status));
+            return;
           }
-          existing = 0;
-          received = 0;
-        }
+          if (status === 416 && existing > 0) {
+            res.resume();
+            restartFromZero();
+            go(options.url, hops + 1);
+            return;
+          }
+          if (status < 200 || status >= 300) {
+            res.resume();
+            fail(new Error(`Download failed: HTTP ${status}`));
+            return;
+          }
 
-        const length = Number(res.headers["content-length"] || 0);
-        const total =
-          status === 206 && length > 0
-            ? existing + length
-            : length > 0
-              ? length
-              : expectedSize || 0;
+          if (status === 200 && existing > 0) {
+            // Server ignored Range: the body is the whole file.
+            restartFromZero();
+          }
 
-        hashReady
-          .then(() => armHash())
-          .then(() => {
-            out = fs.createWriteStream(partial, { flags: existing > 0 ? "a" : "w" });
+          const length = Number(res.headers["content-length"] || 0);
+          const total =
+            status === 206 && length > 0
+              ? existing + length
+              : length > 0
+                ? length
+                : expectedSize || 0;
+
+          out = fs.createWriteStream(partial, { flags: existing > 0 ? "a" : "w" });
+          bumpIdle();
+          res.on("error", fail);
+          out.on("error", fail);
+          res.on("data", (chunk: Buffer) => {
+            received += chunk.length;
+            hash?.update(chunk);
             bumpIdle();
-            res.on("error", fail);
-            out.on("error", fail);
-            res.on("data", (chunk: Buffer) => {
-              received += chunk.length;
-              hash?.update(chunk);
-              bumpIdle();
-              const now = Date.now();
-              const dt = Math.max(1, now - lastTick);
-              if (now - lastTick >= 250) {
-                const bytesPerSec = ((received - lastBytes) * 1000) / dt;
-                lastTick = now;
-                lastBytes = received;
-                options.onProgress?.({ received, total, bytesPerSec });
+            const now = Date.now();
+            const dt = Math.max(1, now - lastTick);
+            if (now - lastTick >= 250) {
+              const bytesPerSec = ((received - lastBytes) * 1000) / dt;
+              lastTick = now;
+              lastBytes = received;
+              options.onProgress?.({ received, total, bytesPerSec });
+            }
+          });
+          res.pipe(out);
+          out.on("finish", () => {
+            out?.close((closeErr) => {
+              if (closeErr) {
+                fail(closeErr);
+                return;
               }
-            });
-            res.pipe(out);
-            out.on("finish", () => {
-              out?.close((closeErr) => {
-                if (closeErr) {
-                  fail(closeErr);
+              if (expectedSha256 && hash) {
+                const got = hash.digest("hex");
+                if (got !== expectedSha256) {
+                  fail(new DownloadVerifyError(`sha256 mismatch (got ${got.slice(0, 12)}…)`));
                   return;
                 }
-                if (expectedSha256 && hash) {
-                  const got = hash.digest("hex");
-                  if (got !== expectedSha256) {
-                    fail(new DownloadVerifyError(`sha256 mismatch (got ${got.slice(0, 12)}…)`));
-                    return;
-                  }
-                }
-                ok();
-              });
+              }
+              ok();
             });
-          })
-          .catch(fail);
-      });
+          });
+        });
+      } catch (err) {
+        // Malformed URL or header: http.get throws synchronously.
+        fail(err instanceof Error ? err : new Error(String(err)));
+        return;
+      }
       req.on("error", fail);
     };
 
-    hashReady = Promise.resolve();
     go(options.url, 0);
   });
 

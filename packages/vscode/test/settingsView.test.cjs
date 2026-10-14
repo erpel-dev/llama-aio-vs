@@ -7,6 +7,7 @@ const Module = require("module");
 const path = require("path");
 
 const shown = [];
+let copilotChatInstalled = true;
 const origResolve = Module._resolveFilename;
 Module._resolveFilename = function (request, ...rest) {
   return request === "vscode" ? "vscode" : origResolve.call(this, request, ...rest);
@@ -28,7 +29,8 @@ require.cache.vscode = {
     workspace: {},
     commands: { executeCommand: async () => undefined },
     env: {},
-    Uri: {},
+    extensions: { getExtension: (id) => (copilotChatInstalled && id === "GitHub.copilot-chat" ? {} : undefined) },
+    Uri: { joinPath: (base, ...parts) => ({ fsPath: path.join(base.fsPath, ...parts) }) },
     ProgressLocation: {},
     ViewColumn: {},
     EventEmitter: class {},
@@ -96,6 +98,7 @@ function setup(loadOverrides = {}) {
   };
   const pm = {
     getStatus: () => ({ running: true, starting: false, pid: 1, endpoint: "http://127.0.0.1:8742", message: "Running", configDirty: JSON.stringify(state.loadSettings) !== JSON.stringify(launched.loadSettings) }),
+    refreshStatus: async () => pm.getStatus(),
     isHttpReady: async () => true,
     resolveBinary: () => "",
     isCpuBackend: () => false,
@@ -105,6 +108,9 @@ function setup(loadOverrides = {}) {
   };
   const installer = {
     getInstalledInfo: () => ({ activeBackend: "vulkan", tag: "b1" }),
+    getInstalledInfoCached() {
+      return this.getInstalledInfo();
+    },
     getUiBackendOptions: () => [],
     resolveActiveUiBackend: () => "vulkan",
     peekUpdateCheck: () => ({ pending: false }),
@@ -113,7 +119,16 @@ function setup(loadOverrides = {}) {
   const perf = { get: () => ({}), detailLines: () => [], hasLastRequestContext: () => false, hasLastResponseTrace: () => false, setSpeculativeMode() {} };
   const posted = [];
   let handler;
-  const provider = new SettingsViewProvider({}, store, pm, installer, perf, async () => undefined, {}, () => undefined);
+  const provider = new SettingsViewProvider(
+    { fsPath: path.join(__dirname, "..") },
+    store,
+    pm,
+    installer,
+    perf,
+    async () => undefined,
+    {},
+    () => undefined
+  );
   // Deterministic GPUs instead of probing the test machine.
   provider.detectGpusForEstimate = () => gpus;
   provider.resolveWebviewView(
@@ -122,6 +137,7 @@ function setup(loadOverrides = {}) {
         options: {},
         html: "",
         cspSource: "",
+        asWebviewUri: (u) => ({ toString: () => u.fsPath }),
         postMessage: (m) => {
           posted.push(m);
           return Promise.resolve(true);
@@ -142,6 +158,17 @@ function setup(loadOverrides = {}) {
 describe("SettingsViewProvider memory path", () => {
   beforeEach(() => {
     shown.length = 0;
+    copilotChatInstalled = true;
+  });
+
+  it("state push says whether Copilot Chat is available", async () => {
+    let t = setup();
+    await t.send({ type: "ready" });
+    assert.equal(t.posted.find((m) => m.type === "state").payload.copilotChatAvailable, true);
+    copilotChatInstalled = false;
+    t = setup();
+    await t.send({ type: "ready" });
+    assert.equal(t.posted.find((m) => m.type === "state").payload.copilotChatAvailable, false);
   });
 
   it("state push carries core's verdict for the saved settings", async () => {
@@ -187,7 +214,7 @@ describe("SettingsViewProvider memory path", () => {
     await t.send({ type: "ready" });
     await t.send({ type: "saveLoad", payload: { contextLength: 32768 }, silent: true });
     const patch = t.posted.filter((m) => m.type === "statusPatch").pop();
-    assert.deepEqual(patch.payload.changes, [{ key: "contextLength", label: "ctx", from: "64k", to: "32k" }]);
+    assert.deepEqual(patch.payload.changes, [{ key: "contextLength", label: "context window", from: "64k", to: "32k" }]);
     await t.send({ type: "discardChanges" });
     assert.deepEqual(t.getState().loadSettings, t.launched.loadSettings);
   });
@@ -199,5 +226,22 @@ describe("SettingsViewProvider memory path", () => {
     const expected = core.computeMemoryView(caps, t.getState().loadSettings, gpus).view;
     assert.equal(shown[0].msg, expected.headline);
     assert.ok(shown[0].modal);
+  });
+
+  it("coalesces overlapping state pushes into one trailing push", async () => {
+    const t = setup();
+    await t.send({ type: "ready" });
+    t.posted.length = 0;
+    // Five callers while a push is running: the first push plus one trailing.
+    await Promise.all([1, 2, 3, 4, 5].map(() => t.provider.pushState()));
+    assert.equal(t.posted.filter((m) => m.type === "state").length, 2);
+    // The trailing push sees state changed after the first push started.
+    t.posted.length = 0;
+    const first = t.provider.pushState();
+    await t.send({ type: "saveLoad", payload: { contextLength: 16384 }, silent: true });
+    const second = t.provider.pushState();
+    await Promise.all([first, second]);
+    const states = t.posted.filter((m) => m.type === "state");
+    assert.equal(states.at(-1).payload.state.loadSettings.contextLength, 16384);
   });
 });

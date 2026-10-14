@@ -69,6 +69,7 @@ All commands are in the Command Palette under **Llama AIO:** — start/stop/relo
 
 - VS Code 1.109 or newer
 - GitHub Copilot Chat for the chat integration
+- code-server, VSCodium and other editors that install from Open VSX can run the server, model library and downloads, but Copilot Chat isn't available there. The models can still be used by other extensions that support the VS Code Language Model API.
 - Linux, Windows or macOS; a GPU is optional
 
 ## License

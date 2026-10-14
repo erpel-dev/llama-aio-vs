@@ -2,7 +2,9 @@
   "compilerOptions": {
     "module": "commonjs",
     "target": "ES2022",
-    "lib": ["ES2022"],
+    "lib": [
+      "ES2022"
+    ],
     "outDir": "out",
     "rootDir": "src",
     "sourceMap": true,
@@ -13,6 +15,12 @@
     "moduleResolution": "node",
     "resolveJsonModule": true
   },
-  "include": ["src/**/*"],
-  "exclude": ["node_modules", "out"]
+  "include": [
+    "src/**/*"
+  ],
+  "exclude": [
+    "node_modules",
+    "out",
+    "src/webview/**"
+  ]
 }

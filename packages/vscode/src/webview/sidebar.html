@@ -1,0 +1,636 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src {{cspSource}} 'unsafe-inline'; script-src 'nonce-{{nonce}}';" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Llama AIO</title>
+  <link rel="stylesheet" href="{{styleUri}}" />
+</head>
+<body>
+  <div class="card server stopped sticky-head" id="serverCard">
+    <div class="srv-top">
+      <div class="status-line stopped" id="statusLine">
+        <span class="pill">
+          <span class="dot stopped" id="statusDot"></span>
+          <span id="statusText">Loading…</span>
+        </span>
+        <span class="remote-chip remote-only" id="remoteChip">REMOTE</span>
+        <span class="meta-row" id="statusMeta">—</span>
+      </div>
+      <div class="srv-icons">
+        <button class="icon-btn hidden" id="reloadIconBtn" type="button" title="Reload llama-server (restart with the same settings)" aria-label="Reload server">⟳</button>
+        <button class="icon-btn" id="stopBtn" type="button" title="Stop llama-server" aria-label="Stop server" disabled>■</button>
+        <details class="menu" id="srvMenu">
+          <summary class="icon-btn" title="More server actions" aria-label="More server actions">⋯</summary>
+          <div class="menu-body">
+            <button class="menu-item local-only" id="openLogBtn" type="button">Open log</button>
+            <button class="menu-item local-only" id="copyCmdBtn" type="button">Copy command line</button>
+            <button class="menu-item" id="openWebUiBtn" type="button">Open llama.cpp web UI</button>
+            <button class="menu-item remote-only" id="copyDiagBtn" type="button">Copy connection diagnostics</button>
+            <div class="menu-sep local-only"></div>
+            <label class="menu-label local-only" for="launchMode">Launch mode</label>
+            <select id="launchMode" class="wide local-only" title="How llama-server is started">
+              <option value="externalTerminal">External terminal (logs visible)</option>
+              <option value="background">Background (hidden process)</option>
+            </select>
+            <div class="menu-sep"></div>
+            <button class="menu-item remote-only" id="editConnectionBtn" type="button">Edit connection…</button>
+            <button class="menu-item remote-only" id="setApiKeyBtn" type="button">Set API key…</button>
+            <button class="menu-item remote-only" id="forgetApiKeyBtn" type="button">Forget API key</button>
+            <button class="menu-item remote-only" id="switchLocalBtn" type="button">Switch to this machine</button>
+            <button class="menu-item local-only" id="connectRemoteBtn" type="button">Connect to a server…</button>
+          </div>
+        </details>
+      </div>
+    </div>
+    <div class="srv-model" id="srvModel">No model selected</div>
+    <div class="srv-sub remote-only" id="srvSummary"></div>
+    <div class="srv-sub remote-only" id="srvPerf"></div>
+    <div class="srv-live hidden" id="srvLive" aria-label="Live performance">
+      <div class="live-tiles">
+        <div class="live-tile" title="Generation speed of the last request"><b id="liveGen">—</b><i>gen tok/s</i><span class="spark" id="liveGenSpark"></span></div>
+        <div class="live-tile" title="Prompt processing speed of the last request"><b id="livePrompt">—</b><i>prompt tok/s</i><span class="spark" id="livePromptSpark"></span></div>
+        <div class="live-tile" title="Share of the prompt served from the KV cache"><b id="liveReuse">—</b><i>cache reuse</i><span class="spark" id="liveReuseSpark"></span></div>
+      </div>
+      <div class="live-chat"><span id="liveChatLabel">This chat</span><span class="sub" id="liveChatSub">send a chat to measure</span></div>
+      <div class="ctx-stack thin" id="liveChatStack" role="img" aria-label="This chat's share of the context window"></div>
+    </div>
+    <div class="hidden" id="remoteLoad">
+      <details class="fold" id="remoteLoadFold" open>
+        <summary><span>Server load</span><span class="sum" id="remoteLoadSum">all clients · /metrics</span></summary>
+        <div class="fold-body">
+          <div class="load-head"><span id="remoteLoadLabel">Slots busy</span><span class="count" id="remoteLoadCount"></span></div>
+          <div class="load-bar" id="remoteLoadBar"><span id="remoteLoadFill"></span></div>
+          <div class="meta-row" id="remoteLoadRates"></div>
+        </div>
+      </details>
+    </div>
+    <div class="pending-bar hidden" id="dirtyHint">
+      <div class="pending-head">
+        <button class="pending-toggle" id="dirtyToggle" type="button" aria-expanded="false" aria-controls="dirtyList" title="Show what changed"><span id="dirtyCount">Settings changed</span><span class="caret" aria-hidden="true">▸</span></button>
+        <span class="pending-actions">
+          <button class="warn-primary small" id="dirtyReloadBtn" type="button" title="Restart llama-server with the new settings">Reload</button>
+          <button class="secondary small" id="discardBtn" type="button" title="Put the settings back to what the running server uses">Discard</button>
+        </span>
+      </div>
+      <div class="pending-list hidden" id="dirtyList"></div>
+    </div>
+    <div class="actions-row" id="primaryRow">
+      <button class="primary" id="primaryBtn" data-action="start">Start</button>
+    </div>
+    <div class="found-servers hidden local-only" id="foundServers"></div>
+    <div class="connect-form hidden" id="connectForm">
+      <div class="card-title" style="margin-bottom:4px">Connect to a server</div>
+      <label for="remoteUrlInput">Server URL</label>
+      <input type="text" id="remoteUrlInput" placeholder="https://gpu-box.lan:8080" spellcheck="false" />
+      <label for="remoteLabelInput">Name <span style="opacity:.7">(optional)</span></label>
+      <input type="text" id="remoteLabelInput" placeholder="gpu-box" />
+      <label for="remoteKeyInput">API key <span style="opacity:.7">(optional · Secret Storage)</span></label>
+      <input type="password" id="remoteKeyInput" placeholder="only if the server uses --api-key" autocomplete="off" />
+      <div id="probeList" style="margin-top:8px"></div>
+      <div class="actions-row">
+        <button class="primary" id="connectBtn" type="button">Connect</button>
+        <button class="secondary" id="connectCancelBtn" type="button">Cancel</button>
+      </div>
+      <div class="hint">Your local model and load settings stay saved. Switch to this machine brings them back.</div>
+    </div>
+    <div class="remote-strip hidden" id="remoteStrip"></div>
+    <div class="actions-row hidden" id="remoteActions">
+      <button class="primary" id="remotePrimaryBtn" type="button">Retry now</button>
+      <button class="secondary" id="remoteSecondaryBtn" type="button">Edit connection</button>
+    </div>
+  </div>
+
+  <div class="card hidden" id="remoteModelCard">
+    <div class="card-head">
+      <span class="card-title">Model on server</span>
+      <span class="sub" id="remoteModelSub">—</span>
+    </div>
+    <div class="model-title" id="remoteModelName">—</div>
+    <div class="cap-chips" id="remoteChips"></div>
+    <div class="model-path" id="remoteModelPath"></div>
+    <div class="hint" id="remoteModelHint"></div>
+  </div>
+
+  <div class="setup hidden" id="setupBox">
+    <strong>Get a model first</strong>
+    <p class="hint" style="margin:8px 0">One-click starter: Unsloth {{starterLabel}} ({{starterSize}}, {{starterDetail}}).</p>
+    <div class="btn-col" style="margin-top:4px">
+      <button class="primary" id="setupStarterBtn">Download starter ({{starterLabel}})</button>
+    </div>
+    <ol>
+      <li>Install llama.cpp (once)</li>
+      <li>Download the starter <em>or</em> pick/open any GGUF</li>
+      <li>Start the server</li>
+    </ol>
+  </div>
+
+  <div class="card" id="modelCard">
+    <details class="fold top" id="modelFold" data-default-open open>
+      <summary>
+        <span class="card-title">Model</span>
+        <span class="model-closed-sum"><span class="mc-name" id="modelClosedName"></span><span class="model-status hidden" id="modelClosedStatus"></span></span>
+      </summary>
+      <div class="model-hero">
+        <div class="model-title" id="modelTitle">No model selected</div>
+        <span class="model-status hidden" id="modelStatus"></span>
+      </div>
+      <div class="cap-chips hidden" id="modelCaps"></div>
+      <div class="model-path" id="modelPath"></div>
+      <div class="btn-col hidden" id="starterCol">
+        <button class="primary hidden" id="starterModelBtn">Download starter ({{starterLabel}})</button>
+        <div class="hint hidden" id="starterModelHint" style="margin-top:0">{{starterSize}} · {{starterDetail}}</div>
+      </div>
+      <div class="mm-attach hidden" id="mmprojAttach">
+        <span class="tip mm-label" data-flag="-mm, --mmproj" data-help="Multimodal projector GGUF. llama-server loads it with the language model so Copilot Chat can send images. Auto-attached when a sibling mmproj-*.gguf sits next to the model. Reload the server to apply.">Vision</span>
+        <span class="mm-name" id="mmprojName"></span>
+        <span class="seg" id="mmprojSeg" title="--mmproj-offload / --no-mmproj-offload&#10;Where the CLIP vision projector runs (llama.cpp default: GPU). RAM frees VRAM on the Main GPU; image encode becomes CPU-bound."><button class="seg-btn" type="button" data-mm="gpu">GPU</button><button class="seg-btn" type="button" data-mm="ram">RAM</button></span>
+        <button class="icon-btn" id="pickMmprojBtn" type="button" title="Choose another mmproj…">✎</button>
+        <button class="icon-btn" id="clearMmprojBtn" type="button" title="Detach (text only)">✕</button>
+        <input type="checkbox" id="mmprojOffloadToGpu" class="hidden" checked />
+      </div>
+      <button class="link-btn hidden" id="attachMmprojBtn" type="button" title="Attach a multimodal projector (--mmproj) so Copilot Chat can send images">+ Attach vision projector…</button>
+      <details class="fold" id="libraryFold">
+        <summary><span>Library</span><span class="sum" id="librarySum">—</span></summary>
+        <div class="fold-body">
+          <div class="lib-tools">
+            <input type="text" id="libraryFilter" placeholder="Filter local models, or search Hugging Face…" />
+            <select id="librarySort" title="Sort the library">
+              <option value="recent">Recent</option>
+              <option value="name">Name</option>
+              <option value="size">Size</option>
+            </select>
+          </div>
+          <div class="lib-filters" id="libraryFilters"></div>
+          <div id="libraryJobs"></div>
+          <div id="libraryList"></div>
+          <div class="lib-partial hidden" id="libraryPartials"></div>
+          <div class="lib-dialog hidden" id="libraryDialog"></div>
+          <div class="lib-foot">
+            <span class="meta" id="modelsDirMeta"></span>
+            <button class="secondary small" id="openFileBtn" type="button">Open GGUF…</button>
+          </div>
+        </div>
+      </details>
+      <div class="lib-quick hidden" id="libraryQuick"></div>
+      <div class="model-reload hidden" id="modelReloadBar">
+        <span class="grow" id="modelReloadText"></span>
+        <button class="primary small" type="button" data-model-reload>Reload server</button>
+      </div>
+    </details>
+    <div class="model-closed-line" id="modelClosedLine">
+      <span class="grow" id="modelClosedMeta"></span>
+      <span class="fit-bar hidden" id="modelClosedBar"><i></i></span>
+      <button class="primary small hidden" type="button" id="modelClosedReload" data-model-reload>Reload</button>
+    </div>
+  </div>
+
+  <div class="card" id="memCard">
+    <div class="card-head">
+      <span class="card-title">Memory &amp; load</span>
+      <span class="sub" id="memCtxNote" title="Bars are the estimate with the context window full. Live use is what the driver reports now.">at full context window</span>
+    </div>
+    <div class="verdict unknown" id="memVerdict">Select a model to estimate VRAM / RAM use.</div>
+    <div id="memDevices"></div>
+    <div class="mem-legend hidden" id="memLegend"></div>
+    <div class="hint" id="memFootnote"></div>
+    <div class="fix-row hidden" id="memFixes"></div>
+    <details class="fold" id="memDetails">
+      <summary><span>Breakdown</span><span class="sum">capacity · weights · KV · notes</span></summary>
+      <div class="fold-body">
+        <div class="meta" id="memNotes"></div>
+        <div class="meta" id="memLines"></div>
+      </div>
+    </details>
+
+    <div class="section-sep"></div>
+    <div class="presets" id="presetChips">
+      <button class="chip" id="presetAgent" data-preset="agent" title="Coding agent: q8_0 K + q8_0 V, one slot, 64K context — near-lossless quality with room for tools + history">Coding agent</button>
+      <button class="chip" id="presetContext" data-preset="context" title="Max context: q8_0 K + q4_0 V, largest context that still fits your VRAM. K stays at q8_0 because the key cache is far more sensitive to quantization than the value cache.">Max context</button>
+      <button class="chip" id="presetQuality" data-preset="quality" title="Max quality: f16 K + q8_0 V at 64K context — spends VRAM on key precision instead of shrinking the context (truncated prompts cost more quality than q8_0 V does).">Max quality</button>
+      <span class="chip custom" id="presetCustom" title="Your own mix of context, KV cache types and slots">Custom</span>
+    </div>
+    <div class="hint" id="presetHint">Sets context length, KV cache types, and slots together.</div>
+
+    <div class="row">
+      <div class="label"><span class="name tip" data-flag="-c, --ctx-size" data-help="Size of the prompt context (default: 0 = loaded from model). The slider snaps to 8k, 16k, 32k, 64k, 128k, 256k; type any value in the box.">Context window</span><span class="num-pair"><span class="sub" id="ctxK"></span><input type="number" id="contextLength" min="512" step="256" /></span></div>
+      <input type="range" id="contextLengthRange" min="0" max="1000" step="1" />
+      <div class="ticks" id="ctxTicks"></div>
+      <div class="hint" id="ctxHint">Tokens per slot for prompt + reply</div>
+    </div>
+    <div class="row" id="gpuOffloadRow">
+      <div class="label"><span class="name tip" data-flag="-ngl, --n-gpu-layers" data-help="Max number of layers to store in VRAM (exact number, auto, or all).">GPU layers</span>
+        <span class="seg" id="nglSeg"><button class="seg-btn" type="button" id="nglAll" data-ngl="all">All</button><button class="seg-btn" type="button" id="nglCustom" data-ngl="custom">Custom</button></span>
+      </div>
+      <div class="hidden" id="nglCustomRow">
+        <div class="label"><span class="hint" style="margin:0">Layers on GPU</span><input type="number" id="gpuOffload" min="0" max="128" /></div>
+        <input type="range" id="gpuOffloadRange" min="0" max="128" step="1" />
+      </div>
+      <div class="hint" id="gpuOffloadHint">Max = all model layers.</div>
+    </div>
+    <details class="fold" id="offloadFold">
+      <summary><span>Multi-GPU &amp; CPU offload</span><span class="sum" id="offloadSum">—</span></summary>
+      <div class="fold-body">
+        <div class="row hidden" id="dualGpuRow">
+          <div class="label"><span class="name tip" data-flag="-sm, --split-mode" data-help="How tensors are split. Layer (default) shares the model across cards. Row needs a fast x16 link. Tensor splits every weight matrix across cards (experimental, fastest for multi-GPU inference). None keeps every GPU layer on the Main GPU and leaves the other cards free (--device).">Split</span>
+            <span class="seg" id="splitSeg"><button class="seg-btn" type="button" data-split="none">None</button><button class="seg-btn" type="button" data-split="layer">Layer</button><button class="seg-btn" type="button" data-split="row">Row</button><button class="seg-btn" type="button" data-split="tensor">Tensor</button></span>
+          </div>
+          <select id="splitMode" class="wide hidden" aria-label="Split mode">
+            <option value="layer">Layer (default)</option>
+            <option value="row">Row</option>
+            <option value="tensor">Tensor (experimental)</option>
+            <option value="none">None — Main GPU only</option>
+          </select>
+          <div class="label" style="margin-top:8px"><span class="name tip" data-flag="-mg, --main-gpu" data-help="GPU that holds the compute graph, scratch buffers, and the slider’s share of weights + KV. Index matches llama.cpp --list-devices (Vulkan0, Vulkan1, …), which is often not PCI / btop order.">Main GPU</span></div>
+          <select id="mainGpu" class="wide"></select>
+          <div id="splitDetails">
+            <div class="label" style="margin-top:8px"><span class="name tip" data-flag="-ts, --tensor-split" data-help="Percent of GPU-resident weights on the Main GPU after CPU MoE/FFN. llama.cpp --tensor-split still fills by layer count, so the emitted fractions can differ (cheap first layers get more of Main). The rest is split evenly across the other cards.">Weights on main GPU</span><span id="tensorSplitPct">75%</span></div>
+            <input type="range" id="tensorSplitRange" min="10" max="90" step="1" />
+            <div class="hint" id="tensorSplitHint"></div>
+          </div>
+          <div class="hint" id="dualGpuHint"></div>
+        </div>
+  <div class="row" id="moeRow">
+    <div id="moeFields">
+      <div class="label"><span class="name tip" data-flag="-ncmoe, --n-cpu-moe" data-help="Keep the Mixture of Experts (MoE) weights of the first N layers in the CPU.">CPU MoE layers</span><span class="badge">MoE only</span><input type="number" id="nCpuMoe" min="0" max="256" /></div>
+      <input type="range" id="nCpuMoeRange" min="0" max="128" step="1" />
+      <div class="hint" id="moeHint">Only applies to MoE models.</div>
+    </div>
+    <div id="ffnFields">
+      <div class="label"><span class="name tip" data-flag="-ncffn, --n-cpu-ffn" data-help="Keep the dense FFN weights of the first N layers in the CPU (dense models; for MoE expert weights use --n-cpu-moe).">CPU FFN layers</span><span class="badge">Dense only</span><input type="number" id="nCpuFfn" min="0" max="256" /></div>
+      <input type="range" id="nCpuFfnRange" min="0" max="128" step="1" />
+      <div class="hint" id="ffnHint">Only applies to dense (non-MoE) models.</div>
+    </div>
+  </div>
+      </div>
+    </details>
+  <details class="fold" id="advancedFold">
+    <summary><span>Advanced</span><span class="sum" id="advSum">threads, batch, KV, RoPE, speculative</span></summary>
+  <div class="fold-body" id="advancedBody">
+  <div class="adv-tools"><input type="text" id="advFilter" placeholder="Filter by label or flag (e.g. -ub, rope)" aria-label="Filter advanced settings" /><label class="auto"><input type="checkbox" id="advChangedOnly" /> Changed only</label></div>
+
+  <div class="subgroup-title">Compute</div>
+  <div class="row">
+    <div class="label"><span class="name tip" data-flag="-t, --threads" data-help="Number of CPU threads to use during generation (default: -1).">CPU Thread Pool Size</span><input type="number" id="cpuThreads" min="1" max="64" /></div>
+    <input type="range" id="cpuThreadsRange" min="1" max="64" step="1" />
+    <div class="hint" id="cpuThreadsHint">Max = CPU logical cores.</div>
+  </div>
+  <div class="row">
+    <div class="label"><span class="name tip" data-flag="-b, --batch-size" data-help="Logical maximum batch size (default: 2048).">Evaluation Batch Size</span><input type="number" id="evalBatchSize" min="32" step="32" /></div>
+  </div>
+  <div class="row">
+    <div class="label"><span class="name tip" data-flag="-ub, --ubatch-size" data-help="Physical maximum batch size (default: 512).">Physical Batch Size</span><input type="number" id="physicalBatchSize" min="32" step="32" /></div>
+  </div>
+  <div class="row">
+    <div class="label"><span class="name tip" data-flag="-np, --parallel" data-help="Number of server slots (default: -1 = auto). Context is split across slots.">Max Concurrent Predictions</span><span class="badge">Splits context</span><input type="number" id="maxConcurrentPredictions" min="1" max="64" /></div>
+    <div class="hint">Use <strong>1</strong> for Copilot Chat. Values &gt; 1 split Context Length across slots (e.g. 8192/4 = 2048 per request).</div>
+  </div>
+  <div class="row">
+    <div class="label"><span class="name tip" data-flag="-fa, --flash-attn" data-help="Flash Attention: 'on', 'off' or 'auto' (default: auto — enabled when the backend supports it).">Flash Attention</span>
+      <select id="flashAttention">
+        <option value="auto">Auto (default)</option>
+        <option value="on">On</option>
+        <option value="off">Off</option>
+      </select>
+    </div>
+    <div class="hint">Only sent when not Auto. Forcing <strong>On</strong> can help quantized KV cache; older llama.cpp builds may reject the flag.</div>
+  </div>
+
+  <div class="subgroup-title">Memory &amp; KV cache</div>
+  <div class="toggle"><span class="tip" data-flag="-nkvo, --no-kv-offload" data-help="Whether to enable KV cache offloading to GPU (default: enabled). Uncheck to keep KV in system RAM.">Offload KV Cache to GPU Memory</span><input type="checkbox" id="offloadKvCacheToGpu" /></div>
+  <div class="row">
+    <div class="label"><span class="name tip" data-flag="-ctk, --cache-type-k" data-help="KV cache data type for K. Allowed: f32, f16, bf16, q8_0, q5_1, q5_0, q4_1, q4_0, iq4_nl (default: q8_0). q8_0 halves KV size with little quality loss.">KV Cache Type (K)</span>
+      <select id="cacheTypeK">
+        <option value="f32">f32 (full precision)</option>
+        <option value="f16">f16</option>
+        <option value="bf16">bf16</option>
+        <option value="q8_0">q8_0 (~½ size, default)</option>
+        <option value="q5_1">q5_1 (~5/8 size)</option>
+        <option value="q5_0">q5_0 (~5/8 size)</option>
+        <option value="q4_1">q4_1 (~9/16 size)</option>
+        <option value="q4_0">q4_0 (~9/16 size)</option>
+        <option value="iq4_nl">iq4_nl (~9/16 size, better quality)</option>
+      </select>
+    </div>
+  </div>
+  <div class="toggle"><span class="tip" data-flag="-ctk / -ctv" data-help="Keep V on the same type as K. Mixed K/V types fall off the fast attention path and can cost ~40% of prompt and generation throughput.">Use same type for V</span><input type="checkbox" id="kvTypesLinked" checked /></div>
+  <div class="row">
+    <div class="label"><span class="name tip" data-flag="-ctv, --cache-type-v" data-help="KV cache data type for V. Same types as K (default: q8_0). q4_0 saves more VRAM but can hurt long-context prompt speed.">KV Cache Type (V)</span>
+      <select id="cacheTypeV">
+        <option value="f32">f32 (full precision)</option>
+        <option value="f16">f16</option>
+        <option value="bf16">bf16</option>
+        <option value="q8_0">q8_0 (~½ size, default)</option>
+        <option value="q5_1">q5_1 (~5/8 size)</option>
+        <option value="q5_0">q5_0 (~5/8 size)</option>
+        <option value="q4_1">q4_1 (~9/16 size)</option>
+        <option value="q4_0">q4_0 (~9/16 size)</option>
+        <option value="iq4_nl">iq4_nl (~9/16 size, better quality)</option>
+      </select>
+    </div>
+    <div class="hint hidden" id="kvMismatchHint">V is stored more precisely than K. The key cache is the quantization-sensitive one, so this spends memory where it helps least — prefer K at the higher precision (e.g. q8_0 K with q4_0 V).</div>
+    <div class="hint hidden" id="kvFlashAttnHint">A quantized V cache requires Flash Attention. With Flash Attention set to <strong>Off</strong>, llama-server will refuse to start — set V to f16 or put Flash Attention back to Auto/On.</div>
+  </div>
+  <div class="toggle"><span id="keepModelLabel" class="tip" data-flag="--load-mode mlock" data-help="Force the system to keep the model in RAM rather than swapping (load-mode mlock). On Windows this falls back to mmap.">Keep Model in Memory (--mlock)</span><input type="checkbox" id="keepModelInMemory" /></div>
+  <div class="hint" id="keepModelHint" style="display:none">On Windows this uses mmap (--load-mode mmap); mlock is not reliable.</div>
+  <div class="toggle"><span class="tip" data-flag="--load-mode mmap | none" data-help="Memory-map the model (mmap). If disabled and mlock is off, uses load-mode none (slower load, may reduce pageouts). Lazy mode requires mmap.">Try mmap()</span><input type="checkbox" id="tryMmap" /></div>
+  <div class="row">
+    <div class="label"><span class="name tip" data-flag="-lzm, --lazy-mode" data-help="On-demand reading of large host tensors such as per-layer n-gram / PLE tables. auto = on for tensors larger than 4 GiB (llama.cpp default). Requires mmap.">Lazy tensor reads</span>
+      <select id="lazyMode">
+        <option value="auto">Auto (default — on if &gt; 4 GiB)</option>
+        <option value="on">On — read from disk</option>
+        <option value="off">Off — keep resident</option>
+      </select>
+    </div>
+    <div class="hint">Only sent when not Auto. Keeps mmap even with CPU MoE/FFN so Flash-Next can leave the n-gram table on SSD.</div>
+  </div>
+  <div class="toggle"><span class="tip" data-flag="-kvu, --kv-unified" data-help="Use a single unified KV buffer shared across all sequences (default: enabled if slot count is auto). Uncheck passes --no-kv-unified.">Unified KV Cache</span><input type="checkbox" id="unifiedKvCache" /></div>
+
+  <div class="row">
+    <div class="label"><span class="name tip" data-flag="-ctxcp, --ctx-checkpoints" data-help="Max number of context checkpoints to create per slot (default: 32). Checkpoints let a slot restore an earlier context state instead of reprocessing it.">Context Checkpoints</span><input type="number" id="contextCheckpoints" min="0" /></div>
+    <div class="hint">Only sent when different from 32 (the llama.cpp default), so older builds keep working.</div>
+  </div>
+  <div class="row">
+    <div class="label"><span class="name tip" data-flag="--cache-reuse" data-help="Min chunk size to attempt reusing from the cache via KV shifting (requires prompt caching; llama.cpp default: 0 = off).">Cache Reuse (KV shift)</span><input type="number" id="cacheReuse" min="0" step="32" /></div>
+    <div class="hint">Reuses cached chunks after the prompt prefix diverges — raises prompt reuse in long agent threads. 0 disables it.</div>
+  </div>
+
+  <div class="subgroup-title">Reasoning</div>
+  <div class="row">
+    <div class="label"><span class="name tip" data-flag="--reasoning-format" data-help="How thoughts are returned: deepseek-legacy keeps <think> tags in content and also fills reasoning_content; deepseek puts thoughts only in reasoning_content; none leaves the raw output untouched.">Reasoning Format</span>
+      <select id="reasoningFormat">
+        <option value="deepseek-legacy">deepseek-legacy (default)</option>
+        <option value="deepseek">deepseek</option>
+        <option value="none">none (raw)</option>
+        <option value="auto">auto</option>
+      </select>
+    </div>
+    <div class="hint">Copilot Chat only renders <code>content</code> — <strong>deepseek-legacy</strong> keeps thoughts visible there.</div>
+  </div>
+  <div class="row">
+    <div class="label"><span class="name tip" data-flag="--reasoning-budget" data-help="Token budget for thinking: -1 unrestricted, 0 ends thinking immediately, N > 0 caps thinking at N tokens.">Reasoning Budget</span>
+      <span class="auto-field">
+        <label class="auto"><input type="checkbox" id="reasoningBudgetUnlimited" /> Unlimited</label>
+        <input type="number" id="reasoningBudget" min="0" step="128" />
+      </span>
+    </div>
+    <div class="hint">Caps how many tokens a think model may spend before answering. Set <strong>0</strong> to skip thinking entirely.</div>
+  </div>
+
+  <div class="subgroup-title" id="chatTemplateTitle">Chat template</div>
+  <div class="row" id="chatTemplateSourceRow">
+    <div class="label"><span class="name tip" data-flag="--jinja, --chat-template, --chat-template-file" data-help="Which Jinja chat template llama-server uses. From model keeps the template embedded in the GGUF. Built-in picks a llama.cpp name. File loads a .jinja or .txt template. A change reloads the server.">Source</span>
+      <select id="chatTemplateSource">
+        <option value="model">From model</option>
+        <option value="builtin">Built-in</option>
+        <option value="file">File</option>
+      </select>
+    </div>
+    <div class="hint" id="chatTemplateHint">Uses the Jinja template embedded in the GGUF. llama-server’s Jinja engine is already on.</div>
+    <div class="hint hidden" id="chatTemplateRemoteHint">The remote server owns its chat template. This setting applies the next time you run locally.</div>
+  </div>
+  <div class="row hidden" id="chatTemplateNameRow">
+    <div class="label"><span class="name tip" data-flag="--chat-template" data-help="Built-in llama.cpp chat template name. Sent as --jinja --chat-template NAME, which replaces the template stored in the GGUF.">Template</span>
+      <select id="chatTemplateName">
+        {{chatTemplateOptions}}
+      </select>
+    </div>
+  </div>
+  <div class="row hidden" id="chatTemplateFileRow">
+    <div class="label"><span class="name tip" data-flag="--chat-template-file" data-help="Path to a Jinja chat template file. Sent as --jinja --chat-template-file. The file is not copied; a missing file blocks server start.">Template file</span></div>
+    <input type="hidden" id="chatTemplateFile" />
+    <div class="tpl-file"><span class="tpl-name" id="chatTemplateFileName">No template file selected.</span></div>
+    <div class="btn-row" style="margin:6px 0 0;gap:8px;flex-wrap:wrap">
+      <button class="secondary" id="pickChatTemplateBtn" type="button">Choose template…</button>
+      <button class="secondary" id="clearChatTemplateBtn" type="button">Clear</button>
+    </div>
+    <div class="tpl-problem hidden" id="chatTemplateProblem"></div>
+  </div>
+  <div class="toggle" id="chatTemplateJinjaRow">
+    <span class="tip" data-flag="--jinja, --no-jinja" data-help="llama.cpp’s Jinja engine is on by default. Turn this off only to send --no-jinja and ignore the GGUF Jinja template. A built-in name or a file always keeps Jinja on.">Jinja engine</span>
+    <input type="checkbox" id="chatTemplateJinja" checked />
+  </div>
+
+  <div class="subgroup-title">Positional &amp; seed</div>
+  <div class="row">
+    <div class="label"><span class="name tip" data-flag="--rope-freq-base" data-help="RoPE base frequency, used by NTK-aware scaling (default: loaded from model).">RoPE Frequency Base</span>
+      <span class="auto-field">
+        <label class="auto"><input type="checkbox" id="ropeBaseAuto" /> Auto</label>
+        <input type="number" id="ropeFreqBase" step="1" />
+      </span>
+    </div>
+  </div>
+  <div class="row">
+    <div class="label"><span class="name tip" data-flag="--rope-freq-scale" data-help="RoPE frequency scaling factor; expands context by a factor of 1/N.">RoPE Frequency Scale</span>
+      <span class="auto-field">
+        <label class="auto"><input type="checkbox" id="ropeScaleAuto" /> Auto</label>
+        <input type="number" id="ropeFreqScale" step="0.01" />
+      </span>
+    </div>
+  </div>
+  <div class="row">
+    <div class="label"><span class="name tip" data-flag="-s, --seed" data-help="RNG seed (default: -1 = random).">Seed</span>
+      <span class="auto-field">
+        <label class="auto"><input type="checkbox" id="seedRandom" /> Random</label>
+        <input type="number" id="seed" step="1" />
+      </span>
+    </div>
+  </div>
+
+  <div class="subgroup-title">Speculative decoding</div>
+  <div class="row" id="specModeRow">
+    <div class="label"><span class="name tip" data-flag="--spec-type" data-help="Speculative decoding type. MTP uses next-n layers in the main GGUF, or a sibling mtp-*.gguf (Gemma 4) via --model-draft. DFlash uses a separate draft GGUF with --spec-type draft-dflash. N-gram drafts from n-grams seen in the prompt itself and can stack with MTP or DFlash.">Mode</span>
+      <select id="speculativeMode">
+        <option value="off">Off</option>
+        <option value="mtp" id="specMtpOption">MTP (draft-mtp)</option>
+        <option value="dflash" id="specDflashOption">DFlash (draft-dflash)</option>
+        <option value="ngram">N-gram (no draft model)</option>
+        <option value="ngram-mtp" id="specNgramMtpOption">N-gram + MTP</option>
+        <option value="ngram-dflash">N-gram + DFlash</option>
+      </select>
+    </div>
+    <div class="hint" id="specHint">MTP needs next-n layers in the main GGUF or a sibling mtp-*.gguf. DFlash needs a matching DFlash draft GGUF. N-gram works on any model and can stack with MTP or DFlash.</div>
+  </div>
+  <div class="spec-group hidden" id="specNgramGroup">
+    <div class="spec-group-title">N-gram</div>
+    <div class="row" id="specNgramVariantRow">
+      <div class="label"><span class="name tip" data-flag="--spec-type ngram-*" data-help="N-gram lookup strategy. Simple keeps a rolling window of the prompt. Map-k indexes the prompt for faster lookup on long contexts. K4v additionally caches key/value states per n-gram. Mod is the classic prompt-lookup variant tuned for long drafts.">Variant</span>
+        <select id="ngramVariant">
+          <option value="simple">simple — rolling prompt window</option>
+          <option value="map-k">map-k — indexed lookup (long prompts)</option>
+          <option value="map-k4v">map-k4v — indexed + KV cache</option>
+          <option value="mod">mod — classic prompt-lookup</option>
+        </select>
+      </div>
+    </div>
+    <div class="row" id="specNgramSizeRow">
+      <div class="label"><span class="name tip" data-flag="--spec-ngram-*-size-n" data-help="Length of the lookup n-gram in tokens (default: 12; mod variant match length: 24). Longer = fewer false matches, shorter = more draft attempts.">Lookup size</span><input type="number" id="ngramSizeN" min="2" max="512" /></div>
+      <input type="range" id="ngramSizeNRange" min="2" max="64" step="1" />
+    </div>
+    <div class="row" id="specNgramDraftRow">
+      <div class="label"><span class="name tip" data-flag="--spec-ngram-*-size-m / --spec-ngram-mod-n-max" data-help="How many tokens n-gram may draft from a prompt match (default: 48; mod variant max: 64). This is not MTP/DFlash --spec-draft-n-max.">Draft length</span><input type="number" id="ngramSizeM" min="2" max="2048" /></div>
+    </div>
+    <div class="row" id="specNgramHitsRow">
+      <div class="label"><span class="name tip" data-flag="--spec-ngram-*-min-hits" data-help="Minimum number of times an n-gram must appear before it is used to draft (default: 1). Raise to 2–3 to avoid drafting from coincidental matches. Not used by the mod variant.">Min hits</span><input type="number" id="ngramMinHits" min="1" max="64" /></div>
+    </div>
+  </div>
+  <div class="spec-group hidden" id="specNeuralGroup">
+    <div class="spec-group-title" id="specNeuralHeading">MTP</div>
+    <div class="row hidden" id="specDraftModelRow">
+      <div class="label"><span class="name tip" id="specDraftModelName" data-flag="-md, --model-draft" data-help="Path to the DFlash draft GGUF (architecture = dflash) or Gemma 4 sidecar MTP GGUF (mtp-*.gguf / architecture = gemma4-assistant).">Draft model</span></div>
+      <div class="hint" id="draftModelPathHint" style="margin:4px 0 8px">No draft model selected.</div>
+      <div class="hint" id="draftModelKindHint" style="margin:0 0 8px">DFlash needs a <em>separate</em> draft GGUF (<code>architecture = dflash</code>) for your target — not the main model. Gemma 4 MTP uses a sibling <code>mtp-*.gguf</code>.</div>
+      <div class="btn-row" style="margin:0 0 8px;gap:8px;flex-wrap:wrap">
+        <button class="secondary" id="pickDraftModelBtn" type="button">Choose draft GGUF…</button>
+        <button class="secondary" id="clearDraftModelBtn" type="button">Clear</button>
+      </div>
+    </div>
+    <div class="row hidden" id="specDraftNglRow">
+      <div class="label"><span class="name tip" id="specDraftNglName" data-flag="--spec-draft-ngl" data-help="Max draft-model layers in VRAM (exact number, auto, or all).">GPU offload</span><input type="number" id="draftGpuOffload" min="0" max="999" /></div>
+      <div class="hint" id="draftNglHint">99 usually means all draft layers. DFlash draft KV cache is forced to f16 (quantized draft KV collapses acceptance).</div>
+    </div>
+    <div class="row hidden" id="specDraftMaxRow">
+      <div class="label"><span class="name tip" id="specDraftMaxName" data-flag="--spec-draft-n-max" data-help="Number of tokens the MTP or DFlash drafter proposes per step (--spec-draft-n-max). Separate from n-gram draft length. For DFlash try 8–15.">Max draft tokens</span><input type="number" id="maxDraftTokens" min="0" /></div>
+    </div>
+    <div class="row hidden" id="specDraftMinRow">
+      <div class="label"><span class="name tip" id="specDraftMinName" data-flag="--spec-draft-n-min" data-help="Minimum number of draft tokens to use for speculative decoding (default: 0). MTP only.">Min draft tokens</span><input type="number" id="minDraftTokens" min="0" /></div>
+    </div>
+    <div class="row hidden" id="specDraftPRow">
+      <div class="label"><span class="name tip" id="specDraftPName" data-flag="--spec-draft-p-min" data-help="Stop drafting when the next-token probability drops below this (default here: 0.75). llama.cpp's own default of 0.00 never stops and collapses acceptance. Used by MTP and DFlash.">Draft probability</span><input type="number" id="draftProbability" min="0" max="1" step="0.01" /></div>
+    </div>
+  </div>
+
+  <div class="btn-col" style="margin:12px 0 8px">
+    <button class="secondary" id="resetAdvancedBtn" title="Restore Advanced Settings to Llama AIO defaults (does not change Context Length / GPU Offload / MoE)">Reset advanced to defaults</button>
+  </div>
+
+  </div>
+  </details>
+  </div>
+
+  <div class="card" id="perfCard">
+    <div class="card-head">
+      <span class="card-title">Performance</span>
+      <span class="sub" id="perfWindow"></span>
+    </div>
+    <div class="kpis" id="perfKpis">
+      <div class="kpi"><b id="kpiGen">—</b><i>gen tok/s</i><span class="spark" id="kpiGenSpark"></span></div>
+      <div class="kpi"><b id="kpiPrompt">—</b><i>prompt tok/s</i><span class="spark" id="kpiPromptSpark"></span></div>
+      <div class="kpi"><b id="kpiReuse">—</b><i>cache reuse</i><span class="spark" id="kpiReuseSpark"></span></div>
+      <div class="kpi"><b id="kpiSpec">—</b><i id="kpiSpecLabel">draft accept</i></div>
+    </div>
+    <div class="metric-line hidden" id="perfSpecLine"></div>
+    <div class="ctx-chart-title">
+      <span id="ctxLabel">This chat</span>
+      <span class="sub" id="ctxSub">— (send a chat to measure)</span>
+    </div>
+    <div class="ctx-stack" id="ctxStack" role="img" aria-label="Context"></div>
+    <div class="ctx-legend" id="ctxLegend"></div>
+    <div class="metric-line" id="perfMetrics">No generation yet</div>
+    <details class="fold" id="perfMore">
+      <summary><span>History</span><span class="sum" id="perfHistSum">per-request table</span></summary>
+      <div class="fold-body perf-history"><div id="perfHistoryTable"></div></div>
+    </details>
+  </div>
+
+  <div class="card" id="copilotCard">
+    <details class="fold top" id="copilotFold">
+      <summary>
+        <span class="card-title">Chat Requests</span>
+        <span class="sum" id="copilotSum">—</span>
+        <span class="hdr-btns" id="copilotDebugBtns">
+          <button class="secondary small" id="viewContextBtn" type="button" disabled title="Open the last Copilot → llama.cpp request (messages + tools) in an editor">Last call</button>
+          <button class="secondary small" id="viewResponseBtn" type="button" disabled title="Open the last llama.cpp assistant stream (helps debug empty Chat replies)">Last reply</button>
+        </span>
+      </summary>
+      <div class="fold-body">
+        <div class="sec-label"><span>Reasoning</span></div>
+        <div class="ot-box" id="overthinkingBox">
+          <div class="opt-row">
+            <label for="overthinkingPenalty"><span class="tip" data-flag="logit_bias" data-help="When on, each chat request subtracts the strength from the logits of hesitation words (Wait, maybe, But, and the rest of the measured list). Token ids are looked up once from the running server and cached per model. Off by default: those words are normal in code and tool calls.">Overthinking penalty</span></label>
+            <input type="checkbox" id="overthinkingPenalty" />
+          </div>
+          <div class="opt-row">
+            <span class="tip muted" data-flag="logit_bias" data-help="How much to subtract from each marker logit. 2 shortened the lily-pad trace from 828 to 233 tokens and a binary-search answer from 681 to 458 on Qwen3.8. The paper swept 0.5 to 4.">Strength</span>
+            <span class="seg" id="otStrengthSeg"><button class="seg-btn" type="button" data-v="0.5">0.5</button><button class="seg-btn" type="button" data-v="1">1</button><button class="seg-btn" type="button" data-v="2">2</button><button class="seg-btn" type="button" data-v="3">3</button><button class="seg-btn" type="button" data-v="4">4</button></span>
+            <input type="hidden" id="overthinkingPenaltyStrength" value="2" />
+          </div>
+          <div class="hint" id="overthinkingHint">Off. Strength is remembered, but chat requests do not send it.</div>
+        </div>
+        <div class="opt-row req-line">
+          <span class="tip" data-flag="Chat / API request body" data-help="Max tokens to generate per reply (extension request default / n_predict-style cap).">Max tokens</span>
+          <input type="number" id="maxTokens" min="16" step="16" />
+        </div>
+
+        <div class="sec-label">
+          <span>Sampling</span>
+          <button class="link-btn" id="resetRequestBtn" type="button" title="Restore temperature, top-p/k, min-p, penalties, overthinking penalty, and max tokens to Llama AIO defaults">Reset</button>
+        </div>
+        <div class="mode-strip hidden" id="modeStrip">
+          <span><span class="muted">Model mode</span> <b id="modeStripName">—</b></span>
+          <span id="modeStripValues"></span>
+        </div>
+        <div class="req-grid">
+          <div class="req-cell samp-free"><span class="tip" data-flag="Chat / API request body" data-help="Sampling temperature for completions (extension request default, not a llama-server load flag).">Temperature</span><input type="number" id="temperature" min="0" max="2" step="0.05" /></div>
+          <div class="req-cell samp-free"><span class="tip" data-flag="Chat / API request body" data-help="Nucleus sampling top-p (extension request default).">Top P</span><input type="number" id="topP" min="0" max="1" step="0.01" /></div>
+          <div class="req-cell samp-free"><span class="tip" data-flag="--top-k / request body" data-help="Top-k sampling (extension request default).">Top K</span><input type="number" id="topK" min="0" step="1" /></div>
+          <div class="req-cell"><span class="tip" data-flag="--min-p / request body" data-help="Min-p sampling (0 = disabled). llama-server's built-in default of 0.05 is wrong for most current instruct/coder families — keep 0 unless a model card recommends otherwise. Also shipped as a server CLI default at start, so raw API clients inherit it.">Min P</span><input type="number" id="minP" min="0" max="1" step="0.01" /></div>
+          <div class="req-cell"><span class="tip" data-flag="--repeat-penalty / request body" data-help="Repetition penalty (llama.cpp style; 1.0 = disabled). Values above 1 discourage repeating earlier tokens — useful for prose, harmful for code (breaks exact repetition like closing tags).">Repeat</span><input type="number" id="repeatPenalty" min="0.5" max="2" step="0.01" /></div>
+          <div class="req-cell"><span class="tip" data-flag="--presence-penalty / request body" data-help="Presence penalty (OpenAI-style; 0 = disabled). Positive values push the model toward new topics. Qwen3 No-Think mode recommends 1.5.">Presence</span><input type="number" id="presencePenalty" min="-2" max="2" step="0.05" /></div>
+          <div class="req-cell"><span class="tip" data-flag="--frequency-penalty / request body" data-help="Frequency penalty (OpenAI-style; 0 = disabled). Scaled by how often a token already appeared.">Frequency</span><input type="number" id="frequencyPenalty" min="-2" max="2" step="0.05" /></div>
+        </div>
+
+        <div class="sec-label"><span>Prompt &amp; tools</span></div>
+        <div class="opt-list">
+          <div class="opt-row">
+            <span>Prompt replacements <span class="hint" id="replacementStats">—</span></span>
+            <input type="checkbox" id="promptReplacementsEnabled" title="Strip Copilot system-prompt boilerplate before llama.cpp" />
+          </div>
+          <div class="opt-row">
+            <span>Wikipedia lookup</span>
+            <input type="checkbox" id="wikipediaLookupEnabled" title="Let the model call wikipedia_lookup for encyclopedic facts. Off by default." />
+          </div>
+          <div class="opt-row">
+            <span>Skip duplicate tools</span>
+            <input type="checkbox" id="duplicateToolCallGuardEnabled" title="Skip a tool that already ran with the same arguments in this turn. Off by default — can block a legitimate retry." />
+          </div>
+        </div>
+      </div>
+    </details>
+    <div class="hint hidden" id="noCopilotHint">Copilot Chat isn't available in this editor, so these settings only apply to extensions that use the VS Code Language Model API. The server's OpenAI-compatible endpoint is <code id="noCopilotEndpoint"></code>.</div>
+    <div class="opt-row ot-quick">
+      <label for="overthinkingQuick">Overthinking penalty</label>
+      <span class="ot-quick-ctl"><span class="hint" id="overthinkingQuickState">off</span><input type="checkbox" id="overthinkingQuick" /></span>
+    </div>
+  </div>
+
+  <div class="card" id="backendCard">
+    <div class="card-head">
+      <span><span class="card-title">llama.cpp</span> <span class="sub" id="backendLine">—</span></span>
+      <button class="secondary small hidden" id="installLlamaBtn" type="button">Upgrade to latest</button>
+    </div>
+    <div class="hint" id="backendHint"></div>
+    <div id="llamaInstallBox" class="install-box hidden"></div>
+    <details class="fold" id="backendFold">
+      <summary><span>Backends &amp; install options</span><span class="sum" id="backendSum">—</span></summary>
+      <div class="fold-body">
+        <select id="backendSelect" class="wide" aria-label="Backend"></select>
+        <div class="meta" id="llamaBinaryDetail" style="margin:8px 0 4px"></div>
+        <div class="meta" id="llamaAssetDetail" style="margin:0 0 8px"></div>
+        <div class="btn-col">
+          <button class="secondary" id="checkUpdatesBtn">Check for updates</button>
+          <button class="secondary" id="reinstallLlamaBtn">Reinstall current release</button>
+          <button class="secondary" id="installByTagBtn">Install release tag…</button>
+          <button class="secondary" id="installArchiveBtn">Install from archive…</button>
+        </div>
+        <div class="hint" style="margin-top:8px">
+          Tag / archive installs skip the GitHub API (useful on shared IPs).
+          <a href="https://github.com/ggml-org/llama.cpp/releases" id="releasesLink">Browse releases</a>
+        </div>
+      </div>
+    </details>
+  </div>
+  <script nonce="{{nonce}}" src="{{scriptUri}}"></script>
+</body>
+</html>

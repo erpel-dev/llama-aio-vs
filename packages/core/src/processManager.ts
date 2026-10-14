@@ -1,6 +1,7 @@
 import * as fs from "fs";
 import * as path from "path";
-import { execFileSync, spawn } from "child_process";
+import { spawn } from "child_process";
+import { runStepsAsync, type ExecSteps } from "./execRunner";
 import {
   ensureDirs,
   findLlamaServerOnPath,
@@ -16,7 +17,7 @@ import {
   spawnInExternalTerminal,
 } from "./externalTerminal";
 import { clampLoadSettingsToModel, readModelCapabilities } from "./ggufMetadata";
-import { detectGpus } from "./gpuInfo";
+import { detectGpus, detectGpusAsync } from "./gpuInfo";
 import { envForInstalledBinary, LlamaInstaller } from "./llamaInstaller";
 import {
   hasUsableFhsDynamicLinker,
@@ -27,6 +28,7 @@ import {
 } from "./nixCompat";
 import {
   isLlamaServerProcess,
+  isLlamaServerProcessAsync,
   isPidAlive,
   sameModelFile,
   stopProcessTree,
@@ -138,16 +140,98 @@ class IncrementalLog {
   }
 }
 
+/**
+ * Last `maxBytes` of a log, decoded from the first full line. A server left
+ * running for days can write tens of MB; the failure summary only needs the end.
+ */
+export function readLogTail(logPath: string, maxBytes = 256 * 1024): string {
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(logPath, "r");
+    const size = fs.fstatSync(fd).size;
+    const start = Math.max(0, size - maxBytes);
+    const buf = Buffer.alloc(size - start);
+    const read = fs.readSync(fd, buf, 0, buf.length, start);
+    const text = buf.subarray(0, read).toString("utf8");
+    // Drop the partial first line when we started mid-file.
+    return start > 0 ? text.slice(text.indexOf("\n") + 1) : text;
+  } catch {
+    return "";
+  } finally {
+    if (fd !== undefined) {
+      fs.closeSync(fd);
+    }
+  }
+}
+
 /** Fatal / terminal failure lines from llama-server logs. */
 const FATAL_LOG_RE =
   /error loading model|failed to load|ErrorDeviceLost|out of memory|insufficient memory|CUDA error|VK_ERROR|ggml_vulkan.*failed|llama_init_from_model.*failed|common_init_from_params.*failed|srv\s+load_model:\s+failed/i;
 
 export type StartProgress = (message: string) => void;
 
+/** How long a "nothing of ours on the port" / "adopt pid N" verdict is trusted. */
+const ADOPTION_SCAN_TTL_MS = 10_000;
+
+/** `ss` / `lsof` / `netstat` lookup of the PIDs listening on `port`. */
+function* pidsOnPortSteps(port: number): ExecSteps<number[] | undefined> {
+  if (process.platform === "win32") {
+    const res = yield { command: "netstat", args: ["-ano", "-p", "tcp"], timeoutMs: 8000 };
+    if (!res.ok) {
+      console.warn(`Llama AIO: could not determine what is listening on port ${port}: netstat failed`);
+      return undefined;
+    }
+    const pids = new Set<number>();
+    for (const line of res.stdout.split(/\r?\n/)) {
+      if (!/LISTENING/i.test(line)) {
+        continue;
+      }
+      const parts = line.trim().split(/\s+/);
+      // Proto  LocalAddress  ForeignAddress  State  PID
+      if (parts.length < 5 || !parts[1].endsWith(`:${port}`)) {
+        continue;
+      }
+      const pid = Number(parts[parts.length - 1]);
+      if (Number.isFinite(pid) && pid > 0) {
+        pids.add(pid);
+      }
+    }
+    return [...pids];
+  }
+  if (process.platform === "darwin") {
+    // macOS has no `ss`; lsof prints one PID per line with -t.
+    const res = yield { command: "lsof", args: ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-t"], timeoutMs: 8000 };
+    if (res.ok) {
+      return uniquePids(res.stdout.split(/\s+/));
+    }
+    // `lsof -t` exits 1 with no output when nothing is listening — that is a
+    // real "port is free", not a tooling failure.
+    if (res.status === 1 && !res.stdout.trim()) {
+      return [];
+    }
+    console.warn(`Llama AIO: could not determine what is listening on port ${port}: lsof failed`);
+    return undefined;
+  }
+  const res = yield { command: "ss", args: ["-ltnp", `sport = :${port}`], timeoutMs: 8000 };
+  if (!res.ok) {
+    console.warn(`Llama AIO: could not determine what is listening on port ${port}: ss failed`);
+    return undefined;
+  }
+  return uniquePids([...res.stdout.matchAll(/pid=(\d+)/g)].map((m) => m[1]));
+}
+
 /** Opaque handle from {@link ProcessManager.claimLaunch}; pass into start/reload. */
 export type LaunchToken = { readonly id: number };
 
 export const LAUNCH_IN_PROGRESS_MSG = "A server start/reload is already in progress.";
+
+/** A start/reload was stopped by the user before the server became ready. */
+export class LaunchCancelledError extends Error {
+  constructor() {
+    super("Server start cancelled.");
+    this.name = "LaunchCancelledError";
+  }
+}
 
 /** Why start/stop/reload refuse while connected to a remote server. */
 export function remoteLifecycleMessage(action: string, label: string): string {
@@ -168,6 +252,8 @@ export class ProcessManager {
 
   /** Exclusive launch lock — prevents overlapping start/reload (and dual progress toasts). */
   private launchToken: LaunchToken | undefined;
+  /** Set by {@link stop} while a launch is in flight; checked between start steps. */
+  private launchCancelled = false;
   private nextLaunchId = 1;
 
   /**
@@ -182,6 +268,10 @@ export class ProcessManager {
    * until the lock is rewritten for a new launch.
    */
   private readonly pidIdentity = new Map<number, { startedAt: string; ours: boolean }>();
+
+  /** Last background port scan for a stale lock (see {@link scanForAdoption}). */
+  private adoption: { startedAt: string; port: number; pid?: number; at: number } | undefined;
+  private adoptionScan: Promise<void> | undefined;
 
   /** Probe state of the remote server; only polls while the store is in remote mode. */
   readonly remote: RemoteServerMonitor;
@@ -225,10 +315,6 @@ export class ProcessManager {
     }
   }
 
-  isStarting(): boolean {
-    return !!this.boot || !!this.launchToken;
-  }
-
   /**
    * Claim exclusive start/reload before any awaits (confirm dialogs, withProgress).
    * Returns undefined if another launch is already in flight.
@@ -239,21 +325,12 @@ export class ProcessManager {
     }
     const token: LaunchToken = { id: this.nextLaunchId++ };
     this.launchToken = token;
+    this.launchCancelled = false;
     this.beginBoot(
       kind,
       message || (kind === "reload" ? "Reloading llama-server…" : "Starting llama-server…")
     );
     return token;
-  }
-
-  /** Mark boot UI immediately (before awaits / pushState races). Prefer {@link claimLaunch}. */
-  markStarting(kind: "start" | "reload", message?: string): void {
-    this.claimLaunch(kind, message);
-  }
-
-  /** Clear boot UI after cancel / error paths that never call start/reload. */
-  clearStarting(): void {
-    this.releaseLaunch(this.launchToken);
   }
 
   /** Release a claim when canceling before start/reload, or after they finish. */
@@ -334,11 +411,14 @@ export class ProcessManager {
     // Windows Terminal) while llama-server still owns the port.
     if (lock) {
       // Only adopt a port occupant that is actually a llama-server; otherwise
-      // an unrelated listener would be reported as our running server.
-      const portPids = this.findPidsOnPort(lock.port).filter(isLlamaServerProcess);
-      if (portPids.length) {
-        const pid = portPids[0];
+      // an unrelated listener would be reported as our running server. The
+      // scan runs in the background; until it lands the server reads as stopped.
+      const scan = this.freshAdoption(lock);
+      if (scan?.pid) {
+        const pid = scan.pid;
         this.writeLock({ ...lock, pid });
+        // The scan already checked this pid's command line.
+        this.pidIdentity.set(pid, { startedAt: lock.startedAt, ours: true });
         return {
           running: !this.boot,
           pid,
@@ -352,11 +432,13 @@ export class ProcessManager {
           ...bootFields,
         };
       }
-      // Dead (or reused) pid and nothing of ours on the port: the lock is
-      // stale. Drop it so status polling stops scanning the port every tick —
-      // unless a launch is still in flight here or in another window, whose
-      // provisional lock this may be.
-      if (!this.boot && !activeLaunchLock()) {
+      if (!scan) {
+        void this.scanForAdoption(lock);
+      } else if (!this.boot && !activeLaunchLock()) {
+        // Dead (or reused) pid and nothing of ours on the port: the lock is
+        // stale. Drop it so status polling stops scanning the port — unless a
+        // launch is still in flight here or in another window, whose
+        // provisional lock this may be.
         this.clearLock();
       }
     }
@@ -527,15 +609,10 @@ export class ProcessManager {
 
   /** Raw tail of the server log (unfiltered), for the Output channel after a failed start. */
   readRecentLogLines(maxLines = 20): string {
-    try {
-      const lines = fs
-        .readFileSync(getLogPath(), "utf8")
-        .split(/\r?\n/)
-        .filter((line) => line.length > 0);
-      return lines.slice(-maxLines).join("\n");
-    } catch {
-      return "";
-    }
+    const lines = readLogTail(getLogPath())
+      .split(/\r?\n/)
+      .filter((line) => line.length > 0);
+    return lines.slice(-maxLines).join("\n");
   }
 
   resolveBinary(): string {
@@ -619,7 +696,7 @@ export class ProcessManager {
         };
       }
       report("Stopping previous server…");
-      await this.stop(true);
+      await this.stopServer(true);
       await sleep(400);
     }
 
@@ -627,7 +704,7 @@ export class ProcessManager {
     if (lock && this.lockPidIsOurs(lock)) {
       if (lock.configFingerprint && !this.lockMatchesDesired(lock, model)) {
         report("Stopping previous server…");
-        await this.stop(true);
+        await this.stopServer(true);
       } else {
         // Process alive but HTTP not ready yet — wait briefly, then re-check.
         report("Waiting for existing server…");
@@ -646,12 +723,13 @@ export class ProcessManager {
           }
         }
         report("Stopping previous server…");
-        await this.stop(true);
+        await this.stopServer(true);
       }
     } else if (lock) {
       this.clearLock();
     }
 
+    this.throwIfCancelled();
     const launch = this.resolveLaunch();
     const binary = launch.binary;
 
@@ -660,7 +738,12 @@ export class ProcessManager {
 
     // Fail fast instead of waiting out the readiness timeout when something
     // that is not ours already holds the port.
-    const blockers = (this.queryPidsOnPort(port) ?? []).filter((pid) => !isLlamaServerProcess(pid));
+    const blockers: number[] = [];
+    for (const pid of (await this.queryPidsOnPort(port)) ?? []) {
+      if (!(await isLlamaServerProcessAsync(pid))) {
+        blockers.push(pid);
+      }
+    }
     if (blockers.length) {
       throw new Error(
         `Port ${port} is already in use by another process (pid ${blockers.join(", ")}). ` +
@@ -687,7 +770,7 @@ export class ProcessManager {
       // CPU builds ignore -ngl / --n-cpu-moe; keep args honest so logs/estimate match reality.
       loadSettings = normalizeLoadSettingsForCpuBackend(loadSettings);
     }
-    const gpus = this.isCpuBackend() ? [] : detectGpus(false, binary);
+    const gpus = this.isCpuBackend() ? [] : await detectGpusAsync(false, binary);
     const args = buildServerArgs(model, host, port, loadSettings, {
       gpus,
       // Ship request sampling defaults as CLI flags so raw clients pointing at
@@ -698,6 +781,8 @@ export class ProcessManager {
     const launchMode = resolveLaunchMode(this.store.getConfig().get<string>("launchMode"));
     const configFingerprint = serverConfigFingerprint(model, loadSettings, launchMode);
 
+    // Last exit before anything is spawned: Stop may have landed during the awaits above.
+    this.throwIfCancelled();
     ensureDirs(getLockDir(), path.dirname(getLogPath()));
     // Fresh log per start so failures are easy to read.
     const logPath = getLogPath();
@@ -793,9 +878,12 @@ export class ProcessManager {
     const logTail = new IncrementalLog(logPath);
 
     while (Date.now() - startedAt < maxWaitMs) {
+      // Stop pressed while waiting: stop() already killed the process.
+      this.throwIfCancelled();
       const failed = childSpawnError(launched);
       if (failed) {
-        await this.stop(true).catch(() => undefined);
+        this.throwIfCancelled();
+        await this.stopServer(true).catch(() => undefined);
         throw new Error(
           this.formatStartFailure(`Failed to spawn llama-server (${failed.message}).`)
         );
@@ -806,12 +894,13 @@ export class ProcessManager {
         sawLoading = true;
       }
       if (log.fatal) {
-        await this.stop(true).catch(() => undefined);
+        this.throwIfCancelled();
+        await this.stopServer(true).catch(() => undefined);
         throw new Error(this.formatStartFailure("llama-server failed while loading.", log.fatal));
       }
 
       if (await this.isHttpReady()) {
-        const serverPids = this.findPidsOnPort(port);
+        const serverPids = await this.findPidsOnPort(port);
         const pid = serverPids[0] || launcherPid;
         const finalLock: LockFile = {
           pid,
@@ -845,7 +934,8 @@ export class ProcessManager {
       }
 
       if (launchMode === "background" && launcherPid && !isPidAlive(launcherPid)) {
-        await this.stop(true).catch(() => undefined);
+        this.throwIfCancelled();
+        await this.stopServer(true).catch(() => undefined);
         throw new Error(this.formatStartFailure("llama-server exited early."));
       }
 
@@ -862,7 +952,7 @@ export class ProcessManager {
       await sleep(400);
     }
 
-    await this.stop(true).catch(() => undefined);
+    await this.stopServer(true).catch(() => undefined);
     throw new Error(
       this.formatStartFailure(
         `llama-server did not become ready within ${Math.round(maxWaitMs / 1000)}s.`
@@ -915,8 +1005,7 @@ export class ProcessManager {
 
   private readLogSnippet(logPath: string, maxLines = 18): string {
     try {
-      const lines = fs
-        .readFileSync(logPath, "utf8")
+      const lines = readLogTail(logPath)
         .split(/\r?\n/)
         .filter((l) => l.trim().length > 0);
       // Prefer the abort / error lines over gdb noise.
@@ -932,8 +1021,25 @@ export class ProcessManager {
     }
   }
 
+  /**
+   * Stop the server. A start/reload in flight in this window is cancelled:
+   * it ends with {@link LaunchCancelledError} instead of "exited early".
+   */
   async stop(force = false): Promise<void> {
     this.assertLocal("stop");
+    if (this.launchToken) {
+      this.launchCancelled = true;
+    }
+    await this.stopServer(force);
+  }
+
+  private throwIfCancelled(): void {
+    if (this.launchCancelled) {
+      throw new LaunchCancelledError();
+    }
+  }
+
+  private async stopServer(force: boolean): Promise<void> {
     const lock = this.readLock();
     const port = lock?.port ?? this.store.getPort();
     const pids = new Set<number>();
@@ -951,10 +1057,10 @@ export class ProcessManager {
     // Also clean up stale llama-servers holding our port (missed locks, crashed
     // launchers). Anything else on the port belongs to another application and
     // is left running — the caller is told instead.
-    const occupants = this.queryPidsOnPort(port) ?? [];
+    const occupants = (await this.queryPidsOnPort(port)) ?? [];
     const foreign: number[] = [];
     for (const pid of occupants) {
-      if (pids.has(pid) || isLlamaServerProcess(pid)) {
+      if (pids.has(pid) || (await isLlamaServerProcessAsync(pid))) {
         pids.add(pid);
       } else {
         foreign.push(pid);
@@ -970,7 +1076,7 @@ export class ProcessManager {
     }
     // Wait briefly for the port to free (Windows especially).
     for (let i = 0; i < 20; i++) {
-      if (!this.findPidsOnPort(port).length) {
+      if (!(await this.findPidsOnPort(port)).length) {
         break;
       }
       await sleep(100);
@@ -982,69 +1088,63 @@ export class ProcessManager {
    * PIDs listening on `port`, or undefined when we could not find out (no
    * tooling, permission denied). Callers must treat undefined as "unknown"
    * rather than "nothing there" — the difference decides whether we kill.
+   * Runs `ss` / `lsof` / `netstat` asynchronously: `netstat -ano` alone can
+   * take seconds on Windows.
    */
-  private queryPidsOnPort(port: number): number[] | undefined {
-    try {
-      if (process.platform === "win32") {
-        const out = execFileSync("netstat", ["-ano", "-p", "tcp"], {
-          encoding: "utf8",
-          stdio: ["ignore", "pipe", "ignore"],
-          windowsHide: true,
-          timeout: 8000,
-        });
-        const pids = new Set<number>();
-        for (const line of out.split(/\r?\n/)) {
-          if (!/LISTENING/i.test(line)) {
-            continue;
-          }
-          const parts = line.trim().split(/\s+/);
-          // Proto  LocalAddress  ForeignAddress  State  PID
-          if (parts.length < 5) {
-            continue;
-          }
-          const local = parts[1];
-          if (!local.endsWith(`:${port}`)) {
-            continue;
-          }
-          const pid = Number(parts[parts.length - 1]);
-          if (Number.isFinite(pid) && pid > 0) {
-            pids.add(pid);
-          }
-        }
-        return [...pids];
-      }
-
-      if (process.platform === "darwin") {
-        // macOS has no `ss`; lsof prints one PID per line with -t.
-        const out = execFileSync(
-          "lsof",
-          ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-t"],
-          { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 8000 }
-        );
-        return uniquePids(out.split(/\s+/));
-      }
-
-      const out = execFileSync("ss", ["-ltnp", `sport = :${port}`], {
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "ignore"],
-        timeout: 8000,
-      });
-      return uniquePids([...out.matchAll(/pid=(\d+)/g)].map((m) => m[1]));
-    } catch (err) {
-      // `lsof -t` exits 1 with no output when nothing is listening — that is a
-      // real "port is free", not a tooling failure.
-      const e = err as { status?: number; stdout?: string };
-      if (process.platform === "darwin" && e?.status === 1 && !e?.stdout) {
-        return [];
-      }
-      console.warn(`Llama AIO: could not determine what is listening on port ${port}:`, err);
-      return undefined;
-    }
+  private queryPidsOnPort(port: number): Promise<number[] | undefined> {
+    return runStepsAsync(pidsOnPortSteps(port));
   }
 
   /** Best-effort variant for callers that only need a list to iterate. */
-  private findPidsOnPort(port: number): number[] {
-    return this.queryPidsOnPort(port) ?? [];
+  private async findPidsOnPort(port: number): Promise<number[]> {
+    return (await this.queryPidsOnPort(port)) ?? [];
+  }
+
+  /**
+   * Look for a llama-server holding a stale lock's port (the launcher exited,
+   * the server lives on — Windows `start` / Windows Terminal). Runs in the
+   * background so status polling never waits on a port scan.
+   */
+  private scanForAdoption(lock: LockFile): Promise<void> {
+    if (!this.adoptionScan) {
+      this.adoptionScan = (async () => {
+        let pid: number | undefined;
+        for (const candidate of await this.findPidsOnPort(lock.port)) {
+          if (await isLlamaServerProcessAsync(candidate)) {
+            pid = candidate;
+            break;
+          }
+        }
+        this.adoption = { startedAt: lock.startedAt, port: lock.port, pid, at: Date.now() };
+      })().finally(() => {
+        this.adoptionScan = undefined;
+      });
+    }
+    return this.adoptionScan;
+  }
+
+  /**
+   * {@link getStatus} after any pending port scan for a stale lock finished.
+   * Pollers use this; `getStatus` itself never shells out.
+   */
+  async refreshStatus(): Promise<ServerStatus> {
+    if (!this.store.isRemote()) {
+      const lock = this.readLock();
+      if (lock && !this.lockPidIsOurs(lock) && !this.freshAdoption(lock)) {
+        await this.scanForAdoption(lock);
+      }
+    }
+    return this.getStatus();
+  }
+
+  private freshAdoption(lock: LockFile) {
+    const scan = this.adoption;
+    return scan &&
+      scan.startedAt === lock.startedAt &&
+      scan.port === lock.port &&
+      Date.now() - scan.at < ADOPTION_SCAN_TTL_MS
+      ? scan
+      : undefined;
   }
 
   private async fetchLiveSlotContext(): Promise<
@@ -1081,7 +1181,7 @@ export class ProcessManager {
     try {
       fileLock = acquireLaunchLock("reload");
       report("Stopping server for reload…");
-      await this.stop(true);
+      await this.stopServer(true);
       await sleep(400);
       // Keep boot active across inner start — don't nest beginBoot/endBoot via start().
       return await this.startInner(undefined, report);

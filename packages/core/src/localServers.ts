@@ -3,8 +3,8 @@
  * sidebar can offer Connect. Connecting uses remote mode. Nothing here writes
  * the launch lock or adopts the process — adoption is what lets Stop kill it.
  */
-import { execFileSync } from "child_process";
-import { processCommandLine } from "./processIdentity";
+import { runStepsAsync, runStepsSync, type ExecSteps } from "./execRunner";
+import { processCommandLine, processCommandLineAsync } from "./processIdentity";
 import { isLoopbackHost, isWildcardHost } from "./serverHttp";
 
 export interface ListeningSocket {
@@ -185,34 +185,17 @@ export function discoverLoopbackLlamaServers(opts: {
     .slice(0, MAX_DISCOVERED_SERVERS);
 }
 
-function listListeningSockets(): ListeningSocket[] | undefined {
-  try {
-    if (process.platform === "win32") {
-      const out = execFileSync("netstat", ["-ano", "-p", "tcp"], {
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "ignore"],
-        windowsHide: true,
-        timeout: 8000,
-      });
-      return parseNetstatListeners(out);
-    }
-    if (process.platform === "darwin") {
-      const out = execFileSync("lsof", ["-nP", "-iTCP", "-sTCP:LISTEN"], {
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "ignore"],
-        timeout: 8000,
-      });
-      return parseLsofListeners(out);
-    }
-    const out = execFileSync("ss", ["-ltnp"], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-      timeout: 4000,
-    });
-    return parseSsListeners(out);
-  } catch {
-    return undefined;
+function* listListeningSockets(): ExecSteps<ListeningSocket[] | undefined> {
+  if (process.platform === "win32") {
+    const res = yield { command: "netstat", args: ["-ano", "-p", "tcp"], timeoutMs: 8000 };
+    return res.ok ? parseNetstatListeners(res.stdout) : undefined;
   }
+  if (process.platform === "darwin") {
+    const res = yield { command: "lsof", args: ["-nP", "-iTCP", "-sTCP:LISTEN"], timeoutMs: 8000 };
+    return res.ok ? parseLsofListeners(res.stdout) : undefined;
+  }
+  const res = yield { command: "ss", args: ["-ltnp"], timeoutMs: 4000 };
+  return res.ok ? parseSsListeners(res.stdout) : undefined;
 }
 
 /**
@@ -222,8 +205,26 @@ function listListeningSockets(): ListeningSocket[] | undefined {
  */
 export function discoverLoopbackLlamaServersOnThisMachine(skipPids: readonly number[] = []): DiscoveredLlamaServer[] {
   return discoverLoopbackLlamaServers({
-    sockets: listListeningSockets(),
+    sockets: runStepsSync(listListeningSockets()),
     commandLine: processCommandLine,
+    skipPids,
+  });
+}
+
+/** {@link discoverLoopbackLlamaServersOnThisMachine} without blocking the event loop. */
+export async function discoverLoopbackLlamaServersOnThisMachineAsync(
+  skipPids: readonly number[] = []
+): Promise<DiscoveredLlamaServer[]> {
+  const sockets = await runStepsAsync(listListeningSockets());
+  const commandLines = new Map<number, string | undefined>();
+  for (const pid of new Set((sockets || []).map((sock) => sock.pid))) {
+    if (!skipPids.includes(pid)) {
+      commandLines.set(pid, await processCommandLineAsync(pid));
+    }
+  }
+  return discoverLoopbackLlamaServers({
+    sockets,
+    commandLine: (pid) => commandLines.get(pid),
     skipPids,
   });
 }

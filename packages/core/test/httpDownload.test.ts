@@ -10,6 +10,8 @@ import {
   DownloadVerifyError,
   GatedDownloadError,
   normalizeSha256,
+  resolveRedirect,
+  sendsTokenTo,
 } from "../src/httpDownload";
 
 describe("normalizeSha256", () => {
@@ -21,6 +23,26 @@ describe("normalizeSha256", () => {
   });
 });
 
+describe("redirect helpers", () => {
+  it("resolves a relative Location against the sending URL", () => {
+    assert.equal(
+      resolveRedirect("https://huggingface.co/old/m/resolve/main/a.gguf", "/new/m/resolve/main/a.gguf"),
+      "https://huggingface.co/new/m/resolve/main/a.gguf"
+    );
+  });
+
+  it("refuses an HTTPS to HTTP downgrade", () => {
+    assert.throws(() => resolveRedirect("https://huggingface.co/a", "http://cdn.example/a"), /HTTPS to HTTP/);
+    assert.equal(resolveRedirect("http://127.0.0.1:1/a", "http://127.0.0.1:2/b"), "http://127.0.0.1:2/b");
+  });
+
+  it("sends the token only to the original origin", () => {
+    assert.equal(sendsTokenTo("https://huggingface.co/a", "https://huggingface.co/b"), true);
+    assert.equal(sendsTokenTo("https://huggingface.co/a", "https://cdn-lfs.hf.co/b"), false);
+    assert.equal(sendsTokenTo("https://huggingface.co/a", "http://huggingface.co/b"), false);
+  });
+});
+
 describe("downloadHttpFile", () => {
   const payload = Buffer.from("hello-llama-aio-download-manager-payload");
   const sha = createHash("sha256").update(payload).digest("hex");
@@ -28,11 +50,25 @@ describe("downloadHttpFile", () => {
   let base = "";
   let dropAfter = 0;
   let hits = 0;
+  let cdn: http.Server;
+  let cdnBase = "";
+  const authSeen: Record<string, string | undefined> = {};
 
   before(async () => {
     server = http.createServer((req, res) => {
       hits += 1;
       const url = req.url || "/";
+      authSeen[url] = req.headers.authorization;
+      if (url.startsWith("/renamed")) {
+        res.writeHead(307, { Location: "/file" });
+        res.end();
+        return;
+      }
+      if (url.startsWith("/to-cdn")) {
+        res.writeHead(302, { Location: `${cdnBase}/file` });
+        res.end();
+        return;
+      }
       if (url.startsWith("/gated")) {
         res.writeHead(401, { "Content-Type": "text/plain" });
         res.end("gated");
@@ -72,10 +108,23 @@ describe("downloadHttpFile", () => {
       throw new Error("no listen port");
     }
     base = `http://127.0.0.1:${addr.port}`;
+
+    cdn = http.createServer((req, res) => {
+      authSeen[`cdn:${req.url}`] = req.headers.authorization;
+      res.writeHead(200, { "Content-Length": payload.length });
+      res.end(payload);
+    });
+    await new Promise<void>((resolve) => cdn.listen(0, "127.0.0.1", resolve));
+    const cdnAddr = cdn.address();
+    if (!cdnAddr || typeof cdnAddr === "string") {
+      throw new Error("no listen port");
+    }
+    cdnBase = `http://127.0.0.1:${cdnAddr.port}`;
   });
 
   after(async () => {
     await new Promise<void>((resolve) => server.close(() => resolve()));
+    await new Promise<void>((resolve) => cdn.close(() => resolve()));
   });
 
   const tmp = () => {
@@ -166,6 +215,29 @@ describe("downloadHttpFile", () => {
         (e: unknown) =>
           e instanceof GatedDownloadError && e.pageUrl.includes("gated-model")
       );
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("follows a relative redirect (renamed repo)", async () => {
+    const { dest, dir } = tmp();
+    try {
+      await downloadHttpFile({ url: `${base}/renamed`, dest, expectedSha256: sha, token: "hf_secret" });
+      assert.equal(fs.readFileSync(dest).equals(payload), true);
+      assert.equal(authSeen["/file"], "Bearer hf_secret");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("drops the token on a cross-origin redirect", async () => {
+    const { dest, dir } = tmp();
+    try {
+      await downloadHttpFile({ url: `${base}/to-cdn`, dest, expectedSha256: sha, token: "hf_secret" });
+      assert.equal(fs.readFileSync(dest).equals(payload), true);
+      assert.equal(authSeen["/to-cdn"], "Bearer hf_secret");
+      assert.equal(authSeen["cdn:/file"], undefined);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }

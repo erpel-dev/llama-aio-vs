@@ -3,14 +3,8 @@
  * Used by the TUI (and any non-VS Code frontend). Abort with AbortSignal.
  */
 import type * as http from "http";
-import { ratesFromTimings, type LlamaTimings } from "./llamaTimings";
-import { ConnectionError, joinServerUrl, serverStream } from "./serverHttp";
-import {
-  decodeSseLines,
-  errorMessageFromSseJson,
-  messageFromSseErrorLine,
-  SseStreamError,
-} from "./sseStream";
+import { openChatStream, parseChatStream } from "./chatStream";
+import { ConnectionError } from "./serverHttp";
 
 export type ChatRole = "system" | "user" | "assistant";
 
@@ -53,12 +47,6 @@ export interface ChatCompletionOptions {
   signal?: AbortSignal;
 }
 
-interface LlamaUsage {
-  prompt_tokens?: number;
-  completion_tokens?: number;
-  prompt_tokens_details?: { cached_tokens?: number };
-}
-
 function formatHttpError(status: number, body: string): string {
   const snippet = body.replace(/\s+/g, " ").trim().slice(0, 240);
   return snippet ? `HTTP ${status}: ${snippet}` : `HTTP ${status}`;
@@ -66,7 +54,7 @@ function formatHttpError(status: number, body: string): string {
 
 /**
  * Stream a chat completion from `{endpoint}/v1/chat/completions`.
- * Yields text deltas and a final stats/done pair.
+ * Yields text deltas and a final stats/done pair. Abort ends the stream quietly.
  */
 export async function* streamChatCompletion(
   options: ChatCompletionOptions
@@ -94,13 +82,7 @@ export async function* streamChatCompletion(
 
   let stream: http.IncomingMessage;
   try {
-    stream = await serverStream(joinServerUrl(options.endpoint, "/v1/chat/completions"), {
-      method: "POST",
-      body,
-      headers: { Accept: "text/event-stream" },
-      timeoutMs: 600_000,
-      signal,
-    });
+    stream = await openChatStream(options.endpoint, body, signal);
   } catch (err) {
     if (err instanceof ConnectionError && err.status) {
       throw new Error(formatHttpError(err.status, err.body || ""));
@@ -108,93 +90,38 @@ export async function* streamChatCompletion(
     throw err instanceof ConnectionError && err.kind === "cancelled" ? new Error("Cancelled") : err;
   }
 
-  let lastTimings: LlamaTimings | undefined;
-  let lastUsage: LlamaUsage | undefined;
-  let completionChars = 0;
-
+  // Same parser as the VS Code chat provider; the TUI sends no tools, so
+  // reasoning-only streams show live and nothing is held back.
+  let last: ChatStreamEvent | undefined;
   try {
-    for await (const line of decodeSseLines(stream)) {
-      if (signal?.aborted) {
-        stream.destroy();
-        return;
-      }
-      const trimmed = line.trim();
-      const errorLine = messageFromSseErrorLine(trimmed);
-      if (errorLine) {
-        throw new SseStreamError(errorLine);
-      }
-      if (!trimmed.startsWith("data:")) {
-        continue;
-      }
-      const data = trimmed.slice(5).trim();
-      if (data === "[DONE]") {
-        continue;
-      }
-      try {
-        const json = JSON.parse(data) as {
-          error?: { message?: string } | string;
-          choices?: Array<{
-            delta?: {
-              content?: string | null;
-              reasoning_content?: string | null;
-            };
-          }>;
-          timings?: LlamaTimings;
-          usage?: LlamaUsage;
+    for await (const part of parseChatStream(stream, { toolsEnabled: false, signal })) {
+      if (part.kind === "text") {
+        yield part;
+      } else if (part.kind === "stats") {
+        last = {
+          kind: "stats",
+          promptTokens: part.promptTokens,
+          completionTokens: part.completionTokens,
+          promptTokPerSec: part.promptTokPerSec,
+          genTokPerSec: part.genTokPerSec,
+          cachedPromptTokens: part.cachedPromptTokens,
+          processedPromptTokens: part.processedPromptTokens,
         };
-        const streamError = errorMessageFromSseJson(json);
-        if (streamError) {
-          throw new SseStreamError(streamError);
-        }
-        if (json.timings) {
-          lastTimings = json.timings;
-        }
-        if (json.usage) {
-          lastUsage = json.usage;
-        }
-
-        const delta = json.choices?.[0]?.delta;
-        const content = delta?.content;
-        const reasoning = delta?.reasoning_content;
-        if (typeof content === "string" && content.length) {
-          completionChars += content.length;
-          yield { kind: "text", text: content };
-        } else if (typeof reasoning === "string" && reasoning.length && !content) {
-          // deepseek format: stream reasoning when content is empty
-          completionChars += reasoning.length;
-          yield { kind: "text", text: reasoning };
-        }
-      } catch (err) {
-        if (err instanceof SseStreamError) {
-          throw err;
-        }
-        console.warn(
-          "Llama AIO chat: could not parse SSE event:",
-          data.slice(0, 200),
-          err instanceof Error ? err.message : err
-        );
       }
     }
+  } catch (err) {
+    if (signal?.aborted) {
+      return;
+    }
+    throw err;
   } finally {
     stream.destroy();
   }
-
-  const rates = ratesFromTimings(lastTimings);
-  yield {
-    kind: "stats",
-    promptTokens: lastUsage?.prompt_tokens,
-    completionTokens:
-      lastUsage?.completion_tokens ??
-      lastTimings?.predicted_n ??
-      (completionChars ? Math.max(1, Math.ceil(completionChars / 4)) : undefined),
-    promptTokPerSec: rates.promptTokPerSec,
-    genTokPerSec: rates.genTokPerSec,
-    cachedPromptTokens:
-      lastUsage?.prompt_tokens_details?.cached_tokens ??
-      (typeof lastTimings?.cache_n === "number" && lastTimings.cache_n >= 0
-        ? lastTimings.cache_n
-        : undefined),
-    processedPromptTokens: lastTimings?.prompt_n,
-  };
+  if (signal?.aborted) {
+    return;
+  }
+  if (last) {
+    yield last;
+  }
   yield { kind: "done" };
 }

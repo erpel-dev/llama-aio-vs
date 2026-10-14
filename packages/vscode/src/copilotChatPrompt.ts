@@ -4,6 +4,18 @@ import { SettingsStore } from "@llama-aio/core";
 
 /** Set after Open Chat, Open model picker, or Don't ask again. Dismissing the toast does not set this. */
 export const COPILOT_PROMPT_DISMISSED_KEY = "llamaAio.copilotPromptDismissed";
+/** Set after Copy server URL or Don't show again on the no-Copilot notice. */
+export const NO_COPILOT_NOTICE_DISMISSED_KEY = "llamaAio.noCopilotNoticeDismissed";
+
+/**
+ * Copilot Chat ships built into Microsoft's VS Code (and getExtension also finds
+ * built-ins). VSCodium, code-server and other Open VSX editors do not have it.
+ */
+export const COPILOT_CHAT_EXTENSION_ID = "GitHub.copilot-chat";
+
+export function isCopilotChatAvailable(): boolean {
+  return vscode.extensions.getExtension(COPILOT_CHAT_EXTENSION_ID) !== undefined;
+}
 
 /**
  * After llama-server is ready, remind the user to pick our model in Copilot Chat
@@ -16,6 +28,10 @@ export async function promptUseInCopilotChat(
   statusMessage?: string,
   globalState?: vscode.Memento
 ): Promise<void> {
+  if (!isCopilotChatAvailable()) {
+    await promptNoCopilotChat(store, statusMessage, globalState);
+    return;
+  }
   if (globalState?.get<boolean>(COPILOT_PROMPT_DISMISSED_KEY)) {
     return;
   }
@@ -56,5 +72,38 @@ export async function promptUseInCopilotChat(
     } catch {
       // Picker command varies by VS Code version; Chat is already open.
     }
+  }
+}
+
+/**
+ * Without Copilot Chat there is no chat UI to pick our model in. Say so once,
+ * and point at the endpoint and the LM API instead. Dismissing asks again on
+ * the next start, like the Copilot prompt.
+ */
+async function promptNoCopilotChat(
+  store: SettingsStore,
+  statusMessage?: string,
+  globalState?: vscode.Memento
+): Promise<void> {
+  if (globalState?.get<boolean>(NO_COPILOT_NOTICE_DISMISSED_KEY)) {
+    return;
+  }
+  const endpoint = store.getEndpoint();
+  const base = (statusMessage || "").trim() || "Llama AIO server is ready.";
+
+  const choice = await vscode.window.showInformationMessage(
+    `${base}\nCopilot Chat isn't available in this editor, so the model can't be used in chat here. ` +
+      `The server is running at ${endpoint} (OpenAI-compatible) and can be used by extensions that support the VS Code Language Model API.`,
+    "Copy server URL",
+    "Don't show again"
+  );
+
+  if (!choice) {
+    return;
+  }
+  await globalState?.update(NO_COPILOT_NOTICE_DISMISSED_KEY, true);
+
+  if (choice === "Copy server URL") {
+    await vscode.env.clipboard.writeText(endpoint);
   }
 }

@@ -8,7 +8,7 @@ export interface SettingChange {
 }
 
 const LABELS: Partial<Record<keyof LlamaLoadSettings, string>> = {
-  contextLength: "ctx",
+  contextLength: "context window",
   gpuOffload: "GPU layers",
   cpuThreads: "threads",
   evalBatchSize: "batch",
@@ -17,8 +17,8 @@ const LABELS: Partial<Record<keyof LlamaLoadSettings, string>> = {
   nCpuMoe: "CPU MoE",
   nCpuFfn: "CPU FFN",
   offloadKvCacheToGpu: "KV on GPU",
-  cacheTypeK: "KV K",
-  cacheTypeV: "KV V",
+  cacheTypeK: "KV cache K",
+  cacheTypeV: "KV cache V",
   keepModelInMemory: "mlock",
   tryMmap: "mmap",
   lazyMode: "lazy mode",

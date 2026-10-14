@@ -4,11 +4,13 @@
  */
 
 export * from "./chatClient";
+export * from "./chatStream";
 export * from "./downloadManager";
 export * from "./httpDownload";
 export * from "./config";
 export * from "./contextBreakdown";
 export * from "./events";
+export * from "./execRunner";
 export * from "./externalTerminal";
 export * from "./ggufMetadata";
 export * from "./gpuInfo";

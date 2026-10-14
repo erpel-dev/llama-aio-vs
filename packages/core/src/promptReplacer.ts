@@ -12,11 +12,6 @@ export interface PromptReplacement {
   replace: string;
 }
 
-export interface PersonalityMeta {
-  name: string;
-  description: string;
-}
-
 /** Result of applying replacements to a single text blob. */
 export interface ApplyResult {
   result: string;

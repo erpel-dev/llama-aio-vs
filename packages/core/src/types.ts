@@ -57,11 +57,6 @@ export const KV_CACHE_TYPES: readonly KvCacheType[] = [
   "iq4_nl",
 ];
 
-/** True for cache types stored below 16 bits (need the Flash Attention path for V). */
-export function isQuantizedKvCacheType(type: KvCacheType): boolean {
-  return type !== "f32" && type !== "f16" && type !== "bf16";
-}
-
 export function normalizeKvCacheType(value: unknown, fallback: KvCacheType = "q8_0"): KvCacheType {
   return typeof value === "string" && (KV_CACHE_TYPES as readonly string[]).includes(value)
     ? (value as KvCacheType)
@@ -91,8 +86,6 @@ export function normalizeReasoningFormat(
  * `model` = the Jinja string embedded in the GGUF (no extra flag).
  */
 export type ChatTemplateSource = "model" | "builtin" | "file";
-
-export const CHAT_TEMPLATE_SOURCES: readonly ChatTemplateSource[] = ["model", "builtin", "file"];
 
 /** Reject a picked template above this size so a GGUF cannot be passed as Jinja. */
 export const CHAT_TEMPLATE_FILE_MAX_BYTES = 256 * 1024;

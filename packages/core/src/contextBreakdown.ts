@@ -152,7 +152,7 @@ export function formatExceedContextError(opts: {
     );
   } else {
     lines.push("Fix in Llama AIO sidebar:");
-    lines.push("1. Raise Context Length (Copilot Chat usually needs 65536 or more)");
+    lines.push("1. Raise the Context window (Copilot Chat usually needs 65536 or more)");
     lines.push("2. Set Max Concurrent Predictions = 1 (parallel slots split the context)");
     lines.push('3. Click "Reload to apply changes"');
   }

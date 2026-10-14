@@ -44,12 +44,21 @@ export function setServerApiKeyProvider(provider: ApiKeyProvider | undefined): v
   apiKeyProvider = provider ?? (() => undefined);
 }
 
-export function apiKeyForUrl(url: string): string | undefined {
+/** `scheme://host[:port]` of `url`, or undefined when it does not parse. API keys are stored per origin. */
+export function originOf(url: string | undefined): string | undefined {
+  if (!url) {
+    return undefined;
+  }
   try {
-    return apiKeyProvider(new URL(url).origin) || undefined;
+    return new URL(url).origin;
   } catch {
     return undefined;
   }
+}
+
+export function apiKeyForUrl(url: string): string | undefined {
+  const origin = originOf(url);
+  return origin ? apiKeyProvider(origin) || undefined : undefined;
 }
 
 /** `base` + `path`, keeping any path prefix on `base` (`https://h/llama` + `/props`). */

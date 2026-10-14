@@ -5,6 +5,7 @@
  * behavioural checks of the webview without launching VS Code.
  *
  *   npx tsc -p packages/vscode/tsconfig.json --outDir packages/vscode/out-harness
+ *   node packages/vscode/esbuild.mjs --webview
  *   node packages/vscode/scripts/sidebar-harness.cjs [--out out-harness] [--port 4817]
  *
  * Seeds state read-only from ~/.llama-aio-vs/config.json when present. GPUs come
@@ -39,7 +40,12 @@ const vscodeMock = {
   workspace: { openTextDocument: async () => ({}), getConfiguration: () => ({ get: () => undefined }) },
   commands: { executeCommand: async () => undefined },
   env: { openExternal: async () => true, clipboard: { writeText: async () => undefined } },
-  Uri: { parse: (s) => ({ toString: () => s }), file: (s) => ({ fsPath: s }), joinPath: () => ({}) },
+  extensions: { getExtension: () => (process.env.HARNESS_NO_COPILOT ? undefined : {}) },
+  Uri: {
+    parse: (s) => ({ toString: () => s }),
+    file: (s) => ({ fsPath: s }),
+    joinPath: (base, ...parts) => ({ fsPath: path.join(base.fsPath, ...parts) }),
+  },
   ProgressLocation: { Notification: 15 },
   ViewColumn: { Active: -1 },
   EventEmitter: class {
@@ -204,6 +210,7 @@ const sameConfig = () =>
   launched.modelPath === state.selectedModelPath;
 
 const processManager = {
+  refreshStatus: async () => processManager.getStatus(),
   getStatus: () =>
     remoteMode
       ? {
@@ -248,6 +255,9 @@ const processManager = {
 
 const installer = {
   getInstalledInfo: () => ({ activeBackend: cpuBackend ? "cpu" : "vulkan", tag: "b11163", binaryVersion: "version: 11163" }),
+  getInstalledInfoCached() {
+    return this.getInstalledInfo();
+  },
   getUiBackendOptions: () => [
     { id: "vulkan", label: "Vulkan", installed: true, installedTag: "b11163", active: !cpuBackend, available: true },
     { id: "rocm", label: "ROCm", installed: false, active: false, available: true },
@@ -331,7 +341,8 @@ const webview = {
   options: {},
   html: "",
   cspSource: "",
-  asWebviewUri: (u) => u,
+  // The page loads out/webview/sidebar.{css,js} from this server.
+  asWebviewUri: (u) => ({ toString: () => `/webview/${path.basename(u.fsPath)}` }),
   postMessage: (m) => {
     if (m.type === "state") lastStateMessage = m;
     log.push({ dir: "toWebview", type: m.type, seq: m.seq });
@@ -347,8 +358,9 @@ const webview = {
   },
 };
 
+const webviewDir = path.resolve(__dirname, "..", "out", "webview");
 const provider = new SettingsViewProvider(
-  {},
+  { fsPath: path.resolve(__dirname, "..") },
   store,
   processManager,
   installer,
@@ -401,8 +413,8 @@ function pageHtml() {
   }
   // VS Code theme variables the webview relies on.
   html = html.replace(
-    "<style>",
-    `<style>:root{--vscode-sideBar-background:#181818;--vscode-foreground:#cccccc;--vscode-descriptionForeground:#9d9d9d;--vscode-input-background:#252526;--vscode-input-foreground:#cccccc;--vscode-input-border:#3c3c3c;--vscode-button-background:#0e639c;--vscode-button-foreground:#fff;--vscode-button-secondaryBackground:#3a3d41;--vscode-button-secondaryForeground:#fff;--vscode-textLink-foreground:#3794ff;--vscode-font-family:"Segoe UI",system-ui,sans-serif}</style><style>`
+    "</head>",
+    `<style>:root{--vscode-sideBar-background:#181818;--vscode-foreground:#cccccc;--vscode-descriptionForeground:#9d9d9d;--vscode-input-background:#252526;--vscode-input-foreground:#cccccc;--vscode-input-border:#3c3c3c;--vscode-button-background:#0e639c;--vscode-button-foreground:#fff;--vscode-button-secondaryBackground:#3a3d41;--vscode-button-secondaryForeground:#fff;--vscode-textLink-foreground:#3794ff;--vscode-font-family:"Segoe UI",system-ui,sans-serif}</style></head>`
   );
   return html;
 }
@@ -448,6 +460,15 @@ const server = http.createServer(async (req, res) => {
   if (req.url === "/" || req.url?.startsWith("/?")) {
     res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
     res.end(pageHtml());
+    return;
+  }
+  if (req.url?.startsWith("/webview/")) {
+    const file = path.join(webviewDir, path.basename(req.url.split("?")[0]));
+    const type = file.endsWith(".css") ? "text/css" : file.endsWith(".js") ? "text/javascript" : "application/json";
+    fs.readFile(file, (err, data) => {
+      res.writeHead(err ? 404 : 200, { "content-type": type });
+      res.end(err ? "" : data);
+    });
     return;
   }
   if (req.url === "/events") {

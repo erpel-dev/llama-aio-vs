@@ -9,6 +9,7 @@
 import { execFileSync } from "child_process";
 import * as fs from "fs";
 import * as path from "path";
+import { runStepsAsync, runStepsSync, type ExecSteps } from "./execRunner";
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -45,27 +46,29 @@ export function executableIsUnderDir(exe: string | undefined, dir: string): bool
 
 /** Command line of a running process, lowercased, or undefined when unknown. */
 export function processCommandLine(pid: number): string | undefined {
-  try {
-    if (process.platform === "linux") {
+  return runStepsSync(processCommandLineSteps(pid));
+}
+
+function* processCommandLineSteps(pid: number): ExecSteps<string | undefined> {
+  if (process.platform === "linux") {
+    try {
       return fs.readFileSync(`/proc/${pid}/cmdline`, "utf8").replace(/\0/g, " ").toLowerCase();
+    } catch {
+      // Process gone, or no permission to inspect it.
+      return undefined;
     }
-    if (process.platform === "darwin") {
-      return execFileSync("ps", ["-p", String(pid), "-o", "command="], {
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "ignore"],
-        timeout: 5000,
-      }).toLowerCase();
-    }
-    if (process.platform === "win32") {
-      return execFileSync("tasklist", ["/FI", `PID eq ${pid}`, "/FO", "CSV", "/NH"], {
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "ignore"],
-        windowsHide: true,
-        timeout: 8000,
-      }).toLowerCase();
-    }
-  } catch {
-    // Process gone, or no permission to inspect it.
+  }
+  if (process.platform === "darwin") {
+    const res = yield { command: "ps", args: ["-p", String(pid), "-o", "command="], timeoutMs: 5000 };
+    return res.ok ? res.stdout.toLowerCase() : undefined;
+  }
+  if (process.platform === "win32") {
+    const res = yield {
+      command: "tasklist",
+      args: ["/FI", `PID eq ${pid}`, "/FO", "CSV", "/NH"],
+      timeoutMs: 8000,
+    };
+    return res.ok ? res.stdout.toLowerCase() : undefined;
   }
   return undefined;
 }
@@ -76,6 +79,16 @@ export function processCommandLine(pid: number): string | undefined {
  */
 export function isLlamaServerProcess(pid: number): boolean {
   return looksLikeLlamaServer(processCommandLine(pid));
+}
+
+/** {@link processCommandLine} without blocking the event loop on macOS / Windows. */
+export function processCommandLineAsync(pid: number): Promise<string | undefined> {
+  return runStepsAsync(processCommandLineSteps(pid));
+}
+
+/** {@link isLlamaServerProcess} without blocking the event loop on macOS / Windows. */
+export async function isLlamaServerProcessAsync(pid: number): Promise<boolean> {
+  return looksLikeLlamaServer(await processCommandLineAsync(pid));
 }
 
 /** Split out for testing: the command-line check itself. */

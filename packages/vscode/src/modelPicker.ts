@@ -2,39 +2,21 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import * as vscode from "vscode";
-import { HuggingFaceClient } from "./huggingFace";
 import {
-  buildModelPickerHints,
-  displayGgufTitle,
   findSiblingMmproj,
   formatBytes,
   formatModelSize,
-  formatPickerDetail,
   isDflashDraftArchitecture,
   isMtpDraftArchitecture,
   isMtpSidecarFile,
-  hiddenModelPaths,
   listLocalModelEntries,
-  withoutHiddenModels,
   listMmprojEntries,
   listMtpDraftEntries,
-  pickerGpus,
   readModelCapabilities,
-  readPickerCapabilities,
-  shortHomePath,
-  type LlamaLoadSettings,
-  type LocalModelEntry,
 } from "@llama-aio/core";
 import { getModelsDir } from "@llama-aio/core";
 import { SettingsStore } from "@llama-aio/core";
 
-export interface ModelPickerContext {
-  cpuOnly?: boolean;
-  llamaServerBinary?: string;
-  loadSettings?: LlamaLoadSettings;
-}
-
-/** Open a native file dialog and select an existing .gguf model. */
 export async function openModelFileDialog(
   store: SettingsStore
 ): Promise<string | undefined> {
@@ -75,241 +57,8 @@ export async function openModelFileDialog(
   return selected;
 }
 
-type PickAction = "model" | "openFile" | "hfSearch" | "downloads";
-type PickItem = vscode.QuickPickItem & { action: PickAction; modelPath?: string };
-
-function fitIcon(fit: string): string {
-  if (fit === "fits") {
-    return "$(pass)";
-  }
-  if (fit === "tight") {
-    return "$(warning)";
-  }
-  if (fit === "wont-fit") {
-    return "$(error)";
-  }
-  return "";
-}
-
-function fitLabel(fit: string): string {
-  if (fit === "wont-fit") {
-    return "won't fit";
-  }
-  return fit;
-}
-
-function isCurrentPath(current: string, filePath: string): boolean {
-  return !!current && path.resolve(current) === path.resolve(filePath);
-}
-
 function yieldToUi(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0));
-}
-
-function cheapModelItem(entry: LocalModelEntry, current: string): PickItem {
-  const currentMark = isCurrentPath(current, entry.path);
-  const shards = entry.shardCount && entry.shardCount > 1 ? ` · ${entry.shardCount} shards` : "";
-  return {
-    action: "model",
-    modelPath: entry.path,
-    label: (currentMark ? "$(star-full) " : "") + displayGgufTitle(entry.path),
-    description: `${currentMark ? "current · " : ""}${formatBytes(entry.sizeBytes)}${shards}`,
-    detail: `${entry.source} · ${shortHomePath(path.dirname(entry.path))}`,
-    picked: currentMark,
-  };
-}
-
-function richModelItem(entry: LocalModelEntry, current: string, ctx?: ModelPickerContext): PickItem {
-  const caps = readPickerCapabilities(entry.path);
-  const hints = buildModelPickerHints(entry, {
-    caps,
-    settings: ctx?.loadSettings,
-    gpus: pickerGpus(!!ctx?.cpuOnly, ctx?.llamaServerBinary),
-    cpuOnly: ctx?.cpuOnly,
-    ramTotal: os.totalmem(),
-  });
-  const currentMark = isCurrentPath(current, entry.path);
-  const badges: string[] = [];
-  if (currentMark) {
-    badges.push("current");
-  }
-  if (hints.fit !== "unknown") {
-    badges.push(`${fitIcon(hints.fit)} ${fitLabel(hints.fit)}`.trim());
-  }
-  if (hints.shardCount > 1) {
-    badges.push(`${hints.shardCount} shards`);
-  }
-  return {
-    action: "model",
-    modelPath: entry.path,
-    label: (currentMark ? "$(star-full) " : "") + hints.title,
-    description: `${badges.join("  ·  ")}  ·  ${formatBytes(entry.sizeBytes)}`.replace(/^[ ·]+/, ""),
-    detail: formatPickerDetail(hints),
-    picked: currentMark,
-  };
-}
-
-function hfSearchItem(query: string): PickItem {
-  const q = query.trim();
-  return {
-    action: "hfSearch",
-    label: q
-      ? `$(cloud-download) Search Hugging Face for "${q}"…`
-      : "$(cloud-download) Search Hugging Face…",
-    description: "Download a GGUF",
-    alwaysShow: true,
-  };
-}
-
-/** Pick from models in Llama AIO library and common tool download folders. */
-export async function pickDownloadedModel(
-  _hf: HuggingFaceClient,
-  store: SettingsStore,
-  ctx?: ModelPickerContext
-): Promise<string | undefined> {
-  const config = store.getConfig();
-  const modelsDir = getModelsDir(config);
-  const current = store.getState().selectedModelPath || "";
-
-  const qp = vscode.window.createQuickPick<PickItem>();
-  qp.title = "Select model";
-  qp.placeholder = "Scanning library…";
-  qp.busy = true;
-  qp.ignoreFocusOut = true;
-  qp.matchOnDescription = true;
-  qp.matchOnDetail = true;
-
-  let dismissed = false;
-  const hideSub = qp.onDidHide(() => {
-    dismissed = true;
-  });
-  qp.show();
-  await yieldToUi();
-  if (dismissed) {
-    hideSub.dispose();
-    qp.dispose();
-    return undefined;
-  }
-
-  const allLocal = listLocalModelEntries(config);
-  const local = withoutHiddenModels(allLocal, hiddenModelPaths(config));
-  await yieldToUi();
-  hideSub.dispose();
-  if (dismissed) {
-    qp.dispose();
-    return undefined;
-  }
-
-  if (!local.length) {
-    qp.dispose();
-    if (allLocal.length) {
-      await vscode.window.showInformationMessage(
-        "Every downloaded model is hidden. Use Show hidden in the Llama AIO library to bring one back."
-      );
-      return store.getState().selectedModelPath || undefined;
-    }
-    const choice = await vscode.window.showInformationMessage(
-      `No GGUF models found in ${modelsDir} or common tool folders (LM Studio, Unsloth, HF cache, …). Download one, or open a file.`,
-      "Download from Hugging Face",
-      "Open GGUF file…"
-    );
-    if (choice === "Download from Hugging Face") {
-      await vscode.commands.executeCommand("llamaAio.browseModels");
-      return store.getState().selectedModelPath || undefined;
-    }
-    if (choice === "Open GGUF file…") {
-      return openModelFileDialog(store);
-    }
-    return store.getState().selectedModelPath || undefined;
-  }
-
-  qp.placeholder = "Filter models, or type to search Hugging Face…";
-  qp.busy = false;
-
-  const openItem: PickItem = {
-    action: "openFile",
-    label: "$(folder-opened) Open GGUF file…",
-    description: "Browse the filesystem for an existing .gguf",
-    alwaysShow: true,
-  };
-
-  const downloadsItem: PickItem = {
-    action: "downloads",
-    label: "$(cloud-download) Downloads…",
-    description: "Pause, resume or cancel running downloads",
-    alwaysShow: true,
-  };
-
-  const byPath = new Map<string, PickItem>();
-  for (const e of local) {
-    byPath.set(e.path, cheapModelItem(e, current));
-  }
-  const rebuild = (filter: string) => {
-    qp.items = [openItem, ...local.map((e) => byPath.get(e.path)!), hfSearchItem(filter), downloadsItem];
-  };
-  rebuild("");
-
-  // Badges / fit lines are filled after the list is on screen (P-09).
-  void (async () => {
-    qp.busy = true;
-    for (const e of local) {
-      if (qp.items.length === 0) {
-        break;
-      }
-      byPath.set(e.path, richModelItem(e, current, ctx));
-      rebuild(qp.value);
-      await new Promise((r) => setTimeout(r, 0));
-    }
-    qp.busy = false;
-  })();
-
-  return await new Promise<string | undefined>((resolve) => {
-    let settled = false;
-    const finish = (value: string | undefined) => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      qp.dispose();
-      resolve(value);
-    };
-
-    qp.onDidChangeValue((value) => rebuild(value));
-
-    qp.onDidAccept(async () => {
-      const picked = qp.selectedItems[0];
-      if (!picked) {
-        finish(undefined);
-        return;
-      }
-      if (picked.action === "openFile") {
-        finish(await openModelFileDialog(store));
-        return;
-      }
-      if (picked.action === "downloads") {
-        qp.hide();
-        await vscode.commands.executeCommand("llamaAio.showDownloads");
-        finish(undefined);
-        return;
-      }
-      if (picked.action === "hfSearch") {
-        const q = qp.value.trim();
-        qp.hide();
-        await vscode.commands.executeCommand("llamaAio.browseModels", q || undefined);
-        finish(store.getState().selectedModelPath || undefined);
-        return;
-      }
-      if (!picked.modelPath) {
-        finish(undefined);
-        return;
-      }
-      await store.applySelectedModel(picked.modelPath);
-      finish(picked.modelPath);
-    });
-
-    qp.onDidHide(() => finish(undefined));
-    qp.show();
-  });
 }
 
 /**

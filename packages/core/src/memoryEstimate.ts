@@ -151,14 +151,6 @@ export function gpuBarCapacityBytes(gpu: GpuMemoryInfo | undefined): number | un
   return gpu.totalBytes;
 }
 
-export function gpuWouldSpill(used: number, gpu: GpuMemoryInfo | undefined): boolean {
-  const cap = gpuBarCapacityBytes(gpu);
-  if (!cap || !gpu) {
-    return false;
-  }
-  return deviceWouldSpill(used, cap, isIntegratedGpu(gpu) ? 0 : VRAM_HEADROOM_BYTES);
-}
-
 /**
  * llama.cpp sizes non-unified KV as n_ctx × n_seq_max. Unified KV is one buffer
  * of n_ctx. `-np` is n_seq_max.

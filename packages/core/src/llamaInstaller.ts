@@ -720,10 +720,6 @@ export function peekCachedLatestReleaseTag(): string | undefined {
   return latestTagCache.tag;
 }
 
-export function invalidateLatestReleaseTagCache(): void {
-  latestTagCache = undefined;
-}
-
 /** Cached latest-tag lookup. */
 export async function getLatestReleaseTagCached(force = false, signal?: AbortSignal): Promise<string> {
   throwIfCancelled(signal);
@@ -1475,6 +1471,47 @@ export class LlamaInstaller {
         active: opt.id === active,
       };
     });
+  }
+
+  private installedInfoCache: { key: string; at: number; info: InstalledBuildInfo } | undefined;
+
+  /**
+   * {@link getInstalledInfo} reused for up to `maxAgeMs`. The key covers the
+   * backend setting and the active install's VERSION file and binary, so an
+   * install or backend switch shows up immediately; the age only bounds PATH
+   * changes the stat cannot see. Pass 0 to force a fresh probe.
+   */
+  getInstalledInfoCached(maxAgeMs = 60_000): InstalledBuildInfo {
+    if (activeInstallLock()) {
+      return this.getInstalledInfo();
+    }
+    const key = this.installedInfoKey();
+    const now = Date.now();
+    const hit = this.installedInfoCache;
+    if (hit && hit.key === key && now - hit.at < maxAgeMs) {
+      return hit.info;
+    }
+    const info = this.getInstalledInfo();
+    this.installedInfoCache = { key, at: now, info };
+    return info;
+  }
+
+  private installedInfoKey(): string {
+    const configured = this.getBackend();
+    const active = this.resolveActiveUiBackend(configured);
+    if (active === "path") {
+      return `${configured}|path`;
+    }
+    const dir = this.getActiveInstallDir(active);
+    const stamp = (file: string) => {
+      try {
+        const st = fs.statSync(file);
+        return `${st.mtimeMs}:${st.size}`;
+      } catch {
+        return "-";
+      }
+    };
+    return [configured, active, stamp(path.join(dir, "VERSION")), stamp(getLlamaServerBinary(dir))].join("|");
   }
 
   getInstalledInfo(): InstalledBuildInfo {

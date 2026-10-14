@@ -1,6 +1,6 @@
 import * as fs from "fs";
 import * as vscode from "vscode";
-import { getLogPath, ProcessManager } from "@llama-aio/core";
+import { getLogPath, LaunchCancelledError, ProcessManager } from "@llama-aio/core";
 
 let channel: vscode.OutputChannel | undefined;
 let processManager: ProcessManager | undefined;
@@ -55,9 +55,15 @@ export async function copyServerCommandLine(): Promise<void> {
 
 /**
  * Write a failed start/reload to the Llama AIO output channel, including the
- * last 20 log lines, and show an error toast that can reopen that channel.
+ * last 20 log lines, and show an error toast that can open that channel.
+ * The channel is not forced into view (an auto-start failure at window open
+ * should not steal focus). A start cancelled by Stop is not an error.
  */
 export async function reportLaunchFailure(prefix: string, error: unknown): Promise<void> {
+  if (error instanceof LaunchCancelledError) {
+    vscode.window.setStatusBarMessage("Llama AIO: server start cancelled", 4000);
+    return;
+  }
   const message = error instanceof Error ? error.message : String(error);
   const out = output();
   out.appendLine("");
@@ -69,7 +75,6 @@ export async function reportLaunchFailure(prefix: string, error: unknown): Promi
     out.appendLine("# last 20 log lines");
     out.appendLine(recent);
   }
-  out.show(true);
   const choice = await vscode.window.showErrorMessage(`${prefix}: ${message}`, "Show output");
   if (choice === "Show output") {
     out.show(true);

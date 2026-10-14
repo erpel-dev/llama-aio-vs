@@ -2,7 +2,7 @@
   "name": "llama-aio-vs",
   "displayName": "Llama AIO",
   "description": "All-in-one local llama.cpp for VS Code: install, HF models, LM Studio-style settings, shared server, Copilot Chat provider.",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "publisher": "erpel-dev",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -217,9 +217,9 @@
     "compile": "tsc -p tsconfig.json",
     "bundle": "node esbuild.mjs",
     "watch": "node esbuild.mjs --watch",
-    "lint": "tsc --noEmit -p tsconfig.json",
-    "test": "tsc -p tsconfig.json --outDir out-harness && node scripts/check-webview.cjs && node --test \"test/*.test.cjs\"",
-    "harness": "tsc -p tsconfig.json --outDir out-harness && node scripts/sidebar-harness.cjs"
+    "lint": "tsc --noEmit -p tsconfig.json && tsc -p tsconfig.webview.json && tsc -p tsconfig.webview.strict.json",
+    "test": "tsc -p tsconfig.json --outDir out-harness && tsc -p tsconfig.webview.json && tsc -p tsconfig.webview.strict.json && node esbuild.mjs --webview && node scripts/check-webview.cjs && node --test \"test/*.test.cjs\"",
+    "harness": "tsc -p tsconfig.json --outDir out-harness && node esbuild.mjs --webview && node scripts/sidebar-harness.cjs"
   },
   "dependencies": {
     "@llama-aio/core": "*"

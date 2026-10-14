@@ -160,8 +160,8 @@ describe("diffLoadSettings", () => {
     const a = loadSettings({ contextLength: 81920, cacheTypeV: "q8_0", gpuOffload: 99 });
     const b = { ...a, contextLength: 65536, cacheTypeV: "q4_0" as const };
     assert.deepEqual(diffLoadSettings(a, b), [
-      { key: "contextLength", label: "ctx", from: "80k", to: "64k" },
-      { key: "cacheTypeV", label: "KV V", from: "q8_0", to: "q4_0" },
+      { key: "contextLength", label: "context window", from: "80k", to: "64k" },
+      { key: "cacheTypeV", label: "KV cache V", from: "q8_0", to: "q4_0" },
     ]);
   });
 

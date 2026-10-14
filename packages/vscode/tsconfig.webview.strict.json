@@ -1,0 +1,16 @@
+{
+  "extends": "./tsconfig.webview.json",
+  "compilerOptions": {
+    "strict": true,
+    "noImplicitAny": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true
+  },
+  "include": [],
+  "files": [
+    "src/webview/protocol.ts",
+    "src/webview/format.ts",
+    "src/webview/gpuSplit.ts",
+    "src/webview/perfChart.ts"
+  ]
+}

@@ -2,60 +2,50 @@ import type * as http from "http";
 import * as path from "path";
 import * as vscode from "vscode";
 import {
+  applyModeToRequestBody,
+  applyReplacementsToSystemMessages,
+  buildModeConfigurationSchema,
+  buildReplacementStats,
   ConnectionError,
   connectionHint,
-  joinServerUrl,
-  remoteSlotContext,
-  remoteStateUsable,
-  serverJson,
-  serverStream,
-  type RemoteServerInfo,
-} from "@llama-aio/core";
-import { PerfStats } from "@llama-aio/core";
-import { ProcessManager } from "@llama-aio/core";
-import {
-  applyReplacementsToSystemMessages,
-  buildReplacementStats,
+  duplicateToolCallHint,
+  estimateContextBreakdown,
   estimateTokensFromChars,
+  fingerprintsSinceLastUserMessage,
+  formatExceedContextError,
+  formatToolResultContent,
+  joinServerUrl,
   loadPromptReplacements,
   messageContentChars,
-  type PromptReplacement,
-  type PromptReplacementStats,
-} from "@llama-aio/core";
-import {
-  applyModeToRequestBody,
-  buildModeConfigurationSchema,
-  resolveModeParams,
-  resolveModelModes,
-} from "@llama-aio/core";
-import { overthinkingLogitBias } from "@llama-aio/core";
-import {
-  estimateContextBreakdown,
-  formatExceedContextError,
   messagesHaveImageParts,
-} from "@llama-aio/core";
-import {
-  decodeSseLines,
-  errorMessageFromSseJson,
-  formatToolResultContent,
-  LiveTextGate,
-  messageFromSseErrorLine,
-  parseXmlToolCalls,
-  SseStreamError,
-  stripXmlToolCalls,
-  toolCallSlot,
-} from "@llama-aio/core";
-import {
-  duplicateToolCallHint,
-  fingerprintsSinceLastUserMessage,
+  openChatStream,
+  overthinkingLogitBias,
+  parseChatStream,
+  PerfStats,
+  positiveRate,
+  ProcessManager,
+  remoteSlotContext,
+  remoteStateUsable,
+  resolveModelModes,
+  resolveModeParams,
   rewriteToolInput,
+  serverJson,
+  SettingsStore,
+  SseStreamError,
   toolCallFingerprint,
   WIKIPEDIA_LOOKUP_SYSTEM_HINT,
   WIKIPEDIA_LOOKUP_TOOL_NAME,
   wikipediaLookupToolDefinition,
+  withSystemHints,
+  type ChatStreamPart,
+  type ChatStreamStats,
+  type PromptReplacement,
+  type PromptReplacementStats,
+  type RemoteServerInfo,
 } from "@llama-aio/core";
-import { positiveRate, ratesFromTimings, type LlamaTimings } from "@llama-aio/core";
-import { SettingsStore } from "@llama-aio/core";
+
+const DUPLICATE_TOOL_CALL_SYSTEM_HINT =
+  "Do not repeat a tool call with the same arguments in this turn. If file search returned no matches, broaden the glob (**/*llama* not **/llama) or grep for a symbol. Re-reading a file later is fine.";
 
 interface OpenAiModel {
   id: string;
@@ -91,89 +81,7 @@ type OpenAiToolCall = {
   function: { name: string; arguments: string };
 };
 
-type StreamEvent =
-  | { kind: "text"; text: string }
-  | { kind: "tool_call"; callId: string; name: string; input: object }
-  | {
-      kind: "stats";
-      promptTokens?: number;
-      completionTokens?: number;
-      promptTokPerSec?: number;
-      genTokPerSec?: number;
-      draftTokens?: number;
-      draftTokensAccepted?: number;
-      /** Prompt tokens reused from the KV prefix cache (`timings.cache_n`). */
-      cachedPromptTokens?: number;
-      /** Prompt tokens actually evaluated this call (`timings.prompt_n`). */
-      processedPromptTokens?: number;
-    }
-  | {
-      kind: "trace";
-      assembledText: string;
-      assembledReasoning: string;
-      visibleText: string;
-      structuredToolCalls: Array<{ id: string; name: string; arguments: string }>;
-      xmlToolCalls: Array<{ name: string; input: object; raw: string }>;
-      toolsEnabled: boolean;
-    };
-
-interface LlamaUsage {
-  prompt_tokens?: number;
-  completion_tokens?: number;
-  total_tokens?: number;
-  prompt_tokens_details?: { cached_tokens?: number };
-}
-
-function promptTokensFrom(usage?: LlamaUsage, timings?: LlamaTimings): number | undefined {
-  if (typeof usage?.prompt_tokens === "number" && usage.prompt_tokens > 0) {
-    return usage.prompt_tokens;
-  }
-  if (typeof timings?.cache_n === "number" && timings.cache_n >= 0) {
-    const processed = typeof timings.prompt_n === "number" && timings.prompt_n > 0 ? timings.prompt_n : 0;
-    const total = timings.cache_n + processed;
-    return total > 0 ? total : undefined;
-  }
-  if (typeof timings?.prompt_n === "number" && timings.prompt_n > 0) {
-    return timings.prompt_n;
-  }
-  return undefined;
-}
-
-function estimateCompletionTokens(
-  chars: number,
-  usage?: LlamaUsage,
-  timings?: LlamaTimings
-): number | undefined {
-  if (typeof usage?.completion_tokens === "number" && usage.completion_tokens > 0) {
-    return usage.completion_tokens;
-  }
-  if (typeof timings?.predicted_n === "number" && timings.predicted_n > 0) {
-    return timings.predicted_n;
-  }
-  if (chars > 0) {
-    return Math.max(1, Math.ceil(chars / 4));
-  }
-  return undefined;
-}
-
-type StatsEvent = Extract<StreamEvent, { kind: "stats" }>;
-
-function statsFromTimings(timings?: LlamaTimings, usage?: LlamaUsage, chars = 0): StatsEvent {
-  const rates = ratesFromTimings(timings);
-  return {
-    kind: "stats",
-    promptTokens: promptTokensFrom(usage, timings),
-    completionTokens: estimateCompletionTokens(chars, usage, timings),
-    promptTokPerSec: rates.promptTokPerSec,
-    genTokPerSec: rates.genTokPerSec,
-    draftTokens: timings?.draft_n,
-    draftTokensAccepted: timings?.draft_n_accepted,
-    cachedPromptTokens:
-      usage?.prompt_tokens_details?.cached_tokens ??
-      (typeof timings?.cache_n === "number" && timings.cache_n >= 0 ? timings.cache_n : undefined),
-    processedPromptTokens: timings?.prompt_n,
-  };
-}
+type StatsEvent = ChatStreamStats;
 
 /** Chat error text for a failed request: HTTP bodies are parsed, network errors get one hint. */
 function describeRequestError(
@@ -372,292 +280,46 @@ function toOpenAiMessages(
   return out;
 }
 
-/** Remove model "thinking" blocks from assistant text (Qwen / DeepSeek-style). */
-function stripThinkTags(text: string): string {
-  return text
-    .replace(/<think\b[^>]*>[\s\S]*?<\/think>/gi, "")
-    .replace(/<thinking\b[^>]*>[\s\S]*?<\/thinking>/gi, "")
-    .replace(/<\/?think\b[^>]*>/gi, "")
-    .trim();
-}
-
 /**
- * Streams OpenAI-compatible SSE and yields text / tool-call events.
- * When tools are enabled, content is streamed through a {@link LiveTextGate}
- * that withholds only a short look-ahead tail, so Qwen-style <tool_call> XML
- * (content-only chat format) can still be converted into tool calls instead
- * of being shown as plain text — without freezing Agent mode until the end.
+ * Open the chat stream and run it through core's shared SSE parser. Request
+ * and stream failures become chat-facing errors; a cancelled request ends
+ * quietly instead of surfacing a socket error.
  */
 async function* streamChatCompletions(
   endpoint: string,
   body: Record<string, unknown>,
   token: vscode.CancellationToken,
   extras?: { maxContext?: number; hasImages?: boolean; operatorLabel?: string }
-): AsyncGenerator<StreamEvent> {
-  const payload = JSON.stringify({ ...body, stream: true });
+): AsyncGenerator<ChatStreamPart> {
   const toolsEnabled = Array.isArray(body.tools) && (body.tools as unknown[]).length > 0;
-
   const abort = new AbortController();
   const cancelSub = token.onCancellationRequested(() => abort.abort());
-  let stream: http.IncomingMessage;
   try {
-    stream = await serverStream(joinServerUrl(endpoint, "/v1/chat/completions"), {
-      method: "POST",
-      body: payload,
-      headers: { Accept: "text/event-stream" },
-      // Prompt processing of a long agent context can be silent for minutes.
-      timeoutMs: 600_000,
-      signal: abort.signal,
-    });
-  } catch (err) {
-    cancelSub.dispose();
-    throw describeRequestError(err, endpoint, extras);
-  }
-  stream.once("close", () => cancelSub.dispose());
-
-  let assembledText = "";
-  let assembledReasoning = "";
-  const liveGate = toolsEnabled ? new LiveTextGate() : undefined;
-  const toolCalls: Array<{ id: string; name: string; arguments: string }> = [];
-  let lastTimings: LlamaTimings | undefined;
-  let lastUsage: LlamaUsage | undefined;
-  let completionChars = 0;
-
-  for await (const line of decodeSseLines(stream)) {
-    if (token.isCancellationRequested) {
-      stream.destroy();
-      return;
-    }
-    const trimmed = line.trim();
-    const errorLine = messageFromSseErrorLine(trimmed);
-    if (errorLine) {
-      throw new vscode.LanguageModelError(errorLine);
-    }
-    if (!trimmed.startsWith("data:")) {
-      continue;
-    }
-    const data = trimmed.slice(5).trim();
-    if (data === "[DONE]") {
-      continue;
+    let stream: http.IncomingMessage;
+    try {
+      stream = await openChatStream(endpoint, body, abort.signal);
+    } catch (err) {
+      if (abort.signal.aborted) {
+        return;
+      }
+      throw describeRequestError(err, endpoint, extras);
     }
     try {
-      const json = JSON.parse(data) as {
-        choices?: Array<{
-          finish_reason?: string | null;
-          delta?: {
-            content?: string | null;
-            reasoning_content?: string | null;
-            tool_calls?: Array<{
-              index?: number;
-              id?: string;
-              function?: { name?: string; arguments?: string };
-            }>;
-          };
-          message?: {
-            content?: string | null;
-            reasoning_content?: string | null;
-            tool_calls?: Array<{
-              id?: string;
-              function?: { name?: string; arguments?: string };
-            }>;
-          };
-        }>;
-        timings?: LlamaTimings;
-        usage?: LlamaUsage;
-      };
-      const streamError = errorMessageFromSseJson(json);
-      if (streamError) {
-        throw new SseStreamError(streamError);
-      }
-      if (json.timings) {
-        lastTimings = json.timings;
-      }
-      if (json.usage) {
-        lastUsage = json.usage;
-      }
-
-      const choice = json.choices?.[0];
-      const delta = choice?.delta;
-      let progressed = false;
-
-      if (typeof delta?.reasoning_content === "string" && delta.reasoning_content.length) {
-        assembledReasoning += delta.reasoning_content;
-        completionChars += delta.reasoning_content.length;
-        progressed = true;
-        if (!toolsEnabled && !delta.content) {
-          // Live-stream reasoning when the server only emits reasoning_content
-          // (deepseek format). deepseek-legacy also puts tags in content.
-          yield { kind: "text", text: delta.reasoning_content };
-        }
-      }
-      if (typeof delta?.content === "string" && delta.content.length) {
-        assembledText += delta.content;
-        completionChars += delta.content.length;
-        progressed = true;
-        if (!liveGate) {
-          yield { kind: "text", text: delta.content };
-        } else {
-          // Tools enabled: stream everything except a short tail that could
-          // still become a <tool_call> / <think> opener.
-          const live = liveGate.push(delta.content);
-          if (live) {
-            yield { kind: "text", text: live };
-          }
-        }
-      }
-
-      if (Array.isArray(delta?.tool_calls)) {
-        for (const tc of delta.tool_calls) {
-          const idx = toolCallSlot(toolCalls, tc);
-          if (!toolCalls[idx]) {
-            toolCalls[idx] = { id: "", name: "", arguments: "" };
-          }
-          if (tc.id) {
-            toolCalls[idx].id = tc.id;
-          }
-          if (tc.function?.name) {
-            toolCalls[idx].name = tc.function.name;
-          }
-          if (tc.function?.arguments) {
-            toolCalls[idx].arguments += tc.function.arguments;
-            completionChars += tc.function.arguments.length;
-            progressed = true;
-          }
-        }
-      }
-
-      if (choice?.message?.reasoning_content && !assembledReasoning) {
-        assembledReasoning = choice.message.reasoning_content;
-        completionChars += choice.message.reasoning_content.length;
-        progressed = true;
-      }
-      if (choice?.message?.content && !assembledText) {
-        assembledText = choice.message.content;
-        completionChars += choice.message.content.length;
-        progressed = true;
-      }
-      if (Array.isArray(choice?.message?.tool_calls)) {
-        for (const [idx, tc] of choice.message.tool_calls.entries()) {
-          const hadArgs = !!toolCalls[idx]?.arguments;
-          toolCalls[idx] = {
-            id: tc.id || `call_${idx}`,
-            name: tc.function?.name || "",
-            arguments: tc.function?.arguments || "",
-          };
-          if (!hadArgs && tc.function?.arguments) {
-            completionChars += tc.function.arguments.length;
-            progressed = true;
-          }
-        }
-      }
-
-      // Live tok/s ticks even when tools buffer the text (Copilot Chat/agent).
-      // Console `slot print_timing` is not on the SSE stream until timings arrive.
-      if (progressed || json.timings || json.usage) {
-        const live = statsFromTimings(json.timings, lastUsage, completionChars);
-        if (
-          live.completionTokens ||
-          live.genTokPerSec ||
-          live.promptTokPerSec ||
-          live.promptTokens
-        ) {
-          yield live;
-        }
-      }
+      yield* parseChatStream(stream, { toolsEnabled, signal: abort.signal });
     } catch (err) {
+      if (abort.signal.aborted) {
+        return;
+      }
       if (err instanceof SseStreamError) {
         throw new vscode.LanguageModelError(err.message);
       }
-      // A truncated line can no longer happen here (decodeSseLines only yields
-      // complete lines), so this is a real protocol problem worth surfacing.
-      console.warn(
-        "Llama AIO: could not parse SSE event:",
-        data.slice(0, 300),
-        err instanceof Error ? err.message : err
-      );
+      throw describeRequestError(err, endpoint, extras);
+    } finally {
+      stream.destroy();
     }
+  } finally {
+    cancelSub.dispose();
   }
-
-  if (lastTimings || lastUsage) {
-    yield statsFromTimings(lastTimings, lastUsage, completionChars);
-  } else if (assembledText || assembledReasoning || completionChars) {
-    yield {
-      kind: "stats",
-      completionTokens: estimateCompletionTokens(completionChars),
-    };
-  }
-
-  // Emit OpenAI-structured tool calls first.
-  let emittedStructured = false;
-  const structuredOut: Array<{ id: string; name: string; arguments: string }> = [];
-  for (const [idx, tc] of toolCalls.entries()) {
-    if (!tc?.name) {
-      continue;
-    }
-    emittedStructured = true;
-    structuredOut.push({
-      id: tc.id || `call_${idx}`,
-      name: tc.name,
-      arguments: tc.arguments || "",
-    });
-    let input: object = {};
-    try {
-      input = JSON.parse(tc.arguments || "{}") as object;
-    } catch {
-      input = { raw: tc.arguments || "" };
-    }
-    yield {
-      kind: "tool_call",
-      callId: tc.id || `call_${idx}_${Date.now()}`,
-      name: tc.name,
-      input,
-    };
-  }
-
-  // Prefer content; fall back to reasoning_content when the server used deepseek format.
-  const textForParse = stripThinkTags(assembledText || assembledReasoning);
-  const xmlCalls = emittedStructured ? [] : parseXmlToolCalls(textForParse);
-  const visible = stripXmlToolCalls(textForParse);
-
-  // Tools enabled: emit whatever the live gate still owes (held-back tail, or
-  // text after a tool-call block) so the shown text equals `visible`.
-  if (liveGate) {
-    const remainder = liveGate.finish(visible);
-    if (remainder) {
-      yield { kind: "text", text: remainder };
-    } else if (
-      !liveGate.emittedText &&
-      !visible &&
-      !emittedStructured &&
-      !xmlCalls.length &&
-      assembledReasoning
-    ) {
-      // Still thinking-only after the budget — surface it so Chat is not empty.
-      const reasoningVisible = stripThinkTags(assembledReasoning);
-      if (reasoningVisible) {
-        yield { kind: "text", text: reasoningVisible };
-      }
-    }
-  }
-
-  for (const [idx, call] of xmlCalls.entries()) {
-    yield {
-      kind: "tool_call",
-      callId: `call_xml_${idx}_${Date.now()}`,
-      name: call.name,
-      input: call.input,
-    };
-  }
-
-  yield {
-    kind: "trace",
-    assembledText,
-    assembledReasoning,
-    visibleText: visible,
-    structuredToolCalls: structuredOut,
-    xmlToolCalls: xmlCalls,
-    toolsEnabled,
-  };
 }
 
 export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
@@ -847,7 +509,7 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
   }
 
   async provideLanguageModelChatInformation(
-    options: { silent: boolean },
+    _options: { silent: boolean },
     _token: vscode.CancellationToken
   ): Promise<vscode.LanguageModelChatInformation[]> {
     const target = this.store.getServerTarget();
@@ -958,24 +620,19 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
     }
 
     const prepared = await this.prepareMessagesWithReplacements(convertedRaw);
-    const converted = prepared.messages;
     const guardDuplicates = this.store.isDuplicateToolCallGuardEnabled();
+    const hints: string[] = [];
     if (guardDuplicates && tools?.length) {
-      converted.push({
-        role: "system",
-        content:
-          "Do not repeat a tool call with the same arguments in this turn. If file search returned no matches, broaden the glob (**/*llama* not **/llama) or grep for a symbol. Re-reading a file later is fine.",
-      });
+      hints.push(DUPLICATE_TOOL_CALL_SYSTEM_HINT);
     }
     if (
       this.store.isWikipediaLookupEnabled() &&
       tools?.some((t) => t.function.name === WIKIPEDIA_LOOKUP_TOOL_NAME)
     ) {
-      converted.push({
-        role: "system",
-        content: WIKIPEDIA_LOOKUP_SYSTEM_HINT,
-      });
+      hints.push(WIKIPEDIA_LOOKUP_SYSTEM_HINT);
     }
+    // Front, not end: strict templates reject a trailing system message.
+    const converted = withSystemHints(prepared.messages, hints);
 
     const body: Record<string, unknown> = {
       model: model.id,
@@ -1029,20 +686,20 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
     if (estimatedPromptTokens >= slotCtx) {
       throw new vscode.LanguageModelError(
         remote
-          ? `This prompt is about ${estimatedPromptTokens} tokens and ${serverLabel}'s slot is ${slotCtx}. ` +
+          ? `This prompt is about ${estimatedPromptTokens} tokens and ${serverLabel}'s context window is ${slotCtx} per slot. ` +
               `The server must be restarted with a larger --ctx-size or fewer -np slots.`
-          : `This prompt is about ${estimatedPromptTokens} tokens and the server slot is ${slotCtx}. ` +
-              `It does not fit. Raise Context Length or set Max Concurrent Predictions to 1, then Reload.`
+          : `This prompt is about ${estimatedPromptTokens} tokens and the context window is ${slotCtx} per slot. ` +
+              `It does not fit. Raise the Context window or set Max Concurrent Predictions to 1, then Reload.`
       );
     }
     if (slotCtx < 16384 && !this.warnedSmallSlot) {
       this.warnedSmallSlot = true;
       void vscode.window.showWarningMessage(
         remote
-          ? `${serverLabel}'s slot context is ${slotCtx} tokens (under 16k). This prompt fits, but Copilot agent turns often need more. ` +
+          ? `${serverLabel}'s context window is ${slotCtx} tokens per slot (under 16k). This prompt fits, but Copilot agent turns often need more. ` +
               `The server must be restarted with a larger --ctx-size and fewer parallel slots.`
-          : `Llama AIO slot context is ${slotCtx} tokens (under 16k). This prompt fits, but Copilot agent turns often need more. ` +
-              `Set Context Length ≥ 65536 and Max Concurrent Predictions = 1, then Reload.`
+          : `Llama AIO's context window is ${slotCtx} tokens per slot (under 16k). This prompt fits, but Copilot agent turns often need more. ` +
+              `Set the Context window ≥ 65536 and Max Concurrent Predictions = 1, then Reload.`
       );
     }
     const contextBreakdown = estimateContextBreakdown(
@@ -1171,6 +828,11 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
           }
         }
       }
+      if (token.isCancellationRequested) {
+        // User stopped the request: no stats, no "empty reply" error.
+        this.perf.abort();
+        return;
+      }
       if (lastServerStats) {
         this.perf.complete({
           promptTokens: lastServerStats.promptTokens ?? lastPromptTokens,
@@ -1234,6 +896,9 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
       }
     } catch (e) {
       this.perf.abort();
+      if (token.isCancellationRequested) {
+        return;
+      }
       throw e;
     }
   }

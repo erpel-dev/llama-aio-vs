@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "sidebar-harness",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["packages/vscode/scripts/sidebar-harness.cjs", "--port", "4817"],
+      "port": 4817
+    }
+  ]
+}

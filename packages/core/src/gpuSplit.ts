@@ -461,16 +461,6 @@ export function isLegacyGpu0FirstSplit(tensorSplit: string | undefined): boolean
 }
 
 /**
- * llama.cpp `-ngl`: the last `layersOnGpu` layers are offloaded. Earlier
- * layers stay on CPU.
- */
-export function gpuLayerStart(nLayers: number, layersOnGpu: number): number {
-  const n = Math.max(0, Math.round(nLayers) || 0);
-  const onGpu = Math.min(n, Math.max(0, Math.round(layersOnGpu) || 0));
-  return n - onGpu;
-}
-
-/**
  * Device index for each layer (`-1` = CPU).
  *
  * Layer split walks offloaded layers from the start of that range and fills

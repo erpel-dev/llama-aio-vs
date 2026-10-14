@@ -275,14 +275,14 @@ export class ConfigFile {
   }
 
   async setPreferences(patch: Partial<AppPreferences>): Promise<AppConfig> {
-    this.syncFromDisk();
-    return this.write({ ...this.cache, app: { ...this.cache.app, ...patch } });
+    const absorbed = this.syncFromDisk();
+    return this.announceAbsorbed(absorbed, await this.write({ ...this.cache, app: { ...this.cache.app, ...patch } }));
   }
 
   async setState(patch: Partial<ModelState>): Promise<AppConfig> {
-    this.syncFromDisk();
+    const absorbed = this.syncFromDisk();
     const current = this.cache.state;
-    return this.write({
+    return this.announceAbsorbed(absorbed, await this.write({
       ...this.cache,
       state: {
         ...current,
@@ -290,7 +290,18 @@ export class ConfigFile {
         loadSettings: { ...current.loadSettings, ...(patch.loadSettings || {}) },
         requestSettings: { ...current.requestSettings, ...(patch.requestSettings || {}) },
       },
-    });
+    }));
+  }
+
+  /**
+   * A write that first pulled in a peer's newer file (TUI, other window) must
+   * still announce that edit: the debounced watcher will find nothing new.
+   */
+  private announceAbsorbed(absorbed: boolean, config: AppConfig): AppConfig {
+    if (absorbed) {
+      this._onDidChangeExternally.fire(config);
+    }
+    return config;
   }
 
   private async write(next: AppConfig): Promise<AppConfig> {

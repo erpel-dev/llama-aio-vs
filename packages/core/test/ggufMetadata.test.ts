@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { after, before, describe, it } from "node:test";
 import {
+  capsCacheStamp,
   capsMissDefaultSwaPattern,
   clampLoadSettingsToModel,
   defaultSwaLayout,
@@ -449,5 +450,47 @@ describe("readModelCapabilities cache", () => {
 
     invalidateModelCapabilitiesCache(p);
     assert.equal(readModelCapabilities(p).name, "bravo");
+  });
+});
+
+describe("readModelCapabilities cache", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "llama-aio-caps-cache-"));
+  after(() => {
+    invalidateModelCapabilitiesCache();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  const write = (file: string, name: string) =>
+    fs.writeFileSync(
+      file,
+      miniGguf({
+        "general.architecture": { type: "string", value: "llama" },
+        "general.name": { type: "string", value: name },
+        "llama.block_count": { type: "u32", value: 4 },
+      })
+    );
+
+  it("serves repeat reads from the cache without a TTL, and re-reads after the file changes", () => {
+    const p = path.join(dir, "one.gguf");
+    write(p, "first");
+    assert.equal(readModelCapabilities(p).name, "first");
+    // Same bytes length + forced same mtime would hit; a rewrite with a new name must not.
+    const st = fs.statSync(p);
+    write(p, "second-longer-name");
+    fs.utimesSync(p, st.atime, new Date(st.mtimeMs + 2000));
+    assert.equal(readModelCapabilities(p).name, "second-longer-name");
+  });
+
+  it("keys split models on every shard, so a sibling appearing or changing invalidates shard 1", () => {
+    const p1 = path.join(dir, "split-00001-of-00002.gguf");
+    const p2 = path.join(dir, "split-00002-of-00002.gguf");
+    write(p1, "split");
+    const alone = capsCacheStamp(p1);
+    assert.equal(capsCacheStamp(p1), alone, "stable while nothing changes");
+    write(p2, "shard two");
+    const withSibling = capsCacheStamp(p1);
+    assert.notEqual(withSibling, alone);
+    fs.appendFileSync(p2, Buffer.alloc(16));
+    assert.notEqual(capsCacheStamp(p1), withSibling);
+    assert.equal(capsCacheStamp(path.join(dir, "missing.gguf")), undefined);
   });
 });

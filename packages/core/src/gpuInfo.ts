@@ -1,6 +1,6 @@
 import * as fs from "fs";
-import { execFileSync, spawnSync } from "child_process";
 import * as path from "path";
+import { runStepsAsync, runStepsSync, type ExecSteps } from "./execRunner";
 import { activeInstallLock } from "./installSwap";
 import { withRocmRuntimeEnv } from "./rocmRuntime";
 import { withSyclRuntimeEnv } from "./syclRuntime";
@@ -112,24 +112,14 @@ function shortLspciName(line: string): string | undefined {
   return undefined;
 }
 
-function lspciName(pciSlot: string): string | undefined {
+function* lspciName(pciSlot: string): ExecSteps<string | undefined> {
   const short = pciSlot.replace(/^0000:/, "");
-  try {
-    const out = execFileSync("lspci", ["-s", short, "-nn"], {
-      encoding: "utf8",
-      timeout: 1500,
-      windowsHide: true,
-    }).trim();
-    if (out) {
-      return shortLspciName(out);
-    }
-  } catch {
-    // ignore
-  }
-  return undefined;
+  const res = yield { command: "lspci", args: ["-s", short, "-nn"], timeoutMs: 1500 };
+  const out = res.ok ? res.stdout.trim() : "";
+  return out ? shortLspciName(out) : undefined;
 }
 
-function sysfsGpuName(deviceDir: string, uevent: string, pciSlot?: string): string | undefined {
+function* sysfsGpuName(deviceDir: string, uevent: string, pciSlot?: string): ExecSteps<string | undefined> {
   for (const file of ["product_name", "label"]) {
     try {
       const t = fs.readFileSync(path.join(deviceDir, file), "utf8").trim();
@@ -141,7 +131,7 @@ function sysfsGpuName(deviceDir: string, uevent: string, pciSlot?: string): stri
     }
   }
   if (pciSlot) {
-    const fromPci = lspciName(pciSlot);
+    const fromPci = yield* lspciName(pciSlot);
     if (fromPci) {
       return fromPci;
     }
@@ -150,7 +140,7 @@ function sysfsGpuName(deviceDir: string, uevent: string, pciSlot?: string): stri
   return driver || undefined;
 }
 
-function readSysfsGpus(): GpuMemoryInfo[] | undefined {
+function* readSysfsGpus(): ExecSteps<GpuMemoryInfo[] | undefined> {
   if (process.platform !== "linux") {
     return undefined;
   }
@@ -210,7 +200,7 @@ function readSysfsGpus(): GpuMemoryInfo[] | undefined {
         // ignore
       }
       const pciSlot = /PCI_SLOT_NAME=(\S+)/.exec(uevent)?.[1];
-      const name = sysfsGpuName(deviceDir, uevent, pciSlot);
+      const name = yield* sysfsGpuName(deviceDir, uevent, pciSlot);
       found.push({
         totalBytes,
         usedBytes,
@@ -232,16 +222,14 @@ function readSysfsGpus(): GpuMemoryInfo[] | undefined {
   return sortAndIndex(dedupeByPci(found));
 }
 
-function readNvidiaSmiAll(): GpuMemoryInfo[] | undefined {
+function* readNvidiaSmiAll(): ExecSteps<GpuMemoryInfo[] | undefined> {
+  const res = yield {
+    command: "nvidia-smi",
+    args: ["--query-gpu=name,memory.total,memory.used,pci.bus_id", "--format=csv,noheader,nounits"],
+    timeoutMs: 3000,
+  };
   try {
-    const out = execFileSync(
-      "nvidia-smi",
-      [
-        "--query-gpu=name,memory.total,memory.used,pci.bus_id",
-        "--format=csv,noheader,nounits",
-      ],
-      { encoding: "utf8", timeout: 3000, windowsHide: true }
-    ).trim();
+    const out = res.ok ? res.stdout.trim() : "";
     if (!out) {
       return undefined;
     }
@@ -275,15 +263,16 @@ function readNvidiaSmiAll(): GpuMemoryInfo[] | undefined {
   }
 }
 
-function readRocmSmi(): GpuMemoryInfo | undefined {
+function* readRocmSmi(): ExecSteps<GpuMemoryInfo | undefined> {
   if (process.platform === "win32") {
     return undefined;
   }
+  const res = yield { command: "rocm-smi", args: ["--showmeminfo", "vram", "--csv"], timeoutMs: 4000 };
+  if (!res.ok) {
+    return undefined;
+  }
   try {
-    const out = execFileSync("rocm-smi", ["--showmeminfo", "vram", "--csv"], {
-      encoding: "utf8",
-      timeout: 4000,
-    });
+    const out = res.stdout;
     // Heuristic parse: look for large integers that look like bytes or MiB.
     const nums = [...out.matchAll(/\b(\d{6,})\b/g)].map((m) => Number(m[1]));
     const candidates = nums.filter((n) => n > MIN_VRAM);
@@ -304,20 +293,21 @@ function readRocmSmi(): GpuMemoryInfo | undefined {
  * Windows WMI fallback. `AdapterRAM` saturates at 4 GiB; callers replace that
  * with `--list-devices` or `HardwareInformation.qwMemorySize` when they can.
  */
-function readWindowsWmiGpus(): GpuMemoryInfo[] | undefined {
+function* readWindowsWmiGpus(): ExecSteps<GpuMemoryInfo[] | undefined> {
   if (process.platform !== "win32") {
     return undefined;
   }
+  const res = yield {
+    command: "powershell.exe",
+    args: [
+      "-NoProfile",
+      "-Command",
+      "Get-CimInstance Win32_VideoController | Select-Object Name, AdapterRAM | ConvertTo-Json -Compress",
+    ],
+    timeoutMs: 6000,
+  };
   try {
-    const out = execFileSync(
-      "powershell.exe",
-      [
-        "-NoProfile",
-        "-Command",
-        "Get-CimInstance Win32_VideoController | Select-Object Name, AdapterRAM | ConvertTo-Json -Compress",
-      ],
-      { encoding: "utf8", timeout: 6000, windowsHide: true }
-    ).trim();
+    const out = res.ok ? res.stdout.trim() : "";
     if (!out) {
       return undefined;
     }
@@ -444,21 +434,21 @@ export function parseWindowsGpuRegistry(text: string): WindowsRegistryGpu[] {
   return out;
 }
 
-function readWindowsRegistryGpus(): WindowsRegistryGpu[] | undefined {
+function* readWindowsRegistryGpus(): ExecSteps<WindowsRegistryGpu[] | undefined> {
   if (process.platform !== "win32") {
     return undefined;
   }
+  const res = yield {
+    command: "reg.exe",
+    args: ["query", `HKLM\\SYSTEM\\CurrentControlSet\\Control\\Class\\${DISPLAY_CLASS_GUID}`, "/s"],
+    timeoutMs: 6000,
+    binary: true,
+  };
+  if (!res.ok || !res.buffer) {
+    return undefined;
+  }
   try {
-    const buf = execFileSync(
-      "reg.exe",
-      [
-        "query",
-        `HKLM\\SYSTEM\\CurrentControlSet\\Control\\Class\\${DISPLAY_CLASS_GUID}`,
-        "/s",
-      ],
-      { timeout: 6000, windowsHide: true }
-    );
-    const found = parseWindowsGpuRegistry(decodeRegistryQueryOutput(buf));
+    const found = parseWindowsGpuRegistry(decodeRegistryQueryOutput(res.buffer));
     return found.length ? found : undefined;
   } catch {
     return undefined;
@@ -534,11 +524,6 @@ export function preferStableGpuList(
     return previous;
   }
   return next;
-}
-
-export function resetGpuDetectionCache(): void {
-  cached = undefined;
-  lastGoodGpus = undefined;
 }
 
 /**
@@ -774,11 +759,12 @@ export function resolveWindowsGpuList(
   });
 }
 
-function readLlamaListDevices(binary: string): LlamaListedDevice[] | undefined {
+function* readLlamaListDevices(binary: string): ExecSteps<LlamaListedDevice[] | undefined> {
   const bin = (binary || "").trim();
   if (!bin || bin === "llama-server" || !fs.existsSync(bin)) {
     return undefined;
   }
+  let req;
   try {
     const dir = path.dirname(bin);
     const lib = path.join(dir, "..", "lib");
@@ -792,19 +778,13 @@ function readLlamaListDevices(binary: string): LlamaListedDevice[] | undefined {
     } else if (/[/\\]rocm[/\\]/.test(bin)) {
       env = withRocmRuntimeEnv(env);
     }
-    const result = spawnSync(bin, ["--list-devices"], {
-      encoding: "utf8",
-      timeout: 8000,
-      windowsHide: true,
-      cwd: dir,
-      env,
-    });
-    const text = `${result.stdout || ""}\n${result.stderr || ""}`;
-    const listed = parseLlamaListDevices(text);
-    return listed.length ? listed : undefined;
+    req = { command: bin, args: ["--list-devices"], timeoutMs: 8000, cwd: dir, env, captureStderr: true };
   } catch {
     return undefined;
   }
+  const result = yield req;
+  const listed = parseLlamaListDevices(`${result.stdout}\n${result.stderr}`);
+  return listed.length ? listed : undefined;
 }
 
 /**
@@ -812,15 +792,48 @@ function readLlamaListDevices(binary: string): LlamaListedDevice[] | undefined {
  * `--list-devices` (the order `--tensor-split` / `--main-gpu` use).
  */
 export function detectGpus(force = false, llamaServerBinary?: string): GpuMemoryInfo[] {
-  const now = Date.now();
   const binKey = (llamaServerBinary || "").trim();
-  if (!force && cached && now - cached.at < 15_000 && cached.binKey === binKey) {
-    return cached.gpus;
+  return cachedGpus(force, binKey) ?? runStepsSync(detectGpusSteps(force, binKey));
+}
+
+const GPU_CACHE_MS = 15_000;
+const gpuProbesInFlight = new Map<string, Promise<GpuMemoryInfo[]>>();
+
+function cachedGpus(force: boolean, binKey: string): GpuMemoryInfo[] | undefined {
+  return !force && cached && Date.now() - cached.at < GPU_CACHE_MS && cached.binKey === binKey
+    ? cached.gpus
+    : undefined;
+}
+
+/**
+ * {@link detectGpus} without blocking the event loop: the vendor tools run as
+ * async child processes. Concurrent callers share one probe per binary.
+ */
+export function detectGpusAsync(force = false, llamaServerBinary?: string): Promise<GpuMemoryInfo[]> {
+  const binKey = (llamaServerBinary || "").trim();
+  const hit = cachedGpus(force, binKey);
+  if (hit) {
+    return Promise.resolve(hit);
   }
-  const nvidia = readNvidiaSmiAll();
-  const sysfs = nvidia ? undefined : readSysfsGpus();
-  const wmi = nvidia || sysfs ? undefined : readWindowsWmiGpus();
-  const rocm = nvidia || sysfs || wmi ? undefined : readRocmSmi();
+  const running = gpuProbesInFlight.get(binKey);
+  if (running && !force) {
+    return running;
+  }
+  const probe = runStepsAsync(detectGpusSteps(force, binKey)).finally(() => {
+    if (gpuProbesInFlight.get(binKey) === probe) {
+      gpuProbesInFlight.delete(binKey);
+    }
+  });
+  gpuProbesInFlight.set(binKey, probe);
+  return probe;
+}
+
+function* detectGpusSteps(force: boolean, binKey: string): ExecSteps<GpuMemoryInfo[]> {
+  const now = Date.now();
+  const nvidia = yield* readNvidiaSmiAll();
+  const sysfs = nvidia ? undefined : yield* readSysfsGpus();
+  const wmi = nvidia || sysfs ? undefined : yield* readWindowsWmiGpus();
+  const rocm = nvidia || sysfs || wmi ? undefined : yield* readRocmSmi();
   let gpus = nvidia || sysfs || wmi || (rocm ? [rocm] : []);
   const windowsVram =
     process.platform === "win32" && !nvidia && !sysfs;
@@ -834,7 +847,7 @@ export function detectGpus(force = false, llamaServerBinary?: string): GpuMemory
   const runtimeBuild = /[/\\](sycl|rocm)[/\\]/.test(binKey);
   let listed: LlamaListedDevice[] | undefined;
   if (binKey && !activeInstallLock() && (gpus.length >= 2 || windowsNeedsList || runtimeBuild)) {
-    listed = readLlamaListDevices(binKey);
+    listed = yield* readLlamaListDevices(binKey);
   }
   if (runtimeBuild && listed?.length) {
     const fromList = gpusFromListedDevices(listed);
@@ -843,7 +856,7 @@ export function detectGpus(force = false, llamaServerBinary?: string): GpuMemory
     }
   } else if (windowsVram) {
     const registry = windowsVramNeedsRegistry(wmi || [], listed)
-      ? readWindowsRegistryGpus()
+      ? yield* readWindowsRegistryGpus()
       : undefined;
     gpus = resolveWindowsGpuList(wmi || [], listed, registry);
   } else if (listed?.length && gpus.length >= 2) {

@@ -381,11 +381,6 @@ export function capsMissDefaultSwaPattern(caps: {
   );
 }
 
-/** Read GGUF key/value metadata (header only — does not scan tensors). */
-export function readGgufMetadata(filePath: string): Record<string, GgufValue> {
-  return readGgufHeaderFromFile(filePath).meta;
-}
-
 interface GgufHeaderScan {
   meta: Record<string, GgufValue>;
   /** Byte offset of tensor data section (aligned). */
@@ -487,50 +482,6 @@ function readGgufHeaderFromFile(filePath: string): GgufHeaderScan {
     return scan;
   } finally {
     fs.closeSync(fd);
-  }
-}
-
-/**
- * Share of GGUF tensor bytes belonging to routed MoE experts (`*_exps` in the name).
- * Shared-expert tensors (`*shexp*`) are excluded — `--n-cpu-moe` mainly moves `*_exps`.
- */
-function computeMoeExpertShare(
-  tensors: Array<{ name: string; offset: number }>,
-  dataStart: number,
-  fileSize: number
-): number | undefined {
-  if (!tensors.length || fileSize <= dataStart) {
-    return undefined;
-  }
-  const sorted = [...tensors].sort((a, b) => a.offset - b.offset);
-  let total = 0;
-  let expert = 0;
-  for (let i = 0; i < sorted.length; i++) {
-    const off = sorted[i].offset;
-    const next = i + 1 < sorted.length ? sorted[i + 1].offset : Math.max(off, fileSize - dataStart);
-    const size = Math.max(0, next - off);
-    total += size;
-    if (/_exps(?:\.|$)/i.test(sorted[i].name)) {
-      expert += size;
-    }
-  }
-  if (total <= 0 || expert <= 0) {
-    return undefined;
-  }
-  return Math.min(0.98, Math.max(0.05, expert / total));
-}
-
-/**
- * Share of GGUF tensor bytes belonging to routed MoE experts (`*_exps` in the name).
- * Shared-expert tensors (`*shexp*`) are excluded — `--n-cpu-moe` mainly moves `*_exps`.
- */
-export function measureMoeExpertShare(filePath: string): number | undefined {
-  try {
-    const { dataStart, tensors } = readGgufHeaderFromFile(filePath);
-    const fileSize = fs.statSync(filePath).size;
-    return computeMoeExpertShare(tensors, dataStart, fileSize);
-  } catch {
-    return undefined;
   }
 }
 
@@ -722,19 +673,44 @@ export function heuristicDenseFfnShare(
 }
 
 interface CapsCacheEntry {
-  mtimeMs: number;
-  size: number;
-  at: number;
+  /** mtime/size of the file and its sibling shards (see capsCacheStamp). */
+  stamp: string;
   caps: ModelCapabilities;
 }
 
 /**
- * Parsed headers keyed by path, validated against mtime/size. The TTL bounds
- * staleness for inputs the stat cannot see (shards appearing next to the file).
+ * Parsed headers keyed by path and validated against the mtime/size of the
+ * file *and* its sibling shards (some fields, like the PLE share, come from
+ * later shards). No TTL: a hit is exact. Sized for a large library so the
+ * sidebar's fit badges never thrash the cache.
  */
-const CAPS_CACHE_TTL_MS = 30_000;
-const CAPS_CACHE_MAX = 32;
+const CAPS_CACHE_MAX = 512;
 const capsCache = new Map<string, CapsCacheEntry>();
+
+/**
+ * mtime+size of `filePath` and, for `-00001-of-0000N.gguf` splits, of every
+ * sibling shard that exists. Undefined when the file cannot be stat'ed.
+ * Exported for tests.
+ */
+export function capsCacheStamp(filePath: string): string | undefined {
+  const parts: string[] = [];
+  const split = /^(.*)-(\d{5})-of-(\d{5})\.gguf$/i.exec(filePath);
+  const files = split
+    ? Array.from({ length: Number(split[3]) }, (_, i) => `${split[1]}-${String(i + 1).padStart(5, "0")}-of-${split[3]}.gguf`)
+    : [filePath];
+  for (const file of files) {
+    try {
+      const st = fs.statSync(file);
+      parts.push(`${st.mtimeMs}:${st.size}`);
+    } catch {
+      if (file === filePath) {
+        return undefined;
+      }
+      parts.push("-");
+    }
+  }
+  return parts.join("|");
+}
 
 /** Forget parsed GGUF headers (tests, or after files were replaced in place). */
 export function invalidateModelCapabilitiesCache(filePath?: string): void {
@@ -754,21 +730,18 @@ export function invalidateModelCapabilitiesCache(filePath?: string): void {
  */
 export function readModelCapabilities(filePath: string): ModelCapabilities {
   const key = path.resolve(filePath);
-  const now = Date.now();
-  let st: fs.Stats | undefined;
-  try {
-    st = fs.statSync(filePath);
-  } catch {
-    // fall through — the uncached read reports the real error
-  }
-  const hit = st ? capsCache.get(key) : undefined;
-  if (hit && st && hit.mtimeMs === st.mtimeMs && hit.size === st.size && now - hit.at < CAPS_CACHE_TTL_MS) {
+  const stamp = capsCacheStamp(filePath);
+  const hit = stamp ? capsCache.get(key) : undefined;
+  if (hit && hit.stamp === stamp) {
+    // Refresh LRU position.
+    capsCache.delete(key);
+    capsCache.set(key, hit);
     return structuredClone(hit.caps);
   }
   const caps = readModelCapabilitiesUncached(filePath);
-  if (st) {
+  if (stamp) {
     capsCache.delete(key);
-    capsCache.set(key, { mtimeMs: st.mtimeMs, size: st.size, at: now, caps: structuredClone(caps) });
+    capsCache.set(key, { stamp, caps: structuredClone(caps) });
     while (capsCache.size > CAPS_CACHE_MAX) {
       const oldest = capsCache.keys().next().value;
       if (oldest === undefined) {
