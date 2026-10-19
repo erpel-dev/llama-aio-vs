@@ -2,7 +2,8 @@
  * In-process download job list (pause / resume / cancel) for the M5 panel.
  */
 import * as path from "path";
-import { downloadHttpFile, DownloadAbortError, GatedDownloadError } from "./httpDownload";
+import * as lockfile from "proper-lockfile";
+import { downloadHttpFile, DownloadAbortError, GatedDownloadError, partialDownloadPath, normalizeSha256 } from "./httpDownload";
 
 export type DownloadJobState =
   | "queued"
@@ -67,6 +68,7 @@ export class DownloadManager {
   // Keep file ownership until an aborted attempt has closed its writer, even
   // when its cancelled job has already been removed from the UI history.
   private readonly activeDestinations = new Set<string>();
+  private readonly cleaningPartials = new Set<string>();
   private readonly concurrency: number;
 
   constructor(concurrency = 1) {
@@ -94,8 +96,14 @@ export class DownloadManager {
     const matching = [...this.jobs.values()].filter((j) => this.destinationKey(j.dest) === key);
     const existing = matching.find((j) =>
       j.state === "running" || j.state === "queued" || j.state === "paused" || j.state === "verifying"
-    ) || matching.find((j) => j.state === "done");
-    if (existing && (existing.state === "done" || existing.state === "running" || existing.state === "queued" || existing.state === "verifying")) {
+    );
+    if (existing && (existing.url !== spec.url || existing.expectedSize !== spec.expectedSize ||
+      normalizeSha256(existing.expectedSha256) !== normalizeSha256(spec.expectedSha256))) {
+      throw new Error("A different download already owns this destination");
+    }
+    // Completed history is not a file cache: the transport revalidates the
+    // destination's existence, size and checksum for every new request.
+    if (existing && (existing.state === "running" || existing.state === "queued" || existing.state === "verifying")) {
       return { job: this.snapshot(existing), done: existing.done };
     }
     if (existing && existing.state === "paused") {
@@ -206,9 +214,47 @@ export class DownloadManager {
     }
   }
 
-  private destinationKey(dest: string): string {
-    const resolved = path.resolve(dest);
+  private pathKey(file: string): string {
+    const resolved = path.resolve(file);
     return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+  }
+
+  private destinationKey(dest: string): string {
+    return this.pathKey(partialDownloadPath(dest));
+  }
+
+  /** Includes paused/queued jobs and cancelled attempts whose writer is closing. */
+  isPartialInUse(file: string): boolean {
+    const key = this.pathKey(file);
+    return this.activeDestinations.has(key) || [...this.jobs.values()].some((job) =>
+      this.destinationKey(job.dest) === key &&
+      (job.state === "queued" || job.state === "running" || job.state === "paused" || job.state === "verifying")
+    );
+  }
+
+  /** Reserve an idle partial until removal finishes; new jobs wait for that removal. */
+  async removePartialIfIdle(file: string, remove: () => Promise<void>): Promise<boolean> {
+    const key = this.pathKey(file);
+    if (this.cleaningPartials.has(key) || this.isPartialInUse(file)) return false;
+    this.cleaningPartials.add(key);
+    let release: (() => Promise<void>) | undefined;
+    try {
+      try {
+        release = await lockfile.lock(file, { realpath: false });
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "ELOCKED") return false;
+        throw err;
+      }
+      await remove();
+      return true;
+    } finally {
+      try {
+        await release?.();
+      } finally {
+        this.cleaningPartials.delete(key);
+        this.pump();
+      }
+    }
   }
 
   private pump(): void {
@@ -217,7 +263,8 @@ export class DownloadManager {
     try {
       while (this.running < this.concurrency) {
         const next = [...this.jobs.values()].find((j) =>
-          j.state === "queued" && !j.controller && !this.activeDestinations.has(this.destinationKey(j.dest))
+          j.state === "queued" && !j.controller && !this.activeDestinations.has(this.destinationKey(j.dest)) &&
+          !this.cleaningPartials.has(this.destinationKey(j.dest))
         );
         if (!next) return;
         const controller = new AbortController();

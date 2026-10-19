@@ -93,35 +93,40 @@ export function preferMmprojPath(paths: string[]): string | undefined {
   return [...paths].sort((a, b) => score(a) - score(b) || a.localeCompare(b))[0];
 }
 
-/** First usable `mmproj*.gguf` sitting next to a language GGUF. */
+/** Current directory, then ancestors up to an enclosing downloaded HF repo. */
+function companionDirectories(modelPath: string): string[] {
+  const here = path.dirname(modelPath);
+  const dirs: string[] = [];
+  let dir = here;
+  for (;;) {
+    dirs.push(dir);
+    if (path.basename(dir).includes("__")) return dirs;
+    const parent = path.dirname(dir);
+    if (parent === dir) return [here];
+    dir = parent;
+  }
+}
+
+/** Nearest usable projector, including shared files at a downloaded repo root. */
 export function findSiblingMmproj(modelPath: string): string | undefined {
   const trimmed = (modelPath || "").trim();
-  if (!trimmed) {
-    return undefined;
-  }
-  const dir = path.dirname(trimmed);
-  let names: string[];
-  try {
-    names = fs.readdirSync(dir);
-  } catch {
-    return undefined;
-  }
-  const found: string[] = [];
-  for (const name of names) {
-    if (!name.toLowerCase().endsWith(".gguf") || !isMmprojFileName(name)) {
-      continue;
+  if (!trimmed) return undefined;
+  for (const dir of companionDirectories(trimmed)) {
+    let names: string[];
+    try { names = fs.readdirSync(dir); } catch { continue; }
+    const found: string[] = [];
+    for (const name of names) {
+      if (!name.toLowerCase().endsWith(".gguf") || !isMmprojFileName(name)) continue;
+      const full = path.join(dir, name);
+      try {
+        const st = fs.statSync(full);
+        if (st.isFile() && st.size >= MIN_MMPROJ_BYTES) found.push(full);
+      } catch { /* skip unreadable */ }
     }
-    const full = path.join(dir, name);
-    try {
-      const st = fs.statSync(full);
-      if (st.isFile() && st.size >= MIN_MMPROJ_BYTES) {
-        found.push(full);
-      }
-    } catch {
-      // skip unreadable
-    }
+    const best = preferMmprojPath(found);
+    if (best) return best;
   }
-  return preferMmprojPath(found);
+  return undefined;
 }
 
 /**
@@ -310,10 +315,9 @@ function siblingsForPath(filePath: string): GgufListedFile[] {
   if (!trimmed) {
     return [];
   }
-  const dir = path.dirname(trimmed);
-  const here = listGgufStats(dir);
-  const mtpDir = listGgufStats(path.join(dir, "MTP"));
-  return here.concat(mtpDir);
+  return companionDirectories(trimmed).flatMap((dir) =>
+    listGgufStats(dir).concat(listGgufStats(path.join(dir, "MTP")))
+  );
 }
 
 /** True when this file should be passed as `--model-draft` (sidecar), not started as the main GGUF. */
@@ -679,7 +683,7 @@ function shouldSkipLanguageFile(name: string, size: number, siblings: GgufListed
   if (!name.toLowerCase().endsWith(".gguf")) {
     return true;
   }
-  if (SKIP_NAME_RE.test(name) || isMmprojFileName(name) || isImatrixFileName(name)) {
+  if (SKIP_NAME_RE.test(listingBaseName(name)) || isMmprojFileName(name) || isImatrixFileName(name)) {
     return true;
   }
   if (classifyGgufFile({ path: name, size }, siblings) === "mtp-sidecar") {
@@ -753,7 +757,7 @@ function walkGgufs(
       try {
         const st = fs.statSync(path.join(dir, ent.name));
         if (st.isFile()) {
-          siblingStats.push({ path: ent.name, size: st.size });
+          siblingStats.push({ path: path.join(dir, ent.name), size: st.size });
         }
       } catch {
         // skip unreadable
@@ -781,7 +785,7 @@ function walkGgufs(
       }
       try {
         const st = fs.statSync(full);
-        if (!st.isFile() || skip(ent.name, st.size, siblingStats)) {
+        if (!st.isFile() || skip(full, st.size, siblingStats)) {
           continue;
         }
         // Dedupe by real path (HF snapshots often symlink into blobs/) but keep the
@@ -1190,9 +1194,10 @@ type CanonicalPath = (file: string) => string;
 function groupDirectories(entries: LocalModelEntry[]): string[] {
   const dirs = new Set<string>();
   for (const entry of entries) {
-    const dir = path.dirname(entry.path);
-    dirs.add(dir);
-    dirs.add(path.join(dir, "MTP"));
+    for (const dir of companionDirectories(entry.path)) {
+      dirs.add(dir);
+      dirs.add(path.join(dir, "MTP"));
+    }
   }
   return [...dirs];
 }
@@ -1272,8 +1277,13 @@ function buildLibraryGroupsFromInventory(
     let indexed = directories.get(dir);
     if (indexed) return indexed;
     const here = inventory.get(dir) || [];
-    const siblings = here.concat(inventory.get(path.join(dir, "MTP")) || []);
-    const mmproj = preferMmprojPath(here.filter((f) => f.size >= MIN_MMPROJ_BYTES && isMmprojFileName(f.path)).map((f) => f.path));
+    const parents = companionDirectories(path.join(dir, "model.gguf"));
+    const siblings = parents.flatMap((parent) =>
+      (inventory.get(parent) || []).concat(inventory.get(path.join(parent, "MTP")) || [])
+    );
+    const mmproj = parents.map((parent) => preferMmprojPath(
+      (inventory.get(parent) || []).filter((f) => f.size >= MIN_MMPROJ_BYTES && isMmprojFileName(f.path)).map((f) => f.path)
+    )).find(Boolean);
     const mtp = siblings.filter((f) => f.size >= MIN_MTP_BYTES && classifyGgufFile(f, siblings) === "mtp-sidecar");
     const shards = new Map<string, string[]>();
     for (const file of here) {
@@ -1285,7 +1295,7 @@ function buildLibraryGroupsFromInventory(
       }
     }
     for (const group of shards.values()) group.sort();
-    indexed = { mmproj: here.find((f) => f.path === mmproj), mtp, shards };
+    indexed = { mmproj: siblings.find((f) => f.path === mmproj), mtp, shards };
     directories.set(dir, indexed);
     return indexed;
   };

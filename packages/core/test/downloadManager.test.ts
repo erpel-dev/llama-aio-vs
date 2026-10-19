@@ -66,6 +66,21 @@ describe("DownloadManager", () => {
     assert.equal(mgr.list()[0]?.state, "cancelled");
     fs.rmSync(dir, { recursive: true, force: true });
   });
+
+  it("revalidates completed files after deletion or replacement", async (t) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "llama-redownload-"));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const mgr = new DownloadManager();
+    const spec = { dest: path.join(dir, "model.gguf"), label: "model", url: base, expectedSize: payload.length, expectedSha256: sha };
+    const first = mgr.enqueue(spec); await first.done;
+    fs.unlinkSync(spec.dest);
+    const second = mgr.enqueue(spec); await second.done;
+    assert.notEqual(first.job.id, second.job.id);
+    assert.equal(fs.readFileSync(spec.dest).equals(payload), true);
+    fs.writeFileSync(spec.dest, Buffer.alloc(payload.length));
+    await mgr.enqueue(spec).done;
+    assert.equal(fs.readFileSync(spec.dest).equals(payload), true, "a same-sized corrupt file is checked again");
+  });
 });
 
 async function waitFor(check: () => boolean): Promise<void> {
@@ -77,6 +92,30 @@ async function waitFor(check: () => boolean): Promise<void> {
 }
 
 describe("download queue regressions", () => {
+  it("reserves cleanup destinations and excludes pending, paused and closing jobs", async (t) => {
+    const transport = require("../src/httpDownload") as typeof import("../src/httpDownload");
+    const attempts: Array<(error: Error) => void> = [];
+    t.mock.method(transport, "downloadHttpFile", () => new Promise<string>((_resolve, reject) => attempts.push(reject)));
+    const mgr = new DownloadManager(1);
+    const dest = path.join(os.tmpdir(), "reserved.gguf");
+    let release!: () => void;
+    const cleaning = mgr.removePartialIfIdle(dest + ".partial", () => new Promise<void>((resolve) => { release = resolve; }));
+    const job = mgr.enqueue({ dest, label: "reserved", url: "https://example.invalid" });
+    assert.equal(job.job.state, "queued");
+    assert.equal(attempts.length, 0);
+    assert.equal(await mgr.removePartialIfIdle(dest + ".partial", async () => assert.fail("already reserved")), false);
+    await waitFor(() => !!release);
+    release(); await cleaning;
+    assert.equal(attempts.length, 1);
+    mgr.pause(job.job.id);
+    assert.equal(mgr.isPartialInUse(dest + ".partial"), true);
+    mgr.cancel(job.job.id); mgr.clearFinished();
+    assert.equal(await mgr.removePartialIfIdle(dest + ".partial", async () => assert.fail("writer still closing")), false);
+    attempts[0]!(new transport.DownloadAbortError("pause"));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(await mgr.removePartialIfIdle(dest + ".partial", async () => undefined), true);
+  });
+
   for (const concurrency of [1, 2]) {
     it(`drains queued downloads within ${concurrency} slots`, { timeout: 5000 }, async (t) => {
       const dir = fs.mkdtempSync(path.join(os.tmpdir(), "llama-aio-queue-"));

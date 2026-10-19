@@ -6,6 +6,7 @@ import * as fs from "fs";
 import * as http from "http";
 import * as https from "https";
 import * as path from "path";
+import * as lockfile from "proper-lockfile";
 import { ensureDirs } from "./paths";
 
 export class DownloadAbortError extends Error {
@@ -144,6 +145,22 @@ async function existingIsComplete(
  * the next call can send `Range`.
  */
 export async function downloadHttpFile(options: HttpDownloadOptions): Promise<string> {
+  if (options.signal?.aborted) {
+    throw new DownloadAbortError(options.signal.reason === "pause" ? "pause" : "cancel");
+  }
+  const partial = partialDownloadPath(options.dest);
+  ensureDirs(path.dirname(partial));
+  // Coordinate direct/TUI downloads and other extension windows with both
+  // writers and the partial-file cleaner. Heartbeats protect long transfers.
+  const release = await lockfile.lock(partial, { realpath: false });
+  try {
+    return await downloadHttpFileUnlocked(options);
+  } finally {
+    await release();
+  }
+}
+
+async function downloadHttpFileUnlocked(options: HttpDownloadOptions): Promise<string> {
   const dest = options.dest;
   const expectedSha256 = normalizeSha256(options.expectedSha256);
   const expectedSize =
@@ -203,6 +220,8 @@ export async function downloadHttpFile(options: HttpDownloadOptions): Promise<st
     let received = existing;
     let lastTick = startedAt;
     let lastBytes = existing;
+    let responseBytes = 0;
+    let rangeBytes: number | undefined;
 
     const fail = (err: Error) => {
       if (settled) {
@@ -324,6 +343,21 @@ export async function downloadHttpFile(options: HttpDownloadOptions): Promise<st
           }
 
           const length = Number(res.headers["content-length"] || 0);
+          responseBytes = 0;
+          rangeBytes = undefined;
+          if (status === 206) {
+            const match = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(res.headers["content-range"] || "");
+            const [start, end, size] = match ? match.slice(1).map(Number) : [];
+            if (!match || ![start, end, size].every(Number.isSafeInteger) ||
+              start !== existing || end < start || end !== size - 1 ||
+              (expectedSize !== undefined && size !== expectedSize) ||
+              (length > 0 && length !== end - start + 1)) {
+              res.resume();
+              fail(new DownloadVerifyError("Invalid Content-Range for resumed download"));
+              return;
+            }
+            rangeBytes = end - start + 1;
+          }
           const total =
             status === 206 && length > 0
               ? existing + length
@@ -337,6 +371,7 @@ export async function downloadHttpFile(options: HttpDownloadOptions): Promise<st
           out.on("error", fail);
           res.on("data", (chunk: Buffer) => {
             received += chunk.length;
+            responseBytes += chunk.length;
             hash?.update(chunk);
             bumpIdle();
             const now = Date.now();
@@ -353,6 +388,10 @@ export async function downloadHttpFile(options: HttpDownloadOptions): Promise<st
             out?.close((closeErr) => {
               if (closeErr) {
                 fail(closeErr);
+                return;
+              }
+              if (rangeBytes !== undefined && responseBytes !== rangeBytes) {
+                fail(new DownloadVerifyError("Resumed response length did not match Content-Range"));
                 return;
               }
               if (expectedSha256 && hash) {

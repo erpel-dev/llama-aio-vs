@@ -7,9 +7,12 @@ import type { ConfigAccessor } from "../src/config";
 import {
   buildLibraryGroups,
   buildLibraryGroupsAsync,
+  findSiblingMmproj,
+  findSiblingMtpDraft,
   invalidateModelLibraryCache,
   isOwnedModelPath,
   listLocalModelEntries,
+  listMtpDraftEntries,
   listPartialDownloads,
   listShardPaths,
   removalPathsForQuant,
@@ -96,6 +99,45 @@ describe("library groups and removal", () => {
     for (const dir of dirs) {
       fs.rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it("keeps MTP directory sidecars out of the language picker", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "llama-mtp-context-"));
+    dirs.push(dir);
+    fs.mkdirSync(path.join(dir, "MTP"));
+    const draft = path.join(dir, "MTP", "Model-Q4_0.gguf");
+    writeSparseGguf(draft);
+    writeSparseGguf(path.join(dir, "ggml-vocab-test.gguf"));
+    const main = path.join(dir, "Model-Q4_0.gguf");
+    writeSparseGguf(main);
+    invalidateModelLibraryCache();
+    const config = configFor(dir);
+    assert.deepEqual(listLocalModelEntries(config).filter((e) => e.path.startsWith(dir)).map((e) => e.path), [main]);
+    assert.deepEqual(listMtpDraftEntries(config).filter((e) => e.path.startsWith(dir)).map((e) => e.path), [draft]);
+  });
+
+  it("finds shared repo companions for preserved quant subdirectories", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "llama-hf-companions-"));
+    dirs.push(dir);
+    const repo = path.join(dir, "org__repo");
+    const quantDir = path.join(repo, "Q4");
+    fs.mkdirSync(quantDir, { recursive: true });
+    fs.mkdirSync(path.join(repo, "MTP"));
+    const main = path.join(quantDir, "Model-Q4_0.gguf");
+    const projector = path.join(repo, "mmproj-F16.gguf");
+    const draft = path.join(repo, "MTP", "Model-Q4_0.gguf");
+    writeSparseGguf(main);
+    writeSparseGguf(projector, 1024 * 1024);
+    writeSparseGguf(draft, 1024 * 1024);
+    assert.equal(findSiblingMmproj(main), projector);
+    assert.equal(findSiblingMtpDraft(main), draft);
+    const entries = [{ path: main, source: "Llama AIO", sizeBytes: LANGUAGE_MIN }];
+    const groups = buildLibraryGroups(entries, dir);
+    assert.deepEqual(groups[0]?.companions.map((c) => c.path), [projector, draft]);
+    assert.deepEqual(await buildLibraryGroupsAsync(entries, dir), groups);
+    const nearby = path.join(quantDir, "mmproj-Q8_0.gguf");
+    writeSparseGguf(nearby, 1024 * 1024);
+    assert.equal(findSiblingMmproj(main), nearby, "prefer a nearby quant-specific projector");
   });
 
   for (const count of [100, 300, 600]) {

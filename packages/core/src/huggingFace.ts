@@ -448,8 +448,18 @@ export class HuggingFaceClient {
 
   localDestFor(modelId: string, filePath: string): string {
     const modelsDir = getModelsDir(this.store.getConfig());
-    const destDir = path.join(modelsDir, modelId.replace(/\//g, "__"));
-    return path.join(destDir, path.basename(filePath));
+    const validParts = (value: string) => {
+      const parts = value.split("/");
+      if (!value || path.win32.isAbsolute(value) || parts.some((part) =>
+        !part || part === "." || part === ".." || /[\\:\0]/.test(part)
+      )) {
+        throw new Error("Invalid Hugging Face repository or file path");
+      }
+      return parts;
+    };
+    const repo = validParts(modelId);
+    if (repo.length !== 2) throw new Error("Expected a Hugging Face owner/repository id");
+    return path.join(modelsDir, repo.join("__"), ...validParts(filePath));
   }
 
   private async downloadOneFile(

@@ -1,4 +1,4 @@
-import { detectGpuMemory, detectGpus, GpuMemoryInfo } from "./gpuInfo";
+import { detectGpus, GpuMemoryInfo } from "./gpuInfo";
 import {
   capacityAwareTensorSplit,
   type LayerWeightMassOptions,
@@ -53,7 +53,7 @@ export function fittingContextLength(
   const lowMin = Math.min(FIT_CONTEXT_MIN, high);
   const cpuOnly = !!options.cpuOnly;
   const gpus = resolveGpus(options);
-  const gpu = gpus[0] || options.gpu || detectGpuMemory();
+  const gpu = gpus[0] || options.gpu;
   if (cpuOnly || !gpu?.totalBytes) {
     return Math.min(PREFERRED_CONTEXT, maxCtx);
   }
@@ -92,7 +92,9 @@ export function fittingContextLength(
 }
 
 function resolveGpus(options: RecommendOptions): GpuMemoryInfo[] {
-  if (options.gpus?.length) {
+  if (options.cpuOnly) return [];
+  // An explicit empty result from an async probe must not trigger a sync retry.
+  if (options.gpus !== undefined) {
     return options.gpus.filter((g) => g.totalBytes > 0);
   }
   if (options.gpu?.totalBytes) {
@@ -410,7 +412,7 @@ export function recommendLoadSettings(
   }
 
   const gpus = resolveGpus(options);
-  const gpu = gpus[0] || options.gpu || detectGpuMemory();
+  const gpu = gpus[0] || options.gpu;
   const nLayers = Math.max(1, caps.blockCount || 1);
   const base: LlamaLoadSettings = {
     ...current,

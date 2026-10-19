@@ -1817,9 +1817,11 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
 
   async cleanPartialDownloads(): Promise<void> {
     const modelsDir = getModelsDir(this.store.getConfig());
-    const partials = listPartialDownloads(modelsDir).filter((file) => isOwnedModelPath(file.path, modelsDir));
+    const partials = listPartialDownloads(modelsDir).filter((file) =>
+      isOwnedModelPath(file.path, modelsDir) && !downloadManager.isPartialInUse(file.path)
+    );
     if (!partials.length) {
-      vscode.window.showInformationMessage("No incomplete downloads in the Llama AIO models folder.");
+      vscode.window.showInformationMessage("No unused incomplete downloads in the Llama AIO models folder.");
       return;
     }
     const bytes = partials.reduce((sum, file) => sum + file.sizeBytes, 0);
@@ -1832,7 +1834,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       return;
     }
     for (const file of partials) {
-      await this.trashOwnedFile(file.path);
+      await downloadManager.removePartialIfIdle(file.path, async () => {
+        // Ownership and job activity may have changed while confirmation was open.
+        if (isOwnedModelPath(file.path, modelsDir)) await this.trashOwnedFile(file.path);
+      });
     }
     invalidateModelLibraryCache();
     await this.pushState();
