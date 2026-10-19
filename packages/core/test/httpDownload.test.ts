@@ -44,6 +44,45 @@ describe("redirect helpers", () => {
 });
 
 describe("downloadHttpFile", () => {
+  for (const mode of ["headers", "redirect", "body", "progress"] as const) {
+    it(`covers ${mode} waits with the idle timeout`, { timeout: 3000 }, async (t) => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "llama-aio-idle-"));
+      const server = http.createServer((req, res) => {
+        if (mode === "redirect" && req.url === "/start") {
+          res.writeHead(302, { Location: "/silent" }); res.end();
+        } else if (mode === "body") {
+          res.writeHead(200); res.write("a");
+        } else if (mode === "progress") {
+          let sent = 0;
+          const timer = setInterval(() => {
+            res.write("a");
+            if (++sent === 8) { clearInterval(timer); res.end(); }
+          }, 20);
+          res.on("close", () => clearInterval(timer));
+        }
+      });
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+      t.after(async () => {
+        server.closeAllConnections();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+        fs.rmSync(dir, { recursive: true, force: true });
+      });
+      const dest = path.join(dir, "idle.gguf");
+      const started = Date.now();
+      const result = downloadHttpFile({
+        url: `http://127.0.0.1:${(server.address() as { port: number }).port}/start`,
+        dest, idleTimeoutMs: 100, signal: AbortSignal.timeout(1000),
+      });
+      if (mode === "progress") {
+        await result;
+        assert.equal(fs.readFileSync(dest, "utf8"), "a".repeat(8));
+      } else {
+        await assert.rejects(result, /idle timeout/);
+        assert.ok(Date.now() - started < 900, "timeout must precede the cleanup abort");
+      }
+    });
+  }
+
   const payload = Buffer.from("hello-llama-aio-download-manager-payload");
   const sha = createHash("sha256").update(payload).digest("hex");
   let server: http.Server;

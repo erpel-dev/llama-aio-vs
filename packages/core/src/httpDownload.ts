@@ -214,10 +214,14 @@ export async function downloadHttpFile(options: HttpDownloadOptions): Promise<st
       }
       signal?.removeEventListener("abort", onAbort);
       req?.destroy();
-      if (out) {
+      if (out && !out.closed) {
+        // A resumed attempt may open this same partial file immediately.
+        // Release the queue's slot only after the old writer is closed.
+        out.once("close", () => reject(err));
         out.destroy();
+      } else {
+        reject(err);
       }
-      reject(err);
     };
 
     const ok = () => {
@@ -277,8 +281,13 @@ export async function downloadHttpFile(options: HttpDownloadOptions): Promise<st
       if (existing > 0) {
         headers.Range = `bytes=${existing}-`;
       }
+      bumpIdle(); // Include DNS/connect/TLS/headers and each redirect target.
       try {
         req = request(url, { headers }, (res) => {
+          if (settled) {
+            res.destroy();
+            return;
+          }
           const status = res.statusCode || 0;
           if (status >= 300 && status < 400 && res.headers.location) {
             res.resume();
@@ -368,6 +377,9 @@ export async function downloadHttpFile(options: HttpDownloadOptions): Promise<st
     go(options.url, 0);
   });
 
+  if (signal?.aborted) {
+    throw new DownloadAbortError(signal.reason === "pause" ? "pause" : "cancel");
+  }
   const st = fs.statSync(partial);
   if (expectedSize && st.size !== expectedSize) {
     throw new DownloadVerifyError(

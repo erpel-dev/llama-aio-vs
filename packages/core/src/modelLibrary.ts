@@ -936,6 +936,7 @@ const libraryCache = new Map<string, { at: number; entries: LocalModelEntry[] }>
 /** Drop cached library scans (after downloads, imports, deletions, or a manual refresh). */
 export function invalidateModelLibraryCache(): void {
   libraryCache.clear();
+  libraryGroupsCache.clear();
 }
 
 function libraryCacheKey(kind: LibraryScanKind, config: ConfigAccessor): string {
@@ -1183,11 +1184,112 @@ function fileBytes(filePath: string): number {
   }
 }
 
+type GroupInventory = Map<string, GgufListedFile[]>;
+type CanonicalPath = (file: string) => string;
+
+function groupDirectories(entries: LocalModelEntry[]): string[] {
+  const dirs = new Set<string>();
+  for (const entry of entries) {
+    const dir = path.dirname(entry.path);
+    dirs.add(dir);
+    dirs.add(path.join(dir, "MTP"));
+  }
+  return [...dirs];
+}
+
 /**
  * Group language GGUFs by download repo (an `org__repo` folder) or, otherwise,
  * by parent directory plus the filename with the quant token removed.
+ * Scan each directory and canonicalize each path only once per grouping.
  */
 export function buildLibraryGroups(entries: LocalModelEntry[], modelsDir: string): LibraryGroup[] {
+  const inventory: GroupInventory = new Map(groupDirectories(entries).map((dir) => [dir, listGgufStats(dir)]));
+  const canonical = new Map<string, string>();
+  return buildLibraryGroupsFromInventory(entries, modelsDir, inventory, (file) => {
+    if (!canonical.has(file)) canonical.set(file, canonicalModelPath(file));
+    return canonical.get(file)!;
+  });
+}
+
+const libraryGroupsCache = new Map<string, { at: number; groups: Promise<LibraryGroup[]> }>();
+
+/** Cached grouping for UI payloads; cold filesystem work yields to the host event loop. */
+export async function buildLibraryGroupsAsync(entries: LocalModelEntry[], modelsDir: string): Promise<LibraryGroup[]> {
+  const key = JSON.stringify([modelsDir, entries]);
+  const hit = libraryGroupsCache.get(key);
+  if (hit && Date.now() - hit.at < MODEL_LIBRARY_CACHE_TTL_MS) {
+    return structuredClone(await hit.groups);
+  }
+  const groups = loadLibraryGroups(entries, modelsDir);
+  libraryGroupsCache.delete(key);
+  // Bound retained snapshots when libraries or hide lists change repeatedly.
+  if (libraryGroupsCache.size >= 4) libraryGroupsCache.delete(libraryGroupsCache.keys().next().value!);
+  libraryGroupsCache.set(key, { at: Date.now(), groups });
+  try {
+    return structuredClone(await groups);
+  } catch (err) {
+    if (libraryGroupsCache.get(key)?.groups === groups) libraryGroupsCache.delete(key);
+    throw err;
+  }
+}
+
+async function loadLibraryGroups(entries: LocalModelEntry[], modelsDir: string): Promise<LibraryGroup[]> {
+  const inventory: GroupInventory = new Map();
+  await Promise.all(groupDirectories(entries).map(async (dir) => {
+    let names: string[];
+    try { names = await fs.promises.readdir(dir); } catch { names = []; }
+    const files = await Promise.all(names.filter((name) => name.toLowerCase().endsWith(".gguf")).map(async (name) => {
+      const file = path.join(dir, name);
+      try {
+        const stat = await fs.promises.stat(file);
+        return stat.isFile() ? { path: file, size: stat.size } : undefined;
+      } catch { return undefined; }
+    }));
+    inventory.set(dir, files.filter((file): file is GgufListedFile => !!file));
+  }));
+  const paths = new Set([modelsDir, ...entries.map((e) => e.path), ...[...inventory.values()].flat().map((f) => f.path)]);
+  const canonical = new Map<string, string>();
+  await Promise.all([...paths].map(async (file) => {
+    try { canonical.set(file, file ? await fs.promises.realpath(file) : ""); }
+    catch { canonical.set(file, path.resolve(file)); }
+  }));
+  return buildLibraryGroupsFromInventory(entries, modelsDir, inventory, (file) => canonical.get(file) ?? path.resolve(file));
+}
+
+function buildLibraryGroupsFromInventory(
+  entries: LocalModelEntry[], modelsDir: string, inventory: GroupInventory, canonical: CanonicalPath
+): LibraryGroup[] {
+  const root = modelsDir.trim() ? canonical(modelsDir) : "";
+  const owned = (file: string): boolean => {
+    if (!root) return false;
+    const rel = path.relative(root, canonical(file));
+    return !!rel && rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel);
+  };
+  // Companion classification, projector selection and shard indexing are shared
+  // across every family in a flat directory, not repeated per model.
+  const directories = new Map<string, { mmproj?: GgufListedFile; mtp: GgufListedFile[]; shards: Map<string, string[]> }>();
+  const directory = (dir: string) => {
+    let indexed = directories.get(dir);
+    if (indexed) return indexed;
+    const here = inventory.get(dir) || [];
+    const siblings = here.concat(inventory.get(path.join(dir, "MTP")) || []);
+    const mmproj = preferMmprojPath(here.filter((f) => f.size >= MIN_MMPROJ_BYTES && isMmprojFileName(f.path)).map((f) => f.path));
+    const mtp = siblings.filter((f) => f.size >= MIN_MTP_BYTES && classifyGgufFile(f, siblings) === "mtp-sidecar");
+    const shards = new Map<string, string[]>();
+    for (const file of here) {
+      const key = localShardGroupKey(file.path);
+      if (key) {
+        const group = shards.get(key) || [];
+        group.push(file.path);
+        shards.set(key, group);
+      }
+    }
+    for (const group of shards.values()) group.sort();
+    indexed = { mmproj: here.find((f) => f.path === mmproj), mtp, shards };
+    directories.set(dir, indexed);
+    return indexed;
+  };
+
   const buckets = new Map<string, LocalModelEntry[]>();
   for (const entry of entries) {
     const dir = path.dirname(entry.path);
@@ -1207,7 +1309,7 @@ export function buildLibraryGroups(entries: LocalModelEntry[], modelsDir: string
     const dir = path.dirname(first.path);
     const folder = path.basename(dir);
     const quants: LibraryQuant[] = sorted.map((entry) => {
-      const shardPaths = listShardPaths(entry.path);
+      const shardPaths = directory(path.dirname(entry.path)).shards.get(localShardGroupKey(entry.path) || "") || [entry.path];
       return {
         path: entry.path,
         label: quantLabel(entry.path),
@@ -1215,27 +1317,30 @@ export function buildLibraryGroups(entries: LocalModelEntry[], modelsDir: string
         shardCount: Math.max(entry.shardCount || 1, shardPaths.length),
         shardPaths,
         source: entry.source,
-        owned: isOwnedModelPath(entry.path, modelsDir) && shardPaths.every((shard) => isOwnedModelPath(shard, modelsDir)),
+        owned: owned(entry.path) && shardPaths.every(owned),
       };
     });
     const companions: LibraryCompanion[] = [];
-    const mmproj = findSiblingMmproj(first.path);
+    const indexed = directory(dir);
+    const mmproj = indexed.mmproj?.path;
     if (mmproj) {
       companions.push({
         path: mmproj,
         name: path.basename(mmproj),
         role: "mmproj",
-        sizeBytes: fileBytes(mmproj),
+        sizeBytes: indexed.mmproj!.size,
         shared: quants.length > 1,
       });
     }
-    const mtp = findSiblingMtpDraft(first.path);
+    const mtp = languageRejectsSidecarMtp(first.path) ? undefined : matchMtpDraftToLanguage(
+      first.path, indexed.mtp.filter((f) => canonical(f.path) !== canonical(first.path)).map((f) => f.path)
+    );
     if (mtp && mtp !== mmproj) {
       companions.push({
         path: mtp,
         name: path.basename(mtp),
         role: "mtp",
-        sizeBytes: fileBytes(mtp),
+        sizeBytes: indexed.mtp.find((f) => f.path === mtp)!.size,
         shared: quants.length > 1,
       });
     }

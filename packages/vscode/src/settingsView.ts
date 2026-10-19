@@ -22,7 +22,7 @@ import { LlamaInstaller, UiBackend } from "@llama-aio/core";
 import { clampLoadSettingsToModel, computeMemoryView, diffLoadSettings, fittingContextLength, memoryEstimateInputs, mmprojFileSize, resolveDraftCapabilities, shortGpuName, type SettingChange } from "@llama-aio/core";
 import { resolveModelModes } from "@llama-aio/core";
 import {
-  buildLibraryGroups,
+  buildLibraryGroupsAsync,
   canonicalModelPath,
   displayModelTitle,
   formatModelSize,
@@ -1055,7 +1055,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     const modelsDir = getModelsDir(this.store.getConfig());
     const localEntries = remoteMode ? [] : listLocalModelEntries(this.store.getConfig());
     const localModelCount = localEntries.length;
-    const library = remoteMode ? null : this.libraryPayload(state.selectedModelPath, status);
+    const library = remoteMode ? null : await this.libraryPayload(state.selectedModelPath, status);
     const localSourceDirs = listActiveModelSourceDirs(this.store.getConfig(), localEntries);
     const localSources = localSourceDirs.map((s) => s.source);
 
@@ -1360,7 +1360,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     void vscode.window.showInformationMessage(`DFlash draft set to ${path.basename(filePath)}`);
   }
 
-  private libraryPayload(selectedPath: string, status: { running: boolean; starting?: boolean; modelPath?: string }) {
+  private async libraryPayload(selectedPath: string, status: { running: boolean; starting?: boolean; modelPath?: string }) {
     const config = this.store.getConfig();
     const modelsDir = getModelsDir(config);
     const hidden = hiddenModelPaths(config);
@@ -1403,11 +1403,15 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           ),
         })),
       }));
+    const [groups, hiddenGroups] = await Promise.all([
+      buildLibraryGroupsAsync(visible, modelsDir),
+      buildLibraryGroupsAsync(hiddenEntries, modelsDir),
+    ]);
     const partials = listPartialDownloads(modelsDir);
     const partialBytes = partials.reduce((sum, file) => sum + file.sizeBytes, 0);
     return {
-      groups: decorate(buildLibraryGroups(visible, modelsDir)),
-      hiddenGroups: decorate(buildLibraryGroups(hiddenEntries, modelsDir)),
+      groups: decorate(groups),
+      hiddenGroups: decorate(hiddenGroups),
       partials: partials.map((file) => ({
         path: file.path,
         sizeBytes: file.sizeBytes,

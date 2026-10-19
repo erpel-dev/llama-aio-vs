@@ -4,7 +4,7 @@
  */
 import * as https from "https";
 import * as path from "path";
-import { downloadHttpFile } from "./httpDownload";
+import { downloadHttpFile, resolveRedirect, sendsTokenTo } from "./httpDownload";
 import { shardFileNames } from "./ggufMetadata";
 import {
   licenseFromModelDetail,
@@ -284,79 +284,64 @@ function hfHeaders(token?: string): Record<string, string> {
   return headers;
 }
 
-function requestJson<T>(url: string, token?: string): Promise<T> {
-  return new Promise((resolve, reject) => {
-    https
-      .get(url, { headers: hfHeaders(token) }, (res) => {
-        if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-          requestJson<T>(res.headers.location, token).then(resolve, reject);
+const MAX_METADATA_REDIRECTS = 8;
+
+/** One page, following redirects without moving the credential's origin. */
+async function requestJsonPage<T>(
+  initialUrl: string,
+  credentialUrl: string,
+  token?: string
+): Promise<{ value: T; url: string; next?: string }> {
+  let url = initialUrl;
+  for (let hops = 0; ; hops++) {
+    if (hops > MAX_METADATA_REDIRECTS) throw new Error("Too many redirects");
+    const response = await new Promise<{
+      status: number; body: string; location?: string; link?: string | string[];
+    }>((resolve, reject) => {
+      // Promise construction catches synchronous https.get errors on every
+      // hop. URL resolution and JSON parsing below run in the async function.
+      https.get(url, { headers: hfHeaders(sendsTokenTo(credentialUrl, url) ? token : undefined) }, (res) => {
+        const status = res.statusCode || 0;
+        res.on("error", reject);
+        res.on("aborted", () => reject(new Error("HF response aborted")));
+        if (status >= 300 && status < 400 && res.headers.location) {
           res.resume();
+          resolve({ status, body: "", location: res.headers.location });
           return;
         }
         const chunks: Buffer[] = [];
-        res.on("data", (c) => chunks.push(c));
-        res.on("end", () => {
-          const body = Buffer.concat(chunks).toString("utf8");
-          if (!res.statusCode || res.statusCode >= 400) {
-            reject(new Error(`HF HTTP ${res.statusCode}: ${body.slice(0, 200)}`));
-            return;
-          }
-          try {
-            resolve(JSON.parse(body) as T);
-          } catch (e) {
-            reject(e);
-          }
-        });
-      })
-      .on("error", reject);
-  });
+        res.on("data", (c: Buffer) => chunks.push(c));
+        res.on("end", () => resolve({
+          status, body: Buffer.concat(chunks).toString("utf8"), link: res.headers.link,
+        }));
+      }).on("error", reject);
+    });
+    if (response.location) {
+      url = resolveRedirect(url, response.location);
+      continue;
+    }
+    if (!response.status || response.status >= 400) {
+      throw new Error(`HF HTTP ${response.status}: ${response.body.slice(0, 200)}`);
+    }
+    return { value: JSON.parse(response.body) as T, url, next: parseNextLink(response.link) };
+  }
+}
+
+async function requestJson<T>(url: string, token?: string): Promise<T> {
+  return (await requestJsonPage<T>(url, url, token)).value;
 }
 
 /** Concatenate a Hugging Face paginated JSON array (`Link: rel="next"`). */
-function requestJsonPages<T>(url: string, token?: string): Promise<T[]> {
-  return new Promise((resolve, reject) => {
-    const all: T[] = [];
-    const go = (u: string, page: number) => {
-      if (page > MAX_TREE_PAGES) {
-        resolve(all);
-        return;
-      }
-      https
-        .get(u, { headers: hfHeaders(token) }, (res) => {
-          if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-            go(res.headers.location, page);
-            res.resume();
-            return;
-          }
-          const chunks: Buffer[] = [];
-          res.on("data", (c) => chunks.push(c));
-          res.on("end", () => {
-            const body = Buffer.concat(chunks).toString("utf8");
-            if (!res.statusCode || res.statusCode >= 400) {
-              reject(new Error(`HF HTTP ${res.statusCode}: ${body.slice(0, 200)}`));
-              return;
-            }
-            try {
-              const parsed = JSON.parse(body) as T[];
-              if (Array.isArray(parsed)) {
-                all.push(...parsed);
-              }
-            } catch (e) {
-              reject(e);
-              return;
-            }
-            const next = parseNextLink(res.headers.link);
-            if (next) {
-              go(next, page + 1);
-              return;
-            }
-            resolve(all);
-          });
-        })
-        .on("error", reject);
-    };
-    go(url, 1);
-  });
+async function requestJsonPages<T>(url: string, token?: string): Promise<T[]> {
+  const all: T[] = [];
+  let nextUrl = url;
+  for (let page = 1; page <= MAX_TREE_PAGES; page++) {
+    const result = await requestJsonPage<T[]>(nextUrl, url, token);
+    if (Array.isArray(result.value)) all.push(...result.value);
+    if (!result.next) break;
+    nextUrl = resolveRedirect(result.url, result.next);
+  }
+  return all;
 }
 
 export class HuggingFaceClient {

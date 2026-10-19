@@ -1,6 +1,7 @@
 /**
  * In-process download job list (pause / resume / cancel) for the M5 panel.
  */
+import * as path from "path";
 import { downloadHttpFile, DownloadAbortError, GatedDownloadError } from "./httpDownload";
 
 export type DownloadJobState =
@@ -62,6 +63,10 @@ export class DownloadManager {
   private readonly listeners = new Set<Listener>();
   private seq = 0;
   private running = 0;
+  private pumping = false;
+  // Keep file ownership until an aborted attempt has closed its writer, even
+  // when its cancelled job has already been removed from the UI history.
+  private readonly activeDestinations = new Set<string>();
   private readonly concurrency: number;
 
   constructor(concurrency = 1) {
@@ -85,8 +90,12 @@ export class DownloadManager {
   }
 
   enqueue(spec: EnqueueDownload): { job: DownloadJobSnapshot; done: Promise<string> } {
-    const existing = [...this.jobs.values()].find((j) => j.dest === spec.dest && j.state !== "cancelled");
-    if (existing && (existing.state === "done" || existing.state === "running" || existing.state === "queued")) {
+    const key = this.destinationKey(spec.dest);
+    const matching = [...this.jobs.values()].filter((j) => this.destinationKey(j.dest) === key);
+    const existing = matching.find((j) =>
+      j.state === "running" || j.state === "queued" || j.state === "paused" || j.state === "verifying"
+    ) || matching.find((j) => j.state === "done");
+    if (existing && (existing.state === "done" || existing.state === "running" || existing.state === "queued" || existing.state === "verifying")) {
       return { job: this.snapshot(existing), done: existing.done };
     }
     if (existing && existing.state === "paused") {
@@ -197,66 +206,75 @@ export class DownloadManager {
     }
   }
 
-  private async pump(): Promise<void> {
-    while (this.running < this.concurrency) {
-      const next = [...this.jobs.values()].find((j) => j.state === "queued");
-      if (!next) {
-        return;
+  private destinationKey(dest: string): string {
+    const resolved = path.resolve(dest);
+    return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+  }
+
+  private pump(): void {
+    if (this.pumping) return;
+    this.pumping = true;
+    try {
+      while (this.running < this.concurrency) {
+        const next = [...this.jobs.values()].find((j) =>
+          j.state === "queued" && !j.controller && !this.activeDestinations.has(this.destinationKey(j.dest))
+        );
+        if (!next) return;
+        const controller = new AbortController();
+        next.controller = controller;
+        next.state = "running";
+        this.running += 1;
+        this.activeDestinations.add(this.destinationKey(next.dest));
+        this.emit();
+        void this.run(next, controller);
       }
-      this.running += 1;
-      next.state = "running";
-      next.controller = new AbortController();
-      this.emit();
-      try {
-        const dest = await downloadHttpFile({
-          url: next.url,
-          dest: next.dest,
-          token: next.token,
-          expectedSize: next.expectedSize,
-          expectedSha256: next.expectedSha256,
-          gatedPageUrl: next.gatedPageUrl,
-          headers: next.headers,
-          signal: next.controller.signal,
-          onProgress: (info) => {
-            next.received = info.received;
-            next.total = info.total || next.total;
-            next.bytesPerSec = info.bytesPerSec;
-            if (info.received >= (info.total || 0) && info.total > 0 && next.expectedSha256) {
-              next.state = "verifying";
-            }
-            this.emit();
-          },
-        });
+    } finally {
+      this.pumping = false;
+    }
+  }
+
+  private async run(next: InternalJob, controller: AbortController): Promise<void> {
+    try {
+      const dest = await downloadHttpFile({
+        url: next.url,
+        dest: next.dest,
+        token: next.token,
+        expectedSize: next.expectedSize,
+        expectedSha256: next.expectedSha256,
+        gatedPageUrl: next.gatedPageUrl,
+        headers: next.headers,
+        signal: controller.signal,
+        onProgress: (info) => {
+          if (controller.signal.aborted) return;
+          next.received = info.received;
+          next.total = info.total || next.total;
+          next.bytesPerSec = info.bytesPerSec;
+          if (info.received >= (info.total || 0) && info.total > 0 && next.expectedSha256) {
+            next.state = "verifying";
+          }
+          this.emit();
+        },
+      });
+      if (!controller.signal.aborted) {
         next.state = "done";
         next.received = next.total || next.received;
         next.resolve(dest);
-        this.emit();
-      } catch (e) {
-        if (e instanceof DownloadAbortError && e.reason === "pause") {
-          next.state = "paused";
-          this.emit();
-        } else if (e instanceof DownloadAbortError) {
-          next.state = "cancelled";
-          this.emit();
-        } else if (e instanceof GatedDownloadError) {
-          next.state = "gated";
-          next.error = e.message;
-          next.pageUrl = e.pageUrl;
-          next.reject(e);
-          this.emit();
-        } else {
-          next.state = "error";
-          next.error = e instanceof Error ? e.message : String(e);
-          next.reject(e instanceof Error ? e : new Error(String(e)));
-          this.emit();
-        }
-      } finally {
-        this.running -= 1;
-        next.controller = undefined;
       }
-    }
-    if ([...this.jobs.values()].some((j) => j.state === "queued")) {
-      void this.pump();
+    } catch (e) {
+      // pause/resume/cancel already set the latest desired state. An old
+      // attempt must not overwrite it while its abort is settling.
+      if (!controller.signal.aborted) {
+        next.state = e instanceof GatedDownloadError ? "gated" : "error";
+        next.error = e instanceof Error ? e.message : String(e);
+        if (e instanceof GatedDownloadError) next.pageUrl = e.pageUrl;
+        next.reject(e instanceof Error ? e : new Error(String(e)));
+      }
+    } finally {
+      this.running -= 1;
+      next.controller = undefined;
+      this.activeDestinations.delete(this.destinationKey(next.dest));
+      this.emit();
+      this.pump();
     }
   }
 }

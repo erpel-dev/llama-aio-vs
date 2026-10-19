@@ -260,11 +260,16 @@ export async function* parseChatStream(
       assembledReasoning = choice.message.reasoning_content;
       completionChars += choice.message.reasoning_content.length;
       progressed = true;
+      if (!toolsEnabled && !choice.message.content && !assembledText) {
+        yield { kind: "text", text: choice.message.reasoning_content };
+      }
     }
     if (choice?.message?.content && !assembledText) {
       assembledText = choice.message.content;
       completionChars += choice.message.content.length;
       progressed = true;
+      const live = liveGate ? liveGate.push(choice.message.content) : choice.message.content;
+      if (live) yield { kind: "text", text: live };
     }
     if (Array.isArray(choice?.message?.tool_calls)) {
       for (const [idx, tc] of choice.message.tool_calls.entries()) {
