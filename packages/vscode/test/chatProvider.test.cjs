@@ -38,6 +38,7 @@ require.cache.vscode = {
     LanguageModelToolCallPart: ToolCallPart,
     LanguageModelToolResultPart: ToolResultPart,
     LanguageModelChatMessageRole: Role,
+    LanguageModelChatToolMode: { Auto: 1, Required: 2 },
     LanguageModelError,
     ThemeIcon: class {},
     EventEmitter: class {
@@ -148,6 +149,19 @@ describe("LlamaAioChatProvider requests", () => {
     reply = { events: [delta({ content: "ok" })], delayMs: 0 };
     lastBody = undefined;
   });
+
+  for (const [toolMode, expected] of [[undefined, "auto"], [1, "auto"], [2, "required"]]) {
+    it(`sends ${expected} tool choice for API tool mode ${toolMode}`, async () => {
+      const { provider } = setup();
+      await provider.provideLanguageModelChatResponse(
+        { id: "test-model" }, [msg(Role.User, new TextPart("hello"))],
+        { tools: [{ name: "read_file", description: "read", inputSchema: {} }], toolMode },
+        { report() {} }, cancelToken().token
+      );
+      assert.equal(lastBody.tool_choice, expected);
+      assert.equal(lastBody.tools[0].function.name, "read_file");
+    });
+  }
 
   it("orders tool results right after the assistant call and puts guard hints at the front", async () => {
     const { provider } = setup({ guard: true });

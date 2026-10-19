@@ -148,14 +148,14 @@
         <span class="seg" id="mmprojSeg" title="--mmproj-offload / --no-mmproj-offload&#10;Where the CLIP vision projector runs (llama.cpp default: GPU). RAM frees VRAM on the Main GPU; image encode becomes CPU-bound."><button class="seg-btn" type="button" data-mm="gpu">GPU</button><button class="seg-btn" type="button" data-mm="ram">RAM</button></span>
         <button class="icon-btn" id="pickMmprojBtn" type="button" title="Choose another mmproj…">✎</button>
         <button class="icon-btn" id="clearMmprojBtn" type="button" title="Detach (text only)">✕</button>
-        <input type="checkbox" id="mmprojOffloadToGpu" class="hidden" checked />
+        <input type="checkbox" id="mmprojOffloadToGpu" aria-label="Offload vision projector to GPU" class="hidden" checked />
       </div>
       <button class="link-btn hidden" id="attachMmprojBtn" type="button" title="Attach a multimodal projector (--mmproj) so Copilot Chat can send images">+ Attach vision projector…</button>
       <details class="fold" id="libraryFold">
         <summary><span>Library</span><span class="sum" id="librarySum">—</span></summary>
         <div class="fold-body">
           <div class="lib-tools">
-            <input type="text" id="libraryFilter" placeholder="Filter local models, or search Hugging Face…" />
+            <input type="text" id="libraryFilter" aria-label="Filter local models or search Hugging Face" placeholder="Filter local models, or search Hugging Face…" />
             <select id="librarySort" title="Sort the library">
               <option value="recent">Recent</option>
               <option value="name">Name</option>
@@ -214,8 +214,8 @@
     <div class="hint" id="presetHint">Sets context length, KV cache types, and slots together.</div>
 
     <div class="row">
-      <div class="label"><span class="name tip" data-flag="-c, --ctx-size" data-help="Size of the prompt context (default: 0 = loaded from model). The slider snaps to 8k, 16k, 32k, 64k, 128k, 256k; type any value in the box.">Context window</span><span class="num-pair"><span class="sub" id="ctxK"></span><input type="number" id="contextLength" min="512" step="256" /></span></div>
-      <input type="range" id="contextLengthRange" min="0" max="1000" step="1" />
+      <div class="label"><label for="contextLength" class="name tip" data-flag="-c, --ctx-size" data-help="Size of the prompt context (default: 0 = loaded from model). The slider snaps to 8k, 16k, 32k, 64k, 128k, 256k; type any value in the box.">Context window</label><span class="num-pair"><span class="sub" id="ctxK"></span><input type="number" id="contextLength" min="512" step="256" /></span></div>
+      <input type="range" id="contextLengthRange" aria-label="Context window slider" min="0" max="1000" step="1" />
       <div class="ticks" id="ctxTicks"></div>
       <div class="hint" id="ctxHint">Tokens per slot for prompt + reply</div>
     </div>
@@ -224,8 +224,8 @@
         <span class="seg" id="nglSeg"><button class="seg-btn" type="button" id="nglAll" data-ngl="all">All</button><button class="seg-btn" type="button" id="nglCustom" data-ngl="custom">Custom</button></span>
       </div>
       <div class="hidden" id="nglCustomRow">
-        <div class="label"><span class="hint" style="margin:0">Layers on GPU</span><input type="number" id="gpuOffload" min="0" max="128" /></div>
-        <input type="range" id="gpuOffloadRange" min="0" max="128" step="1" />
+        <div class="label"><label for="gpuOffload" class="hint" style="margin:0">Layers on GPU</label><input type="number" id="gpuOffload" min="0" max="128" /></div>
+        <input type="range" id="gpuOffloadRange" aria-label="GPU layers slider" min="0" max="128" step="1" />
       </div>
       <div class="hint" id="gpuOffloadHint">Max = all model layers.</div>
     </div>
@@ -242,10 +242,10 @@
             <option value="tensor">Tensor (experimental)</option>
             <option value="none">None — Main GPU only</option>
           </select>
-          <div class="label" style="margin-top:8px"><span class="name tip" data-flag="-mg, --main-gpu" data-help="GPU that holds the compute graph, scratch buffers, and the slider’s share of weights + KV. Index matches llama.cpp --list-devices (Vulkan0, Vulkan1, …), which is often not PCI / btop order.">Main GPU</span></div>
+          <div class="label" style="margin-top:8px"><label for="mainGpu" class="name tip" data-flag="-mg, --main-gpu" data-help="GPU that holds the compute graph, scratch buffers, and the slider’s share of weights + KV. Index matches llama.cpp --list-devices (Vulkan0, Vulkan1, …), which is often not PCI / btop order.">Main GPU</label></div>
           <select id="mainGpu" class="wide"></select>
           <div id="splitDetails">
-            <div class="label" style="margin-top:8px"><span class="name tip" data-flag="-ts, --tensor-split" data-help="Percent of GPU-resident weights on the Main GPU after CPU MoE/FFN. llama.cpp --tensor-split still fills by layer count, so the emitted fractions can differ (cheap first layers get more of Main). The rest is split evenly across the other cards.">Weights on main GPU</span><span id="tensorSplitPct">75%</span></div>
+            <div class="label" style="margin-top:8px"><label for="tensorSplitRange" class="name tip" data-flag="-ts, --tensor-split" data-help="Percent of GPU-resident weights on the Main GPU after CPU MoE/FFN. llama.cpp --tensor-split still fills by layer count, so the emitted fractions can differ (cheap first layers get more of Main). The rest is split evenly across the other cards.">Weights on main GPU</label><span id="tensorSplitPct">75%</span></div>
             <input type="range" id="tensorSplitRange" min="10" max="90" step="1" />
             <div class="hint" id="tensorSplitHint"></div>
           </div>
@@ -253,13 +253,13 @@
         </div>
   <div class="row" id="moeRow">
     <div id="moeFields">
-      <div class="label"><span class="name tip" data-flag="-ncmoe, --n-cpu-moe" data-help="Keep the Mixture of Experts (MoE) weights of the first N layers in the CPU.">CPU MoE layers</span><span class="badge">MoE only</span><input type="number" id="nCpuMoe" min="0" max="256" /></div>
-      <input type="range" id="nCpuMoeRange" min="0" max="128" step="1" />
+      <div class="label"><label for="nCpuMoe" class="name tip" data-flag="-ncmoe, --n-cpu-moe" data-help="Keep the Mixture of Experts (MoE) weights of the first N layers in the CPU.">CPU MoE layers</label><span class="badge">MoE only</span><input type="number" id="nCpuMoe" min="0" max="256" /></div>
+      <input type="range" id="nCpuMoeRange" aria-label="CPU MoE layers slider" min="0" max="128" step="1" />
       <div class="hint" id="moeHint">Only applies to MoE models.</div>
     </div>
     <div id="ffnFields">
-      <div class="label"><span class="name tip" data-flag="-ncffn, --n-cpu-ffn" data-help="Keep the dense FFN weights of the first N layers in the CPU (dense models; for MoE expert weights use --n-cpu-moe).">CPU FFN layers</span><span class="badge">Dense only</span><input type="number" id="nCpuFfn" min="0" max="256" /></div>
-      <input type="range" id="nCpuFfnRange" min="0" max="128" step="1" />
+      <div class="label"><label for="nCpuFfn" class="name tip" data-flag="-ncffn, --n-cpu-ffn" data-help="Keep the dense FFN weights of the first N layers in the CPU (dense models; for MoE expert weights use --n-cpu-moe).">CPU FFN layers</label><span class="badge">Dense only</span><input type="number" id="nCpuFfn" min="0" max="256" /></div>
+      <input type="range" id="nCpuFfnRange" aria-label="CPU FFN layers slider" min="0" max="128" step="1" />
       <div class="hint" id="ffnHint">Only applies to dense (non-MoE) models.</div>
     </div>
   </div>
@@ -272,22 +272,22 @@
 
   <div class="subgroup-title">Compute</div>
   <div class="row">
-    <div class="label"><span class="name tip" data-flag="-t, --threads" data-help="Number of CPU threads to use during generation (default: -1).">CPU Thread Pool Size</span><input type="number" id="cpuThreads" min="1" max="64" /></div>
-    <input type="range" id="cpuThreadsRange" min="1" max="64" step="1" />
+    <div class="label"><label for="cpuThreads" class="name tip" data-flag="-t, --threads" data-help="Number of CPU threads to use during generation (default: -1).">CPU Thread Pool Size</label><input type="number" id="cpuThreads" min="1" max="64" /></div>
+    <input type="range" id="cpuThreadsRange" aria-label="CPU thread pool size slider" min="1" max="64" step="1" />
     <div class="hint" id="cpuThreadsHint">Max = CPU logical cores.</div>
   </div>
   <div class="row">
-    <div class="label"><span class="name tip" data-flag="-b, --batch-size" data-help="Logical maximum batch size (default: 2048).">Evaluation Batch Size</span><input type="number" id="evalBatchSize" min="32" step="32" /></div>
+    <div class="label"><label for="evalBatchSize" class="name tip" data-flag="-b, --batch-size" data-help="Logical maximum batch size (default: 2048).">Evaluation Batch Size</label><input type="number" id="evalBatchSize" min="32" step="32" /></div>
   </div>
   <div class="row">
-    <div class="label"><span class="name tip" data-flag="-ub, --ubatch-size" data-help="Physical maximum batch size (default: 512).">Physical Batch Size</span><input type="number" id="physicalBatchSize" min="32" step="32" /></div>
+    <div class="label"><label for="physicalBatchSize" class="name tip" data-flag="-ub, --ubatch-size" data-help="Physical maximum batch size (default: 512).">Physical Batch Size</label><input type="number" id="physicalBatchSize" min="32" step="32" /></div>
   </div>
   <div class="row">
-    <div class="label"><span class="name tip" data-flag="-np, --parallel" data-help="Number of server slots (default: -1 = auto). Context is split across slots.">Max Concurrent Predictions</span><span class="badge">Splits context</span><input type="number" id="maxConcurrentPredictions" min="1" max="64" /></div>
-    <div class="hint">Use <strong>1</strong> for Copilot Chat. Values &gt; 1 split Context Length across slots (e.g. 8192/4 = 2048 per request).</div>
+    <div class="label"><label for="maxConcurrentPredictions" class="name tip" data-flag="-np, --parallel" data-help="Number of server slots (default: -1 = auto). Context capacity depends on Unified KV Cache and the server build.">Max Concurrent Predictions</label><span class="badge" id="slotContextBadge">Shared KV</span><input type="number" id="maxConcurrentPredictions" min="1" max="64" /></div>
+    <div class="hint" id="slotContextHint"></div>
   </div>
   <div class="row">
-    <div class="label"><span class="name tip" data-flag="-fa, --flash-attn" data-help="Flash Attention: 'on', 'off' or 'auto' (default: auto — enabled when the backend supports it).">Flash Attention</span>
+    <div class="label"><label for="flashAttention" class="name tip" data-flag="-fa, --flash-attn" data-help="Flash Attention: 'on', 'off' or 'auto' (default: auto — enabled when the backend supports it).">Flash Attention</label>
       <select id="flashAttention">
         <option value="auto">Auto (default)</option>
         <option value="on">On</option>
@@ -298,9 +298,9 @@
   </div>
 
   <div class="subgroup-title">Memory &amp; KV cache</div>
-  <div class="toggle"><span class="tip" data-flag="-nkvo, --no-kv-offload" data-help="Whether to enable KV cache offloading to GPU (default: enabled). Uncheck to keep KV in system RAM.">Offload KV Cache to GPU Memory</span><input type="checkbox" id="offloadKvCacheToGpu" /></div>
+  <div class="toggle"><label for="offloadKvCacheToGpu" class="tip" data-flag="-nkvo, --no-kv-offload" data-help="Whether to enable KV cache offloading to GPU (default: enabled). Uncheck to keep KV in system RAM.">Offload KV Cache to GPU Memory</label><input type="checkbox" id="offloadKvCacheToGpu" /></div>
   <div class="row">
-    <div class="label"><span class="name tip" data-flag="-ctk, --cache-type-k" data-help="KV cache data type for K. Allowed: f32, f16, bf16, q8_0, q5_1, q5_0, q4_1, q4_0, iq4_nl (default: q8_0). q8_0 halves KV size with little quality loss.">KV Cache Type (K)</span>
+    <div class="label"><label for="cacheTypeK" class="name tip" data-flag="-ctk, --cache-type-k" data-help="KV cache data type for K. Allowed: f32, f16, bf16, q8_0, q5_1, q5_0, q4_1, q4_0, iq4_nl (default: q8_0). q8_0 halves KV size with little quality loss.">KV Cache Type (K)</label>
       <select id="cacheTypeK">
         <option value="f32">f32 (full precision)</option>
         <option value="f16">f16</option>
@@ -314,9 +314,9 @@
       </select>
     </div>
   </div>
-  <div class="toggle"><span class="tip" data-flag="-ctk / -ctv" data-help="Keep V on the same type as K. Mixed K/V types fall off the fast attention path and can cost ~40% of prompt and generation throughput.">Use same type for V</span><input type="checkbox" id="kvTypesLinked" checked /></div>
+  <div class="toggle"><label for="kvTypesLinked" class="tip" data-flag="-ctk / -ctv" data-help="Keep V on the same type as K. Mixed K/V types fall off the fast attention path and can cost ~40% of prompt and generation throughput.">Use same type for V</label><input type="checkbox" id="kvTypesLinked" checked /></div>
   <div class="row">
-    <div class="label"><span class="name tip" data-flag="-ctv, --cache-type-v" data-help="KV cache data type for V. Same types as K (default: q8_0). q4_0 saves more VRAM but can hurt long-context prompt speed.">KV Cache Type (V)</span>
+    <div class="label"><label for="cacheTypeV" class="name tip" data-flag="-ctv, --cache-type-v" data-help="KV cache data type for V. Same types as K (default: q8_0). q4_0 saves more VRAM but can hurt long-context prompt speed.">KV Cache Type (V)</label>
       <select id="cacheTypeV">
         <option value="f32">f32 (full precision)</option>
         <option value="f16">f16</option>
@@ -332,11 +332,11 @@
     <div class="hint hidden" id="kvMismatchHint">V is stored more precisely than K. The key cache is the quantization-sensitive one, so this spends memory where it helps least — prefer K at the higher precision (e.g. q8_0 K with q4_0 V).</div>
     <div class="hint hidden" id="kvFlashAttnHint">A quantized V cache requires Flash Attention. With Flash Attention set to <strong>Off</strong>, llama-server will refuse to start — set V to f16 or put Flash Attention back to Auto/On.</div>
   </div>
-  <div class="toggle"><span id="keepModelLabel" class="tip" data-flag="--load-mode mlock" data-help="Force the system to keep the model in RAM rather than swapping (load-mode mlock). On Windows this falls back to mmap.">Keep Model in Memory (--mlock)</span><input type="checkbox" id="keepModelInMemory" /></div>
+  <div class="toggle"><label for="keepModelInMemory" id="keepModelLabel" class="tip" data-flag="--load-mode mlock" data-help="Force the system to keep the model in RAM rather than swapping (load-mode mlock). On Windows this falls back to mmap.">Keep Model in Memory (--mlock)</label><input type="checkbox" id="keepModelInMemory" /></div>
   <div class="hint" id="keepModelHint" style="display:none">On Windows this uses mmap (--load-mode mmap); mlock is not reliable.</div>
-  <div class="toggle"><span class="tip" data-flag="--load-mode mmap | none" data-help="Memory-map the model (mmap). If disabled and mlock is off, uses load-mode none (slower load, may reduce pageouts). Lazy mode requires mmap.">Try mmap()</span><input type="checkbox" id="tryMmap" /></div>
+  <div class="toggle"><label for="tryMmap" class="tip" data-flag="--load-mode mmap | none" data-help="Memory-map the model (mmap). If disabled and mlock is off, uses load-mode none (slower load, may reduce pageouts). Lazy mode requires mmap.">Try mmap()</label><input type="checkbox" id="tryMmap" /></div>
   <div class="row">
-    <div class="label"><span class="name tip" data-flag="-lzm, --lazy-mode" data-help="On-demand reading of large host tensors such as per-layer n-gram / PLE tables. auto = on for tensors larger than 4 GiB (llama.cpp default). Requires mmap.">Lazy tensor reads</span>
+    <div class="label"><label for="lazyMode" class="name tip" data-flag="-lzm, --lazy-mode" data-help="On-demand reading of large host tensors such as per-layer n-gram / PLE tables. auto = on for tensors larger than 4 GiB (llama.cpp default). Requires mmap.">Lazy tensor reads</label>
       <select id="lazyMode">
         <option value="auto">Auto (default — on if &gt; 4 GiB)</option>
         <option value="on">On — read from disk</option>
@@ -345,20 +345,20 @@
     </div>
     <div class="hint">Only sent when not Auto. Keeps mmap even with CPU MoE/FFN so Flash-Next can leave the n-gram table on SSD.</div>
   </div>
-  <div class="toggle"><span class="tip" data-flag="-kvu, --kv-unified" data-help="Use a single unified KV buffer shared across all sequences (default: enabled if slot count is auto). Uncheck passes --no-kv-unified.">Unified KV Cache</span><input type="checkbox" id="unifiedKvCache" /></div>
+  <div class="toggle"><label for="unifiedKvCache" class="tip" data-flag="-kvu, --kv-unified" data-help="Use a single unified KV buffer shared across all sequences (default: enabled if slot count is auto). Uncheck passes --no-kv-unified.">Unified KV Cache</label><input type="checkbox" id="unifiedKvCache" /></div>
 
   <div class="row">
-    <div class="label"><span class="name tip" data-flag="-ctxcp, --ctx-checkpoints" data-help="Max number of context checkpoints to create per slot (default: 32). Checkpoints let a slot restore an earlier context state instead of reprocessing it.">Context Checkpoints</span><input type="number" id="contextCheckpoints" min="0" /></div>
+    <div class="label"><label for="contextCheckpoints" class="name tip" data-flag="-ctxcp, --ctx-checkpoints" data-help="Max number of context checkpoints to create per slot (default: 32). Checkpoints let a slot restore an earlier context state instead of reprocessing it.">Context Checkpoints</label><input type="number" id="contextCheckpoints" min="0" /></div>
     <div class="hint">Only sent when different from 32 (the llama.cpp default), so older builds keep working.</div>
   </div>
   <div class="row">
-    <div class="label"><span class="name tip" data-flag="--cache-reuse" data-help="Min chunk size to attempt reusing from the cache via KV shifting (requires prompt caching; llama.cpp default: 0 = off).">Cache Reuse (KV shift)</span><input type="number" id="cacheReuse" min="0" step="32" /></div>
+    <div class="label"><label for="cacheReuse" class="name tip" data-flag="--cache-reuse" data-help="Min chunk size to attempt reusing from the cache via KV shifting (requires prompt caching; llama.cpp default: 0 = off).">Cache Reuse (KV shift)</label><input type="number" id="cacheReuse" min="0" step="32" /></div>
     <div class="hint">Reuses cached chunks after the prompt prefix diverges — raises prompt reuse in long agent threads. 0 disables it.</div>
   </div>
 
   <div class="subgroup-title">Reasoning</div>
   <div class="row">
-    <div class="label"><span class="name tip" data-flag="--reasoning-format" data-help="How thoughts are returned: deepseek-legacy keeps <think> tags in content and also fills reasoning_content; deepseek puts thoughts only in reasoning_content; none leaves the raw output untouched.">Reasoning Format</span>
+    <div class="label"><label for="reasoningFormat" class="name tip" data-flag="--reasoning-format" data-help="How thoughts are returned: deepseek-legacy keeps <think> tags in content and also fills reasoning_content; deepseek puts thoughts only in reasoning_content; none leaves the raw output untouched.">Reasoning Format</label>
       <select id="reasoningFormat">
         <option value="deepseek-legacy">deepseek-legacy (default)</option>
         <option value="deepseek">deepseek</option>
@@ -369,9 +369,9 @@
     <div class="hint">Copilot Chat only renders <code>content</code> — <strong>deepseek-legacy</strong> keeps thoughts visible there.</div>
   </div>
   <div class="row">
-    <div class="label"><span class="name tip" data-flag="--reasoning-budget" data-help="Token budget for thinking: -1 unrestricted, 0 ends thinking immediately, N > 0 caps thinking at N tokens.">Reasoning Budget</span>
+    <div class="label"><label for="reasoningBudget" class="name tip" data-flag="--reasoning-budget" data-help="Token budget for thinking: -1 unrestricted, 0 ends thinking immediately, N > 0 caps thinking at N tokens.">Reasoning Budget</label>
       <span class="auto-field">
-        <label class="auto"><input type="checkbox" id="reasoningBudgetUnlimited" /> Unlimited</label>
+        <label class="auto"><input type="checkbox" id="reasoningBudgetUnlimited" aria-label="Unlimited reasoning budget" /> Unlimited</label>
         <input type="number" id="reasoningBudget" min="0" step="128" />
       </span>
     </div>
@@ -380,7 +380,7 @@
 
   <div class="subgroup-title" id="chatTemplateTitle">Chat template</div>
   <div class="row" id="chatTemplateSourceRow">
-    <div class="label"><span class="name tip" data-flag="--jinja, --chat-template, --chat-template-file" data-help="Which Jinja chat template llama-server uses. From model keeps the template embedded in the GGUF. Built-in picks a llama.cpp name. File loads a .jinja or .txt template. A change reloads the server.">Source</span>
+    <div class="label"><label for="chatTemplateSource" class="name tip" data-flag="--jinja, --chat-template, --chat-template-file" data-help="Which Jinja chat template llama-server uses. From model keeps the template embedded in the GGUF. Built-in picks a llama.cpp name. File loads a .jinja or .txt template. A change reloads the server.">Source</label>
       <select id="chatTemplateSource">
         <option value="model">From model</option>
         <option value="builtin">Built-in</option>
@@ -391,7 +391,7 @@
     <div class="hint hidden" id="chatTemplateRemoteHint">The remote server owns its chat template. This setting applies the next time you run locally.</div>
   </div>
   <div class="row hidden" id="chatTemplateNameRow">
-    <div class="label"><span class="name tip" data-flag="--chat-template" data-help="Built-in llama.cpp chat template name. Sent as --jinja --chat-template NAME, which replaces the template stored in the GGUF.">Template</span>
+    <div class="label"><label for="chatTemplateName" class="name tip" data-flag="--chat-template" data-help="Built-in llama.cpp chat template name. Sent as --jinja --chat-template NAME, which replaces the template stored in the GGUF.">Template</label>
       <select id="chatTemplateName">
         {{chatTemplateOptions}}
       </select>
@@ -408,31 +408,31 @@
     <div class="tpl-problem hidden" id="chatTemplateProblem"></div>
   </div>
   <div class="toggle" id="chatTemplateJinjaRow">
-    <span class="tip" data-flag="--jinja, --no-jinja" data-help="llama.cpp’s Jinja engine is on by default. Turn this off only to send --no-jinja and ignore the GGUF Jinja template. A built-in name or a file always keeps Jinja on.">Jinja engine</span>
+    <label for="chatTemplateJinja" class="tip" data-flag="--jinja, --no-jinja" data-help="llama.cpp’s Jinja engine is on by default. Turn this off only to send --no-jinja and ignore the GGUF Jinja template. A built-in name or a file always keeps Jinja on.">Jinja engine</label>
     <input type="checkbox" id="chatTemplateJinja" checked />
   </div>
 
   <div class="subgroup-title">Positional &amp; seed</div>
   <div class="row">
-    <div class="label"><span class="name tip" data-flag="--rope-freq-base" data-help="RoPE base frequency, used by NTK-aware scaling (default: loaded from model).">RoPE Frequency Base</span>
+    <div class="label"><label for="ropeFreqBase" class="name tip" data-flag="--rope-freq-base" data-help="RoPE base frequency, used by NTK-aware scaling (default: loaded from model).">RoPE Frequency Base</label>
       <span class="auto-field">
-        <label class="auto"><input type="checkbox" id="ropeBaseAuto" /> Auto</label>
+        <label class="auto"><input type="checkbox" id="ropeBaseAuto" aria-label="Use model RoPE frequency base" /> Auto</label>
         <input type="number" id="ropeFreqBase" step="1" />
       </span>
     </div>
   </div>
   <div class="row">
-    <div class="label"><span class="name tip" data-flag="--rope-freq-scale" data-help="RoPE frequency scaling factor; expands context by a factor of 1/N.">RoPE Frequency Scale</span>
+    <div class="label"><label for="ropeFreqScale" class="name tip" data-flag="--rope-freq-scale" data-help="RoPE frequency scaling factor; expands context by a factor of 1/N.">RoPE Frequency Scale</label>
       <span class="auto-field">
-        <label class="auto"><input type="checkbox" id="ropeScaleAuto" /> Auto</label>
+        <label class="auto"><input type="checkbox" id="ropeScaleAuto" aria-label="Use model RoPE frequency scale" /> Auto</label>
         <input type="number" id="ropeFreqScale" step="0.01" />
       </span>
     </div>
   </div>
   <div class="row">
-    <div class="label"><span class="name tip" data-flag="-s, --seed" data-help="RNG seed (default: -1 = random).">Seed</span>
+    <div class="label"><label for="seed" class="name tip" data-flag="-s, --seed" data-help="RNG seed (default: -1 = random).">Seed</label>
       <span class="auto-field">
-        <label class="auto"><input type="checkbox" id="seedRandom" /> Random</label>
+        <label class="auto"><input type="checkbox" id="seedRandom" aria-label="Random seed" /> Random</label>
         <input type="number" id="seed" step="1" />
       </span>
     </div>
@@ -440,7 +440,7 @@
 
   <div class="subgroup-title">Speculative decoding</div>
   <div class="row" id="specModeRow">
-    <div class="label"><span class="name tip" data-flag="--spec-type" data-help="Speculative decoding type. MTP uses next-n layers in the main GGUF, or a sibling mtp-*.gguf (Gemma 4) via --model-draft. DFlash uses a separate draft GGUF with --spec-type draft-dflash. N-gram drafts from n-grams seen in the prompt itself and can stack with MTP or DFlash.">Mode</span>
+    <div class="label"><label for="speculativeMode" class="name tip" data-flag="--spec-type" data-help="Speculative decoding type. MTP uses next-n layers in the main GGUF, or a sibling mtp-*.gguf (Gemma 4) via --model-draft. DFlash uses a separate draft GGUF with --spec-type draft-dflash. N-gram drafts from n-grams seen in the prompt itself and can stack with MTP or DFlash.">Mode</label>
       <select id="speculativeMode">
         <option value="off">Off</option>
         <option value="mtp" id="specMtpOption">MTP (draft-mtp)</option>
@@ -455,7 +455,7 @@
   <div class="spec-group hidden" id="specNgramGroup">
     <div class="spec-group-title">N-gram</div>
     <div class="row" id="specNgramVariantRow">
-      <div class="label"><span class="name tip" data-flag="--spec-type ngram-*" data-help="N-gram lookup strategy. Simple keeps a rolling window of the prompt. Map-k indexes the prompt for faster lookup on long contexts. K4v additionally caches key/value states per n-gram. Mod is the classic prompt-lookup variant tuned for long drafts.">Variant</span>
+      <div class="label"><label for="ngramVariant" class="name tip" data-flag="--spec-type ngram-*" data-help="N-gram lookup strategy. Simple keeps a rolling window of the prompt. Map-k indexes the prompt for faster lookup on long contexts. K4v additionally caches key/value states per n-gram. Mod is the classic prompt-lookup variant tuned for long drafts.">Variant</label>
         <select id="ngramVariant">
           <option value="simple">simple — rolling prompt window</option>
           <option value="map-k">map-k — indexed lookup (long prompts)</option>
@@ -465,14 +465,14 @@
       </div>
     </div>
     <div class="row" id="specNgramSizeRow">
-      <div class="label"><span class="name tip" data-flag="--spec-ngram-*-size-n" data-help="Length of the lookup n-gram in tokens (default: 12; mod variant match length: 24). Longer = fewer false matches, shorter = more draft attempts.">Lookup size</span><input type="number" id="ngramSizeN" min="2" max="512" /></div>
-      <input type="range" id="ngramSizeNRange" min="2" max="64" step="1" />
+      <div class="label"><label for="ngramSizeN" class="name tip" data-flag="--spec-ngram-*-size-n" data-help="Length of the lookup n-gram in tokens (default: 12; mod variant match length: 24). Longer = fewer false matches, shorter = more draft attempts.">Lookup size</label><input type="number" id="ngramSizeN" min="2" max="512" /></div>
+      <input type="range" id="ngramSizeNRange" aria-label="N-gram lookup size slider" min="2" max="64" step="1" />
     </div>
     <div class="row" id="specNgramDraftRow">
-      <div class="label"><span class="name tip" data-flag="--spec-ngram-*-size-m / --spec-ngram-mod-n-max" data-help="How many tokens n-gram may draft from a prompt match (default: 48; mod variant max: 64). This is not MTP/DFlash --spec-draft-n-max.">Draft length</span><input type="number" id="ngramSizeM" min="2" max="2048" /></div>
+      <div class="label"><label for="ngramSizeM" class="name tip" data-flag="--spec-ngram-*-size-m / --spec-ngram-mod-n-max" data-help="How many tokens n-gram may draft from a prompt match (default: 48; mod variant max: 64). This is not MTP/DFlash --spec-draft-n-max.">Draft length</label><input type="number" id="ngramSizeM" min="2" max="2048" /></div>
     </div>
     <div class="row" id="specNgramHitsRow">
-      <div class="label"><span class="name tip" data-flag="--spec-ngram-*-min-hits" data-help="Minimum number of times an n-gram must appear before it is used to draft (default: 1). Raise to 2–3 to avoid drafting from coincidental matches. Not used by the mod variant.">Min hits</span><input type="number" id="ngramMinHits" min="1" max="64" /></div>
+      <div class="label"><label for="ngramMinHits" class="name tip" data-flag="--spec-ngram-*-min-hits" data-help="Minimum number of times an n-gram must appear before it is used to draft (default: 1). Raise to 2–3 to avoid drafting from coincidental matches. Not used by the mod variant.">Min hits</label><input type="number" id="ngramMinHits" min="1" max="64" /></div>
     </div>
   </div>
   <div class="spec-group hidden" id="specNeuralGroup">
@@ -487,17 +487,17 @@
       </div>
     </div>
     <div class="row hidden" id="specDraftNglRow">
-      <div class="label"><span class="name tip" id="specDraftNglName" data-flag="--spec-draft-ngl" data-help="Max draft-model layers in VRAM (exact number, auto, or all).">GPU offload</span><input type="number" id="draftGpuOffload" min="0" max="999" /></div>
+      <div class="label"><label for="draftGpuOffload" class="name tip" id="specDraftNglName" data-flag="--spec-draft-ngl" data-help="Max draft-model layers in VRAM (exact number, auto, or all).">GPU offload</label><input type="number" id="draftGpuOffload" min="0" max="999" /></div>
       <div class="hint" id="draftNglHint">99 usually means all draft layers. DFlash draft KV cache is forced to f16 (quantized draft KV collapses acceptance).</div>
     </div>
     <div class="row hidden" id="specDraftMaxRow">
-      <div class="label"><span class="name tip" id="specDraftMaxName" data-flag="--spec-draft-n-max" data-help="Number of tokens the MTP or DFlash drafter proposes per step (--spec-draft-n-max). Separate from n-gram draft length. For DFlash try 8–15.">Max draft tokens</span><input type="number" id="maxDraftTokens" min="0" /></div>
+      <div class="label"><label for="maxDraftTokens" class="name tip" id="specDraftMaxName" data-flag="--spec-draft-n-max" data-help="Number of tokens the MTP or DFlash drafter proposes per step (--spec-draft-n-max). Separate from n-gram draft length. For DFlash try 8–15.">Max draft tokens</label><input type="number" id="maxDraftTokens" min="0" /></div>
     </div>
     <div class="row hidden" id="specDraftMinRow">
-      <div class="label"><span class="name tip" id="specDraftMinName" data-flag="--spec-draft-n-min" data-help="Minimum number of draft tokens to use for speculative decoding (default: 0). MTP only.">Min draft tokens</span><input type="number" id="minDraftTokens" min="0" /></div>
+      <div class="label"><label for="minDraftTokens" class="name tip" id="specDraftMinName" data-flag="--spec-draft-n-min" data-help="Minimum number of draft tokens to use for speculative decoding (default: 0). MTP only.">Min draft tokens</label><input type="number" id="minDraftTokens" min="0" /></div>
     </div>
     <div class="row hidden" id="specDraftPRow">
-      <div class="label"><span class="name tip" id="specDraftPName" data-flag="--spec-draft-p-min" data-help="Stop drafting when the next-token probability drops below this (default here: 0.75). llama.cpp's own default of 0.00 never stops and collapses acceptance. Used by MTP and DFlash.">Draft probability</span><input type="number" id="draftProbability" min="0" max="1" step="0.01" /></div>
+      <div class="label"><label for="draftProbability" class="name tip" id="specDraftPName" data-flag="--spec-draft-p-min" data-help="Stop drafting when the next-token probability drops below this (default here: 0.75). llama.cpp's own default of 0.00 never stops and collapses acceptance. Used by MTP and DFlash.">Draft probability</label><input type="number" id="draftProbability" min="0" max="1" step="0.01" /></div>
     </div>
   </div>
 
@@ -559,7 +559,7 @@
           <div class="hint" id="overthinkingHint">Off. Strength is remembered, but chat requests do not send it.</div>
         </div>
         <div class="opt-row req-line">
-          <span class="tip" data-flag="Chat / API request body" data-help="Max tokens to generate per reply (extension request default / n_predict-style cap).">Max tokens</span>
+          <label for="maxTokens" class="tip" data-flag="Chat / API request body" data-help="Max tokens to generate per reply (extension request default / n_predict-style cap).">Max tokens</label>
           <input type="number" id="maxTokens" min="16" step="16" />
         </div>
 
@@ -572,27 +572,27 @@
           <span id="modeStripValues"></span>
         </div>
         <div class="req-grid">
-          <div class="req-cell samp-free"><span class="tip" data-flag="Chat / API request body" data-help="Sampling temperature for completions (extension request default, not a llama-server load flag).">Temperature</span><input type="number" id="temperature" min="0" max="2" step="0.05" /></div>
-          <div class="req-cell samp-free"><span class="tip" data-flag="Chat / API request body" data-help="Nucleus sampling top-p (extension request default).">Top P</span><input type="number" id="topP" min="0" max="1" step="0.01" /></div>
-          <div class="req-cell samp-free"><span class="tip" data-flag="--top-k / request body" data-help="Top-k sampling (extension request default).">Top K</span><input type="number" id="topK" min="0" step="1" /></div>
-          <div class="req-cell"><span class="tip" data-flag="--min-p / request body" data-help="Min-p sampling (0 = disabled). llama-server's built-in default of 0.05 is wrong for most current instruct/coder families — keep 0 unless a model card recommends otherwise. Also shipped as a server CLI default at start, so raw API clients inherit it.">Min P</span><input type="number" id="minP" min="0" max="1" step="0.01" /></div>
-          <div class="req-cell"><span class="tip" data-flag="--repeat-penalty / request body" data-help="Repetition penalty (llama.cpp style; 1.0 = disabled). Values above 1 discourage repeating earlier tokens — useful for prose, harmful for code (breaks exact repetition like closing tags).">Repeat</span><input type="number" id="repeatPenalty" min="0.5" max="2" step="0.01" /></div>
-          <div class="req-cell"><span class="tip" data-flag="--presence-penalty / request body" data-help="Presence penalty (OpenAI-style; 0 = disabled). Positive values push the model toward new topics. Qwen3 No-Think mode recommends 1.5.">Presence</span><input type="number" id="presencePenalty" min="-2" max="2" step="0.05" /></div>
-          <div class="req-cell"><span class="tip" data-flag="--frequency-penalty / request body" data-help="Frequency penalty (OpenAI-style; 0 = disabled). Scaled by how often a token already appeared.">Frequency</span><input type="number" id="frequencyPenalty" min="-2" max="2" step="0.05" /></div>
+          <div class="req-cell samp-free"><label for="temperature" class="tip" data-flag="Chat / API request body" data-help="Sampling temperature for completions (extension request default, not a llama-server load flag).">Temperature</label><input type="number" id="temperature" min="0" max="2" step="0.05" /></div>
+          <div class="req-cell samp-free"><label for="topP" class="tip" data-flag="Chat / API request body" data-help="Nucleus sampling top-p (extension request default).">Top P</label><input type="number" id="topP" min="0" max="1" step="0.01" /></div>
+          <div class="req-cell samp-free"><label for="topK" class="tip" data-flag="--top-k / request body" data-help="Top-k sampling (extension request default).">Top K</label><input type="number" id="topK" min="0" step="1" /></div>
+          <div class="req-cell"><label for="minP" class="tip" data-flag="--min-p / request body" data-help="Min-p sampling (0 = disabled). llama-server's built-in default of 0.05 is wrong for most current instruct/coder families — keep 0 unless a model card recommends otherwise. Also shipped as a server CLI default at start, so raw API clients inherit it.">Min P</label><input type="number" id="minP" min="0" max="1" step="0.01" /></div>
+          <div class="req-cell"><label for="repeatPenalty" class="tip" data-flag="--repeat-penalty / request body" data-help="Repetition penalty (llama.cpp style; 1.0 = disabled). Values above 1 discourage repeating earlier tokens — useful for prose, harmful for code (breaks exact repetition like closing tags).">Repeat</label><input type="number" id="repeatPenalty" min="0.5" max="2" step="0.01" /></div>
+          <div class="req-cell"><label for="presencePenalty" class="tip" data-flag="--presence-penalty / request body" data-help="Presence penalty (OpenAI-style; 0 = disabled). Positive values push the model toward new topics. Qwen3 No-Think mode recommends 1.5.">Presence</label><input type="number" id="presencePenalty" min="-2" max="2" step="0.05" /></div>
+          <div class="req-cell"><label for="frequencyPenalty" class="tip" data-flag="--frequency-penalty / request body" data-help="Frequency penalty (OpenAI-style; 0 = disabled). Scaled by how often a token already appeared.">Frequency</label><input type="number" id="frequencyPenalty" min="-2" max="2" step="0.05" /></div>
         </div>
 
         <div class="sec-label"><span>Prompt &amp; tools</span></div>
         <div class="opt-list">
           <div class="opt-row">
-            <span>Prompt replacements <span class="hint" id="replacementStats">—</span></span>
+            <label for="promptReplacementsEnabled">Prompt replacements <span class="hint" id="replacementStats">—</span></label>
             <input type="checkbox" id="promptReplacementsEnabled" title="Strip Copilot system-prompt boilerplate before llama.cpp" />
           </div>
           <div class="opt-row">
-            <span>Wikipedia lookup</span>
+            <label for="wikipediaLookupEnabled">Wikipedia lookup</label>
             <input type="checkbox" id="wikipediaLookupEnabled" title="Let the model call wikipedia_lookup for encyclopedic facts. Off by default." />
           </div>
           <div class="opt-row">
-            <span>Skip duplicate tools</span>
+            <label for="duplicateToolCallGuardEnabled">Skip duplicate tools</label>
             <input type="checkbox" id="duplicateToolCallGuardEnabled" title="Skip a tool that already ran with the same arguments in this turn. Off by default — can block a legitimate retry." />
           </div>
         </div>

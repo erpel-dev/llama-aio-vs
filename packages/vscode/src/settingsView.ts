@@ -574,10 +574,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             await this.cleanPartialDownloads();
             break;
           case "searchLibraryHf":
-            await this.searchLibraryHf(typeof msg.query === "string" ? msg.query : "");
+            await this.searchLibraryHf(typeof msg.query === "string" ? msg.query : "", msg.requestId);
             break;
           case "listLibraryHfFiles":
-            await this.listLibraryHfFiles(typeof msg.modelId === "string" ? msg.modelId : "");
+            await this.listLibraryHfFiles(typeof msg.modelId === "string" ? msg.modelId : "", msg.requestId);
             break;
           case "downloadLibraryHf":
             void this.runLibraryDownload(
@@ -1578,7 +1578,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     this.post({ type: "libraryDownloads", jobs });
   }
 
-  private async searchLibraryHf(query: string): Promise<void> {
+  private async searchLibraryHf(query: string, requestId: number): Promise<void> {
     const q = query.trim();
     if (q.length < 2 || !this.view) {
       return;
@@ -1597,17 +1597,18 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           licenseUrl: resolveLicenseUrl(model.id, license) || "",
         };
       });
-      this.post({ type: "libraryHfResults", query: q, repos });
+      this.post({ type: "libraryHfResults", requestId, query: q, repos });
     } catch (e) {
       this.post({
         type: "libraryHfError",
+        requestId,
         query: q,
         message: e instanceof Error ? e.message : String(e),
       });
     }
   }
 
-  private async listLibraryHfFiles(modelId: string): Promise<void> {
+  private async listLibraryHfFiles(modelId: string, requestId: number): Promise<void> {
     if (!modelId || !this.view) {
       return;
     }
@@ -1616,6 +1617,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       const picker = downloadPickerFiles(files);
       this.post({
         type: "libraryHfFiles",
+        requestId,
         modelId,
         companionOnly: picker.companionOnly,
         companionHint: picker.companionOnly ? "" : companionDownloadHint(files),
@@ -1628,6 +1630,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     } catch (e) {
       this.post({
         type: "libraryHfError",
+        requestId,
         query: "",
         message: e instanceof Error ? e.message : String(e),
       });
@@ -1751,12 +1754,15 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     }
     const state = this.store.getState();
     const hits = (candidate: string | undefined) =>
-      !!candidate && plan.files.some((filePath) => sameModelFile(filePath, candidate));
+      !!candidate && plan.files.some((filePath) => sameModelFile(filePath, canonicalModelPath(candidate)));
+    // Resolve aliases before unlinking: afterward realpath cannot resolve a
+    // selected path reached through a symlinked models directory.
+    const clearModel = hits(state.selectedModelPath);
+    const clearMm = hits(state.loadSettings.mmprojPath);
+    const clearDraft = hits(state.loadSettings.draftModelPath);
     const mapped =
       hits(status.modelPath) ||
-      hits(state.selectedModelPath) ||
-      hits(state.loadSettings.mmprojPath) ||
-      hits(state.loadSettings.draftModelPath);
+      clearModel || clearMm || clearDraft;
     if (status.running && mapped) {
       await this.processManager.stop(true);
     }
@@ -1764,9 +1770,6 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       await this.trashOwnedFile(filePath);
     }
     await this.removeEmptyOwnedDir(path.dirname(plan.files[0] || trimmed), modelsDir);
-    const clearModel = hits(state.selectedModelPath);
-    const clearMm = hits(state.loadSettings.mmprojPath);
-    const clearDraft = hits(state.loadSettings.draftModelPath);
     if (clearModel || clearMm || clearDraft) {
       await this.store.setState({
         ...(clearModel

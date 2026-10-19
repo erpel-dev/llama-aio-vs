@@ -43,6 +43,45 @@ require.cache.vscode = {
 const core = require("@llama-aio/core");
 const { SettingsViewProvider } = require(path.join(__dirname, "..", "out-harness", "settingsView.js"));
 
+describe("removal through a symlinked models directory", () => {
+  for (const role of ["main", "mmproj", "draft"]) {
+    it(`stops before deleting and clears the ${role} path after unlink`, async (t) => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "llama-remove-alias-"));
+      t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+      const real = path.join(dir, "real"); fs.mkdirSync(real);
+      const alias = path.join(dir, "models"); fs.symlinkSync(real, alias, "junction");
+      const target = path.join(real, "target.gguf"); fs.writeFileSync(target, "GGUF");
+      const selected = path.join(alias, "target.gguf");
+      let state = {
+        selectedModelPath: role === "main" ? selected : "/other/model.gguf",
+        modelCapabilities: { path: selected }, modelMaxContext: 8192,
+        loadSettings: { ...core.DEFAULT_LOAD_SETTINGS,
+          mmprojPath: role === "mmproj" ? selected : "",
+          draftModelPath: role === "draft" ? selected : "" },
+      };
+      const events = [];
+      await SettingsViewProvider.prototype.removeOwnedQuant.call({
+        store: { getConfig: () => ({ get: key => key === "modelsDir" ? alias : undefined }),
+          getState: () => state, setState: async patch => { state = { ...state, ...patch }; } },
+        processManager: { getStatus: () => ({ running: true, modelPath: state.selectedModelPath }),
+          stop: async force => { assert.equal(force, true); events.push("stop"); } },
+        trashOwnedFile: async file => { events.push("delete"); fs.unlinkSync(file); },
+        removeEmptyOwnedDir: async () => undefined, pushState: async () => undefined,
+      }, selected, []);
+      assert.deepEqual(events, ["stop", "delete"]);
+      assert.equal(fs.existsSync(selected), false);
+      if (role === "main") {
+        assert.equal(state.selectedModelPath, "");
+        assert.equal(state.modelCapabilities, undefined);
+        assert.equal(state.modelMaxContext, undefined);
+      } else {
+        assert.equal(state.selectedModelPath, "/other/model.gguf");
+        assert.equal(state.loadSettings[role === "mmproj" ? "mmprojPath" : "draftModelPath"], "");
+      }
+    });
+  }
+});
+
 describe("partial download cleanup", () => {
   for (const startDuringConfirmation of [false, true]) {
     it(`preserves a transfer${startDuringConfirmation ? " started during confirmation" : " already running"}`, async (t) => {

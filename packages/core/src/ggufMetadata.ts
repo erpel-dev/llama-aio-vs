@@ -121,8 +121,19 @@ const GGUF_READ_CHUNK = 1024 * 1024;
 class GgufReader {
   private window: Buffer = Buffer.alloc(0);
   private windowPos = 0;
+  private readonly fileSize: number;
 
-  constructor(private readonly fd: number) {}
+  constructor(private readonly fd: number) {
+    this.fileSize = fs.fstatSync(fd).size;
+  }
+
+  skipBytes(pos: number, size: number): number {
+    const next = pos + size;
+    if (!Number.isSafeInteger(next) || size < 0 || next > this.fileSize) {
+      throw new Error("Unexpected EOF skipping GGUF metadata");
+    }
+    return next;
+  }
 
   private fill(position: number, size: number): void {
     if (size <= 0) {
@@ -284,6 +295,34 @@ function readValue(r: GgufReader, pos: number, type: number): { value: GgufValue
   }
 }
 
+/** Capabilities and tensor offsets do not use tokenizer metadata. In particular,
+ * do not allocate/decode vocabulary strings just to locate the next field. */
+const FIXED_VALUE_WIDTHS: Record<number, number> = { 0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8 };
+function skipValue(r: GgufReader, pos: number, type: number, depth = 0): number {
+  if (depth > 32) throw new Error("Invalid GGUF metadata nesting");
+  const widths = FIXED_VALUE_WIDTHS;
+  if (widths[type]) return r.skipBytes(pos, widths[type]);
+  if (type === 8) {
+    const len = r.readU64(pos);
+    if (len.value > 16n * 1024n * 1024n) throw new Error(`Invalid GGUF string length: ${len.value}`);
+    return r.skipBytes(len.next, Number(len.value));
+  }
+  if (type === 9) {
+    const at = r.readU32(pos);
+    const n = r.readU64(at.next);
+    const count = checkedCount(n.value, MAX_ARRAY_ITEMS, "array length");
+    // Validate the element type even for an empty array.
+    if (!(at.value in widths) && at.value !== 8 && at.value !== 9) {
+      throw new Error(`Unsupported GGUF value type: ${at.value}`);
+    }
+    if (widths[at.value]) return r.skipBytes(n.next, count * widths[at.value]);
+    let next = n.next;
+    for (let i = 0; i < count; i++) next = skipValue(r, next, at.value, depth + 1);
+    return next;
+  }
+  throw new Error(`Unsupported GGUF value type: ${type}`);
+}
+
 function asNumber(v: GgufValue | undefined): number | undefined {
   if (typeof v === "number" && Number.isFinite(v)) {
     return v;
@@ -412,6 +451,10 @@ function readGgufHeader(r: GgufReader): GgufHeaderScan {
     pos = key.next;
     const type = r.readU32(pos);
     pos = type.next;
+    if (key.value.startsWith("tokenizer.")) {
+      pos = skipValue(r, pos, type.value);
+      continue;
+    }
     const val = readValue(r, pos, type.value);
     pos = val.next;
     meta[key.value] = val.value;
@@ -449,20 +492,27 @@ interface HeaderCacheEntry {
   mtimeMs: number;
   size: number;
   scan: GgufHeaderScan;
+  bytes: number;
 }
 
 /** Parsed headers keyed by path + mtime + size. Callers must not mutate `scan`. */
 const HEADER_CACHE_MAX = 32;
+const HEADER_CACHE_BYTES = 8 * 1024 * 1024;
+let headerCacheBytes = 0;
 const headerCache = new Map<string, HeaderCacheEntry>();
 
 function rememberHeader(key: string, entry: HeaderCacheEntry): void {
+  headerCacheBytes -= headerCache.get(key)?.bytes || 0;
   headerCache.delete(key);
+  if (entry.bytes > HEADER_CACHE_BYTES) return;
   headerCache.set(key, entry);
-  while (headerCache.size > HEADER_CACHE_MAX) {
+  headerCacheBytes += entry.bytes;
+  while (headerCache.size > HEADER_CACHE_MAX || headerCacheBytes > HEADER_CACHE_BYTES) {
     const oldest = headerCache.keys().next().value;
     if (oldest === undefined) {
       break;
     }
+    headerCacheBytes -= headerCache.get(oldest)!.bytes;
     headerCache.delete(oldest);
   }
 }
@@ -478,7 +528,8 @@ function readGgufHeaderFromFile(filePath: string): GgufHeaderScan {
   const fd = fs.openSync(filePath, "r");
   try {
     const scan = readGgufHeader(new GgufReader(fd));
-    rememberHeader(key, { mtimeMs: st.mtimeMs, size: st.size, scan });
+    const bytes = JSON.stringify(scan.meta).length * 2 + scan.tensors.reduce((sum, t) => sum + 64 + t.name.length * 2, 0);
+    rememberHeader(key, { mtimeMs: st.mtimeMs, size: st.size, scan, bytes });
     return scan;
   } finally {
     fs.closeSync(fd);
@@ -676,15 +727,18 @@ interface CapsCacheEntry {
   /** mtime/size of the file and its sibling shards (see capsCacheStamp). */
   stamp: string;
   caps: ModelCapabilities;
+  bytes: number;
 }
 
 /**
  * Parsed headers keyed by path and validated against the mtime/size of the
  * file *and* its sibling shards (some fields, like the PLE share, come from
- * later shards). No TTL: a hit is exact. Sized for a large library so the
- * sidebar's fit badges never thrash the cache.
+ * later shards). No TTL: a hit is exact. Retain compact capabilities by byte
+ * budget, rather than evicting an entire ordinary library above 512 entries.
  */
-const CAPS_CACHE_MAX = 512;
+const CAPS_CACHE_MAX = 8192;
+const CAPS_CACHE_BYTES = 16 * 1024 * 1024;
+let capsCacheBytes = 0;
 const capsCache = new Map<string, CapsCacheEntry>();
 
 /**
@@ -717,9 +771,12 @@ export function invalidateModelCapabilitiesCache(filePath?: string): void {
   if (!filePath) {
     capsCache.clear();
     headerCache.clear();
+    capsCacheBytes = headerCacheBytes = 0;
     return;
   }
   const key = path.resolve(filePath);
+  capsCacheBytes -= capsCache.get(key)?.bytes || 0;
+  headerCacheBytes -= headerCache.get(key)?.bytes || 0;
   capsCache.delete(key);
   headerCache.delete(key);
 }
@@ -740,13 +797,19 @@ export function readModelCapabilities(filePath: string): ModelCapabilities {
   }
   const caps = readModelCapabilitiesUncached(filePath);
   if (stamp) {
+    capsCacheBytes -= capsCache.get(key)?.bytes || 0;
     capsCache.delete(key);
-    capsCache.set(key, { stamp, caps: structuredClone(caps) });
-    while (capsCache.size > CAPS_CACHE_MAX) {
+    const bytes = (key.length + stamp.length + JSON.stringify(caps).length) * 2 + 128;
+    if (bytes <= CAPS_CACHE_BYTES) {
+      capsCache.set(key, { stamp, caps: structuredClone(caps), bytes });
+      capsCacheBytes += bytes;
+    }
+    while (capsCache.size > CAPS_CACHE_MAX || capsCacheBytes > CAPS_CACHE_BYTES) {
       const oldest = capsCache.keys().next().value;
       if (oldest === undefined) {
         break;
       }
+      capsCacheBytes -= capsCache.get(oldest)!.bytes;
       capsCache.delete(oldest);
     }
   }

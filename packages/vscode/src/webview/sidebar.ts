@@ -21,6 +21,7 @@ import {
 import { sparklineSvg } from "./perfChart";
 import {
   lib,
+  applyLibraryHfMessage,
   allLibraryGroups,
   closeLibraryMenu,
   findLibraryQuant,
@@ -28,6 +29,7 @@ import {
   onLibraryClick,
   openLibraryMenu,
   refreshLibrarySum,
+  resetLibraryNavigation,
   renderLibraryDialog,
   renderLibraryFilters,
   renderLibraryJobs,
@@ -1908,6 +1910,13 @@ function advRowKey(row) {
   return '';
 }
 function refreshAdvancedMarks() {
+  const unified = $('unifiedKvCache').checked;
+  const slots = Math.max(1, Number($('maxConcurrentPredictions').value) || 1);
+  const context = Math.max(512, Number($('contextLength').value) || 512);
+  $('slotContextBadge').textContent = unified ? 'Shared KV' : 'Splits context';
+  $('slotContextHint').textContent = unified
+    ? 'Use 1 for a single chat. With unified KV, current llama.cpp builds let a slot use the full context window while all slots share the cache. Older builds may divide context; the server’s reported limit takes precedence.'
+    : 'Use 1 for a single chat. Without unified KV, context is divided across slots: ' + context.toLocaleString() + ' / ' + slots + ' ≈ ' + Math.floor(context / slots).toLocaleString() + ' tokens per request.';
   const body = $('advancedBody');
   if (!body) return;
   const L = readLoad();
@@ -3225,9 +3234,7 @@ $('launchMode').addEventListener('change', () => {
 });
 
 $('libraryFilter').addEventListener('input', function () {
-  lib.hfMode = 'local';
-  lib.hfError = '';
-  lib.hfBusy = false;
+  resetLibraryNavigation();
   renderLibraryList();
 });
 $('libraryFilter').addEventListener('keydown', function (e) {
@@ -3237,6 +3244,7 @@ $('libraryFilters').addEventListener('click', function (e) {
   const chip = e.target.closest ? e.target.closest('[data-lib-filter]') : null;
   if (!chip) return;
   lib.filterMode = chip.getAttribute('data-lib-filter') || 'all';
+  lib.page = 0;
   lib.menuPath = '';
   renderLibraryList();
   renderLibraryDialog();
@@ -3244,6 +3252,7 @@ $('libraryFilters').addEventListener('click', function (e) {
 $('librarySort').value = lib.sort;
 $('librarySort').addEventListener('change', function () {
   lib.sort = $('librarySort').value || 'recent';
+  lib.page = 0;
   renderLibraryList();
   saveUiState();
 });
@@ -3370,28 +3379,8 @@ window.addEventListener('message', (event: MessageEvent<ToWebviewMessage>) => {
     lib.downloads = msg.jobs || [];
     renderLibraryJobs();
   }
-  if (msg.type === 'libraryHfResults') {
-    const raw = (($('libraryFilter') && $('libraryFilter').value) || '').trim().toLowerCase();
-    if ((msg.query || '').toLowerCase() !== raw) return;
-    lib.hfBusy = false;
-    lib.hfError = '';
-    lib.hfRepos = msg.repos || [];
-    lib.hfMode = 'search';
-    renderLibraryList();
-  }
-  if (msg.type === 'libraryHfFiles') {
-    lib.hfBusy = false;
-    lib.hfError = '';
-    lib.hfFiles = msg;
-    lib.hfMode = 'files';
-    renderLibraryList();
-  }
-  if (msg.type === 'libraryHfError') {
-    const raw = (($('libraryFilter') && $('libraryFilter').value) || '').trim().toLowerCase();
-    if (msg.query && msg.query.toLowerCase() !== raw) return;
-    lib.hfBusy = false;
-    lib.hfError = msg.message || 'Search failed.';
-    renderLibraryList();
+  if (msg.type === 'libraryHfResults' || msg.type === 'libraryHfFiles' || msg.type === 'libraryHfError') {
+    applyLibraryHfMessage(msg);
   }
   if (msg.type === 'focusLibrary') {
     const modelFold = $('modelFold');
@@ -3402,7 +3391,7 @@ window.addEventListener('message', (event: MessageEvent<ToWebviewMessage>) => {
     if (msg.query && filter) filter.value = msg.query;
     if (msg.search && msg.query) startLibrarySearch();
     else {
-      lib.hfMode = 'local';
+      resetLibraryNavigation();
       renderLibraryList();
     }
     if (msg.filter && filter) filter.focus();

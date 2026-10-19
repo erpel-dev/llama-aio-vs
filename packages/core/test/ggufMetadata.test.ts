@@ -90,6 +90,57 @@ describe("totalModelBytes", () => {
 });
 
 describe("readModelCapabilities", () => {
+  it("skips vocabulary decoding while preserving following metadata and tensor offsets", (t) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "llama-vocab-skip-"));
+    t.after(() => { invalidateModelCapabilitiesCache(); fs.rmSync(dir, { recursive: true, force: true }); });
+    const file = path.join(dir, "model.gguf");
+    fs.writeFileSync(file, miniGgufWithTensors({
+      "tokenizer.ggml.tokens": { type: "string[]", value: Array.from({ length: 5000 }, (_, i) => `token-${i}`) },
+      "tokenizer.ggml.token_type": { type: "u32[]", value: Array(5000).fill(1) },
+      "tokenizer.chat_template": { type: "string", value: "unused template" },
+      "general.architecture": { type: "string", value: "qwen3moe" },
+      "qwen3moe.block_count": { type: "u32", value: 4 },
+      "qwen3moe.expert_count": { type: "u32", value: 8 },
+      "qwen3moe.attention.head_count_kv": { type: "u32[]", value: [1, 2, 1, 2] },
+    }, [{ name: "blk.0.ffn_down_exps.weight", bytes: 3000 }, { name: "output.weight", bytes: 7000 }]));
+    const decode = t.mock.method(Buffer.prototype, "toString");
+    const caps = readModelCapabilities(file);
+    const decodes = decode.mock.calls.length;
+    decode.mock.restore();
+    assert.equal(caps.architecture, "qwen3moe");
+    assert.equal(caps.blockCount, 4);
+    assert.deepEqual(caps.attentionHeadCountKvPerLayer, [1, 2, 1, 2]);
+    assert.ok(Math.abs((caps.moeExpertShare || 0) - 0.3) < 0.02);
+    assert.ok(decodes < 50, `decoded ${decodes} strings; vocabulary must be skipped`);
+  });
+
+  for (const type of ["string[]", "u32[]"] as const) {
+    it(`rejects truncated skipped ${type} metadata`, (t) => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "llama-vocab-truncated-"));
+      t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+      const file = path.join(dir, "bad.gguf");
+      const value: MiniGgufValue = type === "string[]" ? { type, value: ["abc"] } : { type, value: [1, 2] };
+      const data = miniGguf({ "tokenizer.ggml.tokens": value });
+      // miniGguf appends a dummy data section; truncate the value, not padding.
+      const payloadEnd = 24 + 8 + Buffer.byteLength("tokenizer.ggml.tokens") + 4 + 4 + 8 +
+        (type === "string[]" ? 8 + 3 : 2 * 4);
+      fs.writeFileSync(file, data.subarray(0, payloadEnd - 1));
+      assert.throws(() => readModelCapabilities(file), /EOF/);
+    });
+  }
+
+  it("keeps a 600-model library warm across sequential fit passes", (t) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "llama-large-caps-"));
+    t.after(() => { invalidateModelCapabilitiesCache(); fs.rmSync(dir, { recursive: true, force: true }); });
+    invalidateModelCapabilitiesCache();
+    const files = Array.from({ length: 600 }, (_, i) => path.join(dir, `${i}.gguf`));
+    const data = miniGguf({ "general.architecture": { type: "string", value: "llama" } });
+    for (const file of files) { fs.writeFileSync(file, data); readModelCapabilities(file); }
+    const open = t.mock.method(require("node:fs"), "openSync");
+    for (const file of files) assert.equal(readModelCapabilities(file).architecture, "llama");
+    assert.equal(open.mock.calls.length, 0, "a warm pass must not reparse headers above 512 entries");
+  });
+
   it("rejects a non-GGUF file instead of parsing garbage", () => {
     const p = path.join(os.tmpdir(), `llama-aio-not-gguf-${process.pid}.gguf`);
     fs.writeFileSync(p, Buffer.from("this is not a gguf file at all"));
