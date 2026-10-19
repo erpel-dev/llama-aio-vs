@@ -72,6 +72,12 @@ All commands are in the Command Palette under **Llama AIO:** — start/stop/relo
 - code-server, VSCodium and other editors that install from Open VSX can run the server, model library and downloads, but Copilot Chat isn't available there. The models can still be used by other extensions that support the VS Code Language Model API.
 - Linux, Windows or macOS; a GPU is optional
 
+## Building and releasing
+
+Run `npm ci`, `npm run compile`, and `npm run package:vsix` to build the extension into `dist/`.
+
+The **Build VSIX** GitHub Actions workflow checks, tests, and packages every pull request and push to `main`. Publishing a GitHub release with a tag matching the package version (for example, `v0.3.3`) also attaches the VSIX to that release. Update all workspace package versions and the lockfile together before releasing. To retry an existing release, run the workflow manually with its tag.
+
 ## License
 
 [MIT](LICENSE) © 2026 Timo Leser
