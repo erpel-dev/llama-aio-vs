@@ -5,6 +5,9 @@
  */
 import { $, vscode } from "./api";
 import { escAttr, escText, fmtBytes, fmtCount, fmtEta } from "./format";
+import type { ToWebviewMessage } from "./protocol";
+
+const LIBRARY_PAGE_SIZE = 50;
 
 /** Library card state. Assigned by the state / libraryX messages in sidebar.ts. */
 export const lib = {
@@ -18,6 +21,8 @@ export const lib = {
   hfError: '',
   hfRepos: [] as any,
   hfFiles: null as any,
+  hfRequest: 0,
+  page: 0,
   downloads: [] as any,
   countLabel: '',
   ratios: {} as any,
@@ -27,6 +32,45 @@ export const lib = {
   sort: 'recent',
   menuPath: '',
 };
+
+/** Invalidates outstanding HF replies, including when returning to local results. */
+export function resetLibraryNavigation(mode = 'local') {
+  lib.hfRequest++;
+  lib.hfMode = mode;
+  lib.hfBusy = false;
+  lib.hfError = '';
+  lib.hfFiles = null;
+  lib.page = 0;
+}
+
+function requestLibraryFiles(modelId: string) {
+  resetLibraryNavigation('files');
+  lib.hfBusy = true;
+  lib.hfFiles = { modelId, files: [] };
+  renderLibraryList();
+  vscode.postMessage({ type: 'listLibraryHfFiles', modelId, requestId: lib.hfRequest });
+}
+
+/** Accept only replies belonging to the current navigation, even when the
+ * user repeats the same query or visits the same repo again. */
+export function applyLibraryHfMessage(msg: Extract<ToWebviewMessage, { type: 'libraryHfResults' | 'libraryHfFiles' | 'libraryHfError' }>): boolean {
+  if (msg.requestId !== lib.hfRequest) return false;
+  if (msg.type === 'libraryHfFiles') {
+    if (lib.hfMode !== 'files' || msg.modelId !== lib.hfFiles?.modelId) return false;
+    lib.hfFiles = msg;
+  } else {
+    const raw = (($('libraryFilter') && $('libraryFilter').value) || '').trim().toLowerCase();
+    if (msg.query && msg.query.toLowerCase() !== raw) return false;
+    if (msg.type === 'libraryHfResults') {
+      if (lib.hfMode !== 'search') return false;
+      lib.hfRepos = msg.repos || [];
+    }
+  }
+  lib.hfBusy = false;
+  lib.hfError = msg.type === 'libraryHfError' ? msg.message || 'Search failed.' : '';
+  renderLibraryList();
+  return true;
+}
 
 export function libraryStats() {
   const stats = { total: 0, fits: 0, drafts: 0, vision: 0, hidden: 0 };
@@ -227,6 +271,9 @@ export function renderLibraryList() {
   renderLibraryJobs();
   const raw = (($('libraryFilter') && $('libraryFilter').value) || '').trim();
   const q = raw.toLowerCase();
+  // Reset before filtering, so unhiding the last hidden model renders All
+  // immediately instead of briefly rendering an empty Hidden view.
+  if (lib.filterMode === 'hidden' && !libraryStats().hidden) lib.filterMode = 'all';
   let html = '';
   if (lib.hfBusy) {
     html += '<div class="hint">' + (lib.hfMode === 'files' ? 'Listing GGUF files…' : 'Searching Hugging Face…') + '</div>';
@@ -271,13 +318,20 @@ export function renderLibraryList() {
     if (!groups.length) {
       html += '<div class="hint" style="margin:0 0 8px">' + (q || lib.filterMode !== 'all' ? 'No local model matches.' : 'No models in the library yet.') + '</div>';
     } else {
+      const total = groups.reduce((sum, x) => sum + x.quants.length, 0);
+      lib.page = Math.max(0, Math.min(lib.page, Math.ceil(total / LIBRARY_PAGE_SIZE) - 1));
+      const start = lib.page * LIBRARY_PAGE_SIZE;
+      let offset = 0;
       html += '<div class="lib-list">';
       groups.forEach(function (x) {
+        const visible = x.quants.slice(Math.max(0, start - offset), Math.max(0, start + LIBRARY_PAGE_SIZE - offset));
+        offset += x.quants.length;
+        if (!visible.length) return;
         const g = x.g;
         const vision = groupHasVision(g);
         const sub = [g.detail || '', g.source && g.source !== 'Llama AIO' ? g.source : '', g.hidden ? 'hidden' : ''].filter(Boolean).join(' · ');
         html += '<div class="lib-grp" title="' + escAttr(g.title + (g.detail ? ' — ' + g.detail : '') + ' · ' + g.source) + '"><span class="lib-title">' + escText(g.title) + '</span>' + (vision ? '<span class="lib-tag vision" title="A vision projector (mmproj) sits next to these files">vision</span>' : '') + '<span class="lib-detail">' + escText(sub) + '</span></div>';
-        x.quants.forEach(function (quant) {
+        visible.forEach(function (quant) {
           const sel = quant.path === lib.selected;
           const draft = !!lib.drafts[quant.path];
           const fit = lib.fits[quant.path] || '';
@@ -305,6 +359,12 @@ export function renderLibraryList() {
         });
       });
       html += '</div>';
+      if (total > LIBRARY_PAGE_SIZE) {
+        html += '<div class="lib-pager" role="group" aria-label="Model library pages">' +
+          '<button type="button" class="secondary small" data-act="lib-prev"' + (lib.page === 0 ? ' disabled' : '') + '>Previous</button>' +
+          '<span role="status">' + (start + 1) + '–' + Math.min(total, start + LIBRARY_PAGE_SIZE) + ' of ' + total + '</span>' +
+          '<button type="button" class="secondary small" data-act="lib-next"' + (start + LIBRARY_PAGE_SIZE >= total ? ' disabled' : '') + '>Next</button></div>';
+      }
     }
     if (q.length >= 2) {
       html += '<button type="button" class="secondary lib-wide" data-act="hf-search">Search Hugging Face for “' + escText(raw) + '”</button>';
@@ -365,12 +425,12 @@ export function renderLibraryDialog() {
 export function startLibrarySearch() {
   const raw = (($('libraryFilter') && $('libraryFilter').value) || '').trim();
   if (raw.length < 2) return;
-  lib.hfMode = 'search';
+  resetLibraryNavigation('search');
   lib.hfBusy = true;
   lib.hfError = '';
   lib.hfRepos = [];
   renderLibraryList();
-  vscode.postMessage({ type: 'searchLibraryHf', query: raw });
+  vscode.postMessage({ type: 'searchLibraryHf', query: raw, requestId: lib.hfRequest });
 }
 
 export function openLibraryMenu(filePath) {
@@ -399,6 +459,16 @@ export function onLibraryClick(e) {
     const filePath = btn.getAttribute('data-path') || '';
     if (btn.closest('.lib-menu')) lib.menuPath = '';
     if (act === 'reveal') vscode.postMessage({ type: 'revealInOs', path: filePath });
+    else if (act === 'lib-prev' || act === 'lib-next') {
+      lib.page += act === 'lib-next' ? 1 : -1;
+      lib.menuPath = '';
+      renderLibraryList();
+      // Rendering replaces the activated button. Keep keyboard navigation on
+      // the pager, including at the first/last page where that button disables.
+      const pagerButton = document.querySelector<HTMLButtonElement>('[data-act="' + act + '"]:not(:disabled)') ||
+        document.querySelector<HTMLButtonElement>('.lib-pager button:not(:disabled)');
+      pagerButton?.focus();
+    }
     else if (act === 'copy-path') vscode.postMessage({ type: 'copyPath', path: filePath });
     else if (act === 'use-draft') vscode.postMessage({ type: 'useLibraryDraft', path: filePath });
     else if (act === 'hide') vscode.postMessage({ type: 'hideLibraryModel', path: filePath });
@@ -412,9 +482,7 @@ export function onLibraryClick(e) {
     } else if (act === 'hf-search') {
       startLibrarySearch();
     } else if (act === 'hf-back') {
-      lib.hfMode = lib.hfMode === 'files' || lib.hfMode === 'license' ? 'search' : 'local';
-      lib.hfError = '';
-      lib.hfBusy = false;
+      resetLibraryNavigation(lib.hfMode === 'files' || lib.hfMode === 'license' ? 'search' : 'local');
       renderLibraryList();
     } else if (act === 'hf-repo') {
       const id = btn.getAttribute('data-repo') || '';
@@ -424,28 +492,16 @@ export function onLibraryClick(e) {
         lib.hfMode = 'license';
         renderLibraryList();
       } else if (id) {
-        lib.hfBusy = true;
-        lib.hfError = '';
-        lib.hfMode = 'files';
-        lib.hfFiles = { modelId: id, files: [] };
-        renderLibraryList();
-        vscode.postMessage({ type: 'listLibraryHfFiles', modelId: id });
+        requestLibraryFiles(id);
       }
     } else if (act === 'hf-license-view') {
       const url = btn.getAttribute('data-url') || '';
       if (url) vscode.postMessage({ type: 'openExternal', url: url });
     } else if (act === 'hf-license-ok') {
       const id = btn.getAttribute('data-repo') || '';
-      lib.hfBusy = true;
-      lib.hfError = '';
-      lib.hfMode = 'files';
-      lib.hfFiles = { modelId: id, files: [] };
-      renderLibraryList();
-      vscode.postMessage({ type: 'listLibraryHfFiles', modelId: id });
+      requestLibraryFiles(id);
     } else if (act === 'hf-download') {
-      lib.hfMode = 'local';
-      lib.hfBusy = false;
-      lib.hfError = '';
+      resetLibraryNavigation();
       if ($('libraryFilter')) $('libraryFilter').value = '';
       renderLibraryList();
       vscode.postMessage({

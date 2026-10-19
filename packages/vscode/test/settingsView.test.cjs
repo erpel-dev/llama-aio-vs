@@ -5,6 +5,9 @@ const assert = require("node:assert/strict");
 const { describe, it, beforeEach } = require("node:test");
 const Module = require("module");
 const path = require("path");
+const fs = require("node:fs");
+const os = require("node:os");
+const http = require("node:http");
 
 const shown = [];
 let copilotChatInstalled = true;
@@ -39,6 +42,99 @@ require.cache.vscode = {
 
 const core = require("@llama-aio/core");
 const { SettingsViewProvider } = require(path.join(__dirname, "..", "out-harness", "settingsView.js"));
+
+describe("removal through a symlinked models directory", () => {
+  for (const role of ["main", "mmproj", "draft"]) {
+    it(`stops before deleting and clears the ${role} path after unlink`, async (t) => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "llama-remove-alias-"));
+      t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+      const real = path.join(dir, "real"); fs.mkdirSync(real);
+      const alias = path.join(dir, "models"); fs.symlinkSync(real, alias, "junction");
+      const target = path.join(real, "target.gguf"); fs.writeFileSync(target, "GGUF");
+      const selected = path.join(alias, "target.gguf");
+      let state = {
+        selectedModelPath: role === "main" ? selected : "/other/model.gguf",
+        modelCapabilities: { path: selected }, modelMaxContext: 8192,
+        loadSettings: { ...core.DEFAULT_LOAD_SETTINGS,
+          mmprojPath: role === "mmproj" ? selected : "",
+          draftModelPath: role === "draft" ? selected : "" },
+      };
+      const events = [];
+      await SettingsViewProvider.prototype.removeOwnedQuant.call({
+        store: { getConfig: () => ({ get: key => key === "modelsDir" ? alias : undefined }),
+          getState: () => state, setState: async patch => { state = { ...state, ...patch }; } },
+        processManager: { getStatus: () => ({ running: true, modelPath: state.selectedModelPath }),
+          stop: async force => { assert.equal(force, true); events.push("stop"); } },
+        trashOwnedFile: async file => { events.push("delete"); fs.unlinkSync(file); },
+        removeEmptyOwnedDir: async () => undefined, pushState: async () => undefined,
+      }, selected, []);
+      assert.deepEqual(events, ["stop", "delete"]);
+      assert.equal(fs.existsSync(selected), false);
+      if (role === "main") {
+        assert.equal(state.selectedModelPath, "");
+        assert.equal(state.modelCapabilities, undefined);
+        assert.equal(state.modelMaxContext, undefined);
+      } else {
+        assert.equal(state.selectedModelPath, "/other/model.gguf");
+        assert.equal(state.loadSettings[role === "mmproj" ? "mmprojPath" : "draftModelPath"], "");
+      }
+    });
+  }
+});
+
+describe("partial download cleanup", () => {
+  for (const startDuringConfirmation of [false, true]) {
+    it(`preserves a transfer${startDuringConfirmation ? " started during confirmation" : " already running"}`, async (t) => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "llama-clean-active-"));
+      let response;
+      const server = http.createServer((_req, res) => {
+        response = res;
+        res.writeHead(200, { "Content-Length": 2 }); res.write("a");
+      });
+      await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+      const dest = path.join(dir, "active.gguf");
+      const orphan = path.join(dir, "orphan.gguf.partial");
+      const spec = { dest, label: "active", expectedSize: 2, url: `http://127.0.0.1:${server.address().port}` };
+      let job;
+      t.after(async () => {
+        if (job) core.downloadManager.cancel(job.job.id);
+        server.closeAllConnections();
+        await new Promise(resolve => server.close(resolve));
+        core.downloadManager.clearFinished();
+        fs.rmSync(dir, { recursive: true, force: true });
+      });
+      const waitFor = async check => {
+        const until = Date.now() + 2000;
+        while (!check()) {
+          assert.ok(Date.now() < until, "transfer did not start");
+          await new Promise(resolve => setTimeout(resolve, 5));
+        }
+      };
+      if (startDuringConfirmation) fs.writeFileSync(dest + ".partial", "z");
+      else {
+        job = core.downloadManager.enqueue(spec);
+        await waitFor(() => fs.existsSync(dest + ".partial") && fs.statSync(dest + ".partial").size === 1);
+        fs.writeFileSync(orphan, "unused");
+      }
+      const removed = [];
+      t.mock.method(require("vscode").window, "showWarningMessage", async () => {
+        if (startDuringConfirmation) job = core.downloadManager.enqueue(spec);
+        return "Clean";
+      });
+      await SettingsViewProvider.prototype.cleanPartialDownloads.call({
+        store: { getConfig: () => ({ get: key => key === "modelsDir" ? dir : undefined }) },
+        trashOwnedFile: async file => { removed.push(file); await fs.promises.rm(file); },
+        pushState: async () => undefined,
+      });
+      assert.deepEqual(removed, startDuringConfirmation ? [] : [orphan]);
+      assert.equal(fs.existsSync(dest + ".partial"), true);
+      await waitFor(() => !!response);
+      response.end("b");
+      await job.done;
+      assert.equal(fs.readFileSync(dest, "utf8"), "ab");
+    });
+  }
+});
 
 const GiB = 1024 ** 3;
 const caps = {

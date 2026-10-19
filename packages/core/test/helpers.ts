@@ -39,6 +39,7 @@ export function loadSettings(overrides: Partial<LlamaLoadSettings> = {}): LlamaL
 
 export type MiniGgufValue =
   | { type: "string"; value: string }
+  | { type: "string[]"; value: string[] }
   | { type: "u32"; value: number }
   | { type: "u32[]"; value: number[] }
   | { type: "bool[]"; value: boolean[] };
@@ -64,6 +65,9 @@ export function miniGguf(kv: Record<string, MiniGgufValue>): Buffer {
   for (const [key, entry] of Object.entries(kv)) {
     parts.push(str(key));
     switch (entry.type) {
+      case "string[]":
+        parts.push(u32(9), u32(8), u64(entry.value.length), ...entry.value.map(str));
+        break;
       case "string":
         parts.push(u32(8), str(entry.value));
         break;
@@ -112,6 +116,9 @@ export function miniGgufWithTensors(
   for (const [key, entry] of Object.entries(kv)) {
     parts.push(str(key));
     switch (entry.type) {
+      case "string[]":
+        parts.push(u32(9), u32(8), u64(entry.value.length), ...entry.value.map(str));
+        break;
       case "string":
         parts.push(u32(8), str(entry.value));
         break;

@@ -22,7 +22,7 @@ import { LlamaInstaller, UiBackend } from "@llama-aio/core";
 import { clampLoadSettingsToModel, computeMemoryView, diffLoadSettings, fittingContextLength, memoryEstimateInputs, mmprojFileSize, resolveDraftCapabilities, shortGpuName, type SettingChange } from "@llama-aio/core";
 import { resolveModelModes } from "@llama-aio/core";
 import {
-  buildLibraryGroups,
+  buildLibraryGroupsAsync,
   canonicalModelPath,
   displayModelTitle,
   formatModelSize,
@@ -574,10 +574,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             await this.cleanPartialDownloads();
             break;
           case "searchLibraryHf":
-            await this.searchLibraryHf(typeof msg.query === "string" ? msg.query : "");
+            await this.searchLibraryHf(typeof msg.query === "string" ? msg.query : "", msg.requestId);
             break;
           case "listLibraryHfFiles":
-            await this.listLibraryHfFiles(typeof msg.modelId === "string" ? msg.modelId : "");
+            await this.listLibraryHfFiles(typeof msg.modelId === "string" ? msg.modelId : "", msg.requestId);
             break;
           case "downloadLibraryHf":
             void this.runLibraryDownload(
@@ -1055,7 +1055,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     const modelsDir = getModelsDir(this.store.getConfig());
     const localEntries = remoteMode ? [] : listLocalModelEntries(this.store.getConfig());
     const localModelCount = localEntries.length;
-    const library = remoteMode ? null : this.libraryPayload(state.selectedModelPath, status);
+    const library = remoteMode ? null : await this.libraryPayload(state.selectedModelPath, status);
     const localSourceDirs = listActiveModelSourceDirs(this.store.getConfig(), localEntries);
     const localSources = localSourceDirs.map((s) => s.source);
 
@@ -1360,7 +1360,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     void vscode.window.showInformationMessage(`DFlash draft set to ${path.basename(filePath)}`);
   }
 
-  private libraryPayload(selectedPath: string, status: { running: boolean; starting?: boolean; modelPath?: string }) {
+  private async libraryPayload(selectedPath: string, status: { running: boolean; starting?: boolean; modelPath?: string }) {
     const config = this.store.getConfig();
     const modelsDir = getModelsDir(config);
     const hidden = hiddenModelPaths(config);
@@ -1403,11 +1403,15 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           ),
         })),
       }));
+    const [groups, hiddenGroups] = await Promise.all([
+      buildLibraryGroupsAsync(visible, modelsDir),
+      buildLibraryGroupsAsync(hiddenEntries, modelsDir),
+    ]);
     const partials = listPartialDownloads(modelsDir);
     const partialBytes = partials.reduce((sum, file) => sum + file.sizeBytes, 0);
     return {
-      groups: decorate(buildLibraryGroups(visible, modelsDir)),
-      hiddenGroups: decorate(buildLibraryGroups(hiddenEntries, modelsDir)),
+      groups: decorate(groups),
+      hiddenGroups: decorate(hiddenGroups),
       partials: partials.map((file) => ({
         path: file.path,
         sizeBytes: file.sizeBytes,
@@ -1574,7 +1578,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     this.post({ type: "libraryDownloads", jobs });
   }
 
-  private async searchLibraryHf(query: string): Promise<void> {
+  private async searchLibraryHf(query: string, requestId: number): Promise<void> {
     const q = query.trim();
     if (q.length < 2 || !this.view) {
       return;
@@ -1593,17 +1597,18 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           licenseUrl: resolveLicenseUrl(model.id, license) || "",
         };
       });
-      this.post({ type: "libraryHfResults", query: q, repos });
+      this.post({ type: "libraryHfResults", requestId, query: q, repos });
     } catch (e) {
       this.post({
         type: "libraryHfError",
+        requestId,
         query: q,
         message: e instanceof Error ? e.message : String(e),
       });
     }
   }
 
-  private async listLibraryHfFiles(modelId: string): Promise<void> {
+  private async listLibraryHfFiles(modelId: string, requestId: number): Promise<void> {
     if (!modelId || !this.view) {
       return;
     }
@@ -1612,6 +1617,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       const picker = downloadPickerFiles(files);
       this.post({
         type: "libraryHfFiles",
+        requestId,
         modelId,
         companionOnly: picker.companionOnly,
         companionHint: picker.companionOnly ? "" : companionDownloadHint(files),
@@ -1624,6 +1630,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     } catch (e) {
       this.post({
         type: "libraryHfError",
+        requestId,
         query: "",
         message: e instanceof Error ? e.message : String(e),
       });
@@ -1747,12 +1754,15 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     }
     const state = this.store.getState();
     const hits = (candidate: string | undefined) =>
-      !!candidate && plan.files.some((filePath) => sameModelFile(filePath, candidate));
+      !!candidate && plan.files.some((filePath) => sameModelFile(filePath, canonicalModelPath(candidate)));
+    // Resolve aliases before unlinking: afterward realpath cannot resolve a
+    // selected path reached through a symlinked models directory.
+    const clearModel = hits(state.selectedModelPath);
+    const clearMm = hits(state.loadSettings.mmprojPath);
+    const clearDraft = hits(state.loadSettings.draftModelPath);
     const mapped =
       hits(status.modelPath) ||
-      hits(state.selectedModelPath) ||
-      hits(state.loadSettings.mmprojPath) ||
-      hits(state.loadSettings.draftModelPath);
+      clearModel || clearMm || clearDraft;
     if (status.running && mapped) {
       await this.processManager.stop(true);
     }
@@ -1760,9 +1770,6 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       await this.trashOwnedFile(filePath);
     }
     await this.removeEmptyOwnedDir(path.dirname(plan.files[0] || trimmed), modelsDir);
-    const clearModel = hits(state.selectedModelPath);
-    const clearMm = hits(state.loadSettings.mmprojPath);
-    const clearDraft = hits(state.loadSettings.draftModelPath);
     if (clearModel || clearMm || clearDraft) {
       await this.store.setState({
         ...(clearModel
@@ -1813,9 +1820,11 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
 
   async cleanPartialDownloads(): Promise<void> {
     const modelsDir = getModelsDir(this.store.getConfig());
-    const partials = listPartialDownloads(modelsDir).filter((file) => isOwnedModelPath(file.path, modelsDir));
+    const partials = listPartialDownloads(modelsDir).filter((file) =>
+      isOwnedModelPath(file.path, modelsDir) && !downloadManager.isPartialInUse(file.path)
+    );
     if (!partials.length) {
-      vscode.window.showInformationMessage("No incomplete downloads in the Llama AIO models folder.");
+      vscode.window.showInformationMessage("No unused incomplete downloads in the Llama AIO models folder.");
       return;
     }
     const bytes = partials.reduce((sum, file) => sum + file.sizeBytes, 0);
@@ -1828,7 +1837,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       return;
     }
     for (const file of partials) {
-      await this.trashOwnedFile(file.path);
+      await downloadManager.removePartialIfIdle(file.path, async () => {
+        // Ownership and job activity may have changed while confirmation was open.
+        if (isOwnedModelPath(file.path, modelsDir)) await this.trashOwnedFile(file.path);
+      });
     }
     invalidateModelLibraryCache();
     await this.pushState();

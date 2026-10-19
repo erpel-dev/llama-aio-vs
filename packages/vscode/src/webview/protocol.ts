@@ -68,8 +68,8 @@ export type ToHostMessage =
   | { type: "removeLibraryQuant"; path: string; companionPaths: string[] }
   | { type: "cleanPartialDownloads" }
   // Hugging Face search and downloads
-  | { type: "searchLibraryHf"; query: string }
-  | { type: "listLibraryHfFiles"; modelId: string }
+  | { type: "searchLibraryHf"; query: string; requestId: number }
+  | { type: "listLibraryHfFiles"; modelId: string; requestId: number }
   | { type: "downloadLibraryHf"; modelId: string; filePath: string }
   | { type: "pauseDownload"; id: string }
   | { type: "resumeDownload"; id: string }
@@ -150,6 +150,7 @@ export type ToWebviewMessage =
     }
   | {
       type: "libraryHfResults";
+      requestId: number;
       query: string;
       repos: Array<{
         id: string;
@@ -160,9 +161,10 @@ export type ToWebviewMessage =
         licenseUrl: string;
       }>;
     }
-  | { type: "libraryHfError"; query: string; message: string }
+  | { type: "libraryHfError"; requestId: number; query: string; message: string }
   | {
       type: "libraryHfFiles";
+      requestId: number;
       modelId: string;
       companionOnly: boolean;
       companionHint: string;

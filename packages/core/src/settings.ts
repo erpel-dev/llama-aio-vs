@@ -11,7 +11,7 @@ import {
 import { isLoopbackHost, isWildcardHost, urlHostname } from "./serverHttp";
 import { Event } from "./events";
 import { clampLoadSettingsToModel, isQwen4expArchitecture, readModelCapabilities } from "./ggufMetadata";
-import { detectGpuMemory, detectGpus } from "./gpuInfo";
+import { detectGpusAsync } from "./gpuInfo";
 import { LlamaInstaller } from "./llamaInstaller";
 import { resolveMmprojPath, resolveMtpDraftPath, findSiblingMtpDraft, isMtpSidecarFile } from "./modelLibrary";
 import { recommendLoadSettings } from "./recommendSettings";
@@ -40,6 +40,7 @@ const RECENT_MODELS_MAX = 8;
  * the extension and the TUI always agree on model, tuning, and server address.
  */
 export class SettingsStore {
+  private selectionGeneration = 0;
   constructor(private readonly config: ConfigFile) {}
 
   /** Fires when any frontend (this one included) changes the configuration. */
@@ -114,22 +115,25 @@ export class SettingsStore {
   }
 
   async updateLoadSettings(patch: Partial<LlamaLoadSettings>): Promise<ExtensionState> {
-    const state = this.getState();
-    let loadSettings = normalizeLoadSettings({ ...state.loadSettings, ...patch });
-    if (
-      speculativeUsesMtp(patch.speculativeMode) &&
-      !isMtpSidecarFile({ path: loadSettings.draftModelPath || "" }) &&
-      !(state.modelCapabilities?.nextnPredictLayers && state.modelCapabilities.nextnPredictLayers > 0)
-    ) {
-      const sibling = findSiblingMtpDraft(state.selectedModelPath);
-      if (sibling) {
-        loadSettings = { ...loadSettings, draftModelPath: sibling };
+    await this.config.updateState((raw) => {
+      const state = toExtensionState(raw);
+      let loadSettings = normalizeLoadSettings({ ...state.loadSettings, ...patch });
+      if (
+        speculativeUsesMtp(patch.speculativeMode) &&
+        !isMtpSidecarFile({ path: loadSettings.draftModelPath || "" }) &&
+        !(state.modelCapabilities?.nextnPredictLayers && state.modelCapabilities.nextnPredictLayers > 0)
+      ) {
+        const sibling = findSiblingMtpDraft(state.selectedModelPath);
+        if (sibling) {
+          loadSettings = { ...loadSettings, draftModelPath: sibling };
+        }
       }
-    }
-    if (state.modelCapabilities) {
-      loadSettings = clampLoadSettingsToModel(loadSettings, state.modelCapabilities);
-    }
-    const next = await this.setState({ loadSettings });
+      if (state.modelCapabilities) {
+        loadSettings = clampLoadSettingsToModel(loadSettings, state.modelCapabilities);
+      }
+      return { loadSettings };
+    });
+    const next = this.getState();
     if (patchTouchesChatTemplate(patch) && next.selectedModelPath) {
       await this.writeChatTemplateForModel(next.selectedModelPath, next.loadSettings);
     }
@@ -137,9 +141,10 @@ export class SettingsStore {
   }
 
   async updateRequestSettings(patch: Partial<RequestSettings>): Promise<ExtensionState> {
-    return this.setState({
-      requestSettings: normalizeRequestSettings({ ...this.getState().requestSettings, ...patch }),
-    });
+    await this.config.updateState((current) => ({
+      requestSettings: normalizeRequestSettings({ ...current.requestSettings, ...patch }),
+    }));
+    return this.getState();
   }
 
   /**
@@ -152,6 +157,7 @@ export class SettingsStore {
     modelPath: string,
     options?: { recommendDefaults?: boolean; cpuOnly?: boolean; attachMmproj?: boolean }
   ): Promise<ExtensionState> {
+    const generation = ++this.selectionGeneration;
     const prev = this.getState();
     const caps = readModelCapabilities(modelPath);
     const pathChanged = !!modelPath && modelPath !== prev.selectedModelPath;
@@ -171,17 +177,18 @@ export class SettingsStore {
     };
     if (recommend) {
       const installer = new LlamaInstaller(this);
-      const cpuOnly = options?.cpuOnly ?? installer.resolveActiveUiBackend() === "cpu";
+      const active = options?.cpuOnly === true ? "cpu" : await installer.resolveActiveUiBackendAsync();
+      const cpuOnly = options?.cpuOnly ?? active === "cpu";
       const llamaBinary = cpuOnly
         ? undefined
-        : installer.resolveActiveUiBackend() === "path"
+        : active === "path"
           ? findLlamaServerOnPath()
-          : getLlamaServerBinary(installer.getActiveInstallDir());
-      loadSettings = recommendLoadSettings(loadSettings, caps, {
-        cpuOnly,
-        gpu: cpuOnly ? undefined : detectGpuMemory(),
-        gpus: cpuOnly ? undefined : detectGpus(false, llamaBinary),
-      });
+          : getLlamaServerBinary(installer.getActiveInstallDir(active));
+      const gpus = cpuOnly ? [] : await detectGpusAsync(false, llamaBinary);
+      const gpu = gpus.reduce<(typeof gpus)[number] | undefined>((best, next) =>
+        !best || next.totalBytes > best.totalBytes ? next : best, undefined
+      );
+      loadSettings = recommendLoadSettings(loadSettings, caps, { cpuOnly, gpu, gpus });
     }
     loadSettings = clampLoadSettingsToModel(loadSettings, caps);
     if (pathChanged) {
@@ -195,13 +202,14 @@ export class SettingsStore {
       };
     }
 
-    const next = await this.setState({
+    await this.config.updateState(() => generation === this.selectionGeneration ? {
       selectedModelPath: modelPath,
       modelCapabilities: caps,
       modelMaxContext: caps.maxContextLength,
       loadSettings,
-    });
-    if (pathChanged) {
+    } : {});
+    const next = this.getState();
+    if (pathChanged && generation === this.selectionGeneration) {
       await this.rememberRecentModels([modelPath, prev.selectedModelPath]);
     }
     return next;
@@ -220,34 +228,33 @@ export class SettingsStore {
     loadSettings: LlamaLoadSettings
   ): Promise<void> {
     const key = path.resolve(modelPath);
-    const map = { ...(this.config.get().app.chatTemplates || {}) };
     const choice = normalizeChatTemplate({
       source: loadSettings.chatTemplateSource,
       name: loadSettings.chatTemplateName,
       file: loadSettings.chatTemplateFile,
       jinja: loadSettings.chatTemplateJinja,
     });
-    if (isDefaultChatTemplate(choice)) {
-      delete map[key];
-    } else {
-      map[key] = choice;
-    }
-    await this.getConfig().update("chatTemplates", map);
+    await this.config.updatePreferences((current) => {
+      const map = { ...current.chatTemplates };
+      if (isDefaultChatTemplate(choice)) delete map[key];
+      else map[key] = choice;
+      return { chatTemplates: map };
+    });
   }
 
   /** Newest first, one entry per file. */
   private async rememberRecentModels(newest: string[]): Promise<void> {
-    const list = [...newest, ...(this.getConfig().get<string[]>("recentModels") || [])].filter(Boolean);
-    const seen = new Set<string>();
-    const out = list.filter((p) => {
-      const key = path.resolve(p);
-      if (seen.has(key)) {
-        return false;
-      }
-      seen.add(key);
-      return true;
+    await this.config.updatePreferences((current) => {
+      const list = [...newest, ...current.recentModels].filter(Boolean);
+      const seen = new Set<string>();
+      const out = list.filter((p) => {
+        const key = path.resolve(p);
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+      return { recentModels: out.slice(0, RECENT_MODELS_MAX) };
     });
-    await this.getConfig().update("recentModels", out.slice(0, RECENT_MODELS_MAX));
   }
 
   getConfig(): ConfigAccessor {
@@ -288,7 +295,7 @@ export class SettingsStore {
   }
 
   private async updateServer(patch: Partial<ServerPreferences>): Promise<void> {
-    await this.getConfig().update("server", { ...this.getServerPreferences(), ...patch });
+    await this.config.updatePreferences((current) => ({ server: { ...current.server, ...patch } }));
   }
 
   /** Switch to a remote server. `url` must already be normalized. */

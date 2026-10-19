@@ -1,5 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
+import * as lockfile from "proper-lockfile";
 import { Emitter } from "./events";
 import { getConfigPath, getDataRoot } from "./paths";
 import {
@@ -275,22 +276,59 @@ export class ConfigFile {
   }
 
   async setPreferences(patch: Partial<AppPreferences>): Promise<AppConfig> {
-    const absorbed = this.syncFromDisk();
-    return this.announceAbsorbed(absorbed, await this.write({ ...this.cache, app: { ...this.cache.app, ...patch } }));
+    return this.updatePreferences(() => patch);
+  }
+
+  /** Compute read/modify/write preferences from the latest cross-process snapshot. */
+  async updatePreferences(update: (current: AppPreferences) => Partial<AppPreferences>): Promise<AppConfig> {
+    return this.mutate((current) => ({ ...current, app: { ...current.app, ...update(current.app) } }));
   }
 
   async setState(patch: Partial<ModelState>): Promise<AppConfig> {
-    const absorbed = this.syncFromDisk();
-    const current = this.cache.state;
-    return this.announceAbsorbed(absorbed, await this.write({
-      ...this.cache,
-      state: {
+    return this.updateState(() => patch);
+  }
+
+  async updateState(update: (current: ModelState) => Partial<ModelState>): Promise<AppConfig> {
+    return this.mutate((current) => {
+      const patch = update(current.state);
+      return {
         ...current,
-        ...patch,
-        loadSettings: { ...current.loadSettings, ...(patch.loadSettings || {}) },
-        requestSettings: { ...current.requestSettings, ...(patch.requestSettings || {}) },
-      },
-    }));
+        state: {
+          ...current.state,
+          ...patch,
+          loadSettings: { ...current.state.loadSettings, ...(patch.loadSettings || {}) },
+          requestSettings: { ...current.state.requestSettings, ...(patch.requestSettings || {}) },
+        },
+      };
+    });
+  }
+
+  private async mutate(update: (current: AppConfig) => AppConfig, createOnly = false): Promise<AppConfig> {
+    await fs.promises.mkdir(path.dirname(this.file), { recursive: true });
+    // Atomic rename protects file contents; this lock also protects the
+    // preceding read/merge from another window or TUI writing concurrently.
+    const release = await lockfile.lock(this.file, {
+      realpath: false,
+      stale: 10_000,
+      retries: { retries: 250, minTimeout: 10, maxTimeout: 50 },
+    });
+    let absorbed = false;
+    let next: AppConfig;
+    let changed = false;
+    try {
+      absorbed = this.syncFromDisk();
+      if (createOnly && fs.existsSync(this.file)) {
+        next = this.cache;
+      } else {
+        next = this.write(update(this.cache));
+        changed = true;
+      }
+    } finally {
+      await release();
+    }
+    // Subscribers may write config too: notify only after releasing the lock.
+    if (changed || absorbed) this._onDidChange.fire(next);
+    return this.announceAbsorbed(absorbed, next);
   }
 
   /**
@@ -304,11 +342,9 @@ export class ConfigFile {
     return config;
   }
 
-  private async write(next: AppConfig): Promise<AppConfig> {
+  private write(next: AppConfig): AppConfig {
     const normalized = normalizeConfig(next);
     const text = `${JSON.stringify(normalized, null, 2)}\n`;
-    this.cache = normalized;
-
     if (text !== this.lastWritten) {
       fs.mkdirSync(path.dirname(this.file), { recursive: true });
       const tmp = `${this.file}.tmp-${process.pid}-${Date.now()}`;
@@ -322,15 +358,13 @@ export class ConfigFile {
       }
     }
 
-    this._onDidChange.fire(normalized);
+    this.cache = normalized;
     return normalized;
   }
 
   /** Create the file on disk if it is missing, so it is discoverable/editable. */
   async ensureExists(): Promise<void> {
-    if (!fs.existsSync(this.file)) {
-      await this.write(this.cache);
-    }
+    await this.mutate((current) => current, true);
   }
 
   /**

@@ -458,7 +458,7 @@ input:disabled, select:disabled { opacity: 0.5; }
   gap: 8px;
   margin-bottom: 4px;
 }
-.label span.name { font-weight: 500; }
+.label .name { font-weight: 500; }
 .label .badge {
   font-size: 10px;
   opacity: 0.75;
@@ -826,9 +826,10 @@ button.link-btn:hover { text-decoration: underline; }
 .muted { color: var(--muted); }
 .req-line { margin-top: 4px; }
 .req-line input, .req-cell input { width: 64px; }
-.req-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 2px 14px; }
+.req-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 2px 14px; }
 .req-cell { display: flex; justify-content: space-between; align-items: center; gap: 6px; padding: 3px 0; font-size: 11px; }
 @media (max-width: 250px) { .req-grid { grid-template-columns: 1fr; } }
+.lib-pager { display: flex; justify-content: space-between; align-items: center; gap: 6px; margin-top: 8px; font-size: 11px; }
 .mode-strip {
   display: flex;
   flex-wrap: wrap;

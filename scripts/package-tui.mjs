@@ -66,6 +66,8 @@ mkdirSync(assetsDir, { recursive: true });
 const banner = `#!/usr/bin/env -S node --experimental-ffi
 import { dirname as __otuiDirname, join as __otuiJoin } from "node:path";
 import { fileURLToPath as __otuiFileURLToPath } from "node:url";
+import { createRequire as __otuiCreateRequire } from "node:module";
+const require = __otuiCreateRequire(import.meta.url);
 const __filename = __otuiFileURLToPath(import.meta.url);
 const __dirname = __otuiDirname(__filename);
 if (!process.env.OTUI_ASSET_ROOT) {

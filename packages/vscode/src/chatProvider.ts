@@ -652,7 +652,7 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
     };
     if (tools?.length) {
       body.tools = tools;
-      body.tool_choice = "auto";
+      body.tool_choice = options.toolMode === vscode.LanguageModelChatToolMode.Required ? "required" : "auto";
     }
 
     const modeSet = this.modeSetFor(model.id, props);

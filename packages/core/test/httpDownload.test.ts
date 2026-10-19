@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as http from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
 import { after, before, describe, it } from "node:test";
+import { DownloadManager } from "../src/downloadManager";
 import {
   downloadHttpFile,
   DownloadVerifyError,
@@ -44,6 +46,130 @@ describe("redirect helpers", () => {
 });
 
 describe("downloadHttpFile", () => {
+  it("protects another process's direct download from cleanup and duplicate writers", { timeout: 5000 }, async (t) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "llama-cross-window-download-"));
+    const dest = path.join(dir, "model.gguf");
+    let response: http.ServerResponse | undefined;
+    const server = http.createServer((_req, res) => {
+      response = res; res.writeHead(200, { "Content-Length": 2 }); res.write("a");
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const url = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+    const script = `require(process.argv[1]).downloadHttpFile({ url: process.argv[2], dest: process.argv[3] }).catch(err => { console.error(err); process.exitCode = 1; });`;
+    const child = spawn(process.execPath, ["-e", script, require.resolve("../src/httpDownload"), url, dest], { stdio: ["ignore", "ignore", "pipe"] });
+    let errors = "";
+    child.stderr?.on("data", (part) => { errors += part; });
+    const done = new Promise<void>((resolve, reject) => {
+      child.on("error", reject);
+      child.on("exit", (code) => code === 0 ? resolve() : reject(new Error(errors)));
+    });
+    done.catch(() => undefined);
+    t.after(async () => {
+      child.kill(); server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      fs.rmSync(dir, { recursive: true, force: true });
+    });
+    const until = Date.now() + 2000;
+    while (!fs.existsSync(dest + ".partial") || fs.statSync(dest + ".partial").size !== 1) {
+      assert.ok(Date.now() < until, "child download did not start");
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    const mgr = new DownloadManager();
+    assert.equal(await mgr.removePartialIfIdle(dest + ".partial", async () => assert.fail("foreign writer must be protected")), false);
+    await assert.rejects(downloadHttpFile({ url, dest }), (err: unknown) => (err as NodeJS.ErrnoException).code === "ELOCKED");
+    response!.end("b"); await done;
+    assert.equal(fs.readFileSync(dest, "utf8"), "ab");
+    assert.equal(fs.existsSync(dest + ".partial.lock"), false);
+  });
+
+  for (const range of [undefined, "bytes 0-4/10", "bytes 5-9/11", "bytes 5-8/10", "bytes 5-9/*", "bytes 5-9/9007199254740993"]) {
+    it(`rejects an inconsistent resumed range: ${range}`, async (t) => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "llama-range-"));
+      const dest = path.join(dir, "model.gguf");
+      fs.writeFileSync(dest + ".partial", "01234");
+      const server = http.createServer((req, res) => {
+        assert.equal(req.headers.range, "bytes=5-");
+        res.writeHead(206, { "Content-Length": 5, ...(range ? { "Content-Range": range } : {}) });
+        res.end("ABCDE");
+      });
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+      t.after(async () => {
+        server.closeAllConnections();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+        fs.rmSync(dir, { recursive: true, force: true });
+      });
+      await assert.rejects(downloadHttpFile({
+        dest, expectedSize: 10, url: `http://127.0.0.1:${(server.address() as { port: number }).port}`,
+      }), DownloadVerifyError);
+      assert.equal(fs.existsSync(dest), false);
+      assert.equal(fs.readFileSync(dest + ".partial", "utf8"), "01234");
+    });
+  }
+
+  for (const complete of [true, false]) {
+    it(`checks chunked ranged bodies before publishing (complete=${complete})`, async (t) => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "llama-range-body-"));
+      const dest = path.join(dir, "model.gguf");
+      fs.writeFileSync(dest + ".partial", "01234");
+      const server = http.createServer((_req, res) => {
+        res.writeHead(206, { "Content-Range": "bytes 5-9/10", "Transfer-Encoding": "chunked" });
+        res.end(complete ? "56789" : "56");
+      });
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+      t.after(async () => {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+        fs.rmSync(dir, { recursive: true, force: true });
+      });
+      const result = downloadHttpFile({ dest, url: `http://127.0.0.1:${(server.address() as { port: number }).port}` });
+      if (complete) {
+        await result;
+        assert.equal(fs.readFileSync(dest, "utf8"), "0123456789");
+      } else {
+        await assert.rejects(result, DownloadVerifyError);
+        assert.equal(fs.existsSync(dest), false);
+      }
+    });
+  }
+
+  for (const mode of ["headers", "redirect", "body", "progress"] as const) {
+    it(`covers ${mode} waits with the idle timeout`, { timeout: 3000 }, async (t) => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "llama-aio-idle-"));
+      const server = http.createServer((req, res) => {
+        if (mode === "redirect" && req.url === "/start") {
+          res.writeHead(302, { Location: "/silent" }); res.end();
+        } else if (mode === "body") {
+          res.writeHead(200); res.write("a");
+        } else if (mode === "progress") {
+          let sent = 0;
+          const timer = setInterval(() => {
+            res.write("a");
+            if (++sent === 8) { clearInterval(timer); res.end(); }
+          }, 20);
+          res.on("close", () => clearInterval(timer));
+        }
+      });
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+      t.after(async () => {
+        server.closeAllConnections();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+        fs.rmSync(dir, { recursive: true, force: true });
+      });
+      const dest = path.join(dir, "idle.gguf");
+      const started = Date.now();
+      const result = downloadHttpFile({
+        url: `http://127.0.0.1:${(server.address() as { port: number }).port}/start`,
+        dest, idleTimeoutMs: 100, signal: AbortSignal.timeout(1000),
+      });
+      if (mode === "progress") {
+        await result;
+        assert.equal(fs.readFileSync(dest, "utf8"), "a".repeat(8));
+      } else {
+        await assert.rejects(result, /idle timeout/);
+        assert.ok(Date.now() - started < 900, "timeout must precede the cleanup abort");
+      }
+    });
+  }
+
   const payload = Buffer.from("hello-llama-aio-download-manager-payload");
   const sha = createHash("sha256").update(payload).digest("hex");
   let server: http.Server;

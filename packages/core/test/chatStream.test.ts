@@ -35,6 +35,20 @@ const delta = (d: object) => ({ choices: [{ delta: d }] });
 const timings = { prompt_n: 12, prompt_ms: 100, predicted_n: 5, predicted_ms: 250, cache_n: 30 };
 
 describe("parseChatStream", () => {
+  for (const toolsEnabled of [false, true]) {
+    it(`emits message-style content and reasoning exactly once (tools=${toolsEnabled})`, async () => {
+      for (const message of [{ content: "Hello" }, { reasoning_content: "Thinking hard." }]) {
+        const parts = await collect(sse([{ choices: [{ message }] }, { choices: [{ message }] }, "[DONE]"]), toolsEnabled);
+        assert.equal(text(parts), "content" in message ? message.content : message.reasoning_content);
+      }
+      const parts = await collect(sse([
+        delta({ content: "Hello" }),
+        { choices: [{ message: { content: "Hello" } }] },
+      ]), toolsEnabled);
+      assert.equal(text(parts), "Hello", "a final message must not repeat streamed content");
+    });
+  }
+
   it("streams plain content and ends with server stats and a trace", async () => {
     const parts = await collect(
       sse([delta({ content: "Hel" }), delta({ content: "lo" }), { choices: [{ delta: {}, finish_reason: "stop" }], timings }, "[DONE]"]),

@@ -5,6 +5,7 @@ import { Readable, Transform } from "stream";
 import { pipeline } from "stream/promises";
 import { execFile, execFileSync } from "child_process";
 import { promisify } from "util";
+import { execText } from "./execRunner";
 import { swapInstallDir, withInstallLock, activeInstallLock } from "./installSwap";
 import {
   findSteamRun,
@@ -870,7 +871,7 @@ export function detectCudaHardware(): boolean {
   return cachedDetect("cuda", detectCudaHardwareUncached);
 }
 
-function detectCudaHardwareUncached(): boolean {
+function cudaPresenceHint(): boolean | undefined {
   if (process.env.CUDA_PATH || process.env.CUDA_HOME) {
     return true;
   }
@@ -883,15 +884,37 @@ function detectCudaHardwareUncached(): boolean {
       // ignore
     }
   }
-  if (commandExists("nvidia-smi")) {
-    try {
-      execFileSync("nvidia-smi", ["-L"], { stdio: "ignore", timeout: 3000 });
-      return true;
-    } catch {
-      return false;
-    }
+  return commandExists("nvidia-smi") ? undefined : false;
+}
+
+function detectCudaHardwareUncached(): boolean {
+  const known = cudaPresenceHint();
+  if (known !== undefined) return known;
+  try {
+    execFileSync("nvidia-smi", ["-L"], { stdio: "ignore", timeout: 3000 });
+    return true;
+  } catch {
+    return false;
   }
-  return false;
+}
+
+let cudaProbeInFlight: Promise<boolean> | undefined;
+
+/** Prime the shared hardware cache without blocking on a vendor executable. */
+export function detectCudaHardwareAsync(): Promise<boolean> {
+  const hit = hardwareCache.get("cuda");
+  if (hit && Date.now() - hit.at < HARDWARE_DETECT_TTL_MS) return Promise.resolve(hit.value);
+  if (cudaProbeInFlight) return cudaProbeInFlight;
+  const pending = (async () => {
+    const known = cudaPresenceHint();
+    const value = known ?? (await execText("nvidia-smi", ["-L"], 3000)).ok;
+    hardwareCache.set("cuda", { value, at: Date.now() });
+    return value;
+  })().finally(() => {
+    if (cudaProbeInFlight === pending) cudaProbeInFlight = undefined;
+  });
+  cudaProbeInFlight = pending;
+  return pending;
 }
 
 /** True when Vulkan looks usable (or we can at least install the Vulkan build). */
@@ -1310,6 +1333,14 @@ export class LlamaInstaller {
       }
     }
     return "cpu";
+  }
+
+  /** Auto backend selection for UI operations, including a cold CUDA cache. */
+  async resolveActiveUiBackendAsync(configured = this.getBackend()): Promise<UiBackend> {
+    if (configured !== "path" && !isManagedBackend(configured) && process.platform !== "darwin") {
+      await detectCudaHardwareAsync();
+    }
+    return this.resolveActiveUiBackend(configured);
   }
 
   getActiveInstallDir(backend?: UiBackend): string {
