@@ -51,6 +51,8 @@ export interface RemoteServerInfo {
   /** `/props` answered: this is llama.cpp with its extras (`/tokenize`, slots). */
   isLlamaCpp: boolean;
   modelId?: string;
+  /** Canonical served identity, distinct from a user-facing request alias. */
+  modelAlias?: string;
   modelSizeBytes?: number;
   modelParams?: number;
   trainedContext?: number;
@@ -98,6 +100,7 @@ interface PropsResponse {
   default_generation_settings?: { n_ctx?: number };
   total_slots?: number;
   model_path?: string;
+  model_alias?: string;
   build_info?: string;
   modalities?: { vision?: boolean; audio?: boolean };
 }
@@ -526,6 +529,7 @@ export async function probeRemoteServer(
     info.slotContext = positive(props.default_generation_settings?.n_ctx);
     info.totalSlots = positive(props.total_slots);
     info.modelPath = typeof props.model_path === "string" && props.model_path ? props.model_path : undefined;
+    info.modelAlias = typeof props.model_alias === "string" && props.model_alias ? props.model_alias : undefined;
     info.buildInfo = typeof props.build_info === "string" && props.build_info ? props.build_info : undefined;
     info.vision = props.modalities?.vision === true;
     info.audio = props.modalities?.audio === true;

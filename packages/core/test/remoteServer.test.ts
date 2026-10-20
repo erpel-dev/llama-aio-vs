@@ -139,6 +139,7 @@ describe("probeRemoteServer", () => {
             default_generation_settings: { n_ctx: 65536 },
             total_slots: 2,
             model_path: "/srv/models/qwythos-9b.gguf",
+            model_alias: "qwythos-9b",
             build_info: "b10517-abc",
             modalities: { vision: true },
           })
@@ -163,6 +164,7 @@ describe("probeRemoteServer", () => {
     assert.equal(info.state, "ready");
     assert.equal(info.isLlamaCpp, true);
     assert.equal(info.modelId, "qwythos-9b.gguf");
+    assert.equal(info.modelAlias, "qwythos-9b");
     assert.equal(info.slotContext, 65536);
     assert.equal(info.vision, true);
     assert.equal(info.servedContext, 32768);

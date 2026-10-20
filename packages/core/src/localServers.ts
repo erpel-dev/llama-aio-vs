@@ -5,7 +5,7 @@
  */
 import { runStepsAsync, runStepsSync, type ExecSteps } from "./execRunner";
 import { processCommandLine, processCommandLineAsync } from "./processIdentity";
-import { isLoopbackHost, isWildcardHost } from "./serverHttp";
+import { isLoopbackHost, isWildcardHost, serverJson } from "./serverHttp";
 
 export interface ListeningSocket {
   /** Bind address without brackets. May be `*`, `0.0.0.0`, or `::`. */
@@ -18,7 +18,8 @@ export interface DiscoveredLlamaServer {
   /** Loopback URL to pass to the existing remote connect path. */
   url: string;
   port: number;
-  pid: number;
+  /** Unknown when discovered through Strata's public health endpoint. */
+  pid?: number;
   /** Sidebar wording. Strata is not llama-server and must not be adopted or stopped. */
   name: "llama-server" | "Strata";
 }
@@ -44,6 +45,27 @@ export function localListenerName(commandLine: string | undefined): DiscoveredLl
 
 /** How many suggestions the sidebar shows. */
 export const MAX_DISCOVERED_SERVERS = 3;
+
+/** Strata 0.2's server default, followed by the launcher/older install default. */
+export const STRATA_DEFAULT_PORTS = [8095, 8080] as const;
+
+/** Identify Strata without process access (notably python.exe on Windows). */
+export async function probeLocalStrataServer(url: string): Promise<boolean> {
+  try {
+    if (!isLoopbackHost(new URL(url).hostname)) {
+      return false;
+    }
+    const health = await serverJson<{ service?: string }>(`${url}/health`, {
+      // /health is public. Do not send the managed llama-server's local API key.
+      apiKey: "",
+      timeoutMs: 750,
+      signal: AbortSignal.timeout(750),
+    });
+    return health?.service === "strata";
+  } catch {
+    return false;
+  }
+}
 
 /** True when a socket bound here accepts a connection to loopback. */
 export function isLocalhostReachableBind(bind: string): boolean {
@@ -181,7 +203,7 @@ export function discoverLoopbackLlamaServers(opts: {
     byProcess.set(key, { url, port: sock.port, pid: sock.pid, name });
   }
   return [...byProcess.values()]
-    .sort((a, b) => a.port - b.port || a.pid - b.pid)
+    .sort((a, b) => a.port - b.port || (a.pid ?? 0) - (b.pid ?? 0))
     .slice(0, MAX_DISCOVERED_SERVERS);
 }
 
@@ -211,20 +233,35 @@ export function discoverLoopbackLlamaServersOnThisMachine(skipPids: readonly num
   });
 }
 
-/** {@link discoverLoopbackLlamaServersOnThisMachine} without blocking the event loop. */
+/** Process discovery plus public Strata health probes, without blocking the event loop. */
 export async function discoverLoopbackLlamaServersOnThisMachineAsync(
   skipPids: readonly number[] = []
 ): Promise<DiscoveredLlamaServer[]> {
-  const sockets = await runStepsAsync(listListeningSockets());
+  const [sockets, strata] = await Promise.all([
+    runStepsAsync(listListeningSockets()),
+    Promise.all(STRATA_DEFAULT_PORTS.map(async (port) => {
+      const url = `http://127.0.0.1:${port}`;
+      return await probeLocalStrataServer(url) ? { url, port, name: "Strata" as const } : undefined;
+    })),
+  ]);
   const commandLines = new Map<number, string | undefined>();
   for (const pid of new Set((sockets || []).map((sock) => sock.pid))) {
     if (!skipPids.includes(pid)) {
       commandLines.set(pid, await processCommandLineAsync(pid));
     }
   }
-  return discoverLoopbackLlamaServers({
+  const found = discoverLoopbackLlamaServers({
     sockets,
     commandLine: (pid) => commandLines.get(pid),
     skipPids,
   });
+  for (const server of strata) {
+    if (server && !found.some((s) => s.name === "Strata" && s.port === server.port)) {
+      // A skipped/owned listener must never be offered through the HTTP fallback.
+      if (!sockets?.some((s) => s.port === server.port && skipPids.includes(s.pid))) {
+        found.push(server);
+      }
+    }
+  }
+  return found.slice(0, MAX_DISCOVERED_SERVERS);
 }

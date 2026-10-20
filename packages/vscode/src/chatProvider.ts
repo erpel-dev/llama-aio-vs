@@ -475,16 +475,21 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
   }
 
   /**
-   * Model-mode lookup. Remote servers match on the served id and model file
-   * name only; the local GGUF selection describes a different model.
+   * Model-mode lookup. Remote servers match their canonical alias, filename,
+   * then served id; the local GGUF selection describes a different model.
    */
   private modeSetFor(modelId: string, props: ServerProps | undefined) {
     if (!this.store.isRemote()) {
       return resolveModelModes(this.store.getState().modelCapabilities, modelId);
     }
     const file = props?.model_path || this.remoteInfo()?.modelPath;
-    const hay = [modelId, file ? path.basename(file) : ""].filter(Boolean).join(" ");
-    return resolveModelModes(undefined, hay);
+    const canonical = props?.model_alias || this.remoteInfo()?.modelAlias;
+    // The remote server may run on a different OS. Match only its filename,
+    // never a parent folder or this machine's selected GGUF.
+    const filename = file?.split(/[/\\]/).pop();
+    return resolveModelModes(undefined, canonical)
+      ?? resolveModelModes(undefined, filename)
+      ?? resolveModelModes(undefined, modelId);
   }
 
   private async cachedModelId(fallback: string): Promise<string> {

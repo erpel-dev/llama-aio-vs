@@ -79,6 +79,25 @@ describe("isGemma4Family", () => {
 });
 
 describe("resolveModelModes", () => {
+  it("recognizes Strata 0.2 setup IDs, including Swift's shortened base-model name", () => {
+    const ids = [
+      "qwen3.8-flash-next-q2_0", "qwen3.8-flash-next-iq3_xxs",
+      "qwen3.8-flash-next-coder-iq3_s", "qwen3.8-flash-next-unsloth-ud-q4_k_xl",
+      "qwen3.8-flash-next-gyro-gyro-m", "qwen3.8-flash-next-nvfp4-nvfp4",
+      "swift-1.5-iq3_s", "ukisai/Swift-1.5", "qwen3_8_flash_next_q2_0",
+      "qwen3-8-flash-next-q2_0", "Qwen 3.8 Flash Next",
+    ];
+    for (const id of ids) {
+      const set = resolveModelModes(undefined, id);
+      assert.equal(set?.familyLabel, "Qwen3.8 Flash-Next", id);
+      assert.equal(set?.modes["Think (XHigh)"].chat_template_kwargs?.reasoning_effort, "xhigh", id);
+    }
+    assert.equal(resolveModelModes(undefined, "qwen3.6-35b-a3b-ud-q4_k_xl")?.defaultMode, "Think (Coding)");
+    for (const id of ["swift-1.50", "swift-2.0", "strata", "local-model"]) {
+      assert.equal(resolveModelModes(undefined, id), undefined, id);
+    }
+  });
+
   it("gives Qwen3.8 XHigh/Medium/Low modes from the GGUF path", () => {
     const set = resolveModelModes(
       denseCaps({

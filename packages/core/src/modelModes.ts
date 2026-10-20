@@ -195,6 +195,10 @@ function haystack(caps?: ModelCapabilities, modelId?: string): string {
  */
 export function isQwen4expFamily(hay: string): boolean {
   const h = hay.toLowerCase();
+  // Strata's Swift 1.5 fine-tune IDs omit the base model name entirely.
+  if (/\bswift[-_ ]1[._]5(?=$|[-_.\s/\\])/.test(h)) {
+    return true;
+  }
   if (/qwen4exp/.test(h) || /qwen4_exp/.test(h) || /qwen4-exp/.test(h)) {
     return true;
   }
@@ -202,7 +206,7 @@ export function isQwen4expFamily(hay: string): boolean {
     return false;
   }
   return (
-    /qwen3\.8[-_.]?flash/.test(h) ||
+    /qwen[-_ ]?3[._-]8[-_. ]flash/.test(h) ||
     /qwen-?3\.8[-_.]?flash/.test(h) ||
     /qwen38[-_.]?flash/.test(h) ||
     /flash[-_]?next/.test(h)
