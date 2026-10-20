@@ -24,6 +24,7 @@ import {
   remoteStateLabel,
   remoteStateUsable,
   rocmRuntimeMissingReason,
+  setHfTokenProvider,
   setServerApiKeyProvider,
   shortBuild,
   syclRuntimeMissingReason,
@@ -939,6 +940,54 @@ export function activate(context: vscode.ExtensionContext): void {
       await context.secrets.delete(API_PREFIX + origin);
     },
   });
+
+  // Hugging Face token: Secret Storage first, with the plaintext config value
+  // migrated once so existing users keep their gated-repo access.
+  const HF_TOKEN_SECRET = "llama-aio.hfToken";
+  let hfTokenCache = "";
+  setHfTokenProvider(() => hfTokenCache || undefined);
+  const loadHfToken = async (): Promise<string | undefined> => {
+    try {
+      hfTokenCache = ((await context.secrets.get(HF_TOKEN_SECRET)) || "").trim();
+    } catch {
+      // Secret Storage can be unavailable; fall through to the legacy value.
+      hfTokenCache = "";
+    }
+    if (!hfTokenCache) {
+      const legacy = (store.getConfig().get<string>("hfToken") || "").trim();
+      if (legacy) {
+        hfTokenCache = legacy;
+        try {
+          await context.secrets.store(HF_TOKEN_SECRET, legacy);
+          await store.getConfig().update("hfToken", "");
+        } catch {
+          // Keep working from the in-memory value even if storage fails.
+        }
+      }
+    }
+    return hfTokenCache || undefined;
+  };
+  settingsView.attachHfTokenStore({
+    get: () => hfTokenCache || undefined,
+    load: loadHfToken,
+    async set(value) {
+      hfTokenCache = value;
+      await context.secrets.store(HF_TOKEN_SECRET, value);
+    },
+    async delete() {
+      hfTokenCache = "";
+      await context.secrets.delete(HF_TOKEN_SECRET);
+    },
+  });
+  void loadHfToken();
+  context.subscriptions.push(
+    context.secrets.onDidChange((e) => {
+      if (e.key === HF_TOKEN_SECRET) {
+        void loadHfToken();
+      }
+    })
+  );
+
   const preloadKey = async (url: string | undefined) => {
     const origin = originOf(url);
     if (origin) {

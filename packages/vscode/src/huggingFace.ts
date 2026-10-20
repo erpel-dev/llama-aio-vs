@@ -12,6 +12,7 @@ import {
   preferredMmprojFile,
   preferredMtpDraftFile,
   remoteShardPaths,
+  resolveHfToken,
   STARTER_MODEL,
   HuggingFaceClient,
   type HfFileHit,
@@ -21,8 +22,7 @@ import {
 export { HuggingFaceClient, STARTER_MODEL };
 
 function hfToken(store: SettingsStore): string | undefined {
-  const t = (store.getConfig().get<string>("hfToken") || "").trim();
-  return t || undefined;
+  return resolveHfToken(store);
 }
 
 function enqueueHfFile(

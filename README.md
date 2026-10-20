@@ -44,7 +44,7 @@ The running model appears in Copilot Chat as **Llama AIO: …**, including Agent
 
 ## Good to know
 
-- **One shared server** at `http://127.0.0.1:8742` for all VS Code windows. It starts in an external terminal (logs visible) or in the background.
+- **One shared server** at `http://127.0.0.1:8742` for all VS Code windows. It starts in an external terminal (logs visible) or in the background, and always requires a per-user API key (`~/.llama-aio-vs/runtime/local-api.key`, created on first launch) so loopback stays a transport detail, not an authentication boundary. The extension and TUI send the key automatically.
 - **Backends:** Vulkan (default, good for AMD), CUDA (NVIDIA), CPU, or a `llama-server` already on your `PATH`. Upgrades are swapped in only after a successful download; pin a release tag or install from an archive if you need to.
 - **Licences:** the Hugging Face picker shows each model's licence and warns before downloading anything that isn't clearly permissive.
 - **Vision:** attach an `mmproj` projector to send images (added automatically when one sits next to the model).
@@ -58,7 +58,7 @@ Run **Llama AIO: Open Configuration File** to edit `~/.llama-aio-vs/config.json`
 | --- | --- |
 | `port` / `host` | Server address (default `8742` / `127.0.0.1`) |
 | `modelsDir` / `extraModelDirs` | Where models are downloaded / extra folders to scan |
-| `hfToken` | Token for gated or private Hugging Face models |
+| `hfToken` | Token for gated or private Hugging Face models. VS Code stores the token in Secret Storage (sidebar → Hugging Face token) and migrates an existing value out of `config.json`; the TUI reads `HF_TOKEN` / `HUGGING_FACE_HUB_TOKEN` or this key. |
 | `backend` | `auto`, `vulkan`, `cuda`, `cpu`, `rocm`, … |
 | `launchMode` | `externalTerminal` (default) or `background` |
 | `autoStart` | Start the server when VS Code opens |

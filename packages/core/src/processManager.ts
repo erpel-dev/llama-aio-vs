@@ -53,6 +53,7 @@ import { formatCommandDisplay, normalizeLoadSettingsForCpuBackend } from "./serv
 import { LlamaLoadSettings, ServerStatus } from "./types";
 import { activeInstallLock } from "./installSwap";
 import { acquireLaunchLock, activeLaunchLock, LaunchLockHandle } from "./launchLock";
+import { ensureLocalApiKey } from "./localApiKey";
 import { rocmRuntimeMissingReason } from "./rocmRuntime";
 import { syclRuntimeMissingReason } from "./syclRuntime";
 
@@ -796,7 +797,10 @@ export class ProcessManager {
       "utf8"
     );
 
-    const childEnv = launch.env;
+    // The key travels in the environment, not argv: no `cmd.exe`, no lock file
+    // or log line, and it still works for every llama.cpp build with --api-key.
+    // Loopback is not an auth boundary, so every launch gets one.
+    const childEnv = { ...launch.env, LLAMA_API_KEY: ensureLocalApiKey() };
 
     report(
       launch.method === "steam-run"
@@ -1209,11 +1213,11 @@ export class ProcessManager {
     // half-written JSON document.
     const target = getLockPath();
     const tmp = `${target}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(data, null, 2), "utf8");
+    fs.writeFileSync(tmp, JSON.stringify(data, null, 2), { encoding: "utf8", mode: 0o600 });
     try {
       fs.renameSync(tmp, target);
     } catch {
-      fs.writeFileSync(target, JSON.stringify(data, null, 2), "utf8");
+      fs.writeFileSync(target, JSON.stringify(data, null, 2), { encoding: "utf8", mode: 0o600 });
       try {
         fs.unlinkSync(tmp);
       } catch {

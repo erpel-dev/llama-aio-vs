@@ -17,6 +17,12 @@
   "engines": {
     "vscode": "^1.109.0"
   },
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "Installs and launches native llama.cpp binaries and manages model files, so it stays disabled in restricted mode."
+    }
+  },
   "categories": [
     "AI",
     "Machine Learning",

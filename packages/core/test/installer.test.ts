@@ -14,6 +14,7 @@ import {
   pickNewestBuildTag,
   resetHardwareDetectionCache,
   resolveLatestReleaseTag,
+  sha256FromDigest,
 } from "../src/llamaInstaller";
 
 const asset = (name: string) => ({
@@ -473,5 +474,16 @@ describe("GitHub llama.cpp fetch", () => {
     const gzip = buf[0] === 0x1f && buf[1] === 0x8b;
     const zip = buf[0] === 0x50 && buf[1] === 0x4b;
     assert.ok(gzip || zip, `unexpected magic ${buf.slice(0, 4).toString("hex")}`);
+  });
+});
+
+describe("release asset integrity", () => {
+  it("accepts only sha256 digests from the GitHub API", () => {
+    const hex = "0123456789abcdef".repeat(4);
+    assert.equal(sha256FromDigest(`sha256:${hex}`), hex);
+    assert.equal(sha256FromDigest(`SHA256:${hex.toUpperCase()}`), hex);
+    assert.equal(sha256FromDigest(`sha512:${hex}`), undefined);
+    assert.equal(sha256FromDigest("sha256:short"), undefined);
+    assert.equal(sha256FromDigest(undefined), undefined);
   });
 });

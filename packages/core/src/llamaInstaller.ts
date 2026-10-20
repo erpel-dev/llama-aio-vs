@@ -1,5 +1,5 @@
+import { createHash } from "crypto";
 import * as fs from "fs";
-import * as os from "os";
 import * as path from "path";
 import { Readable, Transform } from "stream";
 import { pipeline } from "stream/promises";
@@ -17,6 +17,7 @@ import {
   ensureDirs,
   findLlamaServerOnPath,
   getBackendInstallDir,
+  getDataRoot,
   getInstallDir,
   getLlamaServerBinary,
   getLockPath,
@@ -141,6 +142,8 @@ export interface GithubAsset {
    */
   url?: string;
   size: number;
+  /** GitHub's asset digest, `sha256:<hex>`. Verified before the archive is extracted. */
+  digest?: string;
 }
 
 interface GithubRelease {
@@ -300,6 +303,58 @@ async function httpGetJson<T>(
 /** How long to wait for download response headers (redirects included). */
 const DOWNLOAD_HEADER_TIMEOUT_MS = 60_000;
 const DOWNLOAD_ATTEMPTS = 3;
+/** Hard ceiling for one release asset (cudart packs are the largest, ~1 GiB). */
+const MAX_RELEASE_ASSET_BYTES = 3 * 1024 * 1024 * 1024;
+
+/**
+ * Hosts GitHub may legitimately redirect a release download to. A redirect
+ * anywhere else is treated as an attack rather than followed.
+ */
+const TRUSTED_RELEASE_HOSTS = new Set([
+  "github.com",
+  "api.github.com",
+  "codeload.github.com",
+  "objects.githubusercontent.com",
+  "release-assets.githubusercontent.com",
+]);
+
+/**
+ * Unique, user-private work directory for one install. `mkdtemp` creates it
+ * 0700 with an unpredictable name, so another local user cannot pre-create it
+ * or point it at a symlink (the old shared `/tmp/llama-aio-vs` allowed that).
+ */
+function createInstallWorkDir(prefix: string): string {
+  const root = path.join(getDataRoot(), "tmp");
+  ensureDirs(root);
+  return fs.mkdtempSync(path.join(root, prefix));
+}
+
+/** Release asset names are single path segments; never let one steer the path. */
+function safeAssetFileName(name: string): string {
+  const base = path.basename(name);
+  if (!base || base !== name || base === "." || base === ".." || /[\\/:]/.test(base)) {
+    throw new Error(`Unexpected release asset name: ${name}`);
+  }
+  return base;
+}
+
+/** `sha256:<hex>` from the GitHub API as a bare lowercase hex digest. */
+export function sha256FromDigest(digest: string | undefined): string | undefined {
+  const match = /^sha256:([a-f0-9]{64})$/i.exec((digest || "").trim());
+  return match ? match[1]!.toLowerCase() : undefined;
+}
+
+function assertTrustedDownloadHost(url: string): void {
+  let host: string;
+  try {
+    host = new URL(url).hostname.toLowerCase();
+  } catch {
+    throw new Error(`Download failed: invalid URL ${url}`);
+  }
+  if (!TRUSTED_RELEASE_HOSTS.has(host) && !host.endsWith(".githubusercontent.com")) {
+    throw new Error(`Download failed: refusing unexpected redirect host ${host}`);
+  }
+}
 
 interface DownloadTick {
   received: number;
@@ -313,13 +368,14 @@ async function downloadFile(
   url: string,
   dest: string,
   onProgress?: (tick: DownloadTick) => void,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  expectedSha256?: string
 ): Promise<void> {
   let lastErr: unknown;
   for (let attempt = 1; attempt <= DOWNLOAD_ATTEMPTS; attempt++) {
     throwIfCancelled(signal);
     try {
-      await downloadFileOnce(url, dest, onProgress, signal);
+      await downloadFileOnce(url, dest, onProgress, signal, expectedSha256);
       return;
     } catch (err) {
       try {
@@ -344,7 +400,8 @@ async function downloadFileOnce(
   url: string,
   dest: string,
   onProgress?: (tick: DownloadTick) => void,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  expectedSha256?: string
 ): Promise<void> {
   const res = await githubFetch(
     url,
@@ -358,7 +415,13 @@ async function downloadFileOnce(
   if (!res.body) {
     throw new Error(`Download failed: empty body for ${url}`);
   }
+  // A redirected download must still come from GitHub's asset hosts.
+  assertTrustedDownloadHost(res.url || url);
   const total = Number(res.headers.get("content-length") || 0);
+  if (total > MAX_RELEASE_ASSET_BYTES) {
+    throw new Error(`Download failed: ${total} bytes exceeds the ${MAX_RELEASE_ASSET_BYTES} byte limit`);
+  }
+  const hash = expectedSha256 ? createHash("sha256") : undefined;
   let received = 0;
   const started = Date.now();
   let lastEmit = 0;
@@ -387,12 +450,25 @@ async function downloadFileOnce(
   const counter = new Transform({
     transform(chunk: Buffer | Uint8Array, _enc, cb) {
       received += chunk.length;
+      if (received > MAX_RELEASE_ASSET_BYTES) {
+        cb(new Error(`Download failed: body exceeds the ${MAX_RELEASE_ASSET_BYTES} byte limit`));
+        return;
+      }
+      hash?.update(chunk);
       emit();
       cb(null, chunk);
     },
   });
-  await pipeline(src, counter, fs.createWriteStream(dest), { signal });
+  await pipeline(src, counter, fs.createWriteStream(dest, { flags: "wx", mode: 0o600 }), { signal });
   emit(true);
+  if (hash && expectedSha256) {
+    const actual = hash.digest("hex");
+    if (actual !== expectedSha256.toLowerCase()) {
+      throw new Error(
+        `Download integrity check failed for ${path.basename(dest)}: expected sha256 ${expectedSha256}, got ${actual}`
+      );
+    }
+  }
 }
 
 async function downloadReleaseFile(
@@ -403,7 +479,8 @@ async function downloadReleaseFile(
   fileIndex: number,
   fileCount: number,
   releaseTag: string | undefined,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  expectedSha256?: string
 ): Promise<void> {
   const label = fileCount > 1 ? `${assetName} (${fileIndex} of ${fileCount})` : assetName;
   const base = {
@@ -429,7 +506,8 @@ async function downloadReleaseFile(
         etaSeconds: tick.etaSeconds,
       });
     },
-    signal
+    signal,
+    expectedSha256
   );
 }
 
@@ -1838,8 +1916,35 @@ export class LlamaInstaller {
       releaseTag: tag,
     });
 
+    const downloaded = await this.downloadReleaseAssets(tag, uiBackend, progress, signal);
+    try {
+      return await this.installFromArchiveUnlocked(downloaded.archivePath, {
+        uiBackend,
+        tag,
+        assetName: downloaded.assetName,
+        cudartArchivePath: downloaded.cudartPath,
+        progress,
+        signal,
+      });
+    } finally {
+      fs.rmSync(downloaded.workDir, { recursive: true, force: true });
+    }
+  }
+
+  /**
+   * Resolve the right assets for `tag` and download them into a private work
+   * directory. GitHub's `digest` field is verified when the API listed the
+   * assets, so a tampered mirror, proxy or CDN payload never gets extracted.
+   */
+  private async downloadReleaseAssets(
+    tag: string,
+    uiBackend: UiBackend,
+    progress: ProgressReporter | undefined,
+    signal?: AbortSignal
+  ): Promise<{ assetName: string; archivePath: string; cudartPath?: string; workDir: string }> {
     let assetName: string | undefined;
     let assetUrl: string | undefined;
+    let assetSha256: string | undefined;
     const probes: Array<{ name: string; probe: UrlProbe }> = [];
 
     const listed = await this.listReleaseAssets(tag, signal);
@@ -1847,6 +1952,7 @@ export class LlamaInstaller {
     if (picked) {
       assetName = picked.name;
       assetUrl = picked.url || picked.browser_download_url;
+      assetSha256 = sha256FromDigest(picked.digest);
     } else {
       const candidates = candidateAssetNames(tag, uiBackend);
       for (const name of candidates) {
@@ -1872,46 +1978,63 @@ export class LlamaInstaller {
       throw new Error(describeMissingAsset(tag, uiBackend, probes, listed));
     }
 
-    const tmpDir = path.join(os.tmpdir(), "llama-aio-vs");
-    ensureDirs(tmpDir);
-    const archivePath = path.join(tmpDir, assetName);
-    const cudartPlanned =
-      uiBackend === "cuda" && process.platform === "win32" && listed
-        ? pickCudartAsset(listed, assetName)
-        : undefined;
-    const fileCount = cudartPlanned ? 2 : 1;
-    await downloadReleaseFile(progress, assetUrl, archivePath, assetName, 1, fileCount, tag, signal);
+    const workDir = createInstallWorkDir("download-");
+    try {
+      const archivePath = path.join(workDir, safeAssetFileName(assetName));
+      const cudartPlanned =
+        uiBackend === "cuda" && process.platform === "win32" && listed
+          ? pickCudartAsset(listed, assetName)
+          : undefined;
+      const fileCount = cudartPlanned ? 2 : 1;
+      await downloadReleaseFile(
+        progress,
+        assetUrl,
+        archivePath,
+        assetName,
+        1,
+        fileCount,
+        tag,
+        signal,
+        assetSha256
+      );
 
-    let cudartPath: string | undefined;
-    if (uiBackend === "cuda" && process.platform === "win32") {
-      const cudart = cudartPlanned;
-      const cudartUrl = cudart?.url || cudart?.browser_download_url;
-      const cudartName = cudart?.name;
-      if (cudartUrl && cudartName) {
-        cudartPath = path.join(tmpDir, cudartName);
-        await downloadReleaseFile(progress, cudartUrl, cudartPath, cudartName, 2, 2, tag, signal);
-      } else {
-        for (const name of candidateCudartNames(assetName)) {
-          throwIfCancelled(signal);
-          const url = directAssetUrl(tag, name);
-          if (!(await urlExists(url, signal))) {
-            continue;
+      let cudartPath: string | undefined;
+      if (uiBackend === "cuda" && process.platform === "win32") {
+        const cudart = cudartPlanned;
+        const cudartUrl = cudart?.url || cudart?.browser_download_url;
+        const cudartName = cudart?.name;
+        if (cudartUrl && cudartName) {
+          cudartPath = path.join(workDir, safeAssetFileName(cudartName));
+          await downloadReleaseFile(
+            progress,
+            cudartUrl,
+            cudartPath,
+            cudartName,
+            2,
+            2,
+            tag,
+            signal,
+            sha256FromDigest(cudart?.digest)
+          );
+        } else {
+          for (const name of candidateCudartNames(assetName)) {
+            throwIfCancelled(signal);
+            const url = directAssetUrl(tag, name);
+            if (!(await urlExists(url, signal))) {
+              continue;
+            }
+            cudartPath = path.join(workDir, safeAssetFileName(name));
+            await downloadReleaseFile(progress, url, cudartPath, name, 2, 2, tag, signal);
+            break;
           }
-          cudartPath = path.join(tmpDir, name);
-          await downloadReleaseFile(progress, url, cudartPath, name, 2, 2, tag, signal);
-          break;
         }
       }
-    }
 
-    return this.installFromArchiveUnlocked(archivePath, {
-      uiBackend,
-      tag,
-      assetName,
-      cudartArchivePath: cudartPath,
-      progress,
-      signal,
-    });
+      return { assetName, archivePath, cudartPath, workDir };
+    } catch (err) {
+      fs.rmSync(workDir, { recursive: true, force: true });
+      throw err;
+    }
   }
 
   /**
@@ -1936,6 +2059,26 @@ export class LlamaInstaller {
 
   private async installFromArchiveUnlocked(
     archivePath: string,
+    options: {
+      uiBackend?: UiBackend;
+      tag?: string;
+      assetName?: string;
+      cudartArchivePath?: string;
+      progress?: ProgressReporter;
+      signal?: AbortSignal;
+    } = {}
+  ): Promise<string> {
+    const workDir = createInstallWorkDir("extract-");
+    try {
+      return await this.extractAndInstall(archivePath, workDir, options);
+    } finally {
+      fs.rmSync(workDir, { recursive: true, force: true });
+    }
+  }
+
+  private async extractAndInstall(
+    archivePath: string,
+    workDir: string,
     options: {
       uiBackend?: UiBackend;
       tag?: string;
@@ -1988,11 +2131,9 @@ export class LlamaInstaller {
 
     const installDir = getBackendInstallDir(this.store.getConfig(), uiBackend);
     ensureDirs(installDir);
-    const tmpDir = path.join(os.tmpdir(), "llama-aio-vs");
-    ensureDirs(tmpDir);
 
     emitInstall(progress, { phase: "extract", message: "Extracting…", assetName, releaseTag: tag });
-    const extractTo = path.join(tmpDir, `extract-${Date.now()}`);
+    const extractTo = path.join(workDir, "archive");
     ensureDirs(extractTo);
     await extractArchive(archivePath, extractTo);
 
@@ -2079,7 +2220,7 @@ export class LlamaInstaller {
         assetName,
         releaseTag: tag,
       });
-      const cudartExtract = path.join(tmpDir, `cudart-extract-${Date.now()}`);
+      const cudartExtract = path.join(workDir, "cudart");
       ensureDirs(cudartExtract);
       await extractArchive(options.cudartArchivePath, cudartExtract);
       copyFilesIntoBin(cudartExtract, binDir, [".dll"]);

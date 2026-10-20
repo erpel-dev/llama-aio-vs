@@ -7,6 +7,7 @@
 import * as http from "http";
 import * as https from "https";
 import * as net from "net";
+import { isLoopbackOrigin, readLocalApiKey } from "./localApiKey";
 
 export type ConnectionErrorKind =
   | "refused"
@@ -58,7 +59,12 @@ export function originOf(url: string | undefined): string | undefined {
 
 export function apiKeyForUrl(url: string): string | undefined {
   const origin = originOf(url);
-  return origin ? apiKeyProvider(origin) || undefined : undefined;
+  if (!origin) {
+    return undefined;
+  }
+  // Remote keys win. Loopback falls back to the local server's key, which the
+  // extension and the TUI share through the runtime directory.
+  return apiKeyProvider(origin) || (isLoopbackOrigin(origin) ? readLocalApiKey() : undefined);
 }
 
 /** `base` + `path`, keeping any path prefix on `base` (`https://h/llama` + `/props`). */
