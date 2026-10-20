@@ -49,6 +49,8 @@ const DUPLICATE_TOOL_CALL_SYSTEM_HINT =
 
 interface OpenAiModel {
   id: string;
+  owned_by?: string;
+  meta?: { label?: string };
 }
 
 interface OpenAiModelsResponse {
@@ -341,7 +343,7 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
   private static readonly PROBE_TTL_MS = 2_000;
   private readyProbe: { endpoint: string; at: number } | undefined;
   private propsProbe: { endpoint: string; at: number; props: ServerProps } | undefined;
-  private modelProbe: { endpoint: string; at: number; modelId: string } | undefined;
+  private modelProbe: { endpoint: string; at: number; modelId: string; modelName?: string } | undefined;
 
   private async getReplacementRules(): Promise<PromptReplacement[]> {
     const custom = this.store.getPromptReplacementsFile();
@@ -487,8 +489,14 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
     // The remote server may run on a different OS. Match only its filename,
     // never a parent folder or this machine's selected GGUF.
     const filename = file?.split(/[/\\]/).pop();
+    const cached = this.modelProbe;
+    const remote = this.remoteInfo();
+    const cachedName = cached?.endpoint === this.store.getEndpoint() && cached.modelId === modelId
+      ? cached.modelName : undefined;
+    const name = cachedName ?? (remote?.modelId === modelId ? remote.modelName : undefined);
     return resolveModelModes(undefined, canonical)
       ?? resolveModelModes(undefined, filename)
+      ?? resolveModelModes(undefined, name)
       ?? resolveModelModes(undefined, modelId);
   }
 
@@ -502,9 +510,12 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
       const models = await serverJson<OpenAiModelsResponse>(joinServerUrl(endpoint, "/v1/models"), {
         timeoutMs: this.store.isRemote() ? 5000 : 3000,
       });
-      const modelId = models.data?.[0]?.id;
+      const first = models.data?.[0];
+      const modelId = first?.id;
       if (modelId) {
-        this.modelProbe = { endpoint, at: Date.now(), modelId };
+        const modelName = first.owned_by === "strata" && typeof first.meta?.label === "string"
+          ? first.meta.label : undefined;
+        this.modelProbe = { endpoint, at: Date.now(), modelId, modelName };
         return modelId;
       }
     } catch {

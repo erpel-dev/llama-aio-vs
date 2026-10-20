@@ -5,7 +5,7 @@
  */
 import { runStepsAsync, runStepsSync, type ExecSteps } from "./execRunner";
 import { processCommandLine, processCommandLineAsync } from "./processIdentity";
-import { isLoopbackHost, isWildcardHost, serverJson } from "./serverHttp";
+import { isLoopbackHost, isWildcardHost, readBody, serverJson, serverRequest } from "./serverHttp";
 
 export interface ListeningSocket {
   /** Bind address without brackets. May be `*`, `0.0.0.0`, or `::`. */
@@ -46,8 +46,8 @@ export function localListenerName(commandLine: string | undefined): DiscoveredLl
 /** How many suggestions the sidebar shows. */
 export const MAX_DISCOVERED_SERVERS = 3;
 
-/** Strata 0.2's server default, followed by the launcher/older install default. */
-export const STRATA_DEFAULT_PORTS = [8095, 8080] as const;
+/** Desktop host, standalone server, launcher, and source-run host defaults. */
+export const STRATA_DEFAULT_PORTS = [47831, 8095, 8080, 8791] as const;
 
 /** Identify Strata without process access (notably python.exe on Windows). */
 export async function probeLocalStrataServer(url: string): Promise<boolean> {
@@ -55,13 +55,27 @@ export async function probeLocalStrataServer(url: string): Promise<boolean> {
     if (!isLoopbackHost(new URL(url).hostname)) {
       return false;
     }
-    const health = await serverJson<{ service?: string }>(`${url}/health`, {
-      // /health is public. Do not send the managed llama-server's local API key.
+    const options = {
+      // Health endpoints are public. Never send the managed server's API key.
       apiKey: "",
       timeoutMs: 750,
       signal: AbortSignal.timeout(750),
-    });
-    return health?.service === "strata";
+    };
+    try {
+      const health = await serverJson<{ service?: string }>(`${url}/health`, options);
+      if (health?.service === "strata") {
+        return true;
+      }
+    } catch {
+      // The Desktop host serves the UI here; its health route is /api/health.
+    }
+    const res = await serverRequest(`${url}/api/health`, options);
+    const body = await readBody(res, 64 * 1024);
+    const health = JSON.parse(body);
+    const headers = String(res.headers["access-control-allow-headers"] || "").toLowerCase().split(/\s*,\s*/);
+    return res.statusCode === 200 && headers.includes("x-strata-client")
+      && health?.ok === true && typeof health.backend?.kind === "string"
+      && !!health.engine && typeof health.engine === "object" && !Array.isArray(health.engine);
   } catch {
     return false;
   }

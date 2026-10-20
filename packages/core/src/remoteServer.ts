@@ -53,6 +53,8 @@ export interface RemoteServerInfo {
   modelId?: string;
   /** Canonical served identity, distinct from a user-facing request alias. */
   modelAlias?: string;
+  /** Strata Desktop's human-readable family name for opaque IDs such as q2_0. */
+  modelName?: string;
   modelSizeBytes?: number;
   modelParams?: number;
   trainedContext?: number;
@@ -90,7 +92,8 @@ export interface RemoteServerInfo {
 interface ModelsResponse {
   data?: Array<{
     id?: string;
-    meta?: { size?: number; n_params?: number; n_ctx_train?: number };
+    owned_by?: string;
+    meta?: { size?: number; n_params?: number; n_ctx_train?: number; label?: string };
     /** vLLM's served context length. */
     max_model_len?: number;
   }>;
@@ -502,6 +505,8 @@ export async function probeRemoteServer(
     });
     const first = models.data?.[0];
     info.modelId = typeof first?.id === "string" && first.id ? first.id : undefined;
+    info.modelName = first?.owned_by === "strata" && typeof first.meta?.label === "string"
+      ? first.meta.label : undefined;
     info.modelSizeBytes = positive(first?.meta?.size);
     info.modelParams = positive(first?.meta?.n_params);
     info.trainedContext = positive(first?.meta?.n_ctx_train);

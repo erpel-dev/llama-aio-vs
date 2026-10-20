@@ -57,6 +57,8 @@ let endpoint = "";
 let lastBody;
 let servedModelId;
 let servedProps;
+let servedMetadata;
+let propsStatus;
 /** How /v1/chat/completions answers: array of SSE data objects, optional per-event delay. */
 let reply = { events: [], delayMs: 0 };
 
@@ -71,13 +73,13 @@ before(async () => {
         return;
       }
       if (req.url === "/props") {
-        res.writeHead(200, { "Content-Type": "application/json" });
+        res.writeHead(propsStatus || 200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ default_generation_settings: { n_ctx: 32768 }, total_slots: 1, ...servedProps }));
         return;
       }
       if (req.url === "/v1/models") {
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ data: [{ id: servedModelId || "test-model" }] }));
+        res.end(JSON.stringify({ data: [{ id: servedModelId || "test-model", ...servedMetadata }] }));
         return;
       }
       lastBody = JSON.parse(body);
@@ -155,7 +157,36 @@ describe("LlamaAioChatProvider requests", () => {
     lastBody = undefined;
     servedModelId = undefined;
     servedProps = undefined;
+    servedMetadata = undefined;
+    propsStatus = undefined;
   });
+
+  for (const [id, label, family, defaultMode] of [
+    ["q2_0", "Qwen3.8-Flash-Next Q2_0", "Qwen3.8 Flash-Next", "Think (XHigh)"],
+    ["swift-iq3_s", "Swift 1.5 IQ3_S", "Qwen3.8 Flash-Next", "Think (XHigh)"],
+    ["gyro-gyro-m", "Qwen3.8-Flash-Next Gyro-M", "Qwen3.8 Flash-Next", "Think (XHigh)"],
+    ["qwen36-ud-q4_k_xl", "Qwen3.6-35B-A3B UD-Q4_K_XL", "Qwen3", "Think (Coding)"],
+  ]) {
+    for (const source of ["models", "remote probe"]) {
+      it(`maps Desktop ID ${id} through the ${source} label and preserves its request ID`, async () => {
+        servedModelId = id;
+        servedMetadata = source === "models" ? { owned_by: "strata", meta: { label } } : undefined;
+        propsStatus = 404;
+        const { provider } = setup({ remote: true, remoteInfo: {
+          isLlamaCpp: false, modelId: id,
+          ...(source === "remote probe" ? { modelName: label } : {}),
+        } });
+        const [model] = await provider.provideLanguageModelChatInformation({}, cancelToken().token);
+        assert.equal(model.id, id);
+        assert.equal(model.configurationSchema.properties.reasoningEffort.default, defaultMode);
+        assert.equal(provider.modeSetFor(id, undefined).familyLabel, family);
+        await provider.provideLanguageModelChatResponse(model, [msg(Role.User, new TextPart("hello"))],
+          {}, { report() {} }, cancelToken().token);
+        assert.equal(lastBody.model, id);
+        assert.equal(lastBody.chat_template_kwargs.reasoning_effort, family === "Qwen3" ? undefined : "xhigh");
+      });
+    }
+  }
 
   for (const source of ["props", "remote probe"]) {
     it(`uses Strata's canonical model alias from ${source} for the picker and request profile`, async () => {
