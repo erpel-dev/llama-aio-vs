@@ -32,6 +32,7 @@ describe("ProcessManager stop during start", { skip: process.platform === "win32
   let pm: ProcessManager;
   let store: SettingsStore;
   const pidFile = path.join(home, "fake-server.pid");
+  const keyFile = path.join(home, "fake-server.key");
 
   before(async () => {
     // A "llama-server" that never answers HTTP: start keeps waiting until stopped.
@@ -43,6 +44,7 @@ describe("ProcessManager stop during start", { skip: process.platform === "win32
         "#!/bin/sh",
         'case "$1" in --version|--list-devices) echo "version: 1 (fake)"; exit 0;; esac',
         `echo $$ > "${pidFile}"`,
+        `echo "\${LLAMA_API_KEY:-}" > "${keyFile}"`,
         'echo "loading model"',
         "exec sleep 60",
         "",
@@ -76,6 +78,7 @@ describe("ProcessManager stop during start", { skip: process.platform === "win32
     }
     assert.ok(fs.existsSync(pidFile), "fake llama-server was spawned");
     const pid = Number(fs.readFileSync(pidFile, "utf8").trim());
+    assert.match(fs.readFileSync(keyFile, "utf8").trim(), /^[a-f0-9]{64}$/, "launch carries LLAMA_API_KEY");
     await pm.stop(true);
     const result = await outcome;
     assert.ok(result instanceof LaunchCancelledError, `expected cancel, got ${String(result)}`);

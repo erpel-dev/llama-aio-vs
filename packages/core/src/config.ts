@@ -118,10 +118,25 @@ export const DEFAULT_APP_PREFERENCES: AppPreferences = {
   server: DEFAULT_SERVER_PREFERENCES,
 };
 
+/** Only http(s) URLs without embedded credentials survive a hand-edited config. */
+function validRemoteUrl(value: string): string {
+  if (!value) {
+    return "";
+  }
+  try {
+    const url = new URL(value);
+    return (url.protocol === "http:" || url.protocol === "https:") && url.hostname && !url.username && !url.password
+      ? value
+      : "";
+  } catch {
+    return "";
+  }
+}
+
 function normalizeServerPreferences(raw: unknown): ServerPreferences {
   const src = (raw && typeof raw === "object" ? raw : {}) as Partial<ServerPreferences>;
   const str = (v: unknown) => (typeof v === "string" ? v.trim() : "");
-  const remoteUrl = str(src.remoteUrl);
+  const remoteUrl = validRemoteUrl(str(src.remoteUrl));
   return {
     mode: src.mode === "remote" && remoteUrl ? "remote" : "local",
     remoteUrl,

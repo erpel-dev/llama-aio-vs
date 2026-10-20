@@ -34,39 +34,29 @@ describe("buildWindowsExternalLaunch", () => {
   const logPath = path.join("C:", "Users", "me", ".llama-aio-vs", "runtime", "llama-server.log");
   const args = ["-m", "model.gguf", "--port", "8742"];
 
-  it("starts llama-server.exe via cmd start, never PowerShell", () => {
+  it("spawns llama-server.exe directly, never a shell", () => {
     const plan = buildWindowsExternalLaunch({ binary, args, logPath });
-    assert.equal(plan.command, "cmd.exe");
-    assert.equal(plan.argv[0], "/c");
-    assert.equal(plan.argv[1], "start");
-    assert.equal(plan.argv[2], "Llama AIO - llama-server");
-    assert.equal(plan.argv[3], binary);
-    assert.equal(plan.argv[4], "--log-file");
-    assert.equal(plan.argv[5], logPath);
+    assert.equal(plan.command, binary);
+    assert.deepEqual(plan.argv, ["--log-file", logPath, ...args]);
     const joined = plan.argv.join(" ").toLowerCase();
+    assert.equal(joined.includes("cmd.exe"), false);
     assert.equal(joined.includes("powershell"), false);
     assert.equal(joined.includes("executionpolicy"), false);
     assert.equal(joined.includes(".ps1"), false);
     assert.equal(plan.cwd, path.dirname(binary));
   });
 
-  it("uses Windows Terminal as the console host when available", () => {
-    const wt = path.join("C:", "Program Files", "Windows Terminal", "wt.exe");
+  it("keeps shell metacharacters inside a single argv element", () => {
+    const nasty = path.join("C:", "models", "evil", "model&calc&.gguf");
     const plan = buildWindowsExternalLaunch({
       binary,
-      args,
+      args: ["-m", nasty, "--port", "8742"],
       logPath,
-      windowsTerminal: wt,
     });
-    assert.equal(plan.command, wt);
-    assert.deepEqual(plan.argv.slice(0, 5), [
-      "-d",
-      path.dirname(binary),
-      "--title",
-      "Llama AIO - llama-server",
-      binary,
-    ]);
-    assert.equal(plan.argv.includes("powershell.exe"), false);
+    // No shell sits between spawn and llama-server, so `&` cannot split the command.
+    assert.equal(plan.command, binary);
+    assert.equal(plan.argv.filter((arg) => arg === nasty).length, 1);
+    assert.equal(plan.argv.includes("-m"), true);
   });
 });
 

@@ -101,29 +101,22 @@ export function withLogFileArg(args: string[], logPath: string): string[] {
 }
 
 /**
- * argv for a visible Windows console running llama-server.exe directly.
- * Never PowerShell: a temp `.ps1` + `-ExecutionPolicy Bypass` looks like a dropper.
+ * Launch plan for a visible Windows console running llama-server.exe directly.
+ * Never a shell: `cmd.exe /c start` and `wt.exe` re-parse their command line, so
+ * a model path containing `&`, `;`, `%` or `^` (legal in Windows file names and
+ * in Hugging Face listings) would execute as a shell command. Spawning the
+ * binary itself keeps every argument opaque to the OS loader.
  */
 export function buildWindowsExternalLaunch(options: {
   binary: string;
   args: string[];
   logPath: string;
-  windowsTerminal?: string;
 }): ExternalLaunchPlan {
-  const { binary, args, logPath, windowsTerminal } = options;
-  const cwd = path.dirname(binary);
-  const launchArgs = withLogFileArg(args, logPath);
-  if (windowsTerminal) {
-    return {
-      command: windowsTerminal,
-      argv: ["-d", cwd, "--title", "Llama AIO - llama-server", binary, ...launchArgs],
-      cwd,
-    };
-  }
+  const { binary, args, logPath } = options;
   return {
-    command: "cmd.exe",
-    argv: ["/c", "start", "Llama AIO - llama-server", binary, ...launchArgs],
-    cwd,
+    command: binary,
+    argv: withLogFileArg(args, logPath),
+    cwd: path.dirname(binary),
   };
 }
 
@@ -356,9 +349,15 @@ function spawnMac(
   logPath: string
 ): ChildProcess {
   const libDir = path.dirname(binary);
+  // `do script` runs in Terminal's own shell, so env passed to osascript does
+  // not reach llama-server: export the differing entries in the script itself.
+  const extraExports = Object.entries(env)
+    .filter(([key, value]) => value !== undefined && process.env[key] !== value)
+    .map(([key, value]) => `export ${key}=${shQuote(value as string)}`);
   const script = [
     `echo "Llama AIO · llama-server"`,
     `export DYLD_LIBRARY_PATH=${shQuote(libDir)}\${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}`,
+    ...extraExports,
     `${shQuote(binary)} ${args.map(shQuote).join(" ")} 2>&1 | tee -a ${shQuote(logPath)}`,
     `code=$?`,
     `echo`,
@@ -389,13 +388,7 @@ function spawnWindows(
   env: NodeJS.ProcessEnv,
   logPath: string
 ): ChildProcess {
-  const wt = whichOnPath("wt.exe") || whichOnPath("wt");
-  const plan = buildWindowsExternalLaunch({
-    binary,
-    args,
-    logPath,
-    windowsTerminal: wt,
-  });
+  const plan = buildWindowsExternalLaunch({ binary, args, logPath });
   const child = captureChildError(
     spawn(plan.command, plan.argv, {
       detached: true,

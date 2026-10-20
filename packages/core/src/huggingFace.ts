@@ -34,6 +34,33 @@ import {
   type HfModelHit,
 } from "./types";
 
+/**
+ * Conservative charset for repo ids and file paths: everything a shell or a
+ * Windows console host could re-parse (`& ; % ! ^ | < > " ' * ? : \ $ `) is
+ * rejected, so a downloaded name can never become command syntax.
+ */
+export const SAFE_HF_PATH_PART = /^[A-Za-z0-9._ +,@()[\]{}=~-]+$/;
+
+/**
+ * Where the Hugging Face token comes from. The VS Code extension registers a
+ * sync provider backed by Secret Storage so the token never lands in
+ * `config.json`; `HF_TOKEN` / `HUGGING_FACE_HUB_TOKEN` cover the TUI.
+ */
+let hfTokenProvider: (() => string | undefined) | undefined;
+
+export function setHfTokenProvider(provider: (() => string | undefined) | undefined): void {
+  hfTokenProvider = provider;
+}
+
+/** Secret Storage provider → environment → legacy `config.json` value. */
+export function resolveHfToken(store?: SettingsStore): string | undefined {
+  const provided = hfTokenProvider?.();
+  const env =
+    (process.env.HF_TOKEN || "").trim() || (process.env.HUGGING_FACE_HUB_TOKEN || "").trim();
+  const configured = store ? (store.getConfig().get<string>("hfToken") || "").trim() : "";
+  return (provided || "").trim() || env || configured || undefined;
+}
+
 function fileRole(file: HfFileHit, files: HfFileHit[]): GgufFileRole {
   return classifyGgufFile(file, files);
 }
@@ -257,6 +284,8 @@ export function preferredMtpDraftFile(
 }
 
 const MAX_TREE_PAGES = 20;
+/** Metadata pages are small; refuse a hostile/broken endpoint that streams forever. */
+const MAX_METADATA_BYTES = 32 * 1024 * 1024;
 
 /** RFC 8288 `Link: <url>; rel="next"` used by the Hugging Face tree API. */
 export function parseNextLink(linkHeader: string | string[] | undefined): string | undefined {
@@ -310,7 +339,15 @@ async function requestJsonPage<T>(
           return;
         }
         const chunks: Buffer[] = [];
-        res.on("data", (c: Buffer) => chunks.push(c));
+        let size = 0;
+        res.on("data", (c: Buffer) => {
+          size += c.length;
+          if (size > MAX_METADATA_BYTES) {
+            res.destroy(new Error(`HF response exceeds ${MAX_METADATA_BYTES} bytes`));
+            return;
+          }
+          chunks.push(c);
+        });
         res.on("end", () => resolve({
           status, body: Buffer.concat(chunks).toString("utf8"), link: res.headers.link,
         }));
@@ -348,8 +385,7 @@ export class HuggingFaceClient {
   constructor(private readonly store: SettingsStore) {}
 
   private token(): string | undefined {
-    const t = (this.store.getConfig().get<string>("hfToken") || "").trim();
-    return t || undefined;
+    return resolveHfToken(this.store);
   }
 
   async searchGgufModels(query: string, limit = 25): Promise<HfModelHit[]> {
@@ -451,7 +487,7 @@ export class HuggingFaceClient {
     const validParts = (value: string) => {
       const parts = value.split("/");
       if (!value || path.win32.isAbsolute(value) || parts.some((part) =>
-        !part || part === "." || part === ".." || /[\\:\0]/.test(part)
+        !part || part === "." || part === ".." || !SAFE_HF_PATH_PART.test(part)
       )) {
         throw new Error("Invalid Hugging Face repository or file path");
       }

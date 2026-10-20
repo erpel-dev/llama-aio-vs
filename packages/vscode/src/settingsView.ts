@@ -1,3 +1,4 @@
+import { randomBytes } from "crypto";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
@@ -71,6 +72,14 @@ export interface ApiKeyStore {
   load(origin: string): Promise<string | undefined>;
   set(origin: string, value: string): Promise<void>;
   delete(origin: string): Promise<void>;
+}
+
+/** Hugging Face token in Secret Storage, with a sync cache for request headers. */
+export interface HfTokenStore {
+  get(): string | undefined;
+  load(): Promise<string | undefined>;
+  set(value: string): Promise<void>;
+  delete(): Promise<void>;
 }
 
 export type ModelActions = {
@@ -151,6 +160,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
   private localServerScan?: { at: number; servers: { url: string; port: number; pid: number }[] };
   private localServerScanRun?: Promise<{ url: string; port: number; pid: number }[]>;
   private apiKeys?: ApiKeyStore;
+  private hfTokens?: HfTokenStore;
 
   /** Typed send to the sidebar; a no-op while the view is closed. */
   private post(msg: ToWebviewMessage): void {
@@ -160,6 +170,11 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
   /** Secret Storage cache owned by the extension. Keys never go in config.json. */
   attachApiKeyStore(store: ApiKeyStore): void {
     this.apiKeys = store;
+  }
+
+  /** Hugging Face token keeps the same treatment as remote API keys. */
+  attachHfTokenStore(store: HfTokenStore): void {
+    this.hfTokens = store;
   }
 
   constructor(
@@ -597,13 +612,27 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           case "setHfToken": {
             const token = await vscode.window.showInputBox({
               title: "Hugging Face access token",
-              prompt: "Paste a token with access to gated repos (stored in Llama AIO config).",
+              prompt:
+                "Paste a token with access to gated repos (stored in VS Code Secret Storage; leave empty to clear).",
               password: true,
               ignoreFocusOut: true,
             });
             if (token !== undefined) {
-              await this.store.getConfig().update("hfToken", token.trim());
-              vscode.window.setStatusBarMessage("Llama AIO: Hugging Face token saved", 4000);
+              const trimmed = token.trim();
+              if (this.hfTokens) {
+                if (trimmed) {
+                  await this.hfTokens.set(trimmed);
+                } else {
+                  await this.hfTokens.delete();
+                }
+              } else {
+                // No secret store available (e.g. tests): keep the legacy path.
+                await this.store.getConfig().update("hfToken", trimmed);
+              }
+              vscode.window.setStatusBarMessage(
+                trimmed ? "Llama AIO: Hugging Face token saved" : "Llama AIO: Hugging Face token cleared",
+                4000
+              );
             }
             break;
           }
@@ -1885,10 +1914,5 @@ function escapeHtml(text: string): string {
 }
 
 function getNonce(): string {
-  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-  let nonce = "";
-  for (let i = 0; i < 32; i++) {
-    nonce += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
-  return nonce;
+  return randomBytes(16).toString("base64");
 }

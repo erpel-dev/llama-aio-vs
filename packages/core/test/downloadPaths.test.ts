@@ -39,4 +39,26 @@ describe("Hugging Face local destinations", () => {
       assert.throws(() => hf.localDestFor(repo, "model.gguf"));
     }
   });
+
+  it("rejects names that a console host would re-parse as command syntax", () => {
+    const hf = new HuggingFaceClient({ getConfig: () => ({ get: () => "/models" }) } as unknown as SettingsStore);
+    for (const file of [
+      "model&calc&.gguf",
+      "model;calc.gguf",
+      "model%PATH%.gguf",
+      "model!x!.gguf",
+      "model^calc.gguf",
+      "model|calc.gguf",
+      "model\"x.gguf",
+      "model'x.gguf",
+      "model$HOME.gguf",
+      "model`id`.gguf",
+    ]) {
+      assert.throws(() => hf.localDestFor("org/repo", file), /Invalid/, file);
+    }
+    for (const repo of ["org/repo&calc", "org;repo"]) {
+      assert.throws(() => hf.localDestFor(repo, "model.gguf"), /Invalid/, repo);
+    }
+    assert.equal(hf.localDestFor("org/repo", "Qwen3 8B (Q4_K_M)+.gguf"), path.join("/models", "org__repo", "Qwen3 8B (Q4_K_M)+.gguf"));
+  });
 });
