@@ -44,6 +44,7 @@ The running model appears in Copilot Chat as **Llama AIO: …**, including Agent
 
 ## Good to know
 
+- **Strata:** the sidebar detects Desktop's public API on `47831`, the standalone server on `8095`, the launcher on `8080`, and the source-run host on `8791`, then offers **Connect**. Other ports are discovered when process information is available. Served model names, canonical aliases, and Desktop model labels select the matching chat profile, including Swift 1.5 and short IDs such as `q2_0` for Qwen3.8 Flash-Next. Desktop chooses a different free port if `47831` is occupied.
 - **One shared server** at `http://127.0.0.1:8742` for all VS Code windows. It starts in an external terminal (logs visible) or in the background, and always requires a per-user API key (`~/.llama-aio-vs/runtime/local-api.key`, created on first launch) so loopback stays a transport detail, not an authentication boundary. The extension and TUI send the key automatically.
 - **Backends:** Vulkan (default, good for AMD), CUDA (NVIDIA), CPU, or a `llama-server` already on your `PATH`. Upgrades are swapped in only after a successful download; pin a release tag or install from an archive if you need to.
 - **Licences:** the Hugging Face picker shows each model's licence and warns before downloading anything that isn't clearly permissive.

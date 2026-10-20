@@ -18,6 +18,7 @@ import {
   probeRemoteServer,
   remoteLifecycleMessage,
   type GpuMemoryInfo,
+  type DiscoveredLlamaServer,
 } from "@llama-aio/core";
 import { LlamaInstaller, UiBackend } from "@llama-aio/core";
 import { clampLoadSettingsToModel, computeMemoryView, diffLoadSettings, fittingContextLength, memoryEstimateInputs, mmprojFileSize, resolveDraftCapabilities, shortGpuName, type SettingChange } from "@llama-aio/core";
@@ -157,8 +158,8 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
   private pushInFlight: Promise<void> | undefined;
   private pushTrailing: Promise<void> | undefined;
   /** Last loopback scan. The 5s status poll reuses this instead of running `ss` every tick. */
-  private localServerScan?: { at: number; servers: { url: string; port: number; pid: number }[] };
-  private localServerScanRun?: Promise<{ url: string; port: number; pid: number }[]>;
+  private localServerScan?: { at: number; servers: DiscoveredLlamaServer[] };
+  private localServerScanRun?: Promise<DiscoveredLlamaServer[]>;
   private apiKeys?: ApiKeyStore;
   private hfTokens?: HfTokenStore;
 
@@ -782,7 +783,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
   private async localServersForSidebar(
     status: ReturnType<ProcessManager["getStatus"]>,
     httpReady = false
-  ): Promise<{ url: string; port: number; pid: number }[]> {
+  ): Promise<DiscoveredLlamaServer[]> {
     if (this.store.isRemote() || status.running || status.starting || httpReady) {
       this.localServerScan = undefined;
       return [];

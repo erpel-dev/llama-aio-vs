@@ -51,6 +51,10 @@ export interface RemoteServerInfo {
   /** `/props` answered: this is llama.cpp with its extras (`/tokenize`, slots). */
   isLlamaCpp: boolean;
   modelId?: string;
+  /** Canonical served identity, distinct from a user-facing request alias. */
+  modelAlias?: string;
+  /** Strata Desktop's human-readable family name for opaque IDs such as q2_0. */
+  modelName?: string;
   modelSizeBytes?: number;
   modelParams?: number;
   trainedContext?: number;
@@ -88,7 +92,8 @@ export interface RemoteServerInfo {
 interface ModelsResponse {
   data?: Array<{
     id?: string;
-    meta?: { size?: number; n_params?: number; n_ctx_train?: number };
+    owned_by?: string;
+    meta?: { size?: number; n_params?: number; n_ctx_train?: number; label?: string };
     /** vLLM's served context length. */
     max_model_len?: number;
   }>;
@@ -98,6 +103,7 @@ interface PropsResponse {
   default_generation_settings?: { n_ctx?: number };
   total_slots?: number;
   model_path?: string;
+  model_alias?: string;
   build_info?: string;
   modalities?: { vision?: boolean; audio?: boolean };
 }
@@ -499,6 +505,8 @@ export async function probeRemoteServer(
     });
     const first = models.data?.[0];
     info.modelId = typeof first?.id === "string" && first.id ? first.id : undefined;
+    info.modelName = first?.owned_by === "strata" && typeof first.meta?.label === "string"
+      ? first.meta.label : undefined;
     info.modelSizeBytes = positive(first?.meta?.size);
     info.modelParams = positive(first?.meta?.n_params);
     info.trainedContext = positive(first?.meta?.n_ctx_train);
@@ -526,6 +534,7 @@ export async function probeRemoteServer(
     info.slotContext = positive(props.default_generation_settings?.n_ctx);
     info.totalSlots = positive(props.total_slots);
     info.modelPath = typeof props.model_path === "string" && props.model_path ? props.model_path : undefined;
+    info.modelAlias = typeof props.model_alias === "string" && props.model_alias ? props.model_alias : undefined;
     info.buildInfo = typeof props.build_info === "string" && props.build_info ? props.build_info : undefined;
     info.vision = props.modalities?.vision === true;
     info.audio = props.modalities?.audio === true;

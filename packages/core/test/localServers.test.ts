@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import { createServer } from "node:http";
+import { setServerApiKeyProvider } from "../src/serverHttp";
 import {
   discoverLoopbackLlamaServers,
   localListenerName,
   parseLsofListeners,
   parseNetstatListeners,
   parseSsListeners,
+  probeLocalStrataServer,
 } from "../src/localServers";
 
 const SS = `
@@ -75,9 +78,85 @@ describe("discoverLoopbackLlamaServers", () => {
     assert.equal(localListenerName("/opt/llama/llama-server -m x.gguf"), "llama-server");
   });
 
+  it("discovers the new default port and custom ports without a --port argument", () => {
+    for (const port of [8095, 18095]) {
+      const sockets = parseSsListeners(
+        `LISTEN 0 128 0.0.0.0:${port} 0.0.0.0:* users:(("python",pid=15,fd=7))\n`
+      );
+      for (const cmd of ["python -m serve.server --engine strata", "/opt/Strata/python/python -m serve.server"]) {
+        assert.deepEqual(discoverLoopbackLlamaServers({ sockets, commandLine: () => cmd }), [
+          { url: `http://127.0.0.1:${port}`, port, pid: 15, name: "Strata" },
+        ]);
+      }
+    }
+  });
+
   it("returns nothing when the socket list could not be read", () => {
     assert.deepEqual(discoverLoopbackLlamaServers({ sockets: undefined, commandLine }), []);
   });
+});
+
+describe("Strata health discovery without process metadata", () => {
+  for (const [body, expected] of [
+    ['{"status":"ok","service":"strata","loaded":true}', true],
+    ['{"status":"ok","service":"strata","loaded":false,"api_key":true}', true],
+    ['{"status":"ok"}', false],
+    ['{"service":"another-app"}', false],
+    ["<html>Other application</html>", false],
+  ] as const) {
+    it(`identifies ${body}`, async () => {
+      setServerApiKeyProvider(() => "private-key-for-another-server");
+      const server = createServer((req, res) => {
+        assert.equal(req.headers.authorization, undefined);
+        if (req.url !== "/health") {
+          res.writeHead(404);
+          res.end();
+          return;
+        }
+        res.end(body);
+      });
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+      try {
+        const addr = server.address();
+        assert.ok(addr && typeof addr !== "string");
+        assert.equal(await probeLocalStrataServer(`http://127.0.0.1:${addr.port}`), expected);
+      } finally {
+        setServerApiKeyProvider(undefined);
+        await new Promise<void>((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
+      }
+    });
+  }
+
+  it("does not probe non-loopback hosts", async () => {
+    assert.equal(await probeLocalStrataServer("http://192.0.2.1:8095"), false);
+  });
+
+  it("handles invalid URLs", async () => {
+    assert.equal(await probeLocalStrataServer("invalid"), false);
+  });
+
+  for (const [marker, expected] of [["x-strata-client", true], ["x-other-client", false]]) {
+    it(`identifies the Desktop host via /api/health with ${marker}`, async () => {
+      const server = createServer((req, res) => {
+        assert.equal(req.headers.authorization, undefined);
+        if (req.url === "/health") {
+          res.end("<html>Strata Desktop UI</html>");
+          return;
+        }
+        assert.equal(req.url, "/api/health");
+        res.setHeader("access-control-allow-headers", `content-type, authorization, ${marker}`);
+        res.end(JSON.stringify({ ok: true, uptimeSec: 1, backend: { kind: "strata", name: "Strata" }, engine: { status: "stopped" }, clients: 0 }));
+      });
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+      try {
+        const addr = server.address();
+        assert.ok(addr && typeof addr !== "string");
+        assert.equal(await probeLocalStrataServer(`http://127.0.0.1:${addr.port}`), expected);
+      } finally {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
+    });
+  }
 });
 
 describe("parseLsofListeners", () => {

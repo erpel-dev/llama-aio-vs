@@ -55,6 +55,10 @@ const { LlamaAioChatProvider } = require(path.join(__dirname, "..", "out-harness
 let server;
 let endpoint = "";
 let lastBody;
+let servedModelId;
+let servedProps;
+let servedMetadata;
+let propsStatus;
 /** How /v1/chat/completions answers: array of SSE data objects, optional per-event delay. */
 let reply = { events: [], delayMs: 0 };
 
@@ -69,13 +73,13 @@ before(async () => {
         return;
       }
       if (req.url === "/props") {
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ default_generation_settings: { n_ctx: 32768 }, total_slots: 1 }));
+        res.writeHead(propsStatus || 200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ default_generation_settings: { n_ctx: 32768 }, total_slots: 1, ...servedProps }));
         return;
       }
       if (req.url === "/v1/models") {
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ data: [{ id: "test-model" }] }));
+        res.end(JSON.stringify({ data: [{ id: servedModelId || "test-model", ...servedMetadata }] }));
         return;
       }
       lastBody = JSON.parse(body);
@@ -93,7 +97,7 @@ before(async () => {
 });
 after(() => new Promise((resolve) => server.close(() => resolve())));
 
-function setup({ guard = false } = {}) {
+function setup({ guard = false, remote = false, remoteInfo = {} } = {}) {
   const perfCalls = [];
   const state = {
     selectedModelPath: "/m/test.gguf",
@@ -102,9 +106,9 @@ function setup({ guard = false } = {}) {
   };
   const store = {
     getEndpoint: () => endpoint,
-    isRemote: () => false,
+    isRemote: () => remote,
     getState: () => state,
-    getServerTarget: () => ({ mode: "local", baseUrl: endpoint, label: "this machine" }),
+    getServerTarget: () => ({ mode: remote ? "remote" : "local", baseUrl: endpoint, label: "this machine" }),
     getPromptReplacementsFile: () => "",
     isPromptReplacementsEnabled: () => false,
     isWikipediaLookupEnabled: () => false,
@@ -116,11 +120,14 @@ function setup({ guard = false } = {}) {
   const pm = {
     isHttpReady: async () => true,
     getStatus: () => ({ starting: false, configDirty: false }),
-    remote: { current: () => undefined },
+    remote: {
+      current: () => remote ? { state: "ready", ...remoteInfo } : undefined,
+      refresh: async () => ({ state: "ready", ...remoteInfo }),
+    },
   };
   const perf = new Proxy({}, { get: (_t, name) => (...args) => perfCalls.push([name, args]) });
   const provider = new LlamaAioChatProvider(store, pm, perf, path.join(__dirname, ".."));
-  return { provider, perfCalls };
+  return { provider, perfCalls, state };
 }
 
 function cancelToken() {
@@ -148,6 +155,74 @@ describe("LlamaAioChatProvider requests", () => {
   beforeEach(() => {
     reply = { events: [delta({ content: "ok" })], delayMs: 0 };
     lastBody = undefined;
+    servedModelId = undefined;
+    servedProps = undefined;
+    servedMetadata = undefined;
+    propsStatus = undefined;
+  });
+
+  for (const [id, label, family, defaultMode] of [
+    ["q2_0", "Qwen3.8-Flash-Next Q2_0", "Qwen3.8 Flash-Next", "Think (XHigh)"],
+    ["unsloth-ud-iq4_xs", "Qwen3.8-Flash-Next (Unsloth) UD-IQ4_XS", "Qwen3.8 Flash-Next", "Think (XHigh)"],
+    ["swift-iq3_s", "Swift 1.5 IQ3_S", "Qwen3.8 Flash-Next", "Think (XHigh)"],
+    ["gyro-gyro-m", "Qwen3.8-Flash-Next Gyro-M", "Qwen3.8 Flash-Next", "Think (XHigh)"],
+    ["qwen36-ud-q4_k_xl", "Qwen3.6-35B-A3B UD-Q4_K_XL", "Qwen3", "Think (Coding)"],
+  ]) {
+    for (const source of ["models", "remote probe"]) {
+      it(`maps Desktop ID ${id} through the ${source} label and preserves its request ID`, async () => {
+        servedModelId = id;
+        servedMetadata = source === "models" ? { owned_by: "strata", meta: { label } } : undefined;
+        propsStatus = 404;
+        const { provider } = setup({ remote: true, remoteInfo: {
+          isLlamaCpp: false, modelId: id,
+          ...(source === "remote probe" ? { modelName: label } : {}),
+        } });
+        const [model] = await provider.provideLanguageModelChatInformation({}, cancelToken().token);
+        assert.equal(model.id, id);
+        assert.equal(model.configurationSchema.properties.reasoningEffort.default, defaultMode);
+        assert.equal(provider.modeSetFor(id, undefined).familyLabel, family);
+        await provider.provideLanguageModelChatResponse(model, [msg(Role.User, new TextPart("hello"))],
+          {}, { report() {} }, cancelToken().token);
+        assert.equal(lastBody.model, id);
+        assert.equal(lastBody.chat_template_kwargs.reasoning_effort, family === "Qwen3" ? undefined : "xhigh");
+      });
+    }
+  }
+
+  for (const source of ["props", "remote probe"]) {
+    it(`uses Strata's canonical model alias from ${source} for the picker and request profile`, async () => {
+      servedModelId = "local-model";
+      const identity = { modelAlias: "swift-1.5-iq3_s", modelPath: "C:\\models\\pack\\full" };
+      servedProps = source === "props"
+        ? { model_alias: identity.modelAlias, model_path: identity.modelPath }
+        : {};
+      const { provider, state } = setup({ remote: true, remoteInfo: source === "remote probe" ? identity : {} });
+      state.modelCapabilities = { architecture: "gemma4", path: "/m/gemma4.gguf" };
+      const [model] = await provider.provideLanguageModelChatInformation({}, cancelToken().token);
+      assert.equal(model.id, "local-model");
+      assert.equal(model.configurationSchema.properties.reasoningEffort.default, "Think (XHigh)");
+      assert.match(model.tooltip, /Think \(Medium\)/);
+      await provider.provideLanguageModelChatResponse(
+        model, [msg(Role.User, new TextPart("hello"))],
+        { modelConfiguration: { reasoningEffort: "Think (Medium)" } },
+        { report() {} }, cancelToken().token
+      );
+      assert.equal(lastBody.model, "local-model");
+      assert.equal(lastBody.chat_template_kwargs.reasoning_effort, "medium");
+      assert.equal(lastBody.temperature, 1);
+      assert.equal(lastBody.top_k, 20);
+    });
+  }
+
+  it("uses the remote filename across Windows separators without matching parent folder names", () => {
+    const { provider } = setup({ remote: true });
+    assert.equal(provider.modeSetFor("local-model", { model_path: "C:\\models\\Qwen3.8-Flash-Next.gguf" }).familyLabel,
+      "Qwen3.8 Flash-Next");
+    assert.equal(provider.modeSetFor("local-model", { model_path: "C:\\Qwen3.8-Flash-Next\\pack\\full" }), undefined);
+    assert.equal(provider.modeSetFor("qwen3.8-flash-next", { model_alias: "qwen3.6-35b-a3b" }).familyLabel, "Qwen3");
+    assert.equal(provider.modeSetFor("local-model", {
+      model_alias: "qwen3.6-35b-a3b", model_path: "C:\\models\\Qwen3.8-Flash-Next.gguf",
+    }).familyLabel, "Qwen3");
   });
 
   for (const [toolMode, expected] of [[undefined, "auto"], [1, "auto"], [2, "required"]]) {

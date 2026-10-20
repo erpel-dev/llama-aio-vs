@@ -61,8 +61,9 @@ describe("probeRemoteServer", () => {
           JSON.stringify({
             data: [
               {
-                id: "qwythos-9b.gguf",
-                meta: { size: 1000, n_params: 9e9, n_ctx_train: 1048576 },
+                id: mode === "desktop" ? "q2_0" : "qwythos-9b.gguf",
+                owned_by: mode === "desktop" ? "strata" : undefined,
+                meta: { size: 1000, n_params: 9e9, n_ctx_train: 1048576, label: "Qwen3.8-Flash-Next Q2_0" },
                 max_model_len: 32768,
               },
             ],
@@ -128,7 +129,7 @@ describe("probeRemoteServer", () => {
         return;
       }
       if (path === "/props") {
-        if (mode === "auth" || mode === "limited" || mode === "vllm") {
+        if (mode === "auth" || mode === "limited" || mode === "vllm" || mode === "desktop") {
           res.writeHead(mode === "auth" ? 401 : 404);
           res.end(mode === "auth" ? "unauthorized" : "missing");
           return;
@@ -139,6 +140,7 @@ describe("probeRemoteServer", () => {
             default_generation_settings: { n_ctx: 65536 },
             total_slots: 2,
             model_path: "/srv/models/qwythos-9b.gguf",
+            model_alias: "qwythos-9b",
             build_info: "b10517-abc",
             modalities: { vision: true },
           })
@@ -163,6 +165,8 @@ describe("probeRemoteServer", () => {
     assert.equal(info.state, "ready");
     assert.equal(info.isLlamaCpp, true);
     assert.equal(info.modelId, "qwythos-9b.gguf");
+    assert.equal(info.modelAlias, "qwythos-9b");
+    assert.equal(info.modelName, undefined);
     assert.equal(info.slotContext, 65536);
     assert.equal(info.vision, true);
     assert.equal(info.servedContext, 32768);
@@ -175,6 +179,17 @@ describe("probeRemoteServer", () => {
     assert.match(slots?.detail || "", /--slots/);
     assert.equal(metrics?.ok, null);
     assert.match(metrics?.detail || "", /--metrics/);
+  });
+
+  it("retains Strata Desktop's family label for an opaque API ID without /props", async () => {
+    mode = "desktop";
+    await listen();
+    const info = await probeRemoteServer(base);
+    assert.equal(info.modelId, "q2_0");
+    assert.equal(info.modelName, "Qwen3.8-Flash-Next Q2_0");
+    assert.equal(info.modelAlias, undefined);
+    assert.equal(info.state, "limited");
+    assert.equal(remoteStateUsable(info.state), true);
   });
 
   it("marks every slot busy and keeps the queue from /metrics", async () => {
