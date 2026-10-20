@@ -163,6 +163,7 @@ describe("LlamaAioChatProvider requests", () => {
 
   for (const [id, label, family, defaultMode] of [
     ["q2_0", "Qwen3.8-Flash-Next Q2_0", "Qwen3.8 Flash-Next", "Think (XHigh)"],
+    ["unsloth-ud-iq4_xs", "Qwen3.8-Flash-Next (Unsloth) UD-IQ4_XS", "Qwen3.8 Flash-Next", "Think (XHigh)"],
     ["swift-iq3_s", "Swift 1.5 IQ3_S", "Qwen3.8 Flash-Next", "Think (XHigh)"],
     ["gyro-gyro-m", "Qwen3.8-Flash-Next Gyro-M", "Qwen3.8 Flash-Next", "Think (XHigh)"],
     ["qwen36-ud-q4_k_xl", "Qwen3.6-35B-A3B UD-Q4_K_XL", "Qwen3", "Think (Coding)"],
