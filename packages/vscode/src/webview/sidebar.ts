@@ -147,6 +147,7 @@ function renderRemoteModel() {
     if (info.modelParams) bits.push(fmtParams(info.modelParams));
     if (info.modelSizeBytes) bits.push(fmtBytes(info.modelSizeBytes));
     if (info.trainedContext) bits.push('trained ' + fmtTokShort(info.trainedContext) + ' ctx');
+    if (info.slotContext || info.servedContext) bits.push('served ' + fmtTokShort(info.slotContext || info.servedContext) + ' ctx');
     if (info.vision) bits.push('vision');
     bits.forEach(function (text) {
       const chip = document.createElement('span');
@@ -304,7 +305,7 @@ function renderRemoteStatus() {
     stripText = ((info.error && info.error.message) || 'Not reachable.') + (remoteHint ? ' ' + remoteHint : '');
   } else if (state === 'limited') {
     stripKind = 'info';
-    stripText = 'Chat works. llama.cpp extras (slot size, vision, overthinking penalty) are off because /props did not answer.';
+    stripText = 'Chat works. llama.cpp extras (slot inspection, vision, overthinking penalty) are off because /props did not answer.';
   } else if (state === 'busy') {
     stripKind = 'warn';
     stripLead = 'Shared server.';

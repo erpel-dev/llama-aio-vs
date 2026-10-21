@@ -23,7 +23,7 @@ export type RemoteState =
   | "unreachable";
 
 export interface RemoteProbeRow {
-  path: "/health" | "/v1/models" | "/props" | "/slots" | "/metrics";
+  path: "/health" | "/v1/models" | "/props" | "/slots" | "/metrics" | "/api/native";
   /** true = answered OK, false = failed, null = skipped or endpoint off. */
   ok: boolean | null;
   status?: number;
@@ -58,7 +58,7 @@ export interface RemoteServerInfo {
   modelSizeBytes?: number;
   modelParams?: number;
   trainedContext?: number;
-  /** Context limit an OpenAI-compatible server reports in `/v1/models` (vLLM `max_model_len`). */
+  /** Served context from the model list or the matching Strata Desktop engine. */
   servedContext?: number;
   slotContext?: number;
   totalSlots?: number;
@@ -93,7 +93,7 @@ interface ModelsResponse {
   data?: Array<{
     id?: string;
     owned_by?: string;
-    meta?: { size?: number; n_params?: number; n_ctx_train?: number; label?: string };
+    meta?: { size?: number; n_params?: number; n_ctx_train?: number; label?: string; n_ctx?: number; context?: number; instanceId?: string };
     /** vLLM's served context length. */
     max_model_len?: number;
   }>;
@@ -114,6 +114,32 @@ const REMOTE_PROPS_TIMEOUT_MS = 5000;
 
 function positive(n: unknown): number | undefined {
   return typeof n === "number" && Number.isFinite(n) && n > 0 ? n : undefined;
+}
+
+/** The loaded engine's limit, never a catalog/training limit or a saved config. */
+async function attachStrataContext(info: RemoteServerInfo, instanceId: string | undefined, apiKey?: string): Promise<void> {
+  try {
+    const native = await serverJson<{ instances?: Array<{
+      id?: string; apiModelId?: string; status?: string;
+      metrics?: { engine?: { max_context?: number } };
+    }> }>(joinServerUrl(info.url, "/api/native"), {
+      apiKey,
+      timeoutMs: 2000,
+      signal: AbortSignal.timeout(2000),
+    });
+    const matches = Array.isArray(native?.instances) ? native.instances.filter(i =>
+      i?.apiModelId === info.modelId && (!instanceId || i.id === instanceId) && i.status === "ready") : [];
+    const context = matches.length === 1 ? positive(matches[0].metrics?.engine?.max_context) : undefined;
+    if (context !== undefined && Number.isSafeInteger(context)) {
+      info.servedContext = context;
+      info.probes.push({ path: "/api/native", ok: true, status: 200, detail: `served context ${context}` });
+    } else {
+      info.probes.push({ path: "/api/native", ok: null, status: 200, detail: "no matching engine context reported" });
+    }
+  } catch {
+    // Optional metadata must not block chat or expose runtime response bodies.
+    info.probes.push({ path: "/api/native", ok: null, detail: "engine context unavailable" });
+  }
 }
 
 /** Finite and non-negative. Zero is a real gauge reading (idle). */
@@ -497,6 +523,8 @@ export async function probeRemoteServer(
   }
 
   let authFailed = healthStatus === 401 || healthStatus === 403;
+  let strataModel = false;
+  let strataInstanceId: string | undefined;
 
   try {
     const models = await serverJson<ModelsResponse>(joinServerUrl(baseUrl, "/v1/models"), {
@@ -504,13 +532,16 @@ export async function probeRemoteServer(
       timeoutMs: REMOTE_PROPS_TIMEOUT_MS,
     });
     const first = models.data?.[0];
+    strataModel = first?.owned_by === "strata";
+    strataInstanceId = typeof first?.meta?.instanceId === "string" ? first.meta.instanceId : undefined;
     info.modelId = typeof first?.id === "string" && first.id ? first.id : undefined;
     info.modelName = first?.owned_by === "strata" && typeof first.meta?.label === "string"
       ? first.meta.label : undefined;
     info.modelSizeBytes = positive(first?.meta?.size);
     info.modelParams = positive(first?.meta?.n_params);
     info.trainedContext = positive(first?.meta?.n_ctx_train);
-    info.servedContext = positive(first?.max_model_len);
+    info.servedContext = positive(first?.max_model_len) ?? positive(first?.meta?.n_ctx)
+      ?? (strataModel ? positive(first?.meta?.context) : undefined);
     info.probes.push({
       path: "/v1/models",
       ok: !!info.modelId,
@@ -558,6 +589,10 @@ export async function probeRemoteServer(
         detail: e.status === 404 ? "not llama.cpp (no /props)" : e.message,
       });
     }
+  }
+
+  if (!authFailed && strataModel && info.modelId && !info.slotContext && !info.servedContext) {
+    await attachStrataContext(info, strataInstanceId, opts.apiKey);
   }
 
   if (!authFailed && (info.isLlamaCpp || info.modelId || (healthStatus >= 200 && healthStatus < 300))) {
@@ -717,6 +752,7 @@ export class RemoteServerMonitor {
       prev.state !== next.state ||
       prev.modelId !== next.modelId ||
       prev.slotContext !== next.slotContext ||
+      prev.servedContext !== next.servedContext ||
       prev.vision !== next.vision ||
       prev.slotsBusy !== next.slotsBusy ||
       prev.slotsTotal !== next.slotsTotal ||
@@ -762,6 +798,7 @@ export function formatRemoteDiagnostics(info: RemoteServerInfo | undefined, extr
     info?.modelId ? `Model: ${info.modelId}` : "",
     info?.buildInfo ? `Build: ${info.buildInfo}` : "",
     info?.slotContext ? `Slot context: ${info.slotContext}` : "",
+    info?.servedContext ? `Served context: ${info.servedContext}` : "",
     info?.totalSlots ? `Slots: ${info.totalSlots}` : "",
     info?.slotsTotal ? `Slots busy: ${info.slotsBusy ?? 0}/${info.slotsTotal}` : "",
     typeof info?.requestsDeferred === "number" ? `Queued: ${info.requestsDeferred}` : "",
