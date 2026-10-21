@@ -1049,6 +1049,7 @@ export function activate(context: vscode.ExtensionContext): void {
         remoteStateUsable(info.state),
         info.modelId,
         info.slotContext,
+        info.servedContext,
         info.vision,
         info.isLlamaCpp,
       ].join("|");

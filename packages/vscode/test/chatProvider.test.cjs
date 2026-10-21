@@ -59,6 +59,7 @@ let servedModelId;
 let servedProps;
 let servedMetadata;
 let propsStatus;
+let servedNative;
 /** How /v1/chat/completions answers: array of SSE data objects, optional per-event delay. */
 let reply = { events: [], delayMs: 0 };
 
@@ -80,6 +81,16 @@ before(async () => {
       if (req.url === "/v1/models") {
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ data: [{ id: servedModelId || "test-model", ...servedMetadata }] }));
+        return;
+      }
+      if (req.url === "/api/native") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(servedNative || {}));
+        return;
+      }
+      if (req.method === "GET") {
+        res.writeHead(404);
+        res.end("missing");
         return;
       }
       lastBody = JSON.parse(body);
@@ -159,7 +170,32 @@ describe("LlamaAioChatProvider requests", () => {
     servedProps = undefined;
     servedMetadata = undefined;
     propsStatus = undefined;
+    servedNative = undefined;
   });
+
+  for (const source of ["models", "runtime"]) {
+    it(`advertises Strata's served 256K context from ${source} and accepts a prompt beyond the 32K fallback`, async () => {
+      servedModelId = "gyro-gyro-s";
+      servedMetadata = { owned_by: "strata", meta: {
+        label: "Qwen3.8-Flash-Next Gyro-S", instanceId: "gyro-instance",
+        ...(source === "models" ? { context: 262144 } : {}),
+      } };
+      servedNative = { instances: [{ id: "gyro-instance", apiModelId: servedModelId, status: "ready",
+        context: 65536, metrics: { engine: { max_context: 262144 } } }] };
+      propsStatus = 404;
+      const info = await core.probeRemoteServer(endpoint);
+      assert.equal(core.remoteSlotContext(info), 262144);
+      const { provider } = setup({ remote: true, remoteInfo: info });
+      const [model] = await provider.provideLanguageModelChatInformation({}, cancelToken().token);
+      assert.equal(model.maxInputTokens + model.maxOutputTokens, 262144);
+      assert.match(model.tooltip, /slot context 262144/);
+      await provider.provideLanguageModelChatResponse(model,
+        [msg(Role.User, new TextPart("word ".repeat(40000)))], {},
+        { report() {} }, cancelToken().token);
+      assert.equal(lastBody.model, "gyro-gyro-s");
+      assert.equal(lastBody.messages.at(-1).content.length, 200000);
+    });
+  }
 
   for (const [id, label, family, defaultMode] of [
     ["q2_0", "Qwen3.8-Flash-Next Q2_0", "Qwen3.8 Flash-Next", "Think (XHigh)"],

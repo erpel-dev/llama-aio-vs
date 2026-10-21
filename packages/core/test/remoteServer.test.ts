@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createServer, type Server } from "node:http";
-import { describe, it, afterEach } from "node:test";
+import { describe, it, beforeEach, afterEach } from "node:test";
 import {
   formatRemoteDiagnostics,
   parseLlamaMetrics,
@@ -14,6 +14,7 @@ import {
   remoteSlotContext,
   remoteStateLabel,
   remoteStateUsable,
+  RemoteServerMonitor,
 } from "../src/remoteServer";
 import { legacyRemoteHostUrl } from "../src/settings";
 
@@ -30,6 +31,17 @@ describe("probeRemoteServer", () => {
   let server: Server;
   let base = "";
   let mode = "ready";
+  let modelOverrides: Record<string, unknown>;
+  let nativeBody: unknown;
+  let nativeStatus: number;
+  let seenPaths: string[];
+
+  beforeEach(() => {
+    modelOverrides = {};
+    nativeBody = undefined;
+    nativeStatus = 200;
+    seenPaths = [];
+  });
 
   afterEach(async () => {
     if (server) {
@@ -40,6 +52,12 @@ describe("probeRemoteServer", () => {
   async function listen() {
     server = createServer((req, res) => {
       const path = req.url || "";
+      seenPaths.push(path);
+      if (path === "/api/native" && nativeBody !== undefined) {
+        res.writeHead(nativeStatus, { "content-type": "application/json" });
+        res.end(JSON.stringify(nativeBody));
+        return;
+      }
       if (mode === "loading" && path === "/health") {
         res.writeHead(503);
         res.end('{"error":{"message":"Loading model"}}');
@@ -65,6 +83,7 @@ describe("probeRemoteServer", () => {
                 owned_by: mode === "desktop" ? "strata" : undefined,
                 meta: { size: 1000, n_params: 9e9, n_ctx_train: 1048576, label: "Qwen3.8-Flash-Next Q2_0" },
                 max_model_len: 32768,
+                ...modelOverrides,
               },
             ],
           })
@@ -190,6 +209,92 @@ describe("probeRemoteServer", () => {
     assert.equal(info.modelAlias, undefined);
     assert.equal(info.state, "limited");
     assert.equal(remoteStateUsable(info.state), true);
+  });
+
+  function useStrataDesktop() {
+    mode = "desktop";
+    modelOverrides = { max_model_len: undefined, meta: { instanceId: "target", n_ctx_train: 1048576 } };
+  }
+
+  for (const field of ["n_ctx", "context"]) {
+    it(`uses the served 256K context from model metadata ${field}`, async () => {
+      useStrataDesktop();
+      modelOverrides.meta = { [field]: 262144 };
+      await listen();
+      const info = await probeRemoteServer(base);
+      assert.equal(remoteSlotContext(info), 262144);
+      assert.equal(seenPaths.includes("/api/native"), false);
+    });
+  }
+
+  it("uses the matching Strata engine's runtime context instead of stale configuration or another model", async () => {
+    useStrataDesktop();
+    nativeBody = { instances: [
+      { id: "other", apiModelId: "other-model", status: "ready", metrics: { engine: { max_context: 8192 } } },
+      { id: "target", apiModelId: "q2_0", status: "ready", context: 65536,
+        metrics: { engine: { max_context: 262144 } }, requests: [{ prompt: "never retain" }] },
+    ] };
+    await listen();
+    const info = await probeRemoteServer(base);
+    assert.equal(remoteSlotContext(info), 262144);
+    assert.equal(info.state, "limited");
+    assert.equal(info.probes.find(p => p.path === "/api/native")?.ok, true);
+    assert.equal(JSON.stringify(info).includes("never retain"), false);
+    assert.match(formatRemoteDiagnostics(info, { url: base, hasApiKey: false }), /Served context: 262144/);
+  });
+
+  for (const instance of [
+    { id: "other", apiModelId: "q2_0", status: "ready", metrics: { engine: { max_context: 262144 } } },
+    { id: "target", apiModelId: "other-model", status: "ready", metrics: { engine: { max_context: 262144 } } },
+    { id: "target", apiModelId: "q2_0", status: "loading", metrics: { engine: { max_context: 262144 } } },
+    ...[undefined, 0, -1, 1.5, "262144"].map(n => ({ id: "target", apiModelId: "q2_0", status: "ready", context: 1048576,
+      metrics: { engine: { max_context: n } } })),
+  ]) {
+    it(`ignores unmatched or invalid runtime context: ${JSON.stringify(instance)}`, async () => {
+      useStrataDesktop();
+      nativeBody = { instances: [instance] };
+      await listen();
+      const info = await probeRemoteServer(base);
+      assert.equal(remoteSlotContext(info), 32768);
+      assert.equal(info.state, "limited");
+    });
+  }
+
+  it("keeps chat usable when the optional Strata runtime endpoint requires different access", async () => {
+    useStrataDesktop();
+    nativeBody = { error: "private runtime details" };
+    nativeStatus = 401;
+    await listen();
+    const info = await probeRemoteServer(base);
+    assert.equal(remoteStateUsable(info.state), true);
+    assert.equal(remoteSlotContext(info), 32768);
+    assert.equal(JSON.stringify(info).includes("private runtime details"), false);
+  });
+
+  it("does not use training limits or query Strata management routes for other servers", async () => {
+    useStrataDesktop();
+    modelOverrides.owned_by = "another-provider";
+    modelOverrides.meta = { context: 262144, n_ctx_train: 1048576 };
+    await listen();
+    assert.equal(remoteSlotContext(await probeRemoteServer(base)), 32768);
+    assert.equal(seenPaths.includes("/api/native"), false);
+  });
+
+  it("announces served-context changes so the Copilot picker refreshes after a context reload", async () => {
+    useStrataDesktop();
+    modelOverrides.meta = { context: 262144 };
+    await listen();
+    const monitor = new RemoteServerMonitor(() => base);
+    const limits: number[] = [];
+    monitor.onDidChange(info => limits.push(remoteSlotContext(info)));
+    try {
+      await monitor.refresh(true);
+      modelOverrides.meta = { context: 131072 };
+      await monitor.refresh(true);
+      assert.deepEqual(limits, [262144, 131072]);
+    } finally {
+      monitor.dispose();
+    }
   });
 
   it("marks every slot busy and keeps the queue from /metrics", async () => {
