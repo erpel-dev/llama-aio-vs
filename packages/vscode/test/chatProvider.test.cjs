@@ -198,11 +198,11 @@ describe("LlamaAioChatProvider requests", () => {
   }
 
   for (const [id, label, family, defaultMode] of [
-    ["q2_0", "Qwen3.8-Flash-Next Q2_0", "Qwen3.8 Flash-Next", "Think (XHigh)"],
-    ["unsloth-ud-iq4_xs", "Qwen3.8-Flash-Next (Unsloth) UD-IQ4_XS", "Qwen3.8 Flash-Next", "Think (XHigh)"],
-    ["swift-iq3_s", "Swift 1.5 IQ3_S", "Qwen3.8 Flash-Next", "Think (XHigh)"],
-    ["gyro-gyro-m", "Qwen3.8-Flash-Next Gyro-M", "Qwen3.8 Flash-Next", "Think (XHigh)"],
-    ["qwen36-ud-q4_k_xl", "Qwen3.6-35B-A3B UD-Q4_K_XL", "Qwen3", "Think (Coding)"],
+    ["q2_0", "Qwen3.8-Flash-Next Q2_0", "Qwen3.8 Flash-Next", "xhigh"],
+    ["unsloth-ud-iq4_xs", "Qwen3.8-Flash-Next (Unsloth) UD-IQ4_XS", "Qwen3.8 Flash-Next", "xhigh"],
+    ["swift-iq3_s", "Swift 1.5 IQ3_S", "Qwen3.8 Flash-Next", "xhigh"],
+    ["gyro-gyro-m", "Qwen3.8-Flash-Next Gyro-M", "Qwen3.8 Flash-Next", "xhigh"],
+    ["qwen36-ud-q4_k_xl", "Qwen3.6-35B-A3B UD-Q4_K_XL", "Qwen3", "medium"],
   ]) {
     for (const source of ["models", "remote probe"]) {
       it(`maps Desktop ID ${id} through the ${source} label and preserves its request ID`, async () => {
@@ -225,6 +225,30 @@ describe("LlamaAioChatProvider requests", () => {
     }
   }
 
+  for (const [effort, templateEffort, thinking] of [
+    ["xhigh", "xhigh", true], ["medium", "medium", true],
+    ["low", "low", true], ["none", undefined, false],
+  ]) {
+    it(`passes the Copilot CLI ${effort} selection to Strata's template`, async () => {
+      servedModelId = "unsloth-ud-iq4_xs";
+      servedMetadata = { owned_by: "strata", meta: { label: "Qwen3.8-Flash-Next (Unsloth) UD-IQ4_XS" } };
+      propsStatus = 404;
+      const { provider } = setup({ remote: true, remoteInfo: { modelId: servedModelId } });
+      const [model] = await provider.provideLanguageModelChatInformation({}, cancelToken().token);
+      const schema = model.configurationSchema.properties.reasoningEffort;
+      // The CLI bridge retains standard values only, discarding display names.
+      const allowed = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
+      assert.deepEqual(schema.enum.filter(value => allowed.has(value)), ["xhigh", "medium", "low", "none"]);
+      await provider.provideLanguageModelChatResponse(model, [msg(Role.User, new TextPart("hello"))],
+        { modelConfiguration: { reasoningEffort: effort } }, { report() {} }, cancelToken().token);
+      assert.equal(lastBody.model, servedModelId);
+      assert.equal(lastBody.chat_template_kwargs.reasoning_effort, templateEffort);
+      assert.equal(lastBody.chat_template_kwargs.enable_thinking, thinking);
+      assert.equal(lastBody.reasoning_effort, undefined);
+      assert.equal(lastBody.temperature, thinking ? 1 : 0.7);
+    });
+  }
+
   for (const source of ["props", "remote probe"]) {
     it(`uses Strata's canonical model alias from ${source} for the picker and request profile`, async () => {
       servedModelId = "local-model";
@@ -236,7 +260,7 @@ describe("LlamaAioChatProvider requests", () => {
       state.modelCapabilities = { architecture: "gemma4", path: "/m/gemma4.gguf" };
       const [model] = await provider.provideLanguageModelChatInformation({}, cancelToken().token);
       assert.equal(model.id, "local-model");
-      assert.equal(model.configurationSchema.properties.reasoningEffort.default, "Think (XHigh)");
+      assert.equal(model.configurationSchema.properties.reasoningEffort.default, "xhigh");
       assert.match(model.tooltip, /Think \(Medium\)/);
       await provider.provideLanguageModelChatResponse(
         model, [msg(Role.User, new TextPart("hello"))],
@@ -267,7 +291,7 @@ describe("LlamaAioChatProvider requests", () => {
     servedMetadata = { owned_by: "strata", meta: { label: "Qwen3.8-Flash-Next (Unsloth) UD-IQ4_XS" } };
     provider.modelProbe = undefined;
     const [recovered] = await provider.provideLanguageModelChatInformation({}, cancelToken().token);
-    assert.equal(recovered.configurationSchema.properties.reasoningEffort.default, "Think (XHigh)");
+    assert.equal(recovered.configurationSchema.properties.reasoningEffort.default, "xhigh");
     await new Promise((resolve) => setTimeout(resolve, 10));
     assert.deepEqual(announcements, ["changed"]);
 
@@ -281,7 +305,7 @@ describe("LlamaAioChatProvider requests", () => {
     remoteInfo.modelName = undefined;
     provider.modelProbe = { endpoint, at: Date.now(), modelId: servedModelId };
     const [relabelled] = await provider.provideLanguageModelChatInformation({}, cancelToken().token);
-    assert.equal(relabelled.configurationSchema.properties.reasoningEffort.default, "Think (XHigh)");
+    assert.equal(relabelled.configurationSchema.properties.reasoningEffort.default, "xhigh");
   });
 
   it("keeps thinking modes when a later probe identifies no model at all", async () => {
@@ -291,14 +315,14 @@ describe("LlamaAioChatProvider requests", () => {
     const remoteInfo = { isLlamaCpp: false, modelId: servedModelId, servedContext: 262144 };
     const { provider } = setup({ remote: true, remoteInfo });
     const [first] = await provider.provideLanguageModelChatInformation({}, cancelToken().token);
-    assert.equal(first.configurationSchema.properties.reasoningEffort.default, "Think (XHigh)");
+    assert.equal(first.configurationSchema.properties.reasoningEffort.default, "xhigh");
 
     // Strata reloading: /v1/models lists the id without a label, /props is still its web UI.
     servedMetadata = undefined;
     remoteInfo.modelName = undefined;
     provider.modelProbe = { endpoint, at: Date.now(), modelId: servedModelId };
     const [degraded] = await provider.provideLanguageModelChatInformation({}, cancelToken().token);
-    assert.equal(degraded.configurationSchema.properties.reasoningEffort.default, "Think (XHigh)");
+    assert.equal(degraded.configurationSchema.properties.reasoningEffort.default, "xhigh");
 
     // A different, identifiable model must not inherit those modes.
     servedMetadata = { owned_by: "strata", meta: { label: "Mellum2.1-12B-Thinking" } };

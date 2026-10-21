@@ -3,6 +3,7 @@ import { describe, it } from "node:test";
 import { denseCaps } from "./helpers";
 import {
   applyModeToRequestBody,
+  buildModeConfigurationSchema,
   isGemma4Family,
   isGlimmerFamily,
   isQwen38Family,
@@ -10,6 +11,28 @@ import {
   resolveModeParams,
   resolveModelModes,
 } from "../src/modelModes";
+
+describe("Copilot CLI reasoning compatibility", () => {
+  const allowed = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
+  for (const id of ["Qwen3.8-Flash-Next", "Qwen3.8-27B", "Qwen3.6-35B", "Muse-Glimmer-30B", "gemma-4-12B-it"]) {
+    it(`keeps every ${id} preset through the CLI effort filter and maps it back`, () => {
+      const set = resolveModelModes(undefined, id)!;
+      const property = buildModeConfigurationSchema(set).properties.reasoningEffort as {
+        enum: string[]; enumItemLabels: string[]; default: string;
+      };
+      assert.deepEqual(property.enum.filter(value => allowed.has(value)), property.enum);
+      assert.equal(new Set(property.enum).size, property.enum.length);
+      assert.equal(resolveModeParams(set, { reasoningEffort: property.default }).modeName, set.defaultMode);
+      for (const [index, value] of property.enum.entries()) {
+        const name = property.enumItemLabels[index];
+        const selected = resolveModeParams(set, { reasoningEffort: value });
+        assert.equal(selected.modeName, name);
+        assert.deepEqual(selected.params, set.modes[name]);
+        assert.deepEqual(resolveModeParams(set, { reasoningEffort: name }), selected);
+      }
+    });
+  }
+});
 
 describe("isQwen38Family", () => {
   it("matches Qwen3.8 filenames and ids", () => {

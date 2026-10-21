@@ -268,6 +268,19 @@ export function resolveModelModes(
   return undefined;
 }
 
+// Copilot CLI filters reasoningEffort against its standard effort values. Keep
+// our preset names as labels only; using them as enum values hides the picker.
+const MODE_EFFORT_VALUES: Record<string, string> = {
+  "Think (XHigh)": "xhigh",
+  "Think (High)": "high",
+  "Think (Medium)": "medium",
+  "Think (Low)": "low",
+  "Think (General)": "high",
+  "Think (Coding)": "medium",
+  Think: "high",
+  "No Think": "none",
+};
+
 /** VS Code configurationSchema shape (not always in @types yet). */
 export function buildModeConfigurationSchema(modeSet: ModelModeSet): {
   properties: Record<string, unknown>;
@@ -279,9 +292,9 @@ export function buildModeConfigurationSchema(modeSet: ModelModeSet): {
       reasoningEffort: {
         type: "string",
         title: "Model Mode",
-        enum: modes,
+        enum: modes.map(name => MODE_EFFORT_VALUES[name] ?? name),
         enumItemLabels: modes,
-        default: defaultMode,
+        default: MODE_EFFORT_VALUES[defaultMode] ?? defaultMode,
         description: `${modeSet.familyLabel} thinking mode (chat_template_kwargs + sampling)`,
         group: "navigation",
       },
@@ -295,7 +308,12 @@ export function selectedModeName(
 ): string {
   const raw = modelConfiguration?.reasoningEffort;
   if (typeof raw === "string" && modeSet.modes[raw]) {
+    // Accept names saved by earlier versions, including existing chat sessions.
     return raw;
+  }
+  const mapped = Object.keys(modeSet.modes).find(name => MODE_EFFORT_VALUES[name] === raw);
+  if (mapped) {
+    return mapped;
   }
   return modeSet.modes[modeSet.defaultMode]
     ? modeSet.defaultMode

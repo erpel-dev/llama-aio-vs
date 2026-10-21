@@ -42,6 +42,10 @@ The **Performance** card shows generation and prompt speed, cache reuse, specula
 
 The running model appears in Copilot Chat as **Llama AIO: …**, including Agent mode with streamed replies and tool calls. Curated sampling modes are applied automatically for well-known model families; otherwise set temperature, top-p/k and max tokens under **Chat Requests → Sampling**.
 
+Thinking modes also work in Copilot CLI sessions. That picker uses standard effort names: for Qwen3.8 / Flash-Next, **XHigh**, **Medium**, **Low**, and **None** select the corresponding thinking presets and No Think. Existing chats with the older preset names remain supported.
+
+The llama icon is supplied for both the provider and its models. VS Code 1.142 ignores the provider icon, and its Copilot CLI bridge does not carry custom model icons into CLI sessions, so those surfaces show VS Code's generic icon. The extension cannot override those host controls.
+
 ## Good to know
 
 - **Strata:** the sidebar detects Desktop's public API on `47831`, the standalone server on `8095`, the launcher on `8080`, and the source-run host on `8791`, then offers **Connect**. Other ports are discovered when process information is available. Served model names, canonical aliases, and Desktop model labels select the matching chat profile, including Swift 1.5 and short IDs such as `q2_0` for Qwen3.8 Flash-Next. Desktop chooses a different free port if `47831` is occupied.
