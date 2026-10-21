@@ -9,6 +9,7 @@ import {
   parseNetstatListeners,
   parseSsListeners,
   probeLocalStrataServer,
+  strataListenerRole,
 } from "../src/localServers";
 
 const SS = `
@@ -89,6 +90,49 @@ describe("discoverLoopbackLlamaServers", () => {
         ]);
       }
     }
+  });
+
+  it("lists only the API host of a Strata Desktop install", () => {
+    // One install starts the API host, an Electron window helper, a web harness,
+    // and an engine for the loaded model. Only the host is a chat target.
+    const install = "/tmp/.mount_StrataKhGCjC/usr/lib/Strata";
+    const desktop: Record<number, string> = {
+      8267: `${install}/node ${install}/host/server/index.mjs`,
+      8291: "/tmp/.mount_StrataKhGCjC/usr/bin/strata-desktop --window-child",
+      15450: `${install}/node ${install}/harness/lib/bin.js --profile web --port 0 --no-open`,
+      32782: `${install}/control/python/bin/python3.12 -m serve.server --engine strata --config /x.json --host 127.0.0.1 --port 18500`,
+    };
+    const sockets = parseSsListeners(
+      [
+        'LISTEN 0 511 127.0.0.1:47831 0.0.0.0:* users:(("MainThread",pid=8267,fd=23))',
+        'LISTEN 0 128 127.0.0.1:34987 0.0.0.0:* users:(("strata-desktop",pid=8291,fd=19))',
+        'LISTEN 0 511 127.0.0.1:43943 0.0.0.0:* users:(("MainThread",pid=15450,fd=21))',
+        'LISTEN 0 256 127.0.0.1:18500 0.0.0.0:* users:(("python3.12",pid=32782,fd=11))',
+      ].join("\n")
+    );
+    assert.deepEqual(discoverLoopbackLlamaServers({ sockets, commandLine: (pid) => desktop[pid] }), [
+      { url: "http://127.0.0.1:47831", port: 47831, pid: 8267, name: "Strata" },
+    ]);
+  });
+
+  it("still offers a Strata engine that runs on its own", () => {
+    const sockets = parseSsListeners(
+      'LISTEN 0 128 127.0.0.1:47831 0.0.0.0:* users:(("python",pid=15,fd=7))\n'
+    );
+    assert.deepEqual(
+      discoverLoopbackLlamaServers({ sockets, commandLine: () => "/usr/local/bin/strata --serve --port 47831" }),
+      [{ url: "http://127.0.0.1:47831", port: 47831, pid: 15, name: "Strata" }]
+    );
+  });
+
+  it("classifies Strata processes by the role they play", () => {
+    assert.equal(strataListenerRole("/x/Strata/host/server/index.mjs"), "host");
+    assert.equal(strataListenerRole("C:\\Strata\\host\\server\\index.mjs"), "host");
+    assert.equal(strataListenerRole("/x/strata-desktop --window-child"), "internal");
+    assert.equal(strataListenerRole("/x/Strata/node /x/Strata/harness/lib/bin.js --profile web"), "internal");
+    assert.equal(strataListenerRole("python -m serve.server --engine strata"), "engine");
+    assert.equal(strataListenerRole("node /app/server.js"), undefined);
+    assert.equal(localListenerName("/x/strata-desktop --window-child"), undefined);
   });
 
   it("returns nothing when the socket list could not be read", () => {

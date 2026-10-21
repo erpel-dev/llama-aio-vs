@@ -25,6 +25,35 @@ export interface DiscoveredLlamaServer {
 }
 
 /**
+ * How a Strata process relates to the API a user can connect to.
+ *
+ * Strata Desktop starts several processes from one install: the API host, the
+ * window, a harness, and one engine per loaded model. Only the host (or a
+ * standalone engine run on its own) serves the chat API, so the other ports
+ * must not be offered as separate servers.
+ */
+export type StrataRole = "host" | "engine" | "internal";
+
+export function strataListenerRole(commandLine: string | undefined): StrataRole | undefined {
+  const cmd = (commandLine || "").toLowerCase();
+  if (!cmd) {
+    return undefined;
+  }
+  // Electron's window/render helper and the web harness never serve the API.
+  if (cmd.includes("--window-child") || /harness[/\\][^\s]*bin\.js/.test(cmd)) {
+    return cmd.includes("strata") ? "internal" : undefined;
+  }
+  if (/host[/\\]server[/\\]index\.(mjs|js)/.test(cmd)) {
+    return "host";
+  }
+  // The port is held by `server.py --engine strata`, or by the `strata --serve` binary.
+  if (cmd.includes("--engine strata") || /(^|[^\w])strata([^\w]|$)/.test(cmd)) {
+    return "engine";
+  }
+  return undefined;
+}
+
+/**
  * What a listening process is, for the suggestion line only.
  * This is not {@link looksLikeLlamaServer}: that one decides what Stop may kill.
  */
@@ -36,11 +65,8 @@ export function localListenerName(commandLine: string | undefined): DiscoveredLl
   if (cmd.includes("llama-server")) {
     return "llama-server";
   }
-  // The port is held by `server.py --engine strata`, or by the `strata --serve` binary.
-  if (cmd.includes("--engine strata") || /(^|[^\w])strata([^\w]|$)/.test(cmd)) {
-    return "Strata";
-  }
-  return undefined;
+  const role = strataListenerRole(commandLine);
+  return role === "internal" ? undefined : role ? "Strata" : undefined;
 }
 
 /** How many suggestions the sidebar shows. */
@@ -183,6 +209,20 @@ function preferIpv4(current: DiscoveredLlamaServer, next: DiscoveredLlamaServer)
 }
 
 /**
+ * One API per Strata install. The desktop host serves it; its window and harness
+ * never do, and its per-model engines only serve the desktop app, which reaches
+ * them through the host. So internal components drop out, and an engine yields
+ * to a host discovered on the same machine.
+ */
+function dropStrataInternals(
+  candidates: readonly { server: DiscoveredLlamaServer; role: StrataRole }[]
+): DiscoveredLlamaServer[] {
+  const usable = candidates.filter((c) => c.role !== "internal");
+  const hosts = usable.filter((c) => c.role === "host");
+  return (hosts.length ? hosts : usable).map((c) => c.server);
+}
+
+/**
  * Keep loopback-reachable sockets whose command line is llama-server.
  * One URL per pid and port. IPv4 wins over IPv6 for the same process.
  */
@@ -196,6 +236,7 @@ export function discoverLoopbackLlamaServers(opts: {
   }
   const skip = new Set(opts.skipPids ?? []);
   const byProcess = new Map<string, DiscoveredLlamaServer>();
+  const strata: { server: DiscoveredLlamaServer; role: StrataRole }[] = [];
   for (const sock of opts.sockets) {
     if (skip.has(sock.pid)) {
       continue;
@@ -210,11 +251,20 @@ export function discoverLoopbackLlamaServers(opts: {
       byProcess.set(key, preferIpv4(prev, { ...prev, url }));
       continue;
     }
-    const name = localListenerName(opts.commandLine(sock.pid));
+    const commandLine = opts.commandLine(sock.pid);
+    const name = localListenerName(commandLine);
     if (!name) {
       continue;
     }
-    byProcess.set(key, { url, port: sock.port, pid: sock.pid, name });
+    const server = { url, port: sock.port, pid: sock.pid, name };
+    if (name === "Strata") {
+      strata.push({ server, role: strataListenerRole(commandLine) ?? "engine" });
+      continue;
+    }
+    byProcess.set(key, server);
+  }
+  for (const server of dropStrataInternals(strata)) {
+    byProcess.set(`${server.pid}:${server.port}`, server);
   }
   return [...byProcess.values()]
     .sort((a, b) => a.port - b.port || (a.pid ?? 0) - (b.pid ?? 0))
@@ -271,10 +321,19 @@ export async function discoverLoopbackLlamaServersOnThisMachineAsync(
   });
   for (const server of strata) {
     if (server && !found.some((s) => s.name === "Strata" && s.port === server.port)) {
-      // A skipped/owned listener must never be offered through the HTTP fallback.
-      if (!sockets?.some((s) => s.port === server.port && skipPids.includes(s.pid))) {
-        found.push(server);
+      // The HTTP probe cannot tell the host from the desktop app's own window,
+      // harness, or engine ports, so a known non-host listener stays hidden.
+      const listeners = (sockets ?? []).filter((s) => s.port === server.port);
+      if (listeners.some((s) => skipPids.includes(s.pid))) {
+        continue;
       }
+      const role = listeners.length
+        ? strataListenerRole(commandLines.get(listeners[0].pid)) ?? "engine"
+        : undefined;
+      if (role === "internal" || (role === "engine" && found.some((s) => s.name === "Strata"))) {
+        continue;
+      }
+      found.push(server);
     }
   }
   return found.slice(0, MAX_DISCOVERED_SERVERS);

@@ -161,7 +161,9 @@ function renderRemoteModel() {
   const hint = $('remoteModelHint');
   if (hint) {
     if (info.isLlamaCpp === false && (info.state === 'ready' || info.state === 'limited')) {
-      hint.textContent = 'This server is not llama.cpp. Chat works; slots, vision, and the overthinking penalty stay off.';
+      hint.textContent = info.vision
+        ? 'This server is not llama.cpp, but it reads pictures. Chat and vision work; slots and the overthinking penalty stay off.'
+        : 'This server is not llama.cpp. Chat works; slots, vision, and the overthinking penalty stay off.';
     } else if (info.state === 'auth') {
       hint.textContent = 'Slots, context, and vision need the API key (/props).';
     } else if (info.state === 'unreachable') {
@@ -305,7 +307,9 @@ function renderRemoteStatus() {
     stripText = ((info.error && info.error.message) || 'Not reachable.') + (remoteHint ? ' ' + remoteHint : '');
   } else if (state === 'limited') {
     stripKind = 'info';
-    stripText = 'Chat works. llama.cpp extras (slot inspection, vision, overthinking penalty) are off because /props did not answer.';
+    stripText = info.vision
+      ? 'Chat and vision work. llama.cpp extras (slot inspection, overthinking penalty) stay off because /props did not answer.'
+      : 'Chat works. llama.cpp extras (slot inspection, vision, overthinking penalty) are off because /props did not answer.';
   } else if (state === 'busy') {
     stripKind = 'warn';
     stripLead = 'Shared server.';
@@ -348,9 +352,13 @@ function renderRemoteStatus() {
 }
 
 function applyRemoteChrome(payload) {
+  const wasRemote = remoteMode;
   remoteMode = !!(payload && payload.serverMode === 'remote');
   document.body.classList.toggle('remote-mode', remoteMode);
-  if (remoteMode && connectOpen) setConnectOpen(false);
+  // Only a switch into remote mode closes the form (e.g. another window connected).
+  // Periodic status pushes arrive while remote, and closing on those made the
+  // "Edit connection" form vanish mid-edit.
+  if (remoteMode && !wasRemote && connectOpen) setConnectOpen(false);
   if (typeof syncChatTemplateUi === 'function') syncChatTemplateUi();
   if (payload && payload.remote) remoteInfo = payload.remote;
   else if (!remoteMode) remoteInfo = null;
@@ -3367,6 +3375,7 @@ window.addEventListener('message', (event: MessageEvent<ToWebviewMessage>) => {
     openConnectForm(lastPayload && lastPayload.serverMode === 'remote' ? undefined : { url: '', label: '' });
   }
   if (msg.type === 'remoteProbe') renderProbeList(msg.payload, msg.error || '');
+  if (msg.type === 'remoteConnected') setConnectOpen(false);
   if (msg.type === 'libraryFits') {
     lib.fits = msg.fits || {};
     lib.ratios = msg.ratios || {};

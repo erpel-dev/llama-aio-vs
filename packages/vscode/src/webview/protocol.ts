@@ -119,6 +119,7 @@ export type ToWebviewMessage =
   | { type: "draftModelSelected"; path: string }
   | { type: "mmprojSelected"; path: string }
   | { type: "openConnect" }
+  | { type: "remoteConnected" }
   | { type: "remoteProbe"; payload?: ViewModel; error?: string }
   | {
       type: "focusLibrary";

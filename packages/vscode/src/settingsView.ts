@@ -923,6 +923,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     this.rememberRemoteModel();
     this.notifyChatModels();
     await this.pushState();
+    // Closes the connect form once the new target is live, including when the
+    // user edited an existing connection (the mode does not change then).
+    this.post({ type: "remoteConnected" });
   }
 
   async switchToLocal(): Promise<void> {

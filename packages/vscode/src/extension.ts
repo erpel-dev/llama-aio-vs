@@ -1048,6 +1048,9 @@ export function activate(context: vscode.ExtensionContext): void {
         info.url,
         remoteStateUsable(info.state),
         info.modelId,
+        // The served label carries the model family (e.g. Qwen3.8-Flash-Next),
+        // which decides the picker's thinking modes.
+        info.modelName,
         info.slotContext,
         info.servedContext,
         info.vision,
@@ -1082,6 +1085,13 @@ export function activate(context: vscode.ExtensionContext): void {
       }
     }
     void refreshStatusBar();
+    // The first model query can land while the probe still lacks the served
+    // label, which hides the picker's thinking modes. Once the API key is
+    // loaded, probe and announce so Copilot re-reads the model information.
+    if (store.isRemote()) {
+      await processManager.remote.refresh();
+      chatProvider?.notifyChanged();
+    }
   })();
   // Skip a tick while the previous one is still waiting on a slow probe, so
   // an unreachable remote cannot stack up overlapping refreshes.

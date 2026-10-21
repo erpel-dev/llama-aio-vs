@@ -223,7 +223,9 @@ describe("probeRemoteServer", () => {
       await listen();
       const info = await probeRemoteServer(base);
       assert.equal(remoteSlotContext(info), 262144);
-      assert.equal(seenPaths.includes("/api/native"), false);
+      // The context needs no management route, but vision still comes from /api/native.
+      assert.equal(seenPaths.includes("/api/native"), true);
+      assert.equal(info.probes.find(p => p.path === "/api/native")?.ok, null);
     });
   }
 
@@ -269,6 +271,45 @@ describe("probeRemoteServer", () => {
     assert.equal(remoteStateUsable(info.state), true);
     assert.equal(remoteSlotContext(info), 32768);
     assert.equal(JSON.stringify(info).includes("private runtime details"), false);
+  });
+
+  it("reads picture support from the matching Strata engine because /props is the app's HTML", async () => {
+    useStrataDesktop();
+    nativeBody = { instances: [
+      { id: "other", apiModelId: "other-model", status: "ready", vision: true },
+      { id: "target", apiModelId: "q2_0", status: "ready", vision: true,
+        metrics: { engine: { max_context: 262144, images: true } } },
+    ] };
+    await listen();
+    const info = await probeRemoteServer(base);
+    assert.equal(info.isLlamaCpp, false);
+    assert.equal(info.vision, true);
+    assert.equal(remoteSlotContext(info), 262144);
+    assert.match(info.probes.find(p => p.path === "/api/native")?.detail || "", /vision/);
+  });
+
+  it("asks Strata for picture support even when the context came from /v1/models", async () => {
+    useStrataDesktop();
+    modelOverrides.meta = { instanceId: "target", context: 262144 };
+    nativeBody = { instances: [
+      { id: "target", apiModelId: "q2_0", status: "ready", metrics: { engine: { images: true } } },
+    ] };
+    await listen();
+    const info = await probeRemoteServer(base);
+    assert.equal(info.vision, true);
+    assert.equal(remoteSlotContext(info), 262144);
+  });
+
+  it("keeps vision off when the Strata engine has no picture reader", async () => {
+    useStrataDesktop();
+    nativeBody = { instances: [
+      { id: "target", apiModelId: "q2_0", status: "ready", vision: false,
+        metrics: { engine: { max_context: 262144, images: false } } },
+    ] };
+    await listen();
+    const info = await probeRemoteServer(base);
+    assert.equal(info.vision, false);
+    assert.match(formatRemoteDiagnostics(info, { url: base, hasApiKey: false }), /Vision: no/);
   });
 
   it("does not use training limits or query Strata management routes for other servers", async () => {

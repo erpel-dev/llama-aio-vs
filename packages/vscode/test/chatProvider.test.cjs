@@ -250,6 +250,63 @@ describe("LlamaAioChatProvider requests", () => {
     });
   }
 
+  it("recovers the thinking modes when a probe saw the model before its label", async () => {
+    servedModelId = "unsloth-ud-iq4_xs";
+    servedMetadata = undefined;
+    propsStatus = 404;
+    const remoteInfo = { isLlamaCpp: false, modelId: servedModelId, servedContext: 262144 };
+    const { provider } = setup({ remote: true, remoteInfo });
+    const announcements = [];
+    provider.notifyChanged = () => announcements.push("changed");
+
+    const [degraded] = await provider.provideLanguageModelChatInformation({}, cancelToken().token);
+    assert.equal(degraded.configurationSchema, undefined);
+    assert.equal(degraded.maxInputTokens + degraded.maxOutputTokens, 262144);
+
+    // The next probe reads Strata's label; Copilot must be told to re-query.
+    servedMetadata = { owned_by: "strata", meta: { label: "Qwen3.8-Flash-Next (Unsloth) UD-IQ4_XS" } };
+    provider.modelProbe = undefined;
+    const [recovered] = await provider.provideLanguageModelChatInformation({}, cancelToken().token);
+    assert.equal(recovered.configurationSchema.properties.reasoningEffort.default, "Think (XHigh)");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.deepEqual(announcements, ["changed"]);
+
+    // A stable answer must not announce again (that would loop with Copilot's re-query).
+    await provider.provideLanguageModelChatInformation({}, cancelToken().token);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.deepEqual(announcements, ["changed"]);
+
+    // A later probe that lists the id without its label must keep the family.
+    servedMetadata = undefined;
+    remoteInfo.modelName = undefined;
+    provider.modelProbe = { endpoint, at: Date.now(), modelId: servedModelId };
+    const [relabelled] = await provider.provideLanguageModelChatInformation({}, cancelToken().token);
+    assert.equal(relabelled.configurationSchema.properties.reasoningEffort.default, "Think (XHigh)");
+  });
+
+  it("keeps thinking modes when a later probe identifies no model at all", async () => {
+    servedModelId = "unsloth-ud-iq4_xs";
+    servedMetadata = { owned_by: "strata", meta: { label: "Qwen3.8-Flash-Next (Unsloth) UD-IQ4_XS" } };
+    propsStatus = 404;
+    const remoteInfo = { isLlamaCpp: false, modelId: servedModelId, servedContext: 262144 };
+    const { provider } = setup({ remote: true, remoteInfo });
+    const [first] = await provider.provideLanguageModelChatInformation({}, cancelToken().token);
+    assert.equal(first.configurationSchema.properties.reasoningEffort.default, "Think (XHigh)");
+
+    // Strata reloading: /v1/models lists the id without a label, /props is still its web UI.
+    servedMetadata = undefined;
+    remoteInfo.modelName = undefined;
+    provider.modelProbe = { endpoint, at: Date.now(), modelId: servedModelId };
+    const [degraded] = await provider.provideLanguageModelChatInformation({}, cancelToken().token);
+    assert.equal(degraded.configurationSchema.properties.reasoningEffort.default, "Think (XHigh)");
+
+    // A different, identifiable model must not inherit those modes.
+    servedMetadata = { owned_by: "strata", meta: { label: "Mellum2.1-12B-Thinking" } };
+    provider.modelProbe = undefined;
+    const [otherModel] = await provider.provideLanguageModelChatInformation({}, cancelToken().token);
+    assert.equal(otherModel.configurationSchema, undefined);
+  });
+
   it("uses the remote filename across Windows separators without matching parent folder names", () => {
     const { provider } = setup({ remote: true });
     assert.equal(provider.modeSetFor("local-model", { model_path: "C:\\models\\Qwen3.8-Flash-Next.gguf" }).familyLabel,

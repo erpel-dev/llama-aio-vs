@@ -39,6 +39,7 @@ import {
   withSystemHints,
   type ChatStreamPart,
   type ChatStreamStats,
+  type ModelModeSet,
   type PromptReplacement,
   type PromptReplacementStats,
   type RemoteServerInfo,
@@ -344,6 +345,20 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
   private readyProbe: { endpoint: string; at: number } | undefined;
   private propsProbe: { endpoint: string; at: number; props: ServerProps } | undefined;
   private modelProbe: { endpoint: string; at: number; modelId: string; modelName?: string } | undefined;
+  /**
+   * Last served id → label that /v1/models reported. Kept because a probe taken
+   * while the server swaps models can list the id without its label, which used
+   * to advertise the model without its thinking modes until a window reload.
+   */
+  private lastServedLabel: { endpoint: string; modelId: string; name: string } | undefined;
+  /**
+   * Last mode set advertised for endpoint + model. A probe that answers without
+   * the bits that identify the family (Strata swaps models, /props is a web UI)
+   * must not silently drop the user's thinking modes.
+   */
+  private lastModeSet: { endpoint: string; modelId: string; modeSet: ModelModeSet } | undefined;
+  /** What Copilot last received, so a changed answer can be announced once. */
+  private announcedModels: string | undefined;
 
   private async getReplacementRules(): Promise<PromptReplacement[]> {
     const custom = this.store.getPromptReplacementsFile();
@@ -479,8 +494,14 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
   /**
    * Model-mode lookup. Remote servers match their canonical alias, filename,
    * then served id; the local GGUF selection describes a different model.
+   *
+   * Whatever matched once is remembered per endpoint + model, because a probe
+   * taken while the server reloads (or while Strata answers /props with its web
+   * UI) reports neither the label nor the path, and the picker would otherwise
+   * drop the thinking modes until VS Code is reloaded.
    */
-  private modeSetFor(modelId: string, props: ServerProps | undefined) {
+  private modeSetFor(modelId: string, props: ServerProps | undefined): ModelModeSet | undefined {
+    const endpoint = this.store.getEndpoint();
     if (!this.store.isRemote()) {
       return resolveModelModes(this.store.getState().modelCapabilities, modelId);
     }
@@ -491,13 +512,32 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
     const filename = file?.split(/[/\\]/).pop();
     const cached = this.modelProbe;
     const remote = this.remoteInfo();
-    const cachedName = cached?.endpoint === this.store.getEndpoint() && cached.modelId === modelId
+    const cachedName = cached?.endpoint === endpoint && cached.modelId === modelId
       ? cached.modelName : undefined;
-    const name = cachedName ?? (remote?.modelId === modelId ? remote.modelName : undefined);
-    return resolveModelModes(undefined, canonical)
+    const rememberedLabel = this.lastServedLabel;
+    const rememberedName = rememberedLabel && rememberedLabel.endpoint === endpoint && rememberedLabel.modelId === modelId
+      ? rememberedLabel.name : undefined;
+    const name = cachedName
+      ?? (remote?.modelId === modelId ? remote.modelName : undefined)
+      ?? rememberedName;
+    const found = resolveModelModes(undefined, canonical)
       ?? resolveModelModes(undefined, filename)
       ?? resolveModelModes(undefined, name)
       ?? resolveModelModes(undefined, modelId);
+    if (found) {
+      this.lastModeSet = { endpoint, modelId, modeSet: found };
+      return found;
+    }
+    // Nothing identified the model: keep the modes worked out from the last
+    // answer. An identified model that matches no family keeps none, so
+    // switching models cannot inherit the previous one's modes.
+    if (canonical || filename || name) {
+      return undefined;
+    }
+    const remembered = this.lastModeSet;
+    return remembered && remembered.endpoint === endpoint && remembered.modelId === modelId
+      ? remembered.modeSet
+      : undefined;
   }
 
   private async cachedModelId(fallback: string): Promise<string> {
@@ -516,6 +556,9 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
         const modelName = first.owned_by === "strata" && typeof first.meta?.label === "string"
           ? first.meta.label : undefined;
         this.modelProbe = { endpoint, at: Date.now(), modelId, modelName };
+        if (modelName) {
+          this.lastServedLabel = { endpoint, modelId, name: modelName };
+        }
         return modelId;
       }
     } catch {
@@ -581,7 +624,22 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
     if (modeSet) {
       info.configurationSchema = buildModeConfigurationSchema(modeSet);
     }
+    // Copilot caches what a provider returns and only re-queries when told to.
+    // A probe taken while the server swapped models can hide the thinking modes
+    // (no /v1/models label yet), so announce again once the answer improves.
+    // Only identity is compared: context and load change every few seconds and
+    // are announced by the remote watcher, so including them would thrash.
+    this.announceIfChanged([info.id, info.name, modeSet ? modeSet.familyLabel : ""].join("|"));
     return [info];
+  }
+
+  /** Fires the model-information event once when the advertised model changed. */
+  private announceIfChanged(signature: string): void {
+    const previous = this.announcedModels;
+    this.announcedModels = signature;
+    if (previous !== undefined && previous !== signature) {
+      setTimeout(() => this.notifyChanged(), 0);
+    }
   }
 
   async provideLanguageModelChatResponse(

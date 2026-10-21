@@ -120,8 +120,8 @@ function positive(n: unknown): number | undefined {
 async function attachStrataContext(info: RemoteServerInfo, instanceId: string | undefined, apiKey?: string): Promise<void> {
   try {
     const native = await serverJson<{ instances?: Array<{
-      id?: string; apiModelId?: string; status?: string;
-      metrics?: { engine?: { max_context?: number } };
+      id?: string; apiModelId?: string; status?: string; vision?: boolean;
+      metrics?: { engine?: { max_context?: number; images?: boolean } };
     }> }>(joinServerUrl(info.url, "/api/native"), {
       apiKey,
       timeoutMs: 2000,
@@ -129,12 +129,26 @@ async function attachStrataContext(info: RemoteServerInfo, instanceId: string | 
     });
     const matches = Array.isArray(native?.instances) ? native.instances.filter(i =>
       i?.apiModelId === info.modelId && (!instanceId || i.id === instanceId) && i.status === "ready") : [];
-    const context = matches.length === 1 ? positive(matches[0].metrics?.engine?.max_context) : undefined;
+    const engine = matches.length === 1 ? matches[0].metrics?.engine : undefined;
+    const context = matches.length === 1 ? positive(engine?.max_context) : undefined;
+    // Strata answers /props with its web UI, so `/api/native` is the only place
+    // that says whether the loaded engine has a picture reader (mmproj).
+    const vision = matches.length === 1
+      ? typeof matches[0].vision === "boolean" ? matches[0].vision
+        : typeof engine?.images === "boolean" ? engine.images : undefined
+      : undefined;
+    if (vision !== undefined) {
+      info.vision = vision;
+    }
+    const bits = [
+      context !== undefined && Number.isSafeInteger(context) ? `served context ${context}` : "no matching engine context reported",
+      vision === true ? "vision" : "",
+    ].filter(Boolean);
     if (context !== undefined && Number.isSafeInteger(context)) {
       info.servedContext = context;
-      info.probes.push({ path: "/api/native", ok: true, status: 200, detail: `served context ${context}` });
+      info.probes.push({ path: "/api/native", ok: true, status: 200, detail: bits.join(" · ") });
     } else {
-      info.probes.push({ path: "/api/native", ok: null, status: 200, detail: "no matching engine context reported" });
+      info.probes.push({ path: "/api/native", ok: null, status: 200, detail: bits.join(" · ") });
     }
   } catch {
     // Optional metadata must not block chat or expose runtime response bodies.
@@ -591,8 +605,12 @@ export async function probeRemoteServer(
     }
   }
 
-  if (!authFailed && strataModel && info.modelId && !info.slotContext && !info.servedContext) {
-    await attachStrataContext(info, strataInstanceId, opts.apiKey);
+  if (!authFailed && strataModel && info.modelId) {
+    const needsContext = !info.slotContext && !info.servedContext;
+    const needsVision = info.vision === undefined;
+    if (needsContext || needsVision) {
+      await attachStrataContext(info, strataInstanceId, opts.apiKey);
+    }
   }
 
   if (!authFailed && (info.isLlamaCpp || info.modelId || (healthStatus >= 200 && healthStatus < 300))) {
@@ -801,6 +819,7 @@ export function formatRemoteDiagnostics(info: RemoteServerInfo | undefined, extr
     info?.servedContext ? `Served context: ${info.servedContext}` : "",
     info?.totalSlots ? `Slots: ${info.totalSlots}` : "",
     info?.slotsTotal ? `Slots busy: ${info.slotsBusy ?? 0}/${info.slotsTotal}` : "",
+    typeof info?.vision === "boolean" ? `Vision: ${info.vision ? "yes" : "no"}` : "",
     typeof info?.requestsDeferred === "number" ? `Queued: ${info.requestsDeferred}` : "",
     info?.serverGenTokPerSec ? `Server gen: ${info.serverGenTokPerSec} tok/s` : "",
     info?.serverPromptTokPerSec ? `Server prompt: ${info.serverPromptTokPerSec} tok/s` : "",
