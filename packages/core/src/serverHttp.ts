@@ -192,6 +192,8 @@ export interface ServerRequestOptions {
   /** Overrides the registered key (connection tests before the key is saved). */
   apiKey?: string;
   signal?: AbortSignal;
+  /** Start on a new socket (streaming POSTs must not reuse a closing SSE socket). */
+  freshConnection?: boolean;
 }
 
 function classifyNetworkError(err: unknown, url: string): ConnectionError {
@@ -277,6 +279,7 @@ export function serverRequest(url: string, options: ServerRequestOptions = {}): 
         path: `${u.pathname}${u.search}`,
         method: options.method || (payload !== undefined ? "POST" : "GET"),
         headers,
+        agent: options.freshConnection ? false : undefined,
       },
       (res) => {
         settled = true;

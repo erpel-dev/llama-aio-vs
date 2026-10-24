@@ -156,7 +156,7 @@ const gpus = [
   { totalBytes: 16 * GiB, usedBytes: 0, name: "AMD Radeon RX 9060 XT", index: 1, llamaDeviceId: "Vulkan1", source: "test" },
 ];
 
-function setup(loadOverrides = {}) {
+function setup(loadOverrides = {}, remoteInfo) {
   let state = {
     selectedModelPath: caps.path,
     modelCapabilities: caps,
@@ -182,15 +182,15 @@ function setup(loadOverrides = {}) {
     isWikipediaLookupEnabled: () => false,
     isDuplicateToolCallGuardEnabled: () => false,
     getEndpoint: () => "http://127.0.0.1:8742",
-    isRemote: () => false,
+    isRemote: () => !!remoteInfo,
     getServerPreferences: () => ({
-      mode: "local",
+      mode: remoteInfo ? "remote" : "local",
       remoteUrl: "",
       remoteLabel: "",
       lastRemoteModelId: "",
       plainHttpConfirmed: [],
     }),
-    getServerTarget: () => ({ mode: "local", baseUrl: "http://127.0.0.1:8742", label: "this machine" }),
+    getServerTarget: () => ({ mode: remoteInfo ? "remote" : "local", baseUrl: "http://127.0.0.1:8742", label: "this machine" }),
   };
   const pm = {
     getStatus: () => ({ running: true, starting: false, pid: 1, endpoint: "http://127.0.0.1:8742", message: "Running", configDirty: JSON.stringify(state.loadSettings) !== JSON.stringify(launched.loadSettings) }),
@@ -201,6 +201,7 @@ function setup(loadOverrides = {}) {
     getLaunchedConfig: () => launched,
     claimLaunch: () => ({}),
     releaseLaunch() {},
+    remote: { current: () => remoteInfo, nextRetryAt: () => undefined },
   };
   const installer = {
     getInstalledInfo: () => ({ activeBackend: "vulkan", tag: "b1" }),
@@ -265,6 +266,28 @@ describe("SettingsViewProvider memory path", () => {
     t = setup();
     await t.send({ type: "ready" });
     assert.equal(t.posted.find((m) => m.type === "state").payload.copilotChatAvailable, false);
+  });
+
+  for (const [identity, family, defaultMode] of [
+    [{ modelId: "opaque", modelName: "Spark-X2.6-4B" }, "Spark X2.6", "Think (High)"],
+    [{ modelId: "opaque", modelAlias: "gpt-oss-20b" }, "GPT-OSS", "Think (Medium)"],
+    [{ modelId: "opaque", modelPath: "C:\\models\\GLM-5.3-Flash.gguf" }, "GLM-5.3-Flash", "Think (Max)"],
+    [{ modelId: "LFM2.5-2.6B", modelPath: "/models/opaque.gguf" }, "LFM2.5 2.6B", "Think"],
+  ]) {
+    it(`shows the remote ${family} preset without borrowing the local selection`, async () => {
+      const t = setup({}, { state: "limited", isLlamaCpp: false, ...identity });
+      await t.send({ type: "ready" });
+      const payload = t.posted.find(m => m.type === "state").payload;
+      assert.equal(payload.modeSampling.familyLabel, family);
+      assert.equal(payload.modeSampling.defaultMode, defaultMode);
+      assert.equal(payload.memoryView, null);
+    });
+  }
+
+  it("keeps free sampling for an unknown remote model despite a recognized local model", async () => {
+    const t = setup({}, { state: "limited", isLlamaCpp: false, modelId: "opaque" });
+    await t.send({ type: "ready" });
+    assert.equal(t.posted.find(m => m.type === "state").payload.modeSampling, null);
   });
 
   it("state push carries core's verdict for the saved settings", async () => {

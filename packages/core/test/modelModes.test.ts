@@ -171,7 +171,7 @@ describe("resolveModelModes", () => {
       "Qwen3.6-27B"
     );
     assert.ok(set);
-    assert.equal(set.familyLabel, "Qwen3");
+    assert.equal(set.familyLabel, "Qwen3.5 / 3.6");
     assert.equal(set.defaultMode, "Think (Coding)");
     assert.equal(set.modes["Think (Coding)"].chat_template_kwargs?.reasoning_effort, undefined);
     assert.equal(set.modes["Think (Coding)"].temperature, 0.6);
@@ -181,7 +181,8 @@ describe("resolveModelModes", () => {
     const set = resolveModelModes(undefined, "Qwen3-8B-Q4_K_M.gguf");
     assert.ok(set);
     assert.equal(set.familyLabel, "Qwen3");
-    assert.ok(set.modes["Think (Coding)"]);
+    assert.equal(set.modes.Think.temperature, 0.6);
+    assert.equal(set.modes["No Think"].presence_penalty, 0);
     assert.equal(set.modes["Think (XHigh)"], undefined);
   });
 

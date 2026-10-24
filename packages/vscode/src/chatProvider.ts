@@ -27,6 +27,7 @@ import {
   remoteSlotContext,
   remoteStateUsable,
   resolveModelModes,
+  resolveRemoteModelModes,
   resolveModeParams,
   rewriteToolInput,
   serverJson,
@@ -75,6 +76,7 @@ type OpenAiChatMessage =
       role: "system" | "user" | "assistant";
       content: string | null | OpenAiContentPart[];
       tool_calls?: OpenAiToolCall[];
+      reasoning_content?: string;
     }
   | { role: "tool"; content: string; tool_call_id: string };
 
@@ -190,6 +192,13 @@ function stringifyToolResult(content: readonly unknown[]): string {
   return formatToolResultContent(content);
 }
 
+// Newer hosts expose this runtime class even when compiling against older
+// stable VS Code typings. Keep older hosts' existing text-stream behavior.
+type ThinkingPart = { value: string | string[] };
+function thinkingPartConstructor(): (new (value: string | string[]) => ThinkingPart) | undefined {
+  return (vscode as unknown as { LanguageModelThinkingPart?: new (value: string | string[]) => ThinkingPart }).LanguageModelThinkingPart;
+}
+
 function toOpenAiMessages(
   messages: readonly vscode.LanguageModelChatRequestMessage[]
 ): OpenAiChatMessage[] {
@@ -197,11 +206,17 @@ function toOpenAiMessages(
 
   for (const msg of messages) {
     const textParts: string[] = [];
+    const reasoningParts: string[] = [];
     const imageParts: Array<{ mimeType: string; data: Uint8Array }> = [];
     const toolCalls: OpenAiToolCall[] = [];
     const toolResults: Array<{ callId: string; content: string }> = [];
 
     for (const part of msg.content) {
+      const Thinking = thinkingPartConstructor();
+      if (Thinking && part instanceof Thinking) {
+        reasoningParts.push(Array.isArray(part.value) ? part.value.join("") : part.value);
+        continue;
+      }
       if (part instanceof vscode.LanguageModelToolCallPart) {
         toolCalls.push({
           id: part.callId,
@@ -247,11 +262,12 @@ function toOpenAiMessages(
     }
 
     if (role === "assistant") {
-      if (textContent || toolCalls.length > 0) {
+      if (textContent || toolCalls.length > 0 || reasoningParts.length > 0) {
         out.push({
           role: "assistant",
           content: textContent || null,
           ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
+          ...(reasoningParts.length > 0 ? { reasoning_content: reasoningParts.join("") } : {}),
         });
       }
       continue;
@@ -292,7 +308,7 @@ async function* streamChatCompletions(
   endpoint: string,
   body: Record<string, unknown>,
   token: vscode.CancellationToken,
-  extras?: { maxContext?: number; hasImages?: boolean; operatorLabel?: string }
+  extras?: { maxContext?: number; hasImages?: boolean; operatorLabel?: string; separateReasoning?: boolean }
 ): AsyncGenerator<ChatStreamPart> {
   const toolsEnabled = Array.isArray(body.tools) && (body.tools as unknown[]).length > 0;
   const abort = new AbortController();
@@ -308,7 +324,7 @@ async function* streamChatCompletions(
       throw describeRequestError(err, endpoint, extras);
     }
     try {
-      yield* parseChatStream(stream, { toolsEnabled, signal: abort.signal });
+      yield* parseChatStream(stream, { toolsEnabled, signal: abort.signal, separateReasoning: extras?.separateReasoning });
     } catch (err) {
       if (abort.signal.aborted) {
         return;
@@ -520,10 +536,7 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
     const name = cachedName
       ?? (remote?.modelId === modelId ? remote.modelName : undefined)
       ?? rememberedName;
-    const found = resolveModelModes(undefined, canonical)
-      ?? resolveModelModes(undefined, filename)
-      ?? resolveModelModes(undefined, name)
-      ?? resolveModelModes(undefined, modelId);
+    const found = resolveRemoteModelModes({ modelAlias: canonical, modelPath: filename, modelName: name, modelId });
     if (found) {
       this.lastModeSet = { endpoint, modelId, modeSet: found };
       return found;
@@ -730,6 +743,7 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
     }
 
     const modeSet = this.modeSetFor(model.id, props);
+    const Thinking = modeSet?.preserveReasoning ? thinkingPartConstructor() : undefined;
     const modelConfiguration = (options as { modelConfiguration?: Record<string, unknown> })
       .modelConfiguration;
     let appliedModeName: string | undefined;
@@ -803,6 +817,7 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
     let lastPromptTokens: number | undefined;
     let lastTickAt = 0;
     let emittedTextChars = 0;
+    let emittedReasoningChars = 0;
     let emittedToolCallCount = 0;
     const priorToolCalls = guardDuplicates
       ? fingerprintsSinceLastUserMessage(convertedRaw)
@@ -838,10 +853,14 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
         maxContext: remote ? remoteInfo?.trainedContext : state.modelCapabilities?.maxContextLength,
         hasImages: messagesHaveImageParts(converted),
         operatorLabel: remote ? serverLabel : undefined,
+        separateReasoning: !!Thinking,
       })) {
         if (event.kind === "text") {
           emittedTextChars += event.text.length;
           progress.report(new vscode.LanguageModelTextPart(event.text));
+        } else if (event.kind === "reasoning" && Thinking) {
+          emittedReasoningChars += event.text.length;
+          progress.report(new Thinking(event.text) as unknown as vscode.LanguageModelResponsePart);
         } else if (event.kind === "tool_call") {
           const input = rewriteToolInput(event.name, event.input);
           const fp = toolCallFingerprint(event.name, input);
@@ -930,7 +949,7 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
         });
       }
 
-      const emptyToChat = emittedTextChars <= 0 && emittedToolCallCount <= 0;
+      const emptyToChat = emittedTextChars <= 0 && emittedReasoningChars <= 0 && emittedToolCallCount <= 0;
       if (lastTrace) {
         this.perf.recordResponseTrace({
           model: model.id,

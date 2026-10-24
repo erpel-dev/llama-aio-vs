@@ -42,6 +42,7 @@ export interface ChatStreamTrace {
 
 export type ChatStreamPart =
   | { kind: "text"; text: string }
+  | { kind: "reasoning"; text: string }
   | { kind: "tool_call"; callId: string; name: string; input: object }
   | ChatStreamStats
   | ChatStreamTrace;
@@ -120,6 +121,10 @@ export function openChatStream(
     method: "POST",
     body: JSON.stringify({ ...body, stream: true }),
     headers: { Accept: "text/event-stream" },
+    // llama-server can close an SSE socket just after the response ends. A
+    // follow-up tool turn must not race Node's keep-alive reuse of that socket.
+    // Open a fresh connection instead of retrying a potentially delivered POST.
+    freshConnection: true,
     // Prompt processing of a long agent context can be silent for minutes.
     timeoutMs: 600_000,
     signal,
@@ -159,12 +164,12 @@ type SseChunk = {
  */
 export async function* parseChatStream(
   chunks: AsyncIterable<Uint8Array | string>,
-  options: { toolsEnabled: boolean; signal?: AbortSignal }
+  options: { toolsEnabled: boolean; signal?: AbortSignal; separateReasoning?: boolean }
 ): AsyncGenerator<ChatStreamPart> {
   const { toolsEnabled, signal } = options;
   let assembledText = "";
   let assembledReasoning = "";
-  const liveGate = toolsEnabled ? new LiveTextGate() : undefined;
+  const liveGate = toolsEnabled || options.separateReasoning ? new LiveTextGate() : undefined;
   const toolCalls: Array<{ id: string; name: string; arguments: string }> = [];
   let lastTimings: LlamaTimings | undefined;
   let lastUsage: LlamaUsage | undefined;
@@ -217,7 +222,9 @@ export async function* parseChatStream(
       assembledReasoning += delta.reasoning_content;
       completionChars += delta.reasoning_content.length;
       progressed = true;
-      if (!toolsEnabled && !delta.content) {
+      if (options.separateReasoning) {
+        yield { kind: "reasoning", text: delta.reasoning_content };
+      } else if (!toolsEnabled && !delta.content) {
         // Live-stream reasoning when the server only emits reasoning_content
         // (deepseek format). deepseek-legacy also puts tags in content.
         yield { kind: "text", text: delta.reasoning_content };
@@ -260,7 +267,9 @@ export async function* parseChatStream(
       assembledReasoning = choice.message.reasoning_content;
       completionChars += choice.message.reasoning_content.length;
       progressed = true;
-      if (!toolsEnabled && !choice.message.content && !assembledText) {
+      if (options.separateReasoning) {
+        yield { kind: "reasoning", text: choice.message.reasoning_content };
+      } else if (!toolsEnabled && !choice.message.content && !assembledText) {
         yield { kind: "text", text: choice.message.reasoning_content };
       }
     }
@@ -298,6 +307,14 @@ export async function* parseChatStream(
     return;
   }
 
+  // Older reasoning formats put thoughts inside content; legacy servers may
+  // also duplicate them in reasoning_content. Emit exactly one thinking part.
+  const inlineThinking = /<think(?:ing)?\b[^>]*>([\s\S]*?)(?:<\/think(?:ing)?\s*>|$)/gi;
+  if (options.separateReasoning && !assembledReasoning) {
+    assembledReasoning = [...assembledText.matchAll(inlineThinking)].map(match => match[1]).join("").trim();
+    if (assembledReasoning) yield { kind: "reasoning", text: assembledReasoning };
+  }
+
   if (lastTimings || lastUsage) {
     yield statsFromTimings(lastTimings, lastUsage, completionChars);
   } else if (assembledText || assembledReasoning || completionChars) {
@@ -325,7 +342,8 @@ export async function* parseChatStream(
   const emittedStructured = structuredOut.length > 0;
 
   // Prefer content; fall back to reasoning_content when the server used deepseek format.
-  const textForParse = stripThinkTags(assembledText || assembledReasoning);
+  const answer = options.separateReasoning ? assembledText.replace(inlineThinking, "") : assembledText;
+  const textForParse = stripThinkTags(answer || (options.separateReasoning ? "" : assembledReasoning));
   const xmlCalls = emittedStructured ? [] : parseXmlToolCalls(textForParse);
   const visible = stripXmlToolCalls(textForParse);
 
@@ -335,7 +353,7 @@ export async function* parseChatStream(
     const remainder = liveGate.finish(visible);
     if (remainder) {
       yield { kind: "text", text: remainder };
-    } else if (!liveGate.emittedText && !visible && !emittedStructured && !xmlCalls.length && assembledReasoning) {
+    } else if (!options.separateReasoning && !liveGate.emittedText && !visible && !emittedStructured && !xmlCalls.length && assembledReasoning) {
       // Still thinking-only after the budget — surface it so the reply is not empty.
       const reasoningVisible = stripThinkTags(assembledReasoning);
       if (reasoningVisible) {

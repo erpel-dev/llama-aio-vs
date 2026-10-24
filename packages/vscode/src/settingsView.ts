@@ -22,7 +22,7 @@ import {
 } from "@llama-aio/core";
 import { LlamaInstaller, UiBackend } from "@llama-aio/core";
 import { clampLoadSettingsToModel, computeMemoryView, diffLoadSettings, fittingContextLength, memoryEstimateInputs, mmprojFileSize, resolveDraftCapabilities, shortGpuName, type SettingChange } from "@llama-aio/core";
-import { resolveModelModes } from "@llama-aio/core";
+import { resolveModelModes, resolveRemoteModelModes } from "@llama-aio/core";
 import {
   buildLibraryGroupsAsync,
   canonicalModelPath,
@@ -119,10 +119,8 @@ function chatTemplateNameOptions(): string {
 }
 
 function describeModeSampling(
-  caps: Parameters<typeof resolveModelModes>[0],
-  modelPath: string
+  modeSet: ReturnType<typeof resolveModelModes>
 ): { familyLabel: string; defaultMode: string; temperature: number; topP: number; topK: number } | null {
-  const modeSet = resolveModelModes(caps, modelPath);
   if (!modeSet) {
     return null;
   }
@@ -1146,18 +1144,8 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         updateCheck,
         memoryView: memoryView ?? null,
         modeSampling: remoteMode
-          ? describeModeSampling(
-              undefined,
-              [
-                this.processManager.remote.current()?.modelId,
-                this.processManager.remote.current()?.modelPath
-                  ? path.basename(this.processManager.remote.current()?.modelPath || "")
-                  : "",
-              ]
-                .filter(Boolean)
-                .join(" ")
-            )
-          : describeModeSampling(caps, state.selectedModelPath),
+          ? describeModeSampling(resolveRemoteModelModes(this.processManager.remote.current()))
+          : describeModeSampling(resolveModelModes(caps, state.selectedModelPath)),
         memInputs: memoryEstimateInputs(
           caps,
           draftCaps,
