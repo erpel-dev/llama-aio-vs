@@ -1,0 +1,351 @@
+{
+  "sources": [
+    {
+      "repo": "Niko1221/Strata",
+      "revision": "7dd5cf18e68c639a8773e096c5c79f971ea2a9f5",
+      "files": [
+        "setup.py",
+        "tools/strata_mcp.py",
+        "apps/host/server/model-names.mjs",
+        "serve/server.py",
+        "apps/host/server/real-model-catalog.mjs"
+      ]
+    },
+    {
+      "repo": "mw00/project-maya",
+      "revision": "f26d8bab43f9b10f0475986b541dc46ada45285e",
+      "files": [
+        "maya.py",
+        "serve/server.py",
+        "serve/frontend.py"
+      ]
+    }
+  ],
+  "rows": [
+    {
+      "provider": "strata",
+      "family": "qwen",
+      "installId": "q2_0",
+      "servedId": "qwen3.8-flash-next-q2_0",
+      "label": "Qwen3.8-Flash-Next Q2_0",
+      "profile": "Qwen3.8 Flash-Next"
+    },
+    {
+      "provider": "strata",
+      "family": "qwen",
+      "installId": "iq2_xs",
+      "servedId": "qwen3.8-flash-next-iq2_xs",
+      "label": "Qwen3.8-Flash-Next IQ2_XS",
+      "profile": "Qwen3.8 Flash-Next"
+    },
+    {
+      "provider": "strata",
+      "family": "qwen",
+      "installId": "iq3_xxs",
+      "servedId": "qwen3.8-flash-next-iq3_xxs",
+      "label": "Qwen3.8-Flash-Next IQ3_XXS",
+      "profile": "Qwen3.8 Flash-Next"
+    },
+    {
+      "provider": "strata",
+      "family": "qwen",
+      "installId": "iq3_s",
+      "servedId": "qwen3.8-flash-next-iq3_s",
+      "label": "Qwen3.8-Flash-Next IQ3_S",
+      "profile": "Qwen3.8 Flash-Next"
+    },
+    {
+      "provider": "strata",
+      "family": "swift",
+      "installId": "swift-iq2_xs",
+      "servedId": "swift-1.5-iq2_xs",
+      "label": "Swift 1.5 IQ2_XS",
+      "profile": "Qwen3.8 Flash-Next"
+    },
+    {
+      "provider": "strata",
+      "family": "swift",
+      "installId": "swift-iq3_xxs",
+      "servedId": "swift-1.5-iq3_xxs",
+      "label": "Swift 1.5 IQ3_XXS",
+      "profile": "Qwen3.8 Flash-Next"
+    },
+    {
+      "provider": "strata",
+      "family": "swift",
+      "installId": "swift-iq3_s",
+      "servedId": "swift-1.5-iq3_s",
+      "label": "Swift 1.5 IQ3_S",
+      "profile": "Qwen3.8 Flash-Next"
+    },
+    {
+      "provider": "strata",
+      "family": "coder",
+      "installId": "coder-iq1_m",
+      "servedId": "qwen3.8-flash-next-coder-iq1_m",
+      "label": "Qwen3.8-Flash-Next Coder IQ1_M",
+      "profile": "Qwen3.8 Flash-Next"
+    },
+    {
+      "provider": "strata",
+      "family": "unsloth",
+      "installId": "unsloth-ud-iq4_xs",
+      "servedId": "qwen3.8-flash-next-unsloth-ud-iq4_xs",
+      "label": "Qwen3.8-Flash-Next (Unsloth) UD-IQ4_XS",
+      "profile": "Qwen3.8 Flash-Next"
+    },
+    {
+      "provider": "strata",
+      "family": "unsloth",
+      "installId": "unsloth-ud-q4_k_xl",
+      "servedId": "qwen3.8-flash-next-unsloth-ud-q4_k_xl",
+      "label": "Qwen3.8-Flash-Next (Unsloth) UD-Q4_K_XL",
+      "profile": "Qwen3.8 Flash-Next"
+    },
+    {
+      "provider": "strata",
+      "family": "unsloth",
+      "installId": "unsloth-ud-q5_k_xl",
+      "servedId": "qwen3.8-flash-next-unsloth-ud-q5_k_xl",
+      "label": "Qwen3.8-Flash-Next (Unsloth) UD-Q5_K_XL",
+      "profile": "Qwen3.8 Flash-Next"
+    },
+    {
+      "provider": "strata",
+      "family": "unsloth",
+      "installId": "unsloth-ud-q6_k_xl",
+      "servedId": "qwen3.8-flash-next-unsloth-ud-q6_k_xl",
+      "label": "Qwen3.8-Flash-Next (Unsloth) UD-Q6_K_XL",
+      "profile": "Qwen3.8 Flash-Next"
+    },
+    {
+      "provider": "strata",
+      "family": "unsloth",
+      "installId": "unsloth-q8_0",
+      "servedId": "qwen3.8-flash-next-unsloth-q8_0",
+      "label": "Qwen3.8-Flash-Next (Unsloth) Q8_0",
+      "profile": "Qwen3.8 Flash-Next"
+    },
+    {
+      "provider": "strata",
+      "family": "gyro",
+      "installId": "gyro-gyro-s",
+      "servedId": "qwen3.8-flash-next-gyro-gyro-s",
+      "label": "Qwen3.8-Flash-Next Gyro-S",
+      "profile": "Qwen3.8 Flash-Next"
+    },
+    {
+      "provider": "strata",
+      "family": "gyro",
+      "installId": "gyro-gyro-m",
+      "servedId": "qwen3.8-flash-next-gyro-gyro-m",
+      "label": "Qwen3.8-Flash-Next Gyro-M",
+      "profile": "Qwen3.8 Flash-Next"
+    },
+    {
+      "provider": "strata",
+      "family": "nvfp4",
+      "installId": "nvfp4-nvfp4",
+      "servedId": "qwen3.8-flash-next-nvfp4-nvfp4",
+      "label": "Qwen3.8-Flash-Next (NVFP4) NVFP4",
+      "profile": "Qwen3.8 Flash-Next"
+    },
+    {
+      "provider": "strata",
+      "family": "nvfp4",
+      "installId": "nvfp4-nvfp4-nvidia",
+      "servedId": "qwen3.8-flash-next-nvfp4-nvfp4-nvidia",
+      "label": "Qwen3.8-Flash-Next (NVFP4) NVFP4-NVIDIA",
+      "profile": "Qwen3.8 Flash-Next"
+    },
+    {
+      "provider": "strata",
+      "family": "nvfp4",
+      "installId": "nvfp4-nvfp4-qad",
+      "servedId": "qwen3.8-flash-next-nvfp4-nvfp4-qad",
+      "label": "Qwen3.8-Flash-Next (NVFP4) NVFP4-QAD",
+      "profile": "Qwen3.8 Flash-Next"
+    },
+    {
+      "provider": "strata",
+      "family": "qwen36",
+      "installId": "qwen36-ud-q4_k_xl",
+      "servedId": "qwen3.6-35b-a3b-ud-q4_k_xl",
+      "label": "Qwen3.6-35B-A3B UD-Q4_K_XL",
+      "profile": "Qwen3.5 / 3.6"
+    },
+    {
+      "provider": "strata",
+      "family": "qwen36",
+      "installId": "qwen36-ud-q6_k_xl",
+      "servedId": "qwen3.6-35b-a3b-ud-q6_k_xl",
+      "label": "Qwen3.6-35B-A3B UD-Q6_K_XL",
+      "profile": "Qwen3.5 / 3.6"
+    },
+    {
+      "provider": "strata",
+      "family": "qwen36",
+      "installId": "qwen36-q8_0",
+      "servedId": "qwen3.6-35b-a3b-q8_0",
+      "label": "Qwen3.6-35B-A3B Q8_0",
+      "profile": "Qwen3.5 / 3.6"
+    },
+    {
+      "provider": "strata",
+      "family": "deepseek41",
+      "installId": "deepseek-v4.1-flash-ist-das-2.00bpw",
+      "servedId": "deepseek-v4.1-flash",
+      "label": "DeepSeek-V4.1-Flash IST-DAS-2.00bpw",
+      "profile": "DeepSeek V4.1 Flash"
+    },
+    {
+      "provider": "strata",
+      "family": "deepseek41",
+      "installId": "deepseek-v4.1-flash-ist-das-2.25bpw",
+      "servedId": "deepseek-v4.1-flash",
+      "label": "DeepSeek-V4.1-Flash IST-DAS-2.25bpw",
+      "profile": "DeepSeek V4.1 Flash"
+    },
+    {
+      "provider": "strata",
+      "family": "deepseek41",
+      "installId": "deepseek-v4.1-flash-ist-das-1.75bpw",
+      "servedId": "deepseek-v4.1-flash",
+      "label": "DeepSeek-V4.1-Flash IST-DAS-1.75bpw",
+      "profile": "DeepSeek V4.1 Flash"
+    },
+    {
+      "provider": "strata",
+      "family": "deepseek41",
+      "installId": "deepseek-v4.1-flash-ud-q8_k_xl",
+      "servedId": "deepseek-v4.1-flash",
+      "label": "DeepSeek-V4.1-Flash UD-Q8_K_XL",
+      "profile": "DeepSeek V4.1 Flash"
+    },
+    {
+      "provider": "maya",
+      "family": "glm",
+      "installId": "Maya-S-v2-IQ2_XXS",
+      "servedId": "glm-5.3-flash",
+      "profile": "GLM-5.3-Flash"
+    },
+    {
+      "provider": "maya",
+      "family": "glm",
+      "installId": "Maya-S24",
+      "servedId": "glm-5.3-flash",
+      "profile": "GLM-5.3-Flash"
+    },
+    {
+      "provider": "maya",
+      "family": "glm",
+      "installId": "Maya-M",
+      "servedId": "glm-5.3-flash",
+      "profile": "GLM-5.3-Flash"
+    },
+    {
+      "provider": "maya",
+      "family": "glm",
+      "installId": "Maya-M-Derisked",
+      "servedId": "glm-5.3-flash",
+      "profile": "GLM-5.3-Flash"
+    },
+    {
+      "provider": "maya",
+      "family": "glm",
+      "installId": "Maya-L",
+      "servedId": "glm-5.3-flash",
+      "profile": "GLM-5.3-Flash"
+    },
+    {
+      "provider": "maya",
+      "family": "glm",
+      "installId": "EXL3-3.05bpw",
+      "servedId": "glm-5.3-flash",
+      "profile": "GLM-5.3-Flash"
+    },
+    {
+      "provider": "maya",
+      "family": "glm",
+      "installId": "EXL3-4.05bpw",
+      "servedId": "glm-5.3-flash",
+      "profile": "GLM-5.3-Flash"
+    },
+    {
+      "provider": "maya",
+      "family": "deepseek",
+      "installId": "gguf-q8",
+      "servedId": "deepseek-v4.1-flash",
+      "profile": "DeepSeek V4.1 Flash"
+    },
+    {
+      "provider": "maya",
+      "family": "deepseek",
+      "installId": "gguf-q4",
+      "servedId": "deepseek-v4.1-flash",
+      "profile": "DeepSeek V4.1 Flash"
+    },
+    {
+      "provider": "maya",
+      "family": "deepseek",
+      "installId": "maya-s",
+      "servedId": "deepseek-v4.1-flash",
+      "profile": "DeepSeek V4.1 Flash"
+    },
+    {
+      "provider": "maya",
+      "family": "deepseek",
+      "installId": "maya-m",
+      "servedId": "deepseek-v4.1-flash",
+      "profile": "DeepSeek V4.1 Flash"
+    },
+    {
+      "provider": "maya",
+      "family": "deepseek",
+      "installId": "maya-xs",
+      "servedId": "deepseek-v4.1-flash",
+      "profile": "DeepSeek V4.1 Flash"
+    },
+    {
+      "provider": "maya",
+      "family": "deepseek",
+      "installId": "exl3",
+      "servedId": "deepseek-v4.1-flash",
+      "profile": "DeepSeek V4.1 Flash"
+    },
+    {
+      "provider": "maya",
+      "family": "deepseek",
+      "installId": "exl3-3.5",
+      "servedId": "deepseek-v4.1-flash",
+      "profile": "DeepSeek V4.1 Flash"
+    }
+  ],
+  "legacyRows": [
+    {
+      "id": "qwen2.5-0.5b-q4km",
+      "label": "Qwen2.5-0.5B-Instruct",
+      "profile": "Qwen2.5 0.5B Instruct"
+    },
+    {
+      "id": "qwen3-coder-30b-iq1m",
+      "label": "Qwen3-Coder-30B-A3B-Instruct",
+      "profile": "Qwen3-Coder Instruct"
+    },
+    {
+      "id": "qwen3-30b-q2",
+      "label": "Qwen3-30B-A3B",
+      "profile": "Qwen3"
+    },
+    {
+      "id": "qwen3-30b-iq2m",
+      "label": "Qwen3-30B-A3B",
+      "profile": "Qwen3"
+    },
+    {
+      "id": "qwen3-30b-iq3xxs",
+      "label": "Qwen3-30B-A3B",
+      "profile": "Qwen3"
+    }
+  ]
+}

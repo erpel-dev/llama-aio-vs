@@ -271,6 +271,7 @@ describe("SettingsViewProvider memory path", () => {
   for (const [identity, family, defaultMode] of [
     [{ modelId: "opaque", modelName: "Spark-X2.6-4B" }, "Spark X2.6", "Think (High)"],
     [{ modelId: "opaque", modelAlias: "gpt-oss-20b" }, "GPT-OSS", "Think (Medium)"],
+    [{ modelId: "opaque", modelAliases: ["glm-5.3-flash"] }, "GLM-5.3-Flash", "Think (Max)"],
     [{ modelId: "opaque", modelPath: "C:\\models\\GLM-5.3-Flash.gguf" }, "GLM-5.3-Flash", "Think (Max)"],
     [{ modelId: "LFM2.5-2.6B", modelPath: "/models/opaque.gguf" }, "LFM2.5 2.6B", "Think"],
   ]) {

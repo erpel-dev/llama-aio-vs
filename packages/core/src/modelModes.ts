@@ -286,17 +286,21 @@ function deepSeek41Modes(familyLabel: string, topP: number): ModelModeSet {
     familyLabel, defaultMode: "Think (High)", preserveReasoning: true,
     modes: {
       ...Object.fromEntries([["Max", 100], ["High", 75], ["Low", 50]].map(([name, budget]) => [
-        `Think (${name})`, { ...sampling, chat_template_kwargs: { thinking_mode: "thinking", reasoning_effort: budget } },
+        `Think (${name})`, { ...sampling, chat_template_kwargs: { enable_thinking: true, reasoning_effort: budget } },
       ])),
-      "No Think": { ...sampling, chat_template_kwargs: { thinking_mode: "chat" } },
+      "No Think": { ...sampling, chat_template_kwargs: { enable_thinking: false } },
     },
   };
 }
-const DEEPSEEK41_MODES = deepSeek41Modes("DeepSeek V4.1 Flash", 0.95);
+// Both cards permit top-p 1; Strata/Maya use this undated ID for 1017 too.
+const DEEPSEEK41_MODES = deepSeek41Modes("DeepSeek V4.1 Flash", 1);
 const DEEPSEEK41_1017_MODES = deepSeek41Modes("DeepSeek V4.1 Flash 1017", 1);
 
 const QWEN_CODER_MODES = fixedMode("Qwen3-Coder Instruct", "No Think", {
   ...OPEN_SAMPLING, temperature: 0.7, top_p: 0.8, top_k: 20, repetition_penalty: 1.05,
+});
+const QWEN25_STARTER_MODES = fixedMode("Qwen2.5 0.5B Instruct", "No Think", {
+  ...OPEN_SAMPLING, temperature: 0.7, top_p: 0.8, top_k: 20, repetition_penalty: 1.1,
 });
 const QWEN_CODER_NEXT_MODES = fixedMode("Qwen3-Coder-Next", "No Think", {
   ...OPEN_SAMPLING, top_p: 0.95, top_k: 40,
@@ -357,6 +361,7 @@ function haystack(caps?: ModelCapabilities, modelId?: string): string {
 }
 
 function namedProfile(h: string): ModelModeSet | undefined {
+  if (/\bqwen[-_ ]?2[._]5[-_ ]0[._]5b[-_ ]instruct(?:\b|_)/.test(h)) return QWEN25_STARTER_MODES;
   if (/\btiel[-_ ]coder[-_ ]35b[-_ ]a3b(?:\b|_)/.test(h)) return TIEL_CODER_MODES;
   if (/\bminicpm[-_ ]?5[-_ ]2b(?:\b|_)/.test(h)) return MINICPM5_MODES;
   if (/\bmellum[-_ ]?2[._]1[-_ ]12b[-_ ]a2[._]5b[-_ ]thinking(?:\b|_)/.test(h)) return MELLUM21_MODES;
@@ -365,6 +370,7 @@ function namedProfile(h: string): ModelModeSet | undefined {
   if (/\bflint(?:$|[-_.\s])/.test(h)) return FLINT_MODES;
   if (/\bsage[-_ ]a1[._]5(?:\b|_)/.test(h)) return SAGE15_MODES;
   if (/\bdeepseek[-_ ]v4[._]1[-_ ]flash[-_ ]1017(?:\b|_)/.test(h)) return DEEPSEEK41_1017_MODES;
+  if (/\bdeepseek[-_ ]v4[._]1[-_ ]flash[-_ ]ist[-_ ]das[-_ ](?:1[._]75|2[._](?:00|25))bpw(?:\b|_)/.test(h)) return DEEPSEEK41_1017_MODES;
   if (/\bdeepseek[-_ ]v4[._]1[-_ ]flash(?=$|[.\s]|[-_](?:gguf|(?:ud[-_ ])?(?:iq|q|fp|bf|mxfp|gsq)[\w.-]*)(?:$|[-_.\s]))/.test(h)) return DEEPSEEK41_MODES;
   if (/\bqwen3[._]8[-_ ]35b[-_ ]a3b[-_ ]distill(?:\b|_)/.test(h)) return QWEN38_DISTILL_MODES;
   if (/\bspark[-_ ]?x?2[._]6(?=$|[-_.\s/\\])/.test(h)) return SPARK26_MODES;
@@ -482,14 +488,19 @@ export function resolveModelModes(
 
 /** Shared by remote chat and the sidebar; never consult local model settings. */
 export function resolveRemoteModelModes(
-  info: Pick<RemoteServerInfo, "modelAlias" | "modelPath" | "modelName" | "modelId"> | undefined
+  info: Pick<RemoteServerInfo, "modelAlias" | "modelPath" | "modelName" | "modelId" | "modelAliases"> | undefined
 ): ModelModeSet | undefined {
   if (!info) return undefined;
   for (const identity of [info.modelAlias, info.modelPath, info.modelName, info.modelId]) {
     const profile = resolveModelModes(undefined, identity);
     if (profile) return profile;
   }
-  return undefined;
+  const aliases = (info.modelAliases ?? []).map(alias => resolveModelModes(undefined, alias))
+    .filter((profile): profile is ModelModeSet => !!profile);
+  // An arbitrary alias list may name different families. Leave sampling free
+  // if it contradicts itself instead of choosing whichever alias appeared first.
+  return aliases.length && aliases.every(profile => profile.familyLabel === aliases[0].familyLabel)
+    ? aliases[0] : undefined;
 }
 
 // Copilot CLI filters reasoningEffort against its standard effort values. Keep

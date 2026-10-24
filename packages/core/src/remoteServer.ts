@@ -53,6 +53,8 @@ export interface RemoteServerInfo {
   modelId?: string;
   /** Canonical served identity, distinct from a user-facing request alias. */
   modelAlias?: string;
+  /** Alternate identities published by /v1/models, distinct from the request ID. */
+  modelAliases?: string[];
   /** Strata Desktop's human-readable family name for opaque IDs such as q2_0. */
   modelName?: string;
   modelSizeBytes?: number;
@@ -93,10 +95,27 @@ interface ModelsResponse {
   data?: Array<{
     id?: string;
     owned_by?: string;
-    meta?: { size?: number; n_params?: number; n_ctx_train?: number; label?: string; n_ctx?: number; context?: number; instanceId?: string };
+    alias_of?: string;
+    aliases?: unknown;
+    meta?: { size?: number; n_params?: number; n_ctx_train?: number; label?: string; aliases?: unknown; n_ctx?: number; context?: number; instanceId?: string };
     /** vLLM's served context length. */
     max_model_len?: number;
   }>;
+}
+
+/** Shared parsing for the remote monitor and the chat provider's model probe. */
+export function remoteModelIdentity(model: {
+  id?: unknown; alias_of?: unknown; aliases?: unknown;
+  meta?: { label?: unknown; aliases?: unknown };
+} | undefined): Pick<RemoteServerInfo, "modelId" | "modelAlias" | "modelAliases" | "modelName"> {
+  const string = (value: unknown) => typeof value === "string" && value.trim() ? value.trim() : undefined;
+  const aliases = [...(Array.isArray(model?.aliases) ? model.aliases : []),
+    ...(Array.isArray(model?.meta?.aliases) ? model.meta.aliases : [])];
+  return {
+    modelId: typeof model?.id === "string" && model.id ? model.id : undefined,
+    modelAlias: string(model?.alias_of), modelName: string(model?.meta?.label),
+    modelAliases: [...new Set(aliases.slice(0, 64).map(string).filter((value): value is string => !!value))].sort(),
+  };
 }
 
 interface PropsResponse {
@@ -548,9 +567,7 @@ export async function probeRemoteServer(
     const first = models.data?.[0];
     strataModel = first?.owned_by === "strata";
     strataInstanceId = typeof first?.meta?.instanceId === "string" ? first.meta.instanceId : undefined;
-    info.modelId = typeof first?.id === "string" && first.id ? first.id : undefined;
-    info.modelName = first?.owned_by === "strata" && typeof first.meta?.label === "string"
-      ? first.meta.label : undefined;
+    Object.assign(info, remoteModelIdentity(first));
     info.modelSizeBytes = positive(first?.meta?.size);
     info.modelParams = positive(first?.meta?.n_params);
     info.trainedContext = positive(first?.meta?.n_ctx_train);
@@ -579,7 +596,7 @@ export async function probeRemoteServer(
     info.slotContext = positive(props.default_generation_settings?.n_ctx);
     info.totalSlots = positive(props.total_slots);
     info.modelPath = typeof props.model_path === "string" && props.model_path ? props.model_path : undefined;
-    info.modelAlias = typeof props.model_alias === "string" && props.model_alias ? props.model_alias : undefined;
+    info.modelAlias = typeof props.model_alias === "string" && props.model_alias ? props.model_alias : info.modelAlias;
     info.buildInfo = typeof props.build_info === "string" && props.build_info ? props.build_info : undefined;
     info.vision = props.modalities?.vision === true;
     info.audio = props.modalities?.audio === true;
@@ -769,6 +786,10 @@ export class RemoteServerMonitor {
       !prev ||
       prev.state !== next.state ||
       prev.modelId !== next.modelId ||
+      prev.modelName !== next.modelName ||
+      prev.modelAlias !== next.modelAlias ||
+      prev.modelPath !== next.modelPath ||
+      JSON.stringify(prev.modelAliases) !== JSON.stringify(next.modelAliases) ||
       prev.slotContext !== next.slotContext ||
       prev.servedContext !== next.servedContext ||
       prev.vision !== next.vision ||

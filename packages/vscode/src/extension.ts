@@ -1051,6 +1051,9 @@ export function activate(context: vscode.ExtensionContext): void {
         // The served label carries the model family (e.g. Qwen3.8-Flash-Next),
         // which decides the picker's thinking modes.
         info.modelName,
+        info.modelAlias,
+        info.modelPath,
+        JSON.stringify(info.modelAliases),
         info.slotContext,
         info.servedContext,
         info.vision,

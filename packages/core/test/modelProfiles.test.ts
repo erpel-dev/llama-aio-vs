@@ -5,6 +5,7 @@ import { applyModeToRequestBody, buildModeConfigurationSchema, resolveModeParams
 
 // Contract expectations taken from the author recipes linked in docs/model-profiles.md.
 const cases: Array<[string, string, string, string[]]> = [
+  ["Qwen/Qwen2.5-0.5B-Instruct", "Qwen2.5 0.5B Instruct", "No Think", ["No Think"]],
   ["Tiel-Coder-35B-A3B-MTP-UD-Q4_K_XL.gguf", "Tiel-Coder 35B-A3B", "Think", ["Think", "No Think"]],
   ["MiniCPM5-2B-GGUF", "MiniCPM5 2B", "Think", ["Think", "No Think"]],
   ["Mellum2.1-12B-A2.5B-Thinking-GGUF", "Mellum 2.1 Thinking", "Think", ["Think"]],
@@ -86,11 +87,11 @@ describe("model-specific sampler and reasoning differences", () => {
   it("maps DeepSeek's numeric budgets and keeps checkpoint-specific top-p", () => {
     for (const [mode, budget] of [["max", 100], ["high", 75], ["low", 50]] as const) {
       assert.deepEqual(params("DeepSeek-V4.1-Flash-1017", mode).chat_template_kwargs,
-        { thinking_mode: "thinking", reasoning_effort: budget });
+        { enable_thinking: true, reasoning_effort: budget });
     }
-    assert.equal(params("DeepSeek-V4.1-Flash").top_p, 0.95);
+    assert.equal(params("DeepSeek-V4.1-Flash").top_p, 1);
     assert.equal(params("DeepSeek-V4.1-Flash-1017").top_p, 1);
-    assert.deepEqual(params("DeepSeek-V4.1-Flash-1017", "none").chat_template_kwargs, { thinking_mode: "chat" });
+    assert.deepEqual(params("DeepSeek-V4.1-Flash-1017", "none").chat_template_kwargs, { enable_thinking: false });
     assert.equal(resolveModelModes(undefined, "Flint")?.preserveReasoning, true);
     assert.equal(resolveModelModes(undefined, "DeepSeek-V4.1-Flash-1017")?.preserveReasoning, true);
     assert.equal(params("Underdog-Saluki-27B-1.0", "none").temperature, 0);
