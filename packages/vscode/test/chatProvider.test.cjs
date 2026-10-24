@@ -202,7 +202,7 @@ describe("LlamaAioChatProvider requests", () => {
     ["unsloth-ud-iq4_xs", "Qwen3.8-Flash-Next (Unsloth) UD-IQ4_XS", "Qwen3.8 Flash-Next", "xhigh"],
     ["swift-iq3_s", "Swift 1.5 IQ3_S", "Qwen3.8 Flash-Next", "xhigh"],
     ["gyro-gyro-m", "Qwen3.8-Flash-Next Gyro-M", "Qwen3.8 Flash-Next", "xhigh"],
-    ["qwen36-ud-q4_k_xl", "Qwen3.6-35B-A3B UD-Q4_K_XL", "Qwen3", "medium"],
+    ["qwen36-ud-q4_k_xl", "Qwen3.6-35B-A3B UD-Q4_K_XL", "Qwen3.5 / 3.6", "medium"],
   ]) {
     for (const source of ["models", "remote probe"]) {
       it(`maps Desktop ID ${id} through the ${source} label and preserves its request ID`, async () => {
@@ -220,7 +220,7 @@ describe("LlamaAioChatProvider requests", () => {
         await provider.provideLanguageModelChatResponse(model, [msg(Role.User, new TextPart("hello"))],
           {}, { report() {} }, cancelToken().token);
         assert.equal(lastBody.model, id);
-        assert.equal(lastBody.chat_template_kwargs.reasoning_effort, family === "Qwen3" ? undefined : "xhigh");
+        assert.equal(lastBody.chat_template_kwargs.reasoning_effort, family === "Qwen3.5 / 3.6" ? undefined : "xhigh");
       });
     }
   }
@@ -246,6 +246,73 @@ describe("LlamaAioChatProvider requests", () => {
       assert.equal(lastBody.chat_template_kwargs.enable_thinking, thinking);
       assert.equal(lastBody.reasoning_effort, undefined);
       assert.equal(lastBody.temperature, thinking ? 1 : 0.7);
+    });
+  }
+
+  for (const [label, efforts, sampling, kwargs] of [
+    ["Spark-X2.5-4B", ["high", "none"], [1, 0.95, -1, 1],
+      [{ enable_thinking: true }, { enable_thinking: false }]],
+    ["Spark-X2.6-4B", ["high", "low", "none"], [1, 0.95, -1, 1],
+      [{ enable_thinking: true, reasoning_effort: "high" }, { enable_thinking: true, reasoning_effort: "low" }, { enable_thinking: false }]],
+    ["gpt-oss-20b", ["high", "medium", "low"], [1, 1, -1, 1],
+      [{ reasoning_effort: "high" }, { reasoning_effort: "medium" }, { reasoning_effort: "low" }]],
+    ["GLM-5.3-Flash", ["max", "high", "low"], [1, 0.95, -1, 1],
+      [{ reasoning_effort: "max", clear_thinking: true }, { reasoning_effort: "high", clear_thinking: true }, { reasoning_effort: "low", clear_thinking: true }]],
+    ["LFM2.5-2.6B", ["high"], [0.1, 1, 50, 1.1], [{}]],
+    ["LFM2.5-24B-A2B", ["high"], [0.1, 1, 50, 1.05], [{}]],
+    ["LFM2.5-1.2B-Instruct", ["none"], [0.1, 1, 50, 1.05], [{}]],
+    ["Qwen3-4B-Instruct-2507", ["none"], [0.7, 0.8, 20, 1], [{}]],
+    ["Qwen3-4B-Thinking-2507", ["high"], [0.6, 0.95, 20, 1], [{}]],
+    ["Qwen3-Coder-30B-A3B-Instruct", ["none"], [0.7, 0.8, 20, 1.05], [{}]],
+    ["Qwen3-Coder-Next", ["none"], [1, 0.95, 40, 1], [{}]],
+    ["NVIDIA-Nemotron-3.5-Bolt-E4B", ["high", "none"], [1, 0.95, 64, 1],
+      [{ enable_thinking: true }, { enable_thinking: false }]],
+  ]) {
+    it(`sends every ${label} picker option with its author settings through an opaque remote ID`, async () => {
+      servedModelId = "opaque-q4-instance";
+      servedMetadata = { owned_by: "strata", meta: { label } };
+      propsStatus = 404;
+      const { provider, state } = setup({ remote: true });
+      Object.assign(state.requestSettings, { temperature: 0, topP: 0.1, topK: 1,
+        minP: 0.9, repeatPenalty: 2, presencePenalty: 2, frequencyPenalty: 2 });
+      const [model] = await provider.provideLanguageModelChatInformation({}, cancelToken().token);
+      assert.deepEqual(model.configurationSchema.properties.reasoningEffort.enum, efforts);
+      for (const [index, effort] of efforts.entries()) {
+        await provider.provideLanguageModelChatResponse(model, [msg(Role.User, new TextPart("hello"))],
+          { modelConfiguration: { reasoningEffort: effort },
+            tools: [{ name: "read_file", description: "read", inputSchema: { type: "object" } }], toolMode: 2 },
+          { report() {} }, cancelToken().token);
+        assert.equal(lastBody.model, servedModelId);
+        assert.deepEqual([lastBody.temperature, lastBody.top_p, lastBody.top_k, lastBody.repeat_penalty], sampling);
+        assert.deepEqual(lastBody.chat_template_kwargs, kwargs[index]);
+        assert.equal(lastBody.frequency_penalty, 0);
+        assert.equal(lastBody.min_p, 0);
+        assert.equal(lastBody.reasoning_effort, undefined);
+        assert.equal(lastBody.tool_choice, "required");
+        assert.equal(lastBody.tools[0].function.name, "read_file");
+      }
+    });
+  }
+
+  for (const [label, effort, temperature, topP, topK, presence, minP, kwargs] of [
+    ["Ornith-1.5-9B", "high", 1, 0.95, 20, 1.5, 0, { enable_thinking: true, preserve_thinking: true }],
+    ["NVIDIA-Nemotron-3-Nano-4B", "high", 1, 0.95, -1, 0, 0, { enable_thinking: true }],
+    ["NVIDIA-Nemotron-3-Nano-30B-A3B", "high", 1, 1, -1, 0, 0, { enable_thinking: true }],
+    ["Ternary-Bonsai-2-27B", "xhigh", 1, 0.95, 20, 0, 0.05, { enable_thinking: true, reasoning_effort: "xhigh" }],
+    ["Ternary-Bonsai-2-27B", "none", 0.7, 0.8, 20, 1.5, 0, { enable_thinking: false }],
+  ]) {
+    it(`sends ${label} ${effort} with its distinct penalties and template controls`, async () => {
+      servedModelId = "opaque-q4-instance";
+      servedMetadata = { owned_by: "strata", meta: { label } };
+      propsStatus = 404;
+      const { provider } = setup({ remote: true });
+      const [model] = await provider.provideLanguageModelChatInformation({}, cancelToken().token);
+      await provider.provideLanguageModelChatResponse(model, [msg(Role.User, new TextPart("hello"))],
+        { modelConfiguration: { reasoningEffort: effort } }, { report() {} }, cancelToken().token);
+      assert.equal(lastBody.model, servedModelId);
+      assert.deepEqual([lastBody.temperature, lastBody.top_p, lastBody.top_k, lastBody.presence_penalty, lastBody.min_p],
+        [temperature, topP, topK, presence, minP]);
+      assert.deepEqual(lastBody.chat_template_kwargs, kwargs);
     });
   }
 
@@ -336,10 +403,10 @@ describe("LlamaAioChatProvider requests", () => {
     assert.equal(provider.modeSetFor("local-model", { model_path: "C:\\models\\Qwen3.8-Flash-Next.gguf" }).familyLabel,
       "Qwen3.8 Flash-Next");
     assert.equal(provider.modeSetFor("local-model", { model_path: "C:\\Qwen3.8-Flash-Next\\pack\\full" }), undefined);
-    assert.equal(provider.modeSetFor("qwen3.8-flash-next", { model_alias: "qwen3.6-35b-a3b" }).familyLabel, "Qwen3");
+    assert.equal(provider.modeSetFor("qwen3.8-flash-next", { model_alias: "qwen3.6-35b-a3b" }).familyLabel, "Qwen3.5 / 3.6");
     assert.equal(provider.modeSetFor("local-model", {
       model_alias: "qwen3.6-35b-a3b", model_path: "C:\\models\\Qwen3.8-Flash-Next.gguf",
-    }).familyLabel, "Qwen3");
+    }).familyLabel, "Qwen3.5 / 3.6");
   });
 
   for (const [toolMode, expected] of [[undefined, "auto"], [1, "auto"], [2, "required"]]) {
