@@ -44,7 +44,7 @@ The running model appears in Copilot Chat as **Llama AIO: …**, including Agent
 
 Thinking modes also work in Copilot CLI sessions. That picker uses standard effort names: for Qwen3.8 / Flash-Next, **XHigh**, **Medium**, **Low**, and **None** select the corresponding thinking presets and No Think. Existing chats with the older preset names remain supported.
 
-Profiles also cover Spark X2.5/X2.6, GPT-OSS, GLM-5.3-Flash, selected Ornith and Nemotron checkpoints, LFM2.5, Bonsai 2, and Qwen Coder/Instruct variants. See the [profile catalog](docs/model-profiles.md) for exact versions, defaults, sources, and runtime requirements.
+Profiles also cover Spark X2.5/X2.6, GPT-OSS, GLM-5.3/Flash, DeepSeek V4.1 Flash, Tiel-Coder, MiniCPM5, Mellum2.1, MiMo Distill, Saluki, Flint, Sage, selected Ornith and Nemotron checkpoints, LFM2.5, Bonsai 2, and Qwen Coder/Instruct variants. See the [profile catalog](docs/model-profiles.md) for exact versions, defaults, sources, and runtime requirements.
 
 The llama icon is supplied for both the provider and its models. VS Code 1.142 ignores the provider icon, and its Copilot CLI bridge does not carry custom model icons into CLI sessions, so those surfaces show VS Code's generic icon. The extension cannot override those host controls.
 

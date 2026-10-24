@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import * as http from "node:http";
 import { after, before, describe, it } from "node:test";
 import { streamChatCompletion, type ChatStreamEvent } from "../src/chatClient";
-import { parseChatStream, withSystemHints, type ChatStreamPart } from "../src/chatStream";
+import { openChatStream, parseChatStream, withSystemHints, type ChatStreamPart } from "../src/chatStream";
 import { SseStreamError } from "../src/sseStream";
 
 /** Recorded-style llama-server SSE: one `data:` line per object, split into odd-sized chunks. */
@@ -35,6 +35,80 @@ const delta = (d: object) => ({ choices: [{ delta: d }] });
 const timings = { prompt_n: 12, prompt_ms: 100, predicted_n: 5, predicted_ms: 250, cache_n: 30 };
 
 describe("parseChatStream", () => {
+  it("completes consecutive tool turns when an SSE connection cannot serve another POST", async () => {
+    const seen = new Set<http.IncomingMessage["socket"]>();
+    let rejectedReuse = 0;
+    let accepted = 0;
+    const server = http.createServer((req, res) => {
+      if (seen.has(req.socket)) {
+        rejectedReuse++;
+        req.socket.destroy();
+        return;
+      }
+      seen.add(req.socket);
+      req.resume();
+      req.on("end", () => {
+        accepted++;
+        res.writeHead(200, { "Content-Type": "text/event-stream", Connection: "keep-alive" });
+        res.end('data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n');
+      });
+    });
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    try {
+      const endpoint = `http://127.0.0.1:${(server.address() as import("node:net").AddressInfo).port}`;
+      for (let turn = 0; turn < 2; turn++) {
+        const response = await openChatStream(endpoint, { model: "test", messages: [], stream: true });
+        const parts: ChatStreamPart[] = [];
+        for await (const part of parseChatStream(response, { toolsEnabled: true })) parts.push(part);
+        assert.equal(text(parts), "ok");
+      }
+      assert.equal(accepted, 2);
+      assert.equal(rejectedReuse, 0);
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
+  });
+  for (const legacyDuplicate of [false, true]) {
+    it(`separates inline thoughts without duplicating legacy reasoning (duplicate=${legacyDuplicate})`, async () => {
+      const events: ChatStreamPart[] = [];
+      for await (const event of parseChatStream(from(sse([
+        ...(legacyDuplicate ? [delta({ reasoning_content: "Check it." })] : []),
+        delta({ content: "<thi" }), delta({ content: "nk>Check it.</think>Answer" }),
+      ])), { toolsEnabled: false, separateReasoning: true })) events.push(event);
+      assert.equal(text(events), "Answer");
+      assert.deepEqual(events.filter(p => p.kind === "reasoning"), [{ kind: "reasoning", text: "Check it." }]);
+    });
+  }
+
+  it("keeps an unfinished thinking block out of answer text", async () => {
+    const events: ChatStreamPart[] = [];
+    for await (const event of parseChatStream(from(sse([delta({ content: "<think>Still working" })])),
+      { toolsEnabled: false, separateReasoning: true })) events.push(event);
+    assert.equal(text(events), "");
+    assert.deepEqual(events.filter(p => p.kind === "reasoning"), [{ kind: "reasoning", text: "Still working" }]);
+  });
+  for (const toolsEnabled of [false, true]) {
+    it(`keeps separate reasoning out of final text and tool parsing (tools=${toolsEnabled})`, async () => {
+      const events: ChatStreamPart[] = [];
+      for await (const event of parseChatStream(from(sse([
+        delta({ reasoning_content: "I should inspect the file." }),
+        delta({ content: "Answer" }),
+        { choices: [{ message: { reasoning_content: "I should inspect the file.", content: "Answer" } }] },
+      ])), { toolsEnabled, separateReasoning: true })) events.push(event);
+      assert.equal(text(events), "Answer");
+      assert.deepEqual(events.filter(p => p.kind === "reasoning"), [{ kind: "reasoning", text: "I should inspect the file." }]);
+    });
+  }
+
+  it("emits a reasoning-only message once without manufacturing an answer", async () => {
+    const events: ChatStreamPart[] = [];
+    for await (const event of parseChatStream(from(sse([
+      { choices: [{ message: { reasoning_content: "Still working." } }] },
+    ])), { toolsEnabled: true, separateReasoning: true })) events.push(event);
+    assert.equal(text(events), "");
+    assert.deepEqual(events.filter(p => p.kind === "reasoning"), [{ kind: "reasoning", text: "Still working." }]);
+  });
   for (const toolsEnabled of [false, true]) {
     it(`emits message-style content and reasoning exactly once (tools=${toolsEnabled})`, async () => {
       for (const message of [{ content: "Hello" }, { reasoning_content: "Thinking hard." }]) {

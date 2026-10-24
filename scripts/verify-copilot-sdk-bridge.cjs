@@ -51,6 +51,8 @@ async function main() {
       sendChatRequest: async (model, _extension, messages, options) => {
         captured = { model, messages, options };
         return { result: Promise.resolve(), stream: (async function* () {
+          yield { type: "thinking", value: "I need " };
+          yield { type: "thinking", value: "the file." };
           yield { type: "text", value: "ok" };
           yield { type: "tool_use", name: "read_file", toolCallId: "call_2", parameters: { path: "README.md" } };
         })() };
@@ -64,6 +66,7 @@ async function main() {
       const request = translation.responsesRequestToBridge("llama-aio", {
         model: "opaque-instance", ...(effort ? { reasoning: { effort } } : {}), input: [
           { type: "message", role: "user", content: "Read README.md" },
+          { type: "reasoning", summary: [{ type: "summary_text", text: "I need the file." }] },
           { type: "function_call", call_id: "call_1", name: "read_file", arguments: '{"path":"README.md"}' },
           { type: "function_call_output", call_id: "call_1", output: "Example project" },
         ], tools: [{ type: "function", name: "read_file", parameters: { type: "object" } }],
@@ -74,8 +77,11 @@ async function main() {
       assert.equal(captured.model, "llama-aio/opaque-instance");
       assert.equal(captured.options.tools[0].name, "read_file");
       assert.equal(captured.messages.at(-1).content[0].toolCallId, "call_1");
-      assert.equal(result.output[1].type, "function_call");
-      assert.equal(result.output[1].argumentsJson, '{"path":"README.md"}');
+      const thinking = captured.messages.find(message => message.role === 2).content[0];
+      assert.equal(thinking.type, "thinking");
+      assert.deepEqual(Array.from(thinking.value), ["I need the file."]);
+      assert.deepEqual(Array.from(result.output.find(item => item.type === "reasoning").summary), ["I need the file."]);
+      assert.equal(result.output.find(item => item.type === "function_call").argumentsJson, '{"path":"README.md"}');
       const selected = core.resolveModeParams(profile, captured.options.configuration);
       assert.equal(selected.modeName, core.resolveModeParams(profile, effort ? { reasoningEffort: effort } : undefined).modeName);
       if (effort === "none") assert.equal(selected.modeName, "No Think");

@@ -6,11 +6,13 @@ history. This checks prompt construction, not inference quality or GPU support.
 Use --cache DIR to reuse downloaded HF files (ID directories use __ for /).
 """
 import argparse
+import copy
 import datetime
 import hashlib
 import json
 from pathlib import Path
 import subprocess
+import struct
 import urllib.request
 
 from jinja2 import nodes
@@ -29,6 +31,50 @@ class Generation(Extension):
 
 def reject(message):
     raise ValueError(message)
+
+
+def gguf_template(url):
+    """Read metadata only; close after 32 MiB even if Range is ignored."""
+    request = urllib.request.Request(url, headers={"Range": "bytes=0-33554431"})
+    with urllib.request.urlopen(request, timeout=45) as response:
+        data = response.read(33554432)
+    offset = 0
+
+    def take(fmt):
+        nonlocal offset
+        value = struct.unpack_from("<" + fmt, data, offset)[0]
+        offset += struct.calcsize("<" + fmt)
+        return value
+
+    def string():
+        nonlocal offset
+        size = take("Q")
+        if offset + size > len(data):
+            raise ValueError("GGUF metadata exceeds the bounded prefix")
+        value = data[offset:offset + size]
+        offset += size
+        return value.decode()
+
+    def value(kind):
+        if kind == 8:
+            return string()
+        if kind == 9:
+            item, count = take("I"), take("Q")
+            for _ in range(count):
+                value(item)
+            return None
+        return take({0: "B", 1: "b", 2: "H", 3: "h", 4: "I", 5: "i", 6: "f",
+                     7: "?", 10: "Q", 11: "q", 12: "d"}[kind])
+
+    assert take("I") == 0x46554747
+    assert take("I") in [2, 3]
+    take("Q")  # tensor count
+    for _ in range(take("Q")):
+        key = string()
+        result = value(take("I"))
+        if key == "tokenizer.chat_template":
+            return result
+    raise ValueError("No tokenizer.chat_template in GGUF metadata")
 
 
 def main():
@@ -66,14 +112,31 @@ def main():
                 if optional and error.code == 404:
                     return None
                 raise
+            target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(value)
             return value
 
-        tokenizer = json.loads(fetch("tokenizer_config.json"))
-        template = fetch("chat_template.jinja", optional=True) or tokenizer["chat_template"]
-        if isinstance(template, list):
-            template = next(item["template"] for item in template if item["name"] == "default")
-        compiled = env.from_string(template)
+        tokenizer = {}
+        encoder = None
+        if "gguf" in source:
+            cached = folder / "extracted-chat-template.jinja"
+            if not cached.exists():
+                url = f'https://huggingface.co/{source["id"]}/resolve/{source["revision"]}/{source["gguf"]}'
+                cached.write_text(gguf_template(url))
+            template = cached.read_text()
+        elif "encoder" in source:
+            # Optional, pinned author reference encoder (reviewed stdlib-only
+            # source); this check is intentionally outside the default test run.
+            template = fetch(source["encoder"])
+            namespace = {"__name__": "author_reference_encoder"}
+            exec(compile(template, source["encoder"], "exec"), namespace)
+            encoder = namespace["encode_messages"]
+        else:
+            tokenizer = json.loads(fetch("tokenizer_config.json"))
+            template = fetch("chat_template.jinja", optional=True) or tokenizer["chat_template"]
+            if isinstance(template, list):
+                template = next(item["template"] for item in template if item["name"] == "default")
+        compiled = env.from_string(template) if encoder is None else None
         code = "console.log(JSON.stringify(require('./packages/core/out/modelModes.js').resolveModelModes(undefined, process.argv[1])))"
         profile = json.loads(subprocess.check_output(["node", "-e", code, source["id"]], cwd=root))
         outputs = {}
@@ -83,7 +146,15 @@ def main():
                            for key, value in tokenizer.items() if key.endswith("_token")}
                 context.update(messages=messages, tools=[tool], add_generation_prompt=True)
                 context.update(params.get("chat_template_kwargs", {}))
-                rendered = compiled.render(**context)
+                if encoder:
+                    conversation = copy.deepcopy(messages)
+                    conversation.insert(0, {"role": "system", "content": "", "tools": [tool]})
+                    for message in conversation:
+                        for call in message.get("tool_calls", []):
+                            call["function"]["arguments"] = json.dumps(call["function"]["arguments"])
+                    rendered = encoder(conversation, **params.get("chat_template_kwargs", {}))
+                else:
+                    rendered = compiled.render(**context)
                 assert rendered.strip(), (source["id"], mode, fixture)
                 if fixture == "tools":
                     assert "read_file" in rendered and "Example project." in rendered

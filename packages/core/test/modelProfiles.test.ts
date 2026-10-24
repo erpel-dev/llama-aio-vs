@@ -5,6 +5,16 @@ import { applyModeToRequestBody, buildModeConfigurationSchema, resolveModeParams
 
 // Contract expectations taken from the author recipes linked in docs/model-profiles.md.
 const cases: Array<[string, string, string, string[]]> = [
+  ["Tiel-Coder-35B-A3B-MTP-UD-Q4_K_XL.gguf", "Tiel-Coder 35B-A3B", "Think", ["Think", "No Think"]],
+  ["MiniCPM5-2B-GGUF", "MiniCPM5 2B", "Think", ["Think", "No Think"]],
+  ["Mellum2.1-12B-A2.5B-Thinking-GGUF", "Mellum 2.1 Thinking", "Think", ["Think"]],
+  ["MiMo-V2.6-Distill-Qwen-9B-Q4_K_M.gguf", "MiMo V2.6 Distill Qwen 9B", "Think", ["Think"]],
+  ["Underdog-Saluki-27B-1.0-IQ2-mix.gguf", "Underdog Saluki 27B", "Think", ["Think", "No Think"]],
+  ["RecursiveSI/flint-int4-gguf", "Flint", "Think", ["Think"]],
+  ["Sage-A1.5-Q4_K_M.gguf", "Sage A1.5", "Think", ["Think"]],
+  ["GLM-5.3-Q4_K_M.gguf", "GLM-5.3", "Think (Max)", ["Think (Max)", "Think (High)", "Think (Low)"]],
+  ["DeepSeek-V4.1-Flash-Q4_K_M.gguf", "DeepSeek V4.1 Flash", "Think (High)", ["Think (Max)", "Think (High)", "Think (Low)", "No Think"]],
+  ["DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF", "DeepSeek V4.1 Flash 1017", "Think (High)", ["Think (Max)", "Think (High)", "Think (Low)", "No Think"]],
   ["XHToken/Spark-X2.5-1.7B-GGUF", "Spark X2.5", "Think", ["Think", "No Think"]],
   ["Spark-X2.5-4B-Q4_K_M.gguf", "Spark X2.5", "Think", ["Think", "No Think"]],
   ["Spark-X2.6-4B-Q4_K_M.gguf", "Spark X2.6", "Think (High)", ["Think (High)", "Think (Low)", "No Think"]],
@@ -73,6 +83,19 @@ function params(id: string, mode?: string) {
 }
 
 describe("model-specific sampler and reasoning differences", () => {
+  it("maps DeepSeek's numeric budgets and keeps checkpoint-specific top-p", () => {
+    for (const [mode, budget] of [["max", 100], ["high", 75], ["low", 50]] as const) {
+      assert.deepEqual(params("DeepSeek-V4.1-Flash-1017", mode).chat_template_kwargs,
+        { thinking_mode: "thinking", reasoning_effort: budget });
+    }
+    assert.equal(params("DeepSeek-V4.1-Flash").top_p, 0.95);
+    assert.equal(params("DeepSeek-V4.1-Flash-1017").top_p, 1);
+    assert.deepEqual(params("DeepSeek-V4.1-Flash-1017", "none").chat_template_kwargs, { thinking_mode: "chat" });
+    assert.equal(resolveModelModes(undefined, "Flint")?.preserveReasoning, true);
+    assert.equal(resolveModelModes(undefined, "DeepSeek-V4.1-Flash-1017")?.preserveReasoning, true);
+    assert.equal(params("Underdog-Saluki-27B-1.0", "none").temperature, 0);
+    assert.equal(params("Sage-A1.5").presence_penalty, 1.5);
+  });
   it("keeps Spark version controls separate despite their shared architecture", () => {
     for (const mode of ["Think (High)", "Think (Low)", "No Think"]) {
       const p = params("Spark-X2.6-4B", mode);
@@ -129,6 +152,7 @@ describe("profile identity boundaries", () => {
     assert.equal(resolveModelModes(undefined, "Swift-1.5-Qwen3.8-27B-GSQ-RCO-GGUF")?.familyLabel, "Qwen3.8");
   });
   for (const id of ["Spark-X2.7-4B", "LFM2.5-7B", "Ornith-1.5-31B", "Ornith-2.0-9B", "GLM-4.7-Flash",
+    "MiniCPM5-2B-DSpark-GGUF", "Mellum2.1-12B-A2.5B-Base", "DeepSeek-V4.1-Flash-1018", "GLM-5.4",
     "gpt-oss-20b-Base", "Spark-X2.6-4B-Base", "mtp-Qwen3.8-27B.gguf", "mmproj-Qwen3.8.gguf",
     "Qwen3.8-Flash-Next-DFlash2", "/models/Qwen3.8/unknown.gguf", "C:\\models\\Qwen3.8\\unknown.gguf"]) {
     it(`does not invent a profile for ${id}`, () => assert.equal(resolveModelModes(undefined, id), undefined));

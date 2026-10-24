@@ -167,9 +167,11 @@ function messageChars(m: {
   role?: string;
   content?: unknown;
   tool_calls?: unknown;
+  reasoning_content?: string;
 }): number {
   let chars = (m.role?.length || 0) + 8;
   chars += contentChars(m.content);
+  chars += m.role === "assistant" ? m.reasoning_content?.length || 0 : 0;
   if (m.role === "assistant" && Array.isArray(m.tool_calls)) {
     for (const tc of m.tool_calls as Array<{
       function?: { name?: string; arguments?: string };
@@ -189,7 +191,7 @@ function charsToTokens(chars: number): number {
  * Last user message = Request; earlier user/assistant = History; tool role = Tool results.
  */
 export function estimateContextBreakdown(
-  messages: Array<{ role?: string; content?: unknown; tool_calls?: unknown }>,
+  messages: Array<{ role?: string; content?: unknown; tool_calls?: unknown; reasoning_content?: string }>,
   tools: unknown[] | undefined,
   limitTokens: number
 ): ContextBreakdown {

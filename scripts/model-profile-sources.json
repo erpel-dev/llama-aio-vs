@@ -1,5 +1,18 @@
 [
   {
+    "id": "ConwayResearch/Underdog-Saluki-27B-1.0",
+    "revision": "5acfd9218fa54731f237eea8b3243d430dd85a69",
+    "gguf": "Underdog-Saluki-27B-1.0-IQ2-mix.gguf"
+  },
+  {
+    "id": "InternScience/Sage-A1.5",
+    "revision": "0e3205cf441cf01df0c0d238cc4738d0e43b4ca7"
+  },
+  {
+    "id": "JetBrains/Mellum2.1-12B-A2.5B-Thinking",
+    "revision": "92ddae9fc7665e9f801d141d2e5a6b2caf2460c4"
+  },
+  {
     "id": "LiquidAI/LFM2.5-1.2B-Instruct",
     "revision": "0f604ada3f766f9f257460c4c9f0b5d6f69d431b"
   },
@@ -56,6 +69,10 @@
     "revision": "de4b8e4d43b917e7706784d8bb445c9af86a3540"
   },
   {
+    "id": "RecursiveSI/flint",
+    "revision": "2a247be0c0aec895ccb0ac7ca92229ec6df37288"
+  },
+  {
     "id": "XHToken/Spark-X2.5-1.7B",
     "revision": "14d6e83c13c7add2b62a7c39b2131f4ed1cddcf8"
   },
@@ -66,6 +83,19 @@
   {
     "id": "XHToken/Spark-X2.6-4B",
     "revision": "66e3ae7bee54e0a523d692cb8ef841f35409807b"
+  },
+  {
+    "id": "XiaomiMiMo/MiMo-V2.6-Distill-Qwen-9B",
+    "revision": "2367e865d009c13ac81713a2878291d33ab28177"
+  },
+  {
+    "id": "deepseek-ai/DeepSeek-V4.1-Flash",
+    "revision": "314113f8a7dadb388215396ba5fbee2c610a04d6"
+  },
+  {
+    "id": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+    "revision": "1bae0e1088993b9b82de08f59de5be5a34e42170",
+    "encoder": "encoding/encoding.py"
   },
   {
     "id": "empero-ai/Qwen3.8-35B-A3B-Distill",
@@ -92,6 +122,10 @@
     "revision": "6cee5e81ee83917806bbde320786a8fb61efebee"
   },
   {
+    "id": "openbmb/MiniCPM5-2B",
+    "revision": "f97400052a43d642bbc6e9975e2397e3ae6a6b52"
+  },
+  {
     "id": "ornith-ai/Ornith-1.5-122B",
     "revision": "7681ef608624e7532d8164128bcffdbdbaf1b1af"
   },
@@ -102,6 +136,15 @@
   {
     "id": "ornith-ai/Ornith-1.5-9B",
     "revision": "489cb97981b8654bcfcf30ce1f94ed1b62e07b53"
+  },
+  {
+    "id": "peculiar-ragdoll/Tiel-Coder-35B-A3B-GGUF-MTP",
+    "revision": "bbe9e566f39e4fc9652ac66b71968289a03c520a",
+    "gguf": "Tiel-Coder-35B-A3B-MTP-UD-IQ3_XXS.gguf"
+  },
+  {
+    "id": "zai-org/GLM-5.3",
+    "revision": "ba32f8c19c8738e2c57c71798c601d477a7bf844"
   },
   {
     "id": "zai-org/GLM-5.3-Flash",

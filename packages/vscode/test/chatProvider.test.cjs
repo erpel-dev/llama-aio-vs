@@ -12,6 +12,9 @@ class TextPart {
     this.value = value;
   }
 }
+class ThinkingPart {
+  constructor(value) { this.value = value; }
+}
 class ToolCallPart {
   constructor(callId, name, input) {
     Object.assign(this, { callId, name, input });
@@ -35,6 +38,7 @@ require.cache.vscode = {
   loaded: true,
   exports: {
     LanguageModelTextPart: TextPart,
+    LanguageModelThinkingPart: ThinkingPart,
     LanguageModelToolCallPart: ToolCallPart,
     LanguageModelToolResultPart: ToolResultPart,
     LanguageModelChatMessageRole: Role,
@@ -291,6 +295,14 @@ describe("LlamaAioChatProvider requests", () => {
   }
 
   for (const [label, efforts, sampling, kwargs] of [
+    ["MiniCPM5-2B", ["high", "none"], [1, 0.95, -1, 1],
+      [{ enable_thinking: true }, { enable_thinking: false }]],
+    ["Mellum2.1-12B-A2.5B-Thinking", ["high"], [0.6, 0.95, 20, 1], [{}]],
+    ["MiMo-V2.6-Distill-Qwen-9B", ["high"], [0.6, 0.95, 20, 1], [{}]],
+    ["Flint", ["high"], [1, 0.95, 20, 1], [{}]],
+    ["Sage-A1.5", ["high"], [1, 0.95, 20, 1], [{ enable_thinking: true, preserve_thinking: true }]],
+    ["GLM-5.3", ["max", "high", "low"], [1, 0.95, -1, 1],
+      [{ reasoning_effort: "max", clear_thinking: true }, { reasoning_effort: "high", clear_thinking: true }, { reasoning_effort: "low", clear_thinking: true }]],
     ["Spark-X2.5-4B", ["high", "none"], [1, 0.95, -1, 1],
       [{ enable_thinking: true }, { enable_thinking: false }]],
     ["Spark-X2.6-4B", ["high", "low", "none"], [1, 0.95, -1, 1],
@@ -337,6 +349,10 @@ describe("LlamaAioChatProvider requests", () => {
   }
 
   for (const [label, effort, temperature, topP, topK, presence, minP, kwargs] of [
+    ["Tiel-Coder-35B-A3B-MTP-UD-Q4_K_XL", "high", 0.6, 0.95, 20, 0, 0, { enable_thinking: true }],
+    ["Tiel-Coder-35B-A3B-MTP-UD-Q4_K_XL", "none", 0.7, 0.8, 20, 1.5, 0, { enable_thinking: false }],
+    ["Underdog-Saluki-27B-1.0", "high", 0.6, 0.95, 20, 0, 0, { enable_thinking: true }],
+    ["Underdog-Saluki-27B-1.0", "none", 0, 0.95, 20, 0, 0, { enable_thinking: false }],
     ["Ornith-1.5-9B", "high", 1, 0.95, 20, 1.5, 0, { enable_thinking: true, preserve_thinking: true }],
     ["NVIDIA-Nemotron-3-Nano-4B", "high", 1, 0.95, -1, 0, 0, { enable_thinking: true }],
     ["NVIDIA-Nemotron-3-Nano-30B-A3B", "high", 1, 1, -1, 0, 0, { enable_thinking: true }],
@@ -357,6 +373,68 @@ describe("LlamaAioChatProvider requests", () => {
       assert.deepEqual(lastBody.chat_template_kwargs, kwargs);
     });
   }
+
+  for (const label of ["DeepSeek-V4.1-Flash", "DeepSeek-V4.1-Flash-1017"]) {
+    it(`maps every ${label} SDK effort to the numeric budget without changing the remote request ID`, async () => {
+      servedModelId = "opaque-instance";
+      servedMetadata = { owned_by: "strata", meta: { label } };
+      propsStatus = 404;
+      const { provider } = setup({ remote: true });
+      const [model] = await provider.provideLanguageModelChatInformation({}, cancelToken().token);
+      assert.deepEqual(model.configurationSchema.properties.reasoningEffort.enum, ["max", "high", "low", "none"]);
+      for (const [effort, budget] of [["max", 100], ["high", 75], ["low", 50], ["none", undefined]]) {
+        await provider.provideLanguageModelChatResponse(model, [msg(Role.User, new TextPart("hello"))],
+          { modelConfiguration: { reasoningEffort: effort } }, { report() {} }, cancelToken().token);
+        assert.equal(lastBody.model, "opaque-instance");
+        assert.equal(lastBody.top_p, label.endsWith("1017") ? 1 : 0.95);
+        assert.deepEqual(lastBody.chat_template_kwargs, budget === undefined
+          ? { thinking_mode: "chat" } : { thinking_mode: "thinking", reasoning_effort: budget });
+        assert.equal(lastBody.reasoning_effort, undefined);
+      }
+    });
+  }
+
+  for (const remote of [false, true]) {
+    for (const label of ["Flint", "DeepSeek-V4.1-Flash-1017"]) {
+      it(`round-trips ${label} SDK thinking parts separately from text across tool turns (remote=${remote})`, async () => {
+        servedModelId = remote ? "opaque-instance" : label;
+        servedMetadata = { owned_by: "strata", meta: { label } };
+        propsStatus = 404;
+        const { provider } = setup({ remote });
+        const [model] = await provider.provideLanguageModelChatInformation({}, cancelToken().token);
+        const options = { tools: [{ name: "read_file", description: "read", inputSchema: { type: "object" } }] };
+        reply = { events: [delta({ reasoning_content: "I need " }), delta({ reasoning_content: "the file." }),
+          delta({ tool_calls: [{ index: 0, id: "call_1", function: { name: "read_file", arguments: '{"path":"README.md"}' } }] })], delayMs: 0 };
+        const parts = [];
+        await provider.provideLanguageModelChatResponse(model, [msg(Role.User, new TextPart("Read it"))],
+          options, { report: part => parts.push(part) }, cancelToken().token);
+        assert.equal(parts.filter(p => p instanceof ThinkingPart).map(p => p.value).join(""), "I need the file.");
+        assert.equal(parts.filter(p => p instanceof TextPart).length, 0);
+        assert.equal(parts.filter(p => p instanceof ToolCallPart).length, 1);
+        reply = { events: [delta({ content: "done" })], delayMs: 0 };
+        await provider.provideLanguageModelChatResponse(model, [msg(Role.User, new TextPart("Read it")),
+          msg(Role.Assistant, ...parts), msg(Role.User, new ToolResultPart("call_1", [new TextPart("Project text")]))],
+          options, { report() {} }, cancelToken().token);
+        const assistant = lastBody.messages.find(m => m.role === "assistant");
+        assert.equal(assistant.reasoning_content, "I need the file.");
+        assert.equal(assistant.content, null);
+        assert.equal(assistant.tool_calls[0].id, "call_1");
+      });
+    }
+  }
+
+  it("keeps the legacy text fallback when the host has no thinking-part API", async (t) => {
+    const api = require.cache.vscode.exports;
+    api.LanguageModelThinkingPart = undefined;
+    t.after(() => { api.LanguageModelThinkingPart = ThinkingPart; });
+    servedModelId = "Flint";
+    const { provider } = setup();
+    reply = { events: [delta({ reasoning_content: "Working." })], delayMs: 0 };
+    const parts = [];
+    await provider.provideLanguageModelChatResponse({ id: "Flint" }, [msg(Role.User, new TextPart("hello"))],
+      {}, { report: part => parts.push(part) }, cancelToken().token);
+    assert.equal(parts.filter(p => p instanceof TextPart).map(p => p.value).join(""), "Working.");
+  });
 
   for (const source of ["props", "remote probe"]) {
     it(`uses Strata's canonical model alias from ${source} for the picker and request profile`, async () => {

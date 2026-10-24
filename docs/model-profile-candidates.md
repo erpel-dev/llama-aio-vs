@@ -1,4 +1,8 @@
-# Next model profiles: August 24–October 24, 2026
+# Model profile selection: August 24–October 24, 2026
+
+The current PR now includes the candidates below, including Sage and the two
+remote-server families. Dory remains on the watchlist. See the
+[profile catalog](model-profiles.md) for implemented modes and runtime limits.
 
 Snapshot checked on October 24. This shortlist prioritizes local coding and agent
 use, then remote inference. It uses HF download-ranked text-generation and

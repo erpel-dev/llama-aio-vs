@@ -32,6 +32,8 @@ export interface ModelModeSet {
   defaultMode: string;
   /** Short label for tooltips */
   familyLabel: string;
+  /** Reasoning must survive assistant/tool turns on hosts with thinking parts. */
+  preserveReasoning?: boolean;
 }
 
 const QWEN_THINK_SAMPLING = {
@@ -251,6 +253,47 @@ SPARK26_MODES.modes["No Think"] = { ...SPARK_SAMPLING, chat_template_kwargs: { e
 const GPT_OSS_MODES = effortModes("GPT-OSS", ["high", "medium", "low"], "medium", OPEN_SAMPLING);
 const GLM53_MODES = effortModes("GLM-5.3-Flash", ["max", "high", "low"], "max",
   { ...OPEN_SAMPLING, top_p: 0.95 }, { clear_thinking: true });
+const GLM53_FULL_MODES: ModelModeSet = { ...GLM53_MODES, familyLabel: "GLM-5.3" };
+
+const MINICPM5_MODES = binaryModes("MiniCPM5 2B", { ...OPEN_SAMPLING, top_p: 0.95 });
+const MELLUM21_MODES = fixedMode("Mellum 2.1 Thinking", "Think", {
+  ...OPEN_SAMPLING, temperature: 0.6, top_p: 0.95, top_k: 20,
+});
+const MIMO26_DISTILL_MODES = fixedMode("MiMo V2.6 Distill Qwen 9B", "Think", {
+  ...OPEN_SAMPLING, temperature: 0.6, top_p: 0.95, top_k: 20,
+});
+const FLINT_MODES: ModelModeSet = {
+  ...fixedMode("Flint", "Think", { ...OPEN_SAMPLING, top_p: 0.95, top_k: 20 }),
+  preserveReasoning: true,
+};
+const SAGE15_MODES: ModelModeSet = {
+  familyLabel: "Sage A1.5", defaultMode: "Think",
+  modes: { Think: { ...OPEN_SAMPLING, top_p: 0.95, top_k: 20, presence_penalty: 1.5,
+    chat_template_kwargs: { enable_thinking: true, preserve_thinking: true } } },
+};
+const SALUKI_MODES: ModelModeSet = {
+  familyLabel: "Underdog Saluki 27B", defaultMode: "Think",
+  modes: {
+    Think: { ...OPEN_SAMPLING, temperature: 0.6, top_p: 0.95, top_k: 20,
+      chat_template_kwargs: { enable_thinking: true } },
+    "No Think": { ...OPEN_SAMPLING, temperature: 0, top_p: 0.95, top_k: 20,
+      chat_template_kwargs: { enable_thinking: false } },
+  },
+};
+function deepSeek41Modes(familyLabel: string, topP: number): ModelModeSet {
+  const sampling = { ...OPEN_SAMPLING, top_p: topP };
+  return {
+    familyLabel, defaultMode: "Think (High)", preserveReasoning: true,
+    modes: {
+      ...Object.fromEntries([["Max", 100], ["High", 75], ["Low", 50]].map(([name, budget]) => [
+        `Think (${name})`, { ...sampling, chat_template_kwargs: { thinking_mode: "thinking", reasoning_effort: budget } },
+      ])),
+      "No Think": { ...sampling, chat_template_kwargs: { thinking_mode: "chat" } },
+    },
+  };
+}
+const DEEPSEEK41_MODES = deepSeek41Modes("DeepSeek V4.1 Flash", 0.95);
+const DEEPSEEK41_1017_MODES = deepSeek41Modes("DeepSeek V4.1 Flash 1017", 1);
 
 const QWEN_CODER_MODES = fixedMode("Qwen3-Coder Instruct", "No Think", {
   ...OPEN_SAMPLING, temperature: 0.7, top_p: 0.8, top_k: 20, repetition_penalty: 1.05,
@@ -275,6 +318,10 @@ const QWEN38_DISTILL_MODES: ModelModeSet = {
 // These verified Ornith checkpoints use Qwen3.5 templates and recipes. Other
 // sizes or revisions must not be assigned the same base family by brand alone.
 const ORNITH15_MODES: ModelModeSet = { ...QWEN35_THINKING_MODES, familyLabel: "Ornith 1.5 (Qwen)" };
+const TIEL_CODER_MODES = binaryModes("Tiel-Coder 35B-A3B", {
+  ...OPEN_SAMPLING, temperature: 0.6, top_p: 0.95, top_k: 20,
+});
+TIEL_CODER_MODES.modes["No Think"] = QWEN_NO_THINK;
 
 function nemotronNanoModes(familyLabel: string, reasoningTopP: number): ModelModeSet {
   return {
@@ -310,11 +357,21 @@ function haystack(caps?: ModelCapabilities, modelId?: string): string {
 }
 
 function namedProfile(h: string): ModelModeSet | undefined {
+  if (/\btiel[-_ ]coder[-_ ]35b[-_ ]a3b(?:\b|_)/.test(h)) return TIEL_CODER_MODES;
+  if (/\bminicpm[-_ ]?5[-_ ]2b(?:\b|_)/.test(h)) return MINICPM5_MODES;
+  if (/\bmellum[-_ ]?2[._]1[-_ ]12b[-_ ]a2[._]5b[-_ ]thinking(?:\b|_)/.test(h)) return MELLUM21_MODES;
+  if (/\bmimo[-_ ]v2[._]6[-_ ]distill[-_ ]qwen[-_ ]9b(?:\b|_)/.test(h)) return MIMO26_DISTILL_MODES;
+  if (/\b(?:underdog[-_ ])?saluki[-_ ]27b[-_ ]1[._]0(?:\b|_)/.test(h)) return SALUKI_MODES;
+  if (/\bflint(?:$|[-_.\s])/.test(h)) return FLINT_MODES;
+  if (/\bsage[-_ ]a1[._]5(?:\b|_)/.test(h)) return SAGE15_MODES;
+  if (/\bdeepseek[-_ ]v4[._]1[-_ ]flash[-_ ]1017(?:\b|_)/.test(h)) return DEEPSEEK41_1017_MODES;
+  if (/\bdeepseek[-_ ]v4[._]1[-_ ]flash(?=$|[.\s]|[-_](?:gguf|(?:ud[-_ ])?(?:iq|q|fp|bf|mxfp|gsq)[\w.-]*)(?:$|[-_.\s]))/.test(h)) return DEEPSEEK41_MODES;
   if (/\bqwen3[._]8[-_ ]35b[-_ ]a3b[-_ ]distill(?:\b|_)/.test(h)) return QWEN38_DISTILL_MODES;
   if (/\bspark[-_ ]?x?2[._]6(?=$|[-_.\s/\\])/.test(h)) return SPARK26_MODES;
   if (/\bspark[-_ ]?x?2[._]5(?=$|[-_.\s/\\])/.test(h)) return SPARK25_MODES;
   if (/\bgpt[-_ ]oss(?:\b|_)/.test(h)) return GPT_OSS_MODES;
   if (/\bglm[-_ ]?5[._]3[-_ ]flash(?:\b|_)/.test(h)) return GLM53_MODES;
+  if (/\bglm[-_ ]?5[._]3(?=$|[.\s]|[-_](?:gguf|(?:ud[-_ ])?(?:iq|q|fp|bf|mxfp)[\w.-]*)(?:$|[-_.\s]))/.test(h)) return GLM53_FULL_MODES;
   if (/\b(?:ternary[-_ ])?bonsai[-_ ]?2[-_ ]27b(?:\b|_)/.test(h)) return BONSAI2_MODES;
   if (/\bornith[-_ ]1[._]5[-_ ](?:9b|35b(?:[-_ ]a3b)?|122b)(?:\b|_)/.test(h)) return ORNITH15_MODES;
   if (/\bnemotron[-_ ]3[._]5[-_ ]bolt[-_ ]e4b(?:\b|_)/.test(h)) return NEMOTRON_BOLT_MODES;
@@ -406,6 +463,7 @@ export function resolveModelModes(
     || /(?:^|[-_.\s])mmproj(?:$|[-_.\s])/.test(h)
     || /-mtp\.gguf(?:$|\s)/.test(h)
     || /(?:^|[-_.\s])dflash\d*(?:$|[-_.\s])/.test(h)
+    || /(?:^|[-_.\s])dspark\d*(?:$|[-_.\s])/.test(h)
     || /(?:^|[-_.\s])base(?:$|[-_.\s])/.test(h)) return undefined;
   const named = namedProfile(h);
   if (named) return named;

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { messageContentChars } from "../src/promptReplacer";
 import { describe, it } from "node:test";
 import {
   estimateContextBreakdown,
@@ -7,6 +8,15 @@ import {
 } from "../src/contextBreakdown";
 
 describe("estimateContextBreakdown images", () => {
+  it("includes retained assistant reasoning in prompt and history budgets", () => {
+    const plain = [{ role: "assistant", content: "answer" }, { role: "user", content: "continue" }];
+    const retained = [{ ...plain[0], reasoning_content: "x".repeat(4000) }, plain[1]];
+    assert.equal(messageContentChars(retained) - messageContentChars(plain), 4000);
+    const before = estimateContextBreakdown(plain, [], 32768);
+    const after = estimateContextBreakdown(retained, [], 32768);
+    assert.equal(after.usedTokens - before.usedTokens, 1000);
+    assert.equal(after.segments.find(s => s.key === "history")!.tokens - before.segments.find(s => s.key === "history")!.tokens, 1000);
+  });
   it("does not treat image base64 as hundreds of thousands of tokens", () => {
     const huge = "A".repeat(2_000_000);
     const bd = estimateContextBreakdown(

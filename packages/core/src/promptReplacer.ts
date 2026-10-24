@@ -125,10 +125,11 @@ export function estimateTokensFromChars(chars: number): number {
   return Math.max(1, Math.ceil(Math.max(0, chars) / 4));
 }
 
-export function messageContentChars(messages: Array<{ role?: string; content?: unknown; tool_calls?: unknown }>): number {
+export function messageContentChars(messages: Array<{ role?: string; content?: unknown; tool_calls?: unknown; reasoning_content?: string }>): number {
   let chars = 0;
   for (const m of messages) {
     chars += (m.role?.length || 0) + 8;
+    chars += m.role === "assistant" ? m.reasoning_content?.length || 0 : 0;
     if (typeof m.content === "string") {
       chars += m.content.length;
     } else if (Array.isArray(m.content)) {
@@ -155,7 +156,7 @@ export function messageContentChars(messages: Array<{ role?: string; content?: u
 }
 
 export function estimateRequestTokens(
-  messages: Array<{ role?: string; content?: unknown; tool_calls?: unknown }>,
+  messages: Array<{ role?: string; content?: unknown; tool_calls?: unknown; reasoning_content?: string }>,
   tools?: unknown[]
 ): number {
   let chars = messageContentChars(messages);

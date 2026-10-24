@@ -17,6 +17,15 @@ that the model has different reasoning effort levels.
 | Spark X2.6 | **High**, Low, No Think | Same sampler; only high/low reasoning efforts are valid |
 | GPT-OSS 20B / 120B | High, **Medium**, Low | Temperature 1, unfiltered top-p/k; requires Harmony support |
 | GLM-5.3-Flash | **Max**, High, Low | Temperature 1, top-p .95; clear old thinking on each turn |
+| GLM-5.3 full | **Max**, High, Low | Same controls and sampler as Flash; requires a compatible large-model server |
+| DeepSeek V4.1 Flash / 1017 | Max, **High**, Low, No Think | Temperature 1; numeric budgets 100/75/50. Top-p .95 (original) / 1 (1017) |
+| Tiel-Coder 35B-A3B | **Think**, No Think | Coding recipe .6/.95/20; off follows the Qwen base's .7/.8/20, presence 1.5 |
+| MiniCPM5 2B | **Think**, No Think | 1/.95, min-p 0; no top-k filtering |
+| Mellum2.1 12B-A2.5B Thinking | **Think** only | Author's quickstart recipe .6/.95/20 |
+| MiMo V2.6 Distill Qwen 9B | **Think** only | .6/.95/20; no invented effort ladder |
+| Underdog Saluki 27B 1.0 | **Think**, No Think | Think .6/.95/20; direct tool calls use temperature 0 |
+| Flint | **Think** only | 1/.95/20; preserve returned reasoning across tool turns |
+| Sage A1.5 | **Think** only | 1/.95/20, presence 1.5, min-p 0; standard agent recipe |
 | Ornith 1.5 9B / 35B-A3B / 122B | General, **Coding**, No Think | Verified Qwen-based variants; same recipes as Qwen3.5/3.6 |
 | Nemotron 3 Nano 4B / 30B-A3B | General, **Coding**, No Think | General: temperature 1, top-p .95 (4B) or 1 (30B). Coding/off: .6/.95 |
 | Nemotron 3.5 Bolt E4B | **Think**, No Think | Gemma-based, temperature 1, top-p .95, top-k 64 |
@@ -44,6 +53,22 @@ has no numeric sampler prescribed in its generation config: its unfiltered
 recipe is an extension choice. Nemotron's No Think preset uses the tool-calling
 sampler; Ornith's No Think sampler follows its Qwen base recipe.
 
+Tiel uses the coding sampler without overriding its embedded template's default
+reasoning effort. The MTP checkpoint contains a custom template; it is checked
+directly from the GGUF header rather than assumed identical to the base.
+Saluki likewise uses its own embedded template. Mellum's published quickstart
+uses temperature .6 although its agent benchmark description uses 1; the
+profile deliberately follows the quickstart. Sage's specialized verification
+protocol is not enabled by a normal chat preset.
+
+DeepSeek requires a V4.1-compatible engine that forwards `thinking_mode` and
+numeric `reasoning_effort` from `chat_template_kwargs` into its template or
+reference encoder and parses DSML tool calls into structured OpenAI tool calls.
+The original checkpoint has a Jinja template; 1017 is checked with the pinned
+author reference encoder. Hosted APIs with different parameter conventions may
+need a server-side adapter. Flint requires a llama.cpp build including its
+October 21 architecture support (or another compatible engine).
+
 Model names, GGUF filenames, and server-provided canonical aliases/labels select
 profiles. Opaque Strata IDs work when their metadata identifies the checkpoint;
 the original served ID is retained in requests. Parent directory names do not
@@ -70,6 +95,14 @@ presets therefore apply to local and remote servers, including No Think (`none`)
 The backend still receives Chat Completions with template controls nested in
 `chat_template_kwargs`; it does not need a Responses endpoint. Missing effort
 selections use the advertised profile default.
+
+Flint and DeepSeek reasoning is streamed as separate thinking parts on newer
+hosts and sent back as assistant `reasoning_content` on later tool turns.
+It is counted in context estimates and kept out of the final answer text.
+Older hosts without thinking-part support keep the existing text fallback;
+use a recent VS Code host for reasoning-preserving agent sessions.
+Consecutive streamed tool turns use fresh HTTP connections to avoid reusing
+SSE sockets that llama-server is closing; chat POSTs are not retried.
 
 This applies through VS Code's Llama AIO provider. A standalone SDK configured
 to contact a server directly bypasses the extension: configure that client's
@@ -105,7 +138,7 @@ Additional author cards:
 `npm test` checks identity boundaries, advertised modes, CLI selections, numeric
 samplers, and complete extension HTTP requests through opaque remote IDs.
 The optional check below renders every advertised mode against pinned author
-templates with both plain chat and tool-call/result history. It also verifies
+templates/reference encoders with both plain chat and tool-call/result history. It also verifies
 that different template controls actually change the rendered prompt.
 
 ```sh
@@ -118,8 +151,13 @@ python3 -m venv /tmp/llama-aio-template-check
 Validation also includes real CPU inference with Spark X2.6 4B Q4_K_M on
 llama.cpp b11729: High, Low, and No Think, with plain chat and tool history.
 These are short output-budget smoke checks, not quality or throughput benchmarks.
-Other profiles have contract/request/template coverage, not a claim that every
+MiniCPM5 2B Q4_K_M also passes CPU inference on b11729 with thinking on/off and
+a native structured tool call. Other profiles have contract/request/template coverage, not a claim that every
 checkpoint was loaded on every backend. Use a recent compatible server; Bonsai's
 ternary weights specifically require Prism's fork, which the standard installer
-does not supply. Flint and DeepSeek profiles remain deferred pending separate
-runtime/protocol verification.
+does not supply. DeepSeek's 1017 encoder check executes pinned, reviewed author
+Python code; it is optional and outside the default test suite. GGUF-only
+template checks read a bounded 32 MiB prefix of the pinned model file instead
+of downloading the full checkpoint. For hard Flint tasks, the author recommends
+an output budget of at least 32K tokens; adjust Max tokens and the served
+context accordingly.
