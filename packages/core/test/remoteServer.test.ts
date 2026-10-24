@@ -81,7 +81,8 @@ describe("probeRemoteServer", () => {
               {
                 id: mode === "desktop" ? "q2_0" : "qwythos-9b.gguf",
                 owned_by: mode === "desktop" ? "strata" : undefined,
-                meta: { size: 1000, n_params: 9e9, n_ctx_train: 1048576, label: "Qwen3.8-Flash-Next Q2_0" },
+                meta: { size: 1000, n_params: 9e9, n_ctx_train: 1048576,
+                  ...(mode === "desktop" ? { label: "Qwen3.8-Flash-Next Q2_0" } : {}) },
                 max_model_len: 32768,
                 ...modelOverrides,
               },
@@ -198,6 +199,19 @@ describe("probeRemoteServer", () => {
     assert.match(slots?.detail || "", /--slots/);
     assert.equal(metrics?.ok, null);
     assert.match(metrics?.detail || "", /--metrics/);
+  });
+
+  it("retains alias identities and fork labels without treating every provider as Strata", async () => {
+    mode = "limited";
+    modelOverrides = { id: "private-alias", alias_of: "glm-5.3-flash", aliases: [null, "glm-5.3-flash"],
+      owned_by: "project-maya", meta: { label: "GLM-5.3-Flash", aliases: ["glm-5.3-flash", 123] } };
+    await listen();
+    const info = await probeRemoteServer(base);
+    assert.equal(info.modelId, "private-alias");
+    assert.equal(info.modelAlias, "glm-5.3-flash");
+    assert.deepEqual(info.modelAliases, ["glm-5.3-flash"]);
+    assert.equal(info.modelName, "GLM-5.3-Flash");
+    assert.equal(seenPaths.includes("/api/native"), false);
   });
 
   it("retains Strata Desktop's family label for an opaque API ID without /props", async () => {

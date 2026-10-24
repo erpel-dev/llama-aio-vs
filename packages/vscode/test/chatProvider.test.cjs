@@ -54,6 +54,7 @@ require.cache.vscode = {
 };
 
 const core = require("@llama-aio/core");
+const catalogs = require("../../core/test/fixtures/remote-model-catalogs.json");
 const { LlamaAioChatProvider } = require(path.join(__dirname, "..", "out-harness", "chatProvider.js"));
 
 let server;
@@ -184,6 +185,111 @@ describe("LlamaAioChatProvider requests", () => {
     servedNative = undefined;
     expectedApiKey = undefined;
     seenRequests = [];
+  });
+
+  for (const row of catalogs.rows) {
+    for (const source of row.provider === "strata" ? ["desktop", "standalone"] : ["standalone"]) {
+      it(`selects the remote ${row.provider}/${row.installId} ${source} profile and preserves its served ID`, async () => {
+        servedModelId = source === "desktop" ? `${row.installId}--2` : row.servedId;
+        servedMetadata = source === "desktop" ? { owned_by: "strata", meta: { label: row.label } } : {};
+        propsStatus = source === "desktop" ? 404 : 200;
+        servedProps = source === "standalone" ? { model_alias: row.servedId,
+          model_path: "C:\\models\\pack\\full", default_generation_settings: { n_ctx: 262144 } } : undefined;
+        const { provider, state } = setup({ remote: true });
+        state.modelCapabilities = { architecture: "gemma4", path: "/local/gemma-4-12B-it.gguf" };
+        const [model] = await provider.provideLanguageModelChatInformation({}, cancelToken().token);
+        const profile = provider.modeSetFor(model.id, source === "standalone" ? servedProps : undefined);
+        assert.equal(profile.familyLabel.replace(/ 1017$/, ""), row.profile);
+        const efforts = model.configurationSchema.properties.reasoningEffort.enum;
+        for (const effort of efforts) {
+          await provider.provideLanguageModelChatResponse(model, [msg(Role.User, new TextPart("hello"))],
+            { modelConfiguration: { reasoningEffort: effort } }, { report() {} }, cancelToken().token);
+          assert.equal(lastBody.model, servedModelId);
+          if (row.family === "deepseek" || row.family === "deepseek41") {
+            assert.equal(lastBody.top_p, 1);
+            assert.equal(lastBody.chat_template_kwargs.enable_thinking, effort !== "none");
+          }
+        }
+      });
+    }
+  }
+
+  for (const metadata of [
+    { owned_by: "project-maya", meta: { label: "GLM-5.3-Flash" } },
+    { alias_of: "glm-5.3-flash" },
+    { aliases: ["glm-5.3-flash"] },
+    { owned_by: "strata", meta: { aliases: ["glm-5.3-flash"] } },
+  ]) {
+    it(`recovers an opaque remote alias from ${JSON.stringify(metadata)}`, async () => {
+      servedModelId = "private-model";
+      servedMetadata = metadata;
+      propsStatus = 404;
+      const { provider } = setup({ remote: true });
+      const [model] = await provider.provideLanguageModelChatInformation({}, cancelToken().token);
+      assert.deepEqual(model.configurationSchema.properties.reasoningEffort.enum, ["max", "high", "low"]);
+      await provider.provideLanguageModelChatResponse(model, [msg(Role.User, new TextPart("hello"))],
+        { modelConfiguration: { reasoningEffort: "low" } }, { report() {} }, cancelToken().token);
+      assert.equal(lastBody.model, "private-model");
+      assert.equal(lastBody.chat_template_kwargs.reasoning_effort, "low");
+    });
+  }
+
+  for (const row of catalogs.legacyRows) {
+    it(`uses the family label of legacy Strata entry ${row.id}`, async () => {
+      servedModelId = row.id;
+      servedMetadata = { owned_by: "strata", meta: { label: row.label } };
+      propsStatus = 404;
+      const { provider } = setup({ remote: true });
+      const [model] = await provider.provideLanguageModelChatInformation({}, cancelToken().token);
+      assert.equal(provider.modeSetFor(model.id, undefined).familyLabel, row.profile);
+      await provider.provideLanguageModelChatResponse(model, [msg(Role.User, new TextPart("hello"))],
+        {}, { report() {} }, cancelToken().token);
+      assert.equal(lastBody.model, row.id);
+      if (row.id.startsWith("qwen2.5")) {
+        assert.deepEqual([lastBody.temperature, lastBody.top_p, lastBody.top_k, lastBody.repeat_penalty], [0.7, 0.8, 20, 1.1]);
+        assert.deepEqual(model.configurationSchema.properties.reasoningEffort.enum, ["none"]);
+      }
+    });
+  }
+
+  it("clears earlier GLM reasoning on the client while retaining the current tool turn", async () => {
+    servedModelId = "glm-5.3-flash";
+    propsStatus = 404;
+    const { provider } = setup({ remote: true });
+    const [model] = await provider.provideLanguageModelChatInformation({}, cancelToken().token);
+    await provider.provideLanguageModelChatResponse(model, [
+      msg(Role.User, new TextPart("old question")),
+      msg(Role.Assistant, new ThinkingPart("Old private reasoning"), new TextPart("<think>Legacy reasoning</think>Answer")),
+      msg(Role.User, new TextPart("new question")),
+      msg(Role.Assistant, new ThinkingPart("Current reasoning"), new ToolCallPart("call_1", "read_file", { path: "README.md" })),
+      msg(Role.User, new ToolResultPart("call_1", [new TextPart("file text")])),
+    ], {}, { report() {} }, cancelToken().token);
+    const assistants = lastBody.messages.filter(message => message.role === "assistant");
+    assert.equal(assistants[0].reasoning_content, undefined);
+    assert.equal(assistants[0].content, "Answer");
+    assert.equal(assistants[1].reasoning_content, "Current reasoning");
+    assert.equal(assistants[1].tool_calls[0].id, "call_1");
+  });
+
+  it("refreshes reused remote IDs from new aliases and does not resurrect an old profile after ambiguity", async () => {
+    servedModelId = "private-model";
+    servedMetadata = { owned_by: "strata", meta: { label: "Qwen3.8-Flash-Next" } };
+    propsStatus = 404;
+    const { provider } = setup({ remote: true });
+    const [first] = await provider.provideLanguageModelChatInformation({}, cancelToken().token);
+    assert.equal(first.configurationSchema.properties.reasoningEffort.default, "xhigh");
+    servedMetadata = { meta: { aliases: ["glm-5.3-flash"] } };
+    provider.notifyChanged();
+    const [changed] = await provider.provideLanguageModelChatInformation({}, cancelToken().token);
+    assert.equal(changed.configurationSchema.properties.reasoningEffort.default, "max");
+    servedMetadata = { meta: { aliases: ["glm-5.3-flash", "qwen3.8-flash-next"] } };
+    provider.notifyChanged();
+    const [ambiguous] = await provider.provideLanguageModelChatInformation({}, cancelToken().token);
+    assert.equal(ambiguous.configurationSchema, undefined);
+    servedMetadata = undefined;
+    provider.notifyChanged();
+    const [unidentified] = await provider.provideLanguageModelChatInformation({}, cancelToken().token);
+    assert.equal(unidentified.configurationSchema, undefined);
   });
 
   it("keeps a remote SDK effort selection through an authenticated proxy prefix and tool history", async (t) => {
@@ -386,9 +492,9 @@ describe("LlamaAioChatProvider requests", () => {
         await provider.provideLanguageModelChatResponse(model, [msg(Role.User, new TextPart("hello"))],
           { modelConfiguration: { reasoningEffort: effort } }, { report() {} }, cancelToken().token);
         assert.equal(lastBody.model, "opaque-instance");
-        assert.equal(lastBody.top_p, label.endsWith("1017") ? 1 : 0.95);
+        assert.equal(lastBody.top_p, 1);
         assert.deepEqual(lastBody.chat_template_kwargs, budget === undefined
-          ? { thinking_mode: "chat" } : { thinking_mode: "thinking", reasoning_effort: budget });
+          ? { enable_thinking: false } : { enable_thinking: true, reasoning_effort: budget });
         assert.equal(lastBody.reasoning_effort, undefined);
       }
     });

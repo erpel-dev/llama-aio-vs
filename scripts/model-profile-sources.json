@@ -29,6 +29,10 @@
     "revision": "3fcfdbfa1a1b6d8166846a6323e69f1e1254440d"
   },
   {
+    "id": "Qwen/Qwen2.5-0.5B-Instruct",
+    "revision": "7ae557604adf67be50417f59c2c2f167def9a775"
+  },
+  {
     "id": "Qwen/Qwen3-4B-Instruct-2507",
     "revision": "cdbee75f17c01a7cc42f958dc650907174af0554"
   },

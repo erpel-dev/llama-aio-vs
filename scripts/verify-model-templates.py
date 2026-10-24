@@ -152,7 +152,10 @@ def main():
                     for message in conversation:
                         for call in message.get("tool_calls", []):
                             call["function"]["arguments"] = json.dumps(call["function"]["arguments"])
-                    rendered = encoder(conversation, **params.get("chat_template_kwargs", {}))
+                    kwargs = dict(params.get("chat_template_kwargs", {}))
+                    if "enable_thinking" in kwargs:
+                        kwargs["thinking_mode"] = "thinking" if kwargs.pop("enable_thinking") else "chat"
+                    rendered = encoder(conversation, **kwargs)
                 else:
                     rendered = compiled.render(**context)
                 assert rendered.strip(), (source["id"], mode, fixture)

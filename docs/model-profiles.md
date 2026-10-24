@@ -18,7 +18,7 @@ that the model has different reasoning effort levels.
 | GPT-OSS 20B / 120B | High, **Medium**, Low | Temperature 1, unfiltered top-p/k; requires Harmony support |
 | GLM-5.3-Flash | **Max**, High, Low | Temperature 1, top-p .95; clear old thinking on each turn |
 | GLM-5.3 full | **Max**, High, Low | Same controls and sampler as Flash; requires a compatible large-model server |
-| DeepSeek V4.1 Flash / 1017 | Max, **High**, Low, No Think | Temperature 1; numeric budgets 100/75/50. Top-p .95 (original) / 1 (1017) |
+| DeepSeek V4.1 Flash / 1017 | Max, **High**, Low, No Think | Temperature 1, top-p 1; numeric budgets 100/75/50 |
 | Tiel-Coder 35B-A3B | **Think**, No Think | Coding recipe .6/.95/20; off follows the Qwen base's .7/.8/20, presence 1.5 |
 | MiniCPM5 2B | **Think**, No Think | 1/.95, min-p 0; no top-k filtering |
 | Mellum2.1 12B-A2.5B Thinking | **Think** only | Author's quickstart recipe .6/.95/20 |
@@ -34,6 +34,7 @@ that the model has different reasoning effort levels.
 | LFM2.5 24B-A2B | **Think** only | Temperature .1, top-k 50, repeat penalty 1.05 |
 | Ternary Bonsai 2 27B | **XHigh**, Medium, No Think | Thinking min-p .05; no Low mode; requires Prism's llama.cpp fork |
 | Qwen3 original | **Think**, No Think | Think: .6/.95/20; off: .7/.8/20; presence penalty 0 |
+| Qwen2.5 0.5B Instruct (legacy Strata starter) | **No Think** only | .7/.8/20, repeat penalty 1.1 |
 | Qwen3 Instruct 2507 | **No Think** only | .7/.8/20 |
 | Qwen3 Thinking 2507 | **Think** only | .6/.95/20 |
 | Empero Qwen3.8 35B-A3B Distill | **Think** only | .6/.95/20; Qwen3.6-based template, no effort ladder |
@@ -61,7 +62,7 @@ uses temperature .6 although its agent benchmark description uses 1; the
 profile deliberately follows the quickstart. Sage's specialized verification
 protocol is not enabled by a normal chat preset.
 
-DeepSeek requires a V4.1-compatible engine that forwards `thinking_mode` and
+DeepSeek requires a V4.1-compatible engine that forwards `enable_thinking` and
 numeric `reasoning_effort` from `chat_template_kwargs` into its template or
 reference encoder and parses DSML tool calls into structured OpenAI tool calls.
 The original checkpoint has a Jinja template; 1017 is checked with the pinned
@@ -85,6 +86,19 @@ in its model picker. Profile-owned sampling controls are hidden because the
 preset overrides them. Main models advertising embedded MTP heads remain valid;
 prediction sidecars are excluded. Explicit dense Swift checkpoint names take
 precedence over Strata's shortened Swift alias for Flash-Next.
+
+Published `alias_of`, `aliases`, and `meta.aliases` can identify an opaque model
+too; conflicting alias families leave sampling free. Human-readable `meta.label`
+is accepted from compatible forks as well as Strata. Alias changes invalidate
+picker probes so a reused served ID cannot keep another model's profile.
+See the [Strata/Maya catalog audit](remote-catalog-audit.md) for the complete
+pinned variant matrix and request-parser verification.
+
+Strata and Maya publish an undated DeepSeek ID for the 1017 checkpoint. Top-p 1
+is supported by both cards and matches both native servers. They ignore the
+incoming `thinking_mode` field, so No Think uses `enable_thinking: false` instead.
+GLM's old-reasoning cleanup is also applied on the client, since these adapters
+can discard `clear_thinking`; reasoning within the current tool turn is retained.
 
 ## Copilot SDK harness
 

@@ -25,6 +25,7 @@ import {
   positiveRate,
   ProcessManager,
   remoteSlotContext,
+  remoteModelIdentity,
   remoteStateUsable,
   resolveModelModes,
   resolveRemoteModelModes,
@@ -52,7 +53,9 @@ const DUPLICATE_TOOL_CALL_SYSTEM_HINT =
 interface OpenAiModel {
   id: string;
   owned_by?: string;
-  meta?: { label?: string };
+  alias_of?: string;
+  aliases?: unknown;
+  meta?: { label?: string; aliases?: unknown };
 }
 
 interface OpenAiModelsResponse {
@@ -197,6 +200,23 @@ function stringifyToolResult(content: readonly unknown[]): string {
 type ThinkingPart = { value: string | string[] };
 function thinkingPartConstructor(): (new (value: string | string[]) => ThinkingPart) | undefined {
   return (vscode as unknown as { LanguageModelThinkingPart?: new (value: string | string[]) => ThinkingPart }).LanguageModelThinkingPart;
+}
+
+/** GLM's clear_thinking policy, also for remote adapters that drop the kwarg. */
+function clearEarlierReasoning(messages: OpenAiChatMessage[]): OpenAiChatMessage[] {
+  let lastUser = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === "user") { lastUser = i; break; }
+  }
+  return messages.map((message, i) => {
+    if (i >= lastUser || message.role !== "assistant") return message;
+    const clean = { ...message };
+    delete clean.reasoning_content;
+    if (typeof clean.content === "string") {
+      clean.content = clean.content.replace(/<think(?:ing)?\b[^>]*>[\s\S]*?<\/think(?:ing)?\s*>/gi, "");
+    }
+    return clean;
+  });
 }
 
 function toOpenAiMessages(
@@ -360,7 +380,7 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
   private static readonly PROBE_TTL_MS = 2_000;
   private readyProbe: { endpoint: string; at: number } | undefined;
   private propsProbe: { endpoint: string; at: number; props: ServerProps } | undefined;
-  private modelProbe: { endpoint: string; at: number; modelId: string; modelName?: string } | undefined;
+  private modelProbe: { endpoint: string; at: number; modelId: string; modelName?: string; modelAlias?: string; modelAliases?: string[] } | undefined;
   /**
    * Last served id → label that /v1/models reported. Kept because a probe taken
    * while the server swaps models can list the id without its label, which used
@@ -426,6 +446,9 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
   }
 
   notifyChanged(): void {
+    this.modelProbe = undefined;
+    this.propsProbe = undefined;
+    this.readyProbe = undefined;
     this._onDidChangeModelInformation.fire();
   }
 
@@ -521,22 +544,26 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
     if (!this.store.isRemote()) {
       return resolveModelModes(this.store.getState().modelCapabilities, modelId);
     }
-    const file = props?.model_path || this.remoteInfo()?.modelPath;
-    const canonical = props?.model_alias || this.remoteInfo()?.modelAlias;
+    const remote = this.remoteInfo();
+    const cached = this.modelProbe;
+    const current = cached?.endpoint === endpoint && cached.modelId === modelId ? cached : undefined;
+    const remoteApplies = !remote?.modelId || remote.modelId === modelId;
+    const file = props?.model_path || (remoteApplies ? remote?.modelPath : undefined);
+    const canonical = props?.model_alias || current?.modelAlias || (remoteApplies ? remote?.modelAlias : undefined);
+    const aliases = current?.modelAliases ?? (remoteApplies ? remote?.modelAliases : undefined);
     // The remote server may run on a different OS. Match only its filename,
     // never a parent folder or this machine's selected GGUF.
     const filename = file?.split(/[/\\]/).pop();
-    const cached = this.modelProbe;
-    const remote = this.remoteInfo();
     const cachedName = cached?.endpoint === endpoint && cached.modelId === modelId
       ? cached.modelName : undefined;
     const rememberedLabel = this.lastServedLabel;
     const rememberedName = rememberedLabel && rememberedLabel.endpoint === endpoint && rememberedLabel.modelId === modelId
       ? rememberedLabel.name : undefined;
     const name = cachedName
-      ?? (remote?.modelId === modelId ? remote.modelName : undefined)
-      ?? rememberedName;
-    const found = resolveRemoteModelModes({ modelAlias: canonical, modelPath: filename, modelName: name, modelId });
+      ?? (remote?.modelId === modelId ? remote.modelName : undefined);
+    const hasIdentity = !!(canonical || filename || name || aliases?.some(alias => alias !== modelId));
+    const found = resolveRemoteModelModes({ modelAlias: canonical, modelPath: filename, modelName: name, modelId, modelAliases: aliases })
+      ?? (!hasIdentity ? resolveModelModes(undefined, rememberedName) : undefined);
     if (found) {
       this.lastModeSet = { endpoint, modelId, modeSet: found };
       return found;
@@ -544,7 +571,9 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
     // Nothing identified the model: keep the modes worked out from the last
     // answer. An identified model that matches no family keeps none, so
     // switching models cannot inherit the previous one's modes.
-    if (canonical || filename || name) {
+    if (hasIdentity) {
+      this.lastModeSet = undefined;
+      if (rememberedName) this.lastServedLabel = undefined;
       return undefined;
     }
     const remembered = this.lastModeSet;
@@ -566,9 +595,9 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
       const first = models.data?.[0];
       const modelId = first?.id;
       if (modelId) {
-        const modelName = first.owned_by === "strata" && typeof first.meta?.label === "string"
-          ? first.meta.label : undefined;
-        this.modelProbe = { endpoint, at: Date.now(), modelId, modelName };
+        const identity = remoteModelIdentity(first);
+        const modelName = identity.modelName;
+        this.modelProbe = { ...identity, endpoint, at: Date.now(), modelId };
         if (modelName) {
           this.lastServedLabel = { endpoint, modelId, name: modelName };
         }
@@ -719,7 +748,7 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
       hints.push(WIKIPEDIA_LOOKUP_SYSTEM_HINT);
     }
     // Front, not end: strict templates reject a trailing system message.
-    const converted = withSystemHints(prepared.messages, hints);
+    let converted = withSystemHints(prepared.messages, hints);
 
     const body: Record<string, unknown> = {
       model: model.id,
@@ -750,6 +779,10 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
     if (modeSet) {
       const { modeName, params } = resolveModeParams(modeSet, modelConfiguration);
       appliedModeName = modeName;
+      if (params.chat_template_kwargs?.clear_thinking === true) {
+        converted = clearEarlierReasoning(converted);
+        body.messages = converted;
+      }
       applyModeToRequestBody(body, params);
     }
 
