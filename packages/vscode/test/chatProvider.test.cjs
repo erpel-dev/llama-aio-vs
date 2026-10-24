@@ -60,11 +60,18 @@ let servedProps;
 let servedMetadata;
 let propsStatus;
 let servedNative;
+let expectedApiKey;
+let seenRequests = [];
 /** How /v1/chat/completions answers: array of SSE data objects, optional per-event delay. */
 let reply = { events: [], delayMs: 0 };
 
 before(async () => {
   server = http.createServer((req, res) => {
+    seenRequests.push({ url: req.url, authorization: req.headers.authorization });
+    if (expectedApiKey && req.headers.authorization !== `Bearer ${expectedApiKey}`) {
+      res.writeHead(401); res.end("unauthorized"); return;
+    }
+    req.url = req.url.replace(/^\/llama-proxy(?=\/)/, "");
     let body = "";
     req.on("data", (c) => (body += c));
     req.on("end", async () => {
@@ -171,6 +178,40 @@ describe("LlamaAioChatProvider requests", () => {
     servedMetadata = undefined;
     propsStatus = undefined;
     servedNative = undefined;
+    expectedApiKey = undefined;
+    seenRequests = [];
+  });
+
+  it("keeps a remote SDK effort selection through an authenticated proxy prefix and tool history", async (t) => {
+    const originalEndpoint = endpoint;
+    endpoint += "/llama-proxy";
+    expectedApiKey = "fixture-remote-key";
+    core.setServerApiKeyProvider(origin => origin === new URL(endpoint).origin ? expectedApiKey : undefined);
+    t.after(() => { endpoint = originalEndpoint; expectedApiKey = undefined; core.setServerApiKeyProvider(undefined); });
+    servedModelId = "opaque-instance";
+    servedMetadata = { owned_by: "strata", meta: { label: "Spark-X2.6-4B" } };
+    propsStatus = 404;
+    const { provider, state } = setup({ remote: true, remoteInfo: { isLlamaCpp: false, servedContext: 262144 } });
+    state.modelCapabilities = { architecture: "gemma4", path: "/local/gemma-4-12B-it.gguf" };
+    const [model] = await provider.provideLanguageModelChatInformation({}, cancelToken().token);
+    assert.deepEqual(model.configurationSchema.properties.reasoningEffort.enum, ["high", "low", "none"]);
+    assert.equal(model.maxInputTokens + model.maxOutputTokens, 262144);
+    const parts = [];
+    await provider.provideLanguageModelChatResponse(model, [
+      msg(Role.User, new TextPart("read a file")),
+      msg(Role.Assistant, new ToolCallPart("call_1", "read_file", { path: "README.md" })),
+      msg(Role.User, new ToolResultPart("call_1", [new TextPart("Example project")])),
+    ], { modelConfiguration: { reasoningEffort: "none" },
+      tools: [{ name: "read_file", description: "read", inputSchema: { type: "object" } }] },
+    { report: part => parts.push(part) }, cancelToken().token);
+    assert.deepEqual(lastBody.chat_template_kwargs, { enable_thinking: false });
+    assert.equal(lastBody.model, "opaque-instance");
+    assert.ok(lastBody.messages.some(m => m.role === "tool" && m.tool_call_id === "call_1"));
+    assert.ok(lastBody.messages.some(m => m.tool_calls?.[0].function.arguments === '{"path":"README.md"}'));
+    assert.equal(parts.filter(p => p instanceof TextPart).map(p => p.value).join(""), "ok");
+    for (const suffix of ["/v1/models", "/v1/chat/completions"]) {
+      assert.ok(seenRequests.some(r => r.url === `/llama-proxy${suffix}` && r.authorization === "Bearer fixture-remote-key"));
+    }
   });
 
   for (const source of ["models", "runtime"]) {
@@ -263,6 +304,7 @@ describe("LlamaAioChatProvider requests", () => {
     ["LFM2.5-1.2B-Instruct", ["none"], [0.1, 1, 50, 1.05], [{}]],
     ["Qwen3-4B-Instruct-2507", ["none"], [0.7, 0.8, 20, 1], [{}]],
     ["Qwen3-4B-Thinking-2507", ["high"], [0.6, 0.95, 20, 1], [{}]],
+    ["Qwen3.8-35B-A3B-Distill", ["high"], [0.6, 0.95, 20, 1], [{ enable_thinking: true }]],
     ["Qwen3-Coder-30B-A3B-Instruct", ["none"], [0.7, 0.8, 20, 1.05], [{}]],
     ["Qwen3-Coder-Next", ["none"], [1, 0.95, 40, 1], [{}]],
     ["NVIDIA-Nemotron-3.5-Bolt-E4B", ["high", "none"], [1, 0.95, 64, 1],

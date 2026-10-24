@@ -13,6 +13,7 @@
  */
 
 import type { ModelCapabilities } from "./ggufMetadata";
+import type { RemoteServerInfo } from "./remoteServer";
 
 export interface ModelModeParams {
   temperature?: number;
@@ -263,6 +264,13 @@ const QWEN3_INSTRUCT_MODES = fixedMode("Qwen3 Instruct 2507", "No Think", {
 const QWEN3_THINKING_ONLY_MODES = fixedMode("Qwen3 Thinking 2507", "Think", {
   ...OPEN_SAMPLING, temperature: 0.6, top_p: 0.95, top_k: 20,
 });
+// This distillation names the Qwen3.8 teacher, but retains a Qwen3.6 template.
+// It has no reasoning_effort ladder; the author recommends .6/.95/20.
+const QWEN38_DISTILL_MODES: ModelModeSet = {
+  familyLabel: "Qwen3.8 Distill 35B-A3B", defaultMode: "Think",
+  modes: { Think: { ...OPEN_SAMPLING, temperature: 0.6, top_p: 0.95, top_k: 20,
+    chat_template_kwargs: { enable_thinking: true } } },
+};
 
 // These verified Ornith checkpoints use Qwen3.5 templates and recipes. Other
 // sizes or revisions must not be assigned the same base family by brand alone.
@@ -302,6 +310,7 @@ function haystack(caps?: ModelCapabilities, modelId?: string): string {
 }
 
 function namedProfile(h: string): ModelModeSet | undefined {
+  if (/\bqwen3[._]8[-_ ]35b[-_ ]a3b[-_ ]distill(?:\b|_)/.test(h)) return QWEN38_DISTILL_MODES;
   if (/\bspark[-_ ]?x?2[._]6(?=$|[-_.\s/\\])/.test(h)) return SPARK26_MODES;
   if (/\bspark[-_ ]?x?2[._]5(?=$|[-_.\s/\\])/.test(h)) return SPARK25_MODES;
   if (/\bgpt[-_ ]oss(?:\b|_)/.test(h)) return GPT_OSS_MODES;
@@ -337,7 +346,9 @@ export function isQwen4expFamily(hay: string): boolean {
   const h = hay.toLowerCase();
   // Strata's Swift 1.5 fine-tune IDs omit the base model name entirely.
   if (/\bswift[-_ ]1[._]5(?=$|[-_.\s/\\])/.test(h)) {
-    return true;
+    // A dense Swift quant names its Qwen3.8-27B base explicitly. Only the
+    // shortened Strata alias should imply Flash-Next.
+    return !/qwen[-_ ]?3[._]8[-_ ]27b(?:\b|_)/.test(h);
   }
   if (/qwen4exp/.test(h) || /qwen4_exp/.test(h) || /qwen4-exp/.test(h)) {
     return true;
@@ -391,7 +402,9 @@ export function resolveModelModes(
   const h = haystack(caps, modelId);
   const arch = (caps?.architecture || "").toLowerCase();
   if (/^(?:dflash|gemma4[-_]assistant)$/.test(arch)
-    || /(?:^|[-_.\s])(?:mmproj|mtp)(?:$|[-_.\s])/.test(h)
+    || /(?:^|[\s])(?:mmproj|mtp)[-_.]/.test(h)
+    || /(?:^|[-_.\s])mmproj(?:$|[-_.\s])/.test(h)
+    || /-mtp\.gguf(?:$|\s)/.test(h)
     || /(?:^|[-_.\s])dflash\d*(?:$|[-_.\s])/.test(h)
     || /(?:^|[-_.\s])base(?:$|[-_.\s])/.test(h)) return undefined;
   const named = namedProfile(h);
@@ -406,6 +419,18 @@ export function resolveModelModes(
   if (/^spark2_5$/.test(arch) && !/spark[-_ ]?x?2[._]\d/.test(h)) return SPARK25_MODES;
   if (isGlimmerFamily(arch)) return GLIMMER_THINKING_MODES;
   if (isGemma4Family(arch)) return GEMMA4_THINKING_MODES;
+  return undefined;
+}
+
+/** Shared by remote chat and the sidebar; never consult local model settings. */
+export function resolveRemoteModelModes(
+  info: Pick<RemoteServerInfo, "modelAlias" | "modelPath" | "modelName" | "modelId"> | undefined
+): ModelModeSet | undefined {
+  if (!info) return undefined;
+  for (const identity of [info.modelAlias, info.modelPath, info.modelName, info.modelId]) {
+    const profile = resolveModelModes(undefined, identity);
+    if (profile) return profile;
+  }
   return undefined;
 }
 

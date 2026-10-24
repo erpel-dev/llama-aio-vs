@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { denseCaps } from "./helpers";
-import { applyModeToRequestBody, buildModeConfigurationSchema, resolveModeParams, resolveModelModes } from "../src/modelModes";
+import { applyModeToRequestBody, buildModeConfigurationSchema, resolveModeParams, resolveModelModes, resolveRemoteModelModes } from "../src/modelModes";
 
 // Contract expectations taken from the author recipes linked in docs/model-profiles.md.
 const cases: Array<[string, string, string, string[]]> = [
@@ -28,6 +28,7 @@ const cases: Array<[string, string, string, string[]]> = [
   ["Qwen3-4B-Instruct-2507", "Qwen3 Instruct 2507", "No Think", ["No Think"]],
   ["Qwen3-4B-Thinking-2507", "Qwen3 Thinking 2507", "Think", ["Think"]],
   ["Qwen3-8B", "Qwen3", "Think", ["Think", "No Think"]],
+  ["empero-ai/Qwen3.8-35B-A3B-Distill-GGUF", "Qwen3.8 Distill 35B-A3B", "Think", ["Think"]],
   ["Qwen3.6-35B-A3B", "Qwen3.5 / 3.6", "Think (Coding)", ["Think (General)", "Think (Coding)", "No Think"]],
   ["Qwen3.8-27B", "Qwen3.8", "Think (XHigh)", ["Think (XHigh)", "Think (Medium)", "Think (Low)", "No Think"]],
   ["gemma-4-12B-it", "Gemma 4", "Think", ["Think", "No Think"]],
@@ -101,6 +102,8 @@ describe("model-specific sampler and reasoning differences", () => {
     assert.equal(params("Qwen3-Coder-30B-A3B-Instruct").repetition_penalty, 1.05);
     assert.equal(params("Qwen3-Coder-Next").temperature, 1);
     assert.equal(params("Qwen3-Coder-Next").top_k, 40);
+    assert.equal(params("Qwen3.8-35B-A3B-Distill").temperature, 0.6);
+    assert.equal(params("Qwen3.8-35B-A3B-Distill").chat_template_kwargs?.reasoning_effort, undefined);
   });
 
   it("does not give every Nemotron or Liquid checkpoint the same sampler", () => {
@@ -120,6 +123,11 @@ describe("model-specific sampler and reasoning differences", () => {
 });
 
 describe("profile identity boundaries", () => {
+  it("keeps main models with embedded MTP heads distinct from prediction sidecars", () => {
+    assert.equal(resolveModelModes(undefined, "Qwen3.8-27B-iMatrix-NVFP4-MTP-GGUF")?.familyLabel, "Qwen3.8");
+    assert.equal(resolveModelModes(undefined, "Qwen3.8-27B-MTP-Q4_K_M.gguf")?.familyLabel, "Qwen3.8");
+    assert.equal(resolveModelModes(undefined, "Swift-1.5-Qwen3.8-27B-GSQ-RCO-GGUF")?.familyLabel, "Qwen3.8");
+  });
   for (const id of ["Spark-X2.7-4B", "LFM2.5-7B", "Ornith-1.5-31B", "Ornith-2.0-9B", "GLM-4.7-Flash",
     "gpt-oss-20b-Base", "Spark-X2.6-4B-Base", "mtp-Qwen3.8-27B.gguf", "mmproj-Qwen3.8.gguf",
     "Qwen3.8-Flash-Next-DFlash2", "/models/Qwen3.8/unknown.gguf", "C:\\models\\Qwen3.8\\unknown.gguf"]) {
@@ -136,5 +144,16 @@ describe("profile identity boundaries", () => {
     assert.equal(resolveModelModes(denseCaps({ architecture: "spark2_5", path: "/models/Spark-X2.7-4B.gguf" })), undefined);
     assert.equal(resolveModelModes(denseCaps({ architecture: "gemma4", path: "/models/gemma-4-12B-it-Q4_0-MTP.gguf" })), undefined);
     assert.equal(resolveModelModes(denseCaps({ architecture: "gemma4", path: "/models/gemma-4-12B-it-mmproj.gguf" })), undefined);
+  });
+});
+
+describe("remote profile lookup shared with the sidebar", () => {
+  it("uses aliases, portable filenames, labels, then IDs without local metadata", () => {
+    assert.equal(resolveRemoteModelModes({ modelId: "opaque", modelName: "Spark-X2.6-4B" })?.familyLabel, "Spark X2.6");
+    assert.equal(resolveRemoteModelModes({ modelId: "Spark-X2.6-4B", modelAlias: "gpt-oss-20b" })?.familyLabel, "GPT-OSS");
+    assert.equal(resolveRemoteModelModes({ modelId: "Spark-X2.6-4B", modelPath: "C:\\models\\gpt-oss-20b.gguf" })?.familyLabel, "GPT-OSS");
+    assert.equal(resolveRemoteModelModes({ modelId: "Spark-X2.6-4B", modelPath: "/models/opaque.gguf" })?.familyLabel, "Spark X2.6");
+    assert.equal(resolveRemoteModelModes({ modelId: "opaque", modelPath: "C:\\models\\Spark-X2.6\\pack\\full" }), undefined);
+    assert.equal(resolveRemoteModelModes(undefined), undefined);
   });
 });

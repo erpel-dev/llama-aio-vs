@@ -1381,7 +1381,7 @@ function renderPerfStats(perf, perfLines) {
   }
 }
 
-/** A curated model mode owns temperature / top_p / top_k: show what it sends instead of inert inputs. */
+/** A curated mode owns sampling: show its defaults instead of inert inputs. */
 function renderModeOverrideHint(mode) {
   const strip = $('modeStrip');
   if (!strip) return;
@@ -1402,9 +1402,9 @@ function renderModeOverrideHint(mode) {
     values.appendChild(chip);
   }
   strip.title =
-    mode.familyLabel + ' model detected — the Model Mode picker in Copilot Chat sets temperature, top_p and top_k per request. "' +
+    mode.familyLabel + ' model detected — the Model Mode picker in Copilot Chat or the Copilot SDK harness selects the sampling preset per request. "' +
     mode.defaultMode + '" is the default and sends temperature ' + mode.temperature + ', top_p ' + mode.topP +
-    ', top_k ' + mode.topK + '. Max tokens, the penalties below, and the overthinking penalty still apply.';
+    ', top_k ' + mode.topK + '. The preset also supplies min-p and repetition, presence, and frequency penalties. Max tokens and the overthinking penalty still apply.';
 }
 
 function syncMmprojOffloadUi(cpuOnly) {

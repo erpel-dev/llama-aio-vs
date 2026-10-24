@@ -27,6 +27,7 @@ that the model has different reasoning effort levels.
 | Qwen3 original | **Think**, No Think | Think: .6/.95/20; off: .7/.8/20; presence penalty 0 |
 | Qwen3 Instruct 2507 | **No Think** only | .7/.8/20 |
 | Qwen3 Thinking 2507 | **Think** only | .6/.95/20 |
+| Empero Qwen3.8 35B-A3B Distill | **Think** only | .6/.95/20; Qwen3.6-based template, no effort ladder |
 | Qwen3-Coder 30B-A3B / 480B-A35B Instruct | **No Think** only | .7/.8/20, repeat penalty 1.05 |
 | Qwen3-Coder-Next | **No Think** only | 1/.95/40 |
 | Qwen3.5 / 3.6 | General, **Coding**, No Think | General 1/.95/20, presence 1.5; Coding .6/.95/20, presence 0; off .7/.8/20, presence 1.5 |
@@ -50,6 +51,43 @@ identify a checkpoint. Draft models, MTP sidecars, explicit Base checkpoints,
 and unverified named variants are excluded. Architecture fallback is used only
 where it identifies an established profile; Spark's shared architecture cannot
 distinguish X2.5 from X2.6, so a versioned name takes precedence.
+
+Remote connections use the same alias → filename → model label → served ID
+lookup in chat and the sidebar, including Windows paths when the extension runs
+on another OS. Local GGUF selections do not determine a remote model's profile.
+The sidebar shows the default preset; each chat request uses the choice made
+in its model picker. Profile-owned sampling controls are hidden because the
+preset overrides them. Main models advertising embedded MTP heads remain valid;
+prediction sidecars are excluded. Explicit dense Swift checkpoint names take
+precedence over Strata's shortened Swift alias for Flash-Next.
+
+## Copilot SDK harness
+
+When the VS Code Copilot SDK harness uses the registered Llama AIO model, its
+Responses proxy and renderer bridge forward `reasoning.effort` as the Language
+Model API's model configuration. The same standard effort values and curated
+presets therefore apply to local and remote servers, including No Think (`none`).
+The backend still receives Chat Completions with template controls nested in
+`chat_template_kwargs`; it does not need a Responses endpoint. Missing effort
+selections use the advertised profile default.
+
+This applies through VS Code's Llama AIO provider. A standalone SDK configured
+to contact a server directly bypasses the extension: configure that client's
+sampling and template parameters separately. Remote servers also need to accept
+the template controls; an OpenAI-compatible API alone does not guarantee that.
+
+After compiling core, run the optional upstream bridge contract check:
+
+```sh
+NODE_USE_ENV_PROXY=1 node scripts/verify-copilot-sdk-bridge.cjs
+```
+
+It executes pinned VS Code Responses translation and renderer bridge code,
+checking profile enumeration, context limits, effort/default forwarding, and
+tool history/results across all profiles. VS Code services are stubbed; this
+does not launch a signed-in SDK harness session. Extension HTTP tests separately
+check authenticated remote connections through a URL prefix, served model IDs,
+tool conversion, and the selected sampler/template parameters.
 
 ## Sources and verification
 

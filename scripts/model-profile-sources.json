@@ -68,6 +68,10 @@
     "revision": "66e3ae7bee54e0a523d692cb8ef841f35409807b"
   },
   {
+    "id": "empero-ai/Qwen3.8-35B-A3B-Distill",
+    "revision": "bcc2dbe2f21b213625df2dc1a5a690212373af07"
+  },
+  {
     "id": "google/gemma-4-12B-it",
     "revision": "707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7"
   },

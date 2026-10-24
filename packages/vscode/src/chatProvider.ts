@@ -27,6 +27,7 @@ import {
   remoteSlotContext,
   remoteStateUsable,
   resolveModelModes,
+  resolveRemoteModelModes,
   resolveModeParams,
   rewriteToolInput,
   serverJson,
@@ -520,10 +521,7 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
     const name = cachedName
       ?? (remote?.modelId === modelId ? remote.modelName : undefined)
       ?? rememberedName;
-    const found = resolveModelModes(undefined, canonical)
-      ?? resolveModelModes(undefined, filename)
-      ?? resolveModelModes(undefined, name)
-      ?? resolveModelModes(undefined, modelId);
+    const found = resolveRemoteModelModes({ modelAlias: canonical, modelPath: filename, modelName: name, modelId });
     if (found) {
       this.lastModeSet = { endpoint, modelId, modeSet: found };
       return found;
