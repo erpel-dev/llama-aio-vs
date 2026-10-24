@@ -391,7 +391,7 @@ export function resolveModelModes(
   const h = haystack(caps, modelId);
   const arch = (caps?.architecture || "").toLowerCase();
   if (/^(?:dflash|gemma4[-_]assistant)$/.test(arch)
-    || /(?:^|[\s/\\])(?:mmproj|mtp)[-_.]/.test(h)
+    || /(?:^|[-_.\s])(?:mmproj|mtp)(?:$|[-_.\s])/.test(h)
     || /(?:^|[-_.\s])dflash\d*(?:$|[-_.\s])/.test(h)
     || /(?:^|[-_.\s])base(?:$|[-_.\s])/.test(h)) return undefined;
   const named = namedProfile(h);

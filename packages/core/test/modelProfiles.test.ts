@@ -134,5 +134,7 @@ describe("profile identity boundaries", () => {
     assert.equal(resolveModelModes(denseCaps({ architecture: "qwen3", path: "/models/Qwen3-Coder-Unknown.gguf" })), undefined);
     assert.equal(resolveModelModes(denseCaps({ architecture: "gemma4", path: "/models/Ornith-1.5-31B.gguf" })), undefined);
     assert.equal(resolveModelModes(denseCaps({ architecture: "spark2_5", path: "/models/Spark-X2.7-4B.gguf" })), undefined);
+    assert.equal(resolveModelModes(denseCaps({ architecture: "gemma4", path: "/models/gemma-4-12B-it-Q4_0-MTP.gguf" })), undefined);
+    assert.equal(resolveModelModes(denseCaps({ architecture: "gemma4", path: "/models/gemma-4-12B-it-mmproj.gguf" })), undefined);
   });
 });
