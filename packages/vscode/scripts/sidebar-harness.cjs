@@ -158,6 +158,15 @@ function remoteFixture(kind) {
     model.serverGenTokPerSec = 61;
     model.serverPromptTokPerSec = 1900;
   }
+  if (kind === "strata-empty" || kind === "strata-ready") {
+    Object.assign(model, {
+      url: "http://127.0.0.1:47831", state: kind === "strata-empty" ? "no-model" : "limited",
+      isLlamaCpp: false, modelId: "unsloth-ud-iq4_xs", modelName: "Qwen3.8-Flash-Next (Unsloth) UD-IQ4_XS",
+      slotContext: undefined, servedContext: kind === "strata-empty" ? 262144 : 65536,
+      lastKnownModel: kind === "strata-empty", totalSlots: undefined, modelPath: undefined, buildInfo: undefined,
+      probes: [{ path: "/v1/models", ok: kind === "strata-ready", detail: kind === "strata-empty" ? "no model listed" : "unsloth-ud-iq4_xs" }],
+    });
+  }
   return model;
 }
 

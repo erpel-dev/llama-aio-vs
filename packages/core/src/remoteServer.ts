@@ -16,6 +16,7 @@ import {
 export type RemoteState =
   | "connecting"
   | "loading"
+  | "no-model"
   | "ready"
   | "busy"
   | "auth"
@@ -23,7 +24,7 @@ export type RemoteState =
   | "unreachable";
 
 export interface RemoteProbeRow {
-  path: "/health" | "/v1/models" | "/props" | "/slots" | "/metrics" | "/api/native";
+  path: "/health" | "/api/health" | "/v1/models" | "/props" | "/slots" | "/metrics" | "/api/native";
   /** true = answered OK, false = failed, null = skipped or endpoint off. */
   ok: boolean | null;
   status?: number;
@@ -62,6 +63,11 @@ export interface RemoteServerInfo {
   trainedContext?: number;
   /** Served context from the model list or the matching Strata Desktop engine. */
   servedContext?: number;
+  /** Strata's instance and load timestamp identify one running engine across missing telemetry. */
+  strataInstanceId?: string;
+  strataLoadedAt?: string;
+  /** Context/identity retained while the server cannot report a loaded model. */
+  lastKnownModel?: boolean;
   slotContext?: number;
   totalSlots?: number;
   /**
@@ -136,19 +142,29 @@ function positive(n: unknown): number | undefined {
 }
 
 /** The loaded engine's limit, never a catalog/training limit or a saved config. */
-async function attachStrataContext(info: RemoteServerInfo, instanceId: string | undefined, apiKey?: string): Promise<void> {
+async function attachStrataContext(info: RemoteServerInfo, instanceId: string | undefined, apiKey?: string): Promise<"ready" | "loading" | "no-model" | undefined> {
   try {
     const native = await serverJson<{ instances?: Array<{
-      id?: string; apiModelId?: string; status?: string; vision?: boolean;
+      id?: string; apiModelId?: string; status?: string; vision?: boolean; loadedAt?: string; label?: string; aliases?: unknown;
       metrics?: { engine?: { max_context?: number; images?: boolean } };
     }> }>(joinServerUrl(info.url, "/api/native"), {
       apiKey,
-      timeoutMs: 2000,
-      signal: AbortSignal.timeout(2000),
+      timeoutMs: REMOTE_PROPS_TIMEOUT_MS,
+      signal: AbortSignal.timeout(REMOTE_PROPS_TIMEOUT_MS),
     });
-    const matches = Array.isArray(native?.instances) ? native.instances.filter(i =>
-      i?.apiModelId === info.modelId && (!instanceId || i.id === instanceId) && i.status === "ready") : [];
+    const instances = Array.isArray(native?.instances) ? native.instances.filter(i => i && typeof i === "object") : undefined;
+    const matches = instances?.filter(i => typeof i.apiModelId === "string" && i.apiModelId
+      && (!info.modelId || i.apiModelId === info.modelId) && (!instanceId || i.id === instanceId) && i.status === "ready") ?? [];
+    if (!info.modelId && matches.length === 1) {
+      const instance = matches[0];
+      Object.assign(info, remoteModelIdentity({ id: instance.apiModelId, aliases: instance.aliases, meta: { label: instance.label } }));
+    }
     const engine = matches.length === 1 ? matches[0].metrics?.engine : undefined;
+    if (matches.length === 1) {
+      info.strataInstanceId = matches[0].id;
+      info.strataLoadedAt = typeof matches[0].loadedAt === "string" && matches[0].loadedAt
+        ? matches[0].loadedAt : undefined;
+    }
     const context = matches.length === 1 ? positive(engine?.max_context) : undefined;
     // Strata answers /props with its web UI, so `/api/native` is the only place
     // that says whether the loaded engine has a picture reader (mmproj).
@@ -169,9 +185,15 @@ async function attachStrataContext(info: RemoteServerInfo, instanceId: string | 
     } else {
       info.probes.push({ path: "/api/native", ok: null, status: 200, detail: bits.join(" · ") });
     }
-  } catch {
+    if (matches.length === 1) return "ready";
+    if (!info.modelId && instances && matches.length === 0) {
+      return instances.some(i => i.status === "loading") ? "loading" : "no-model";
+    }
+  } catch (err) {
     // Optional metadata must not block chat or expose runtime response bodies.
-    info.probes.push({ path: "/api/native", ok: null, detail: "engine context unavailable" });
+    const error = err instanceof ConnectionError ? err : undefined;
+    info.probes.push({ path: "/api/native", ok: null, status: error?.status,
+      detail: `engine context unavailable${error ? ` (${error.kind})` : ""}` });
   }
 }
 
@@ -488,14 +510,15 @@ async function attachServerLoad(info: RemoteServerInfo, baseUrl: string, apiKey:
 export async function probeHealth(
   baseUrl: string,
   opts: { apiKey?: string; timeoutMs?: number } = {}
-): Promise<{ status: number; rttMs: number; body: string }> {
+): Promise<{ status: number; rttMs: number; body: string; strataHostHint: boolean }> {
   const t0 = Date.now();
   const res = await serverRequest(joinServerUrl(baseUrl, "/health"), {
     apiKey: opts.apiKey,
     timeoutMs: opts.timeoutMs ?? REMOTE_HEALTH_TIMEOUT_MS,
   });
   const body = await readBody(res, 64 * 1024);
-  return { status: res.statusCode || 0, rttMs: Date.now() - t0, body };
+  return { status: res.statusCode || 0, rttMs: Date.now() - t0, body,
+    strataHostHint: String(res.headers["access-control-allow-headers"] || "").toLowerCase().split(/\s*,\s*/).includes("x-strata-client") };
 }
 
 /**
@@ -517,9 +540,11 @@ export async function probeRemoteServer(
   };
 
   let healthStatus: number;
+  let strataHostHint = false;
   try {
     const health = await probeHealth(baseUrl, { apiKey: opts.apiKey });
     healthStatus = health.status;
+    strataHostHint = health.strataHostHint;
     info.rttMs = health.rttMs;
     if (health.status >= 200 && health.status < 300) {
       info.probes.push({ path: "/health", ok: true, status: health.status, detail: `reachable · ${health.rttMs} ms` });
@@ -558,6 +583,8 @@ export async function probeRemoteServer(
   let authFailed = healthStatus === 401 || healthStatus === 403;
   let strataModel = false;
   let strataInstanceId: string | undefined;
+  let modelsEmpty = false;
+  let strataAvailability: "ready" | "loading" | "no-model" | undefined;
 
   try {
     const models = await serverJson<ModelsResponse>(joinServerUrl(baseUrl, "/v1/models"), {
@@ -565,8 +592,10 @@ export async function probeRemoteServer(
       timeoutMs: REMOTE_PROPS_TIMEOUT_MS,
     });
     const first = models.data?.[0];
+    modelsEmpty = Array.isArray(models.data) && models.data.length === 0;
     strataModel = first?.owned_by === "strata";
     strataInstanceId = typeof first?.meta?.instanceId === "string" ? first.meta.instanceId : undefined;
+    info.strataInstanceId = strataModel ? strataInstanceId : undefined;
     Object.assign(info, remoteModelIdentity(first));
     info.modelSizeBytes = positive(first?.meta?.size);
     info.modelParams = positive(first?.meta?.n_params);
@@ -622,11 +651,28 @@ export async function probeRemoteServer(
     }
   }
 
-  if (!authFailed && strataModel && info.modelId) {
+  // Desktop serves HTML at /health and /props, and lists no models while its
+  // host reconnects/reloads. Confirm its health signature before using native
+  // metadata, rather than requiring owned_by from a non-empty model list.
+  if (!authFailed && modelsEmpty && strataHostHint) {
+    try {
+      const health = await serverJson<{ ok?: boolean; backend?: { kind?: string }; engine?: unknown }>(joinServerUrl(baseUrl, "/api/health"), {
+        apiKey: opts.apiKey, timeoutMs: REMOTE_PROPS_TIMEOUT_MS,
+      });
+      strataModel = health?.ok === true && typeof health.backend?.kind === "string"
+        && !!health.engine && typeof health.engine === "object" && !Array.isArray(health.engine);
+      info.probes.push({ path: "/api/health", ok: strataModel, status: 200, detail: strataModel ? "Strata Desktop host" : "unrecognized host" });
+    } catch {
+      info.probes.push({ path: "/api/health", ok: null, detail: "host metadata unavailable" });
+    }
+  }
+
+  if (!authFailed && strataModel) {
+    if (modelsEmpty) strataAvailability = "loading";
     const needsContext = !info.slotContext && !info.servedContext;
     const needsVision = info.vision === undefined;
     if (needsContext || needsVision) {
-      await attachStrataContext(info, strataInstanceId, opts.apiKey);
+      strataAvailability = await attachStrataContext(info, strataInstanceId, opts.apiKey) ?? strataAvailability;
     }
   }
 
@@ -637,6 +683,8 @@ export async function probeRemoteServer(
   if (authFailed) {
     info.state = "auth";
     info.error = { kind: "auth", message: "The server rejected the request (401). It needs an API key." };
+  } else if (strataAvailability === "loading" || strataAvailability === "no-model") {
+    info.state = strataAvailability;
   } else if (info.isLlamaCpp) {
     info.state = remoteLoadBusy(info) ? "busy" : "ready";
   } else if (info.modelId || healthStatus < 300) {
@@ -681,6 +729,8 @@ export function remoteStateLabel(state: RemoteState | undefined): string {
       return "Connected · limited";
     case "loading":
       return "Loading model";
+    case "no-model":
+      return "No model loaded";
     case "auth":
       return "API key required";
     case "unreachable":
@@ -768,8 +818,35 @@ export class RemoteServerMonitor {
         probed = true;
       }
     }
+    // Preserve the last advertised model during an outage or a Desktop reload.
+    // Its state still blocks requests; this is presentation metadata, never
+    // evidence that the old engine is ready. Fresh model/context data wins.
+    if (prev && prev.url === next.url && !remoteStateUsable(next.state)
+      && (!next.modelId || next.modelId === prev.modelId)) {
+      const missingIdentity = !next.modelId;
+      const fields = ["modelId", "modelAlias", "modelAliases", "modelName", "modelPath", "trainedContext",
+        "slotContext", "servedContext", "strataInstanceId", "strataLoadedAt", "vision"] as const;
+      for (const field of fields) {
+        if ((next[field] === undefined || (field === "modelAliases" && missingIdentity)) && prev[field] !== undefined) {
+          Object.assign(next, { [field]: prev[field] });
+          next.lastKnownModel = true;
+        }
+      }
+    }
     if (probed) {
       applyVllmThroughput(prev, next);
+      // Desktop clears instance.metrics when its engine telemetry poll fails.
+      // Keep the last runtime limit only after /api/native confirms the same
+      // ready instance AND load timestamp. IDs are reused on context reloads;
+      // model ID alone (or an unavailable management endpoint) is not enough.
+      if (!next.slotContext && !next.servedContext && prev?.servedContext
+        && remoteStateUsable(next.state) && prev.url === next.url && prev.modelId === next.modelId
+        && next.strataInstanceId && prev.strataInstanceId === next.strataInstanceId
+        && next.strataLoadedAt && prev.strataLoadedAt === next.strataLoadedAt) {
+        next.servedContext = prev.servedContext;
+        const probe = next.probes.find(p => p.path === "/api/native");
+        if (probe) probe.detail += ` · last reported context ${next.servedContext} (same loaded engine)`;
+      }
     }
     if (next.state === "unreachable") {
       this.nextTryAt = Date.now() + BACKOFF_MS[Math.min(this.failures, BACKOFF_MS.length - 1)];
@@ -792,6 +869,7 @@ export class RemoteServerMonitor {
       JSON.stringify(prev.modelAliases) !== JSON.stringify(next.modelAliases) ||
       prev.slotContext !== next.slotContext ||
       prev.servedContext !== next.servedContext ||
+      prev.lastKnownModel !== next.lastKnownModel ||
       prev.vision !== next.vision ||
       prev.slotsBusy !== next.slotsBusy ||
       prev.slotsTotal !== next.slotsTotal ||
@@ -838,6 +916,7 @@ export function formatRemoteDiagnostics(info: RemoteServerInfo | undefined, extr
     info?.buildInfo ? `Build: ${info.buildInfo}` : "",
     info?.slotContext ? `Slot context: ${info.slotContext}` : "",
     info?.servedContext ? `Served context: ${info.servedContext}` : "",
+    info?.lastKnownModel ? "Model metadata: last known (server has not confirmed a loaded model)" : "",
     info?.totalSlots ? `Slots: ${info.totalSlots}` : "",
     info?.slotsTotal ? `Slots busy: ${info.slotsBusy ?? 0}/${info.slotsTotal}` : "",
     typeof info?.vision === "boolean" ? `Vision: ${info.vision ? "yes" : "no"}` : "",

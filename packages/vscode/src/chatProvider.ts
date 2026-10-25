@@ -483,7 +483,8 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
   private async serverReady(): Promise<boolean> {
     const endpoint = this.store.getEndpoint();
     const hit = this.readyProbe;
-    if (hit && hit.endpoint === endpoint && Date.now() - hit.at < LlamaAioChatProvider.PROBE_TTL_MS) {
+    if (hit && hit.endpoint === endpoint && Date.now() - hit.at < LlamaAioChatProvider.PROBE_TTL_MS
+      && (!this.store.isRemote() || remoteStateUsable(this.remoteInfo()?.state))) {
       return true;
     }
     let ready: boolean;
@@ -506,6 +507,8 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
     switch (info?.state) {
       case "loading":
         return `${target.label} is still loading the model. Send the chat again when the Llama AIO sidebar shows Connected.`;
+      case "no-model":
+        return `${target.label} reports no loaded model. Load a model in Strata, then send the chat again.`;
       case "auth":
         return `${target.label} rejected the request (401): it needs an API key. Use “Set API key…” in the Llama AIO sidebar.`;
       case "unreachable":
@@ -652,9 +655,10 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
       maxInputTokens: maxInput,
       maxOutputTokens: maxOutput,
       statusIcon: new vscode.ThemeIcon("llama-aio-model"),
-      tooltip: modeSet
+      tooltip: (modeSet
         ? `${where} · slot context ${serverSlotCtx} · modes: ${Object.keys(modeSet.modes).join(", ")}${vision ? " · vision" : ""}`
-        : `${where} · slot context ${serverSlotCtx}${vision ? " · vision" : ""}`,
+        : `${where} · slot context ${serverSlotCtx}${vision ? " · vision" : ""}`)
+        + (remoteInfo?.lastKnownModel ? " · last known model; waiting for server" : ""),
       detail: remote
         ? `${serverSlotCtx} ctx/slot · ${target.label}`
         : `${serverSlotCtx} ctx/slot · ${state.selectedModelPath || target.baseUrl}`,

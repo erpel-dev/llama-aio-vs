@@ -1056,6 +1056,7 @@ export function activate(context: vscode.ExtensionContext): void {
         JSON.stringify(info.modelAliases),
         info.slotContext,
         info.servedContext,
+        info.lastKnownModel,
         info.vision,
         info.isLlamaCpp,
       ].join("|");
