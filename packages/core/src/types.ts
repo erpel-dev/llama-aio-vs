@@ -371,6 +371,8 @@ export interface LlamaLoadSettings {
   maxConcurrentPredictions: number;
   /** MoE: force expert tensors of first N layers onto CPU (--n-cpu-moe) */
   nCpuMoe: number;
+  /** GPU expert-cache budget in MiB (--moe-cache-mib); 0 = off. Requires host MoE experts. */
+  moeCacheMiB: number;
   /** Dense: force FFN tensors of first N layers onto CPU (--n-cpu-ffn); MoE models ignore this */
   nCpuFfn: number;
   /** Offload KV cache to GPU (default true; false => --no-kv-offload) */
@@ -431,6 +433,10 @@ export interface LlamaLoadSettings {
   minDraftTokens: number;
   /** Draft probability (--spec-draft-p-min). llama.cpp CLI default is 0; we use 0.75. */
   draftProbability: number;
+  /** Auto enables probabilistic drafting for MTP on supporting binaries; DFlash stays greedy. */
+  draftSampling: "auto" | "greedy" | "probabilistic";
+  /** Draft physical batch (--spec-draft-n-ubatch); 0 inherits the main physical batch. */
+  draftBatchSize: number;
   /**
    * Separate draft GGUF for DFlash or sidecar MTP (`-md` / `--model-draft`).
    * Required when speculativeMode is `dflash` or `ngram-dflash`. For MTP, set when
@@ -520,6 +526,7 @@ export const DEFAULT_LOAD_SETTINGS: LlamaLoadSettings = {
   physicalBatchSize: 512,
   maxConcurrentPredictions: 1,
   nCpuMoe: 0,
+  moeCacheMiB: 0,
   nCpuFfn: 0,
   offloadKvCacheToGpu: true,
   cacheTypeK: "q8_0",
@@ -549,6 +556,8 @@ export const DEFAULT_LOAD_SETTINGS: LlamaLoadSettings = {
   // llama.cpp's CLI default is 0.00, which never stops on low-confidence drafts
   // and collapses acceptance. 0.75 is the practical gate (also for DFlash).
   draftProbability: 0.75,
+  draftSampling: "auto",
+  draftBatchSize: 0,
   draftModelPath: "",
   draftGpuOffload: 99,
   mmprojPath: "",
@@ -639,6 +648,7 @@ export function normalizeLoadSettings(raw: Partial<LlamaLoadSettings> | undefine
     ),
     maxConcurrentPredictions: int(s.maxConcurrentPredictions, 1, 64, d.maxConcurrentPredictions),
     nCpuMoe: int(s.nCpuMoe, 0, 999, d.nCpuMoe),
+    moeCacheMiB: int(s.moeCacheMiB, 0, 1_048_576, d.moeCacheMiB),
     nCpuFfn: int(s.nCpuFfn, 0, 999, d.nCpuFfn),
     offloadKvCacheToGpu: toBoolean(s.offloadKvCacheToGpu, d.offloadKvCacheToGpu),
     cacheTypeK: normalizeKvCacheType(s.cacheTypeK),
@@ -663,6 +673,9 @@ export function normalizeLoadSettings(raw: Partial<LlamaLoadSettings> | undefine
     maxDraftTokens: int(s.maxDraftTokens, 0, 64, d.maxDraftTokens),
     minDraftTokens: int(s.minDraftTokens, 0, 64, d.minDraftTokens),
     draftProbability: float(s.draftProbability, 0, 1, d.draftProbability),
+    draftSampling: s.draftSampling === "greedy" || s.draftSampling === "probabilistic"
+      ? s.draftSampling : "auto",
+    draftBatchSize: int(s.draftBatchSize, 0, 1_048_576, d.draftBatchSize),
     draftModelPath: typeof s.draftModelPath === "string" ? s.draftModelPath.trim() : "",
     draftGpuOffload: int(s.draftGpuOffload, 0, 999, d.draftGpuOffload),
     mmprojPath: typeof s.mmprojPath === "string" ? s.mmprojPath.trim() : "",

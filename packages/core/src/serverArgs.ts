@@ -9,6 +9,7 @@ import {
   type ModelCapabilities,
 } from "./ggufMetadata";
 import { usesSidecarMtp } from "./modelLibrary";
+import type { LlamaServerFeatures } from "./llamaFeatures";
 import {
   CHAT_TEMPLATE_FILE_MAX_BYTES,
   LlamaLoadSettings,
@@ -88,6 +89,7 @@ export function normalizeLoadSettingsForCpuBackend(
     offloadKvCacheToGpu: false,
     mmprojOffloadToGpu: false,
     nCpuMoe: 0,
+    moeCacheMiB: 0,
     nCpuFfn: 0,
   };
 }
@@ -122,7 +124,8 @@ export function buildServerArgs(
   host: string,
   port: number,
   rawSettings: LlamaLoadSettings,
-  options?: { gpus?: GpuMemoryInfo[]; requestSampling?: RequestSettings; caps?: ModelCapabilities }
+  options?: { gpus?: GpuMemoryInfo[]; requestSampling?: RequestSettings; caps?: ModelCapabilities;
+    features?: LlamaServerFeatures }
 ): string[] {
   const settings = normalizeLoadSettings(rawSettings);
   const args: string[] = [
@@ -162,6 +165,8 @@ export function buildServerArgs(
   if (settings.nCpuMoe > 0) {
     args.push("--n-cpu-moe", String(settings.nCpuMoe));
   }
+  const moeCache = options?.features?.moeCache ? effectiveMoeCacheMiB(settings, options.caps) : 0;
+  if (moeCache > 0) args.push("--moe-cache-mib", String(moeCache));
 
   // Dense counterpart to --n-cpu-moe: first N layers' dense FFN tensors stay
   // in system RAM. MoE models reset this to 0 at normalize time. Only sent
@@ -326,6 +331,18 @@ export function buildServerArgs(
     args.push("--cache-type-v-draft", "f16");
   }
 
+  const neuralDraft = speculativeUsesMtp(settings.speculativeMode) ||
+    (speculativeUsesDflash(settings.speculativeMode) && !!settings.draftModelPath);
+  if (neuralDraft) {
+    if (options?.features?.draftSampling) {
+      const sampling = effectiveDraftSampling(settings);
+      if (sampling) args.push("--spec-draft-sampling", sampling);
+    }
+    if (options?.features?.draftUbatch && settings.draftBatchSize > 0) {
+      args.push("--spec-draft-n-ubatch", String(settings.draftBatchSize));
+    }
+  }
+
   // llama.cpp --fit defaults to on, but it cannot change user-set -ngl,
   // --tensor-split, or --n-cpu-moe (CPU tensor overrides). The probe then
   // logs "failed to fit params … n_gpu_layers already set … abort" and
@@ -341,6 +358,56 @@ export function buildServerArgs(
   }
 
   return args;
+}
+
+/** Only experts forced to CPU in GPU-assigned layers can use the upstream cache.
+ * Tensor parallelism currently throws in llama_moe_cache, so refuse it here.
+ */
+export function moeCacheEligibleLayers(settings: LlamaLoadSettings, caps?: ModelCapabilities): number {
+  if (!caps?.isMoe || !caps.blockCount || settings.splitMode === "tensor" || settings.gpuOffload <= 0) return 0;
+  const onGpu = settings.gpuOffload >= 99 ? caps.blockCount : Math.min(settings.gpuOffload, caps.blockCount);
+  return Math.max(0, Math.min(settings.nCpuMoe, caps.blockCount) - (caps.blockCount - onGpu));
+}
+
+export function effectiveMoeCacheMiB(settings: LlamaLoadSettings, caps?: ModelCapabilities): number {
+  return moeCacheEligibleLayers(settings, caps) > 0 ? settings.moeCacheMiB || 0 : 0;
+}
+
+export function effectiveDraftSampling(settings: LlamaLoadSettings): "greedy" | "probabilistic" | undefined {
+  // Help advertises this flag on engines predating DFlash2 probabilistic
+  // support. Do not infer technique support from the shared flag alone.
+  if (!speculativeUsesMtp(settings.speculativeMode)) return undefined;
+  if (settings.draftSampling === "greedy" || settings.draftSampling === "probabilistic") return settings.draftSampling;
+  return "probabilistic";
+}
+
+/** Use for estimates. Keep saved choices intact when an older binary cannot apply them. */
+export function supportedPerformanceSettings(settings: LlamaLoadSettings, features?: LlamaServerFeatures): LlamaLoadSettings {
+  return { ...settings,
+    moeCacheMiB: features?.moeCache ? settings.moeCacheMiB : 0,
+    draftSampling: features?.draftSampling ? settings.draftSampling : "greedy",
+    draftBatchSize: features?.draftUbatch ? settings.draftBatchSize : 0,
+  };
+}
+
+export function performanceFeatureNotes(settings: LlamaLoadSettings, features: LlamaServerFeatures, caps?: ModelCapabilities): string[] {
+  const notes: string[] = [];
+  if (settings.moeCacheMiB > 0) {
+    if (!features.moeCache) notes.push("GPU expert cache is inactive: the binary must advertise --moe-cache-mib and expose a usable GPU backend.");
+    else if (!moeCacheEligibleLayers(settings, caps)) notes.push("GPU expert cache is inactive: it requires CPU MoE experts in GPU-assigned layers and a split mode other than Tensor.");
+  }
+  const neuralDraft = speculativeUsesMtp(settings.speculativeMode) ||
+    (speculativeUsesDflash(settings.speculativeMode) && !!settings.draftModelPath);
+  if (neuralDraft && !features.draftSampling && effectiveDraftSampling(settings) === "probabilistic") {
+    notes.push("Probabilistic drafting is inactive: this llama.cpp binary does not advertise --spec-draft-sampling with probabilistic support.");
+  }
+  if (neuralDraft && settings.draftBatchSize > 0 && !features.draftUbatch) {
+    notes.push("Draft batch override is inactive: this llama.cpp binary does not advertise --spec-draft-n-ubatch.");
+  }
+  if (speculativeUsesDflash(settings.speculativeMode) && settings.draftSampling === "probabilistic") {
+    notes.push("Draft sampling selection is inactive for DFlash: Llama AIO applies it to MTP only, because flag support alone cannot verify DFlash2 probabilistic support.");
+  }
+  return notes;
 }
 
 /** N-gram `--spec-type` + per-variant size flags. Safe to call in stacked modes. */
@@ -391,6 +458,7 @@ export function serverConfigFingerprint(
     physicalBatchSize: settings.physicalBatchSize,
     maxConcurrentPredictions: settings.maxConcurrentPredictions,
     nCpuMoe: settings.nCpuMoe,
+    moeCacheMiB: settings.moeCacheMiB,
     nCpuFfn: settings.nCpuFfn ?? 0,
     offloadKvCacheToGpu: !!settings.offloadKvCacheToGpu,
     cacheTypeK: settings.cacheTypeK || "q8_0",
@@ -412,6 +480,8 @@ export function serverConfigFingerprint(
     minDraftTokens: speculativeUsesMtp(spec) ? settings.minDraftTokens : 0,
     draftProbability:
       speculativeUsesMtp(spec) || speculativeUsesDflash(spec) ? settings.draftProbability : 0,
+    draftSampling: speculativeUsesMtp(spec) || speculativeUsesDflash(spec) ? settings.draftSampling : "auto",
+    draftBatchSize: speculativeUsesMtp(spec) || speculativeUsesDflash(spec) ? settings.draftBatchSize : 0,
     draftModelPath:
       speculativeUsesDflash(spec) || usesSidecarMtp(settings) ? settings.draftModelPath || "" : "",
     draftGpuOffload:

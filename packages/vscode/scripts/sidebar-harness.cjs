@@ -75,7 +75,7 @@ try {
 } catch {
   seed = {};
 }
-const modelPath = seed.selectedModelPath || "";
+const modelPath = argOf("--model", seed.selectedModelPath || "");
 const vulkanBinary = path.join(home, ".llama-aio-vs", "llama.cpp", "vulkan", "bin", "llama-server");
 const realBinary = fs.existsSync(vulkanBinary) ? vulkanBinary : "";
 
@@ -239,6 +239,14 @@ const processManager = {
   isHttpReady: async () => running,
   // The real binary gives llama.cpp's device order via --list-devices (read-only probe).
   resolveBinary: () => realBinary,
+  getServerFeatures: async () => {
+    // Explicit fixtures for exercising guards without a GPU or an installed build.
+    const fixture = argOf("--features", "");
+    if (fixture === "modern") return { probed: true, moeCache: true, draftSampling: true, draftUbatch: true };
+    if (fixture === "old") return { ...core.NO_SERVER_FEATURES, probed: true };
+    return realBinary ? core.probeLlamaServerFeatures({ binary: realBinary, command: realBinary,
+      prefixArgs: [], env: core.withBinaryDirEnv(realBinary) }) : { ...core.NO_SERVER_FEATURES };
+  },
   isCpuBackend: () => cpuBackend,
   getLaunchedConfig: () => (running ? launched : undefined),
   claimLaunch: () => ({ id: 1 }),

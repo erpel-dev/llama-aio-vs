@@ -1887,15 +1887,15 @@ const loadFieldIds = [
   'chatTemplateName', 'chatTemplateJinja',
   'ropeBaseAuto', 'ropeFreqBase', 'ropeScaleAuto', 'ropeFreqScale',
   'seedRandom', 'seed', 'speculativeMode', 'maxDraftTokens', 'minDraftTokens',
-  'draftProbability', 'draftGpuOffload',
+  'draftProbability', 'draftGpuOffload', 'draftSampling', 'draftBatchSize', 'moeCacheMiB',
   'ngramVariant', 'ngramSizeN', 'ngramSizeNRange', 'ngramSizeM', 'ngramMinHits',
   'tensorSplitRange', 'splitMode', 'mainGpu'
 ];
 for (const id of loadFieldIds) {
   const el = $(id);
   if (!el) continue;
-  el.addEventListener('change', () => { scheduleSaveLoad(); refreshMemoryLive(); });
-  el.addEventListener('input', () => { scheduleSaveLoad(); scheduleLiveMemory(); syncTensorSplitPctLabel(); });
+  el.addEventListener('change', () => { scheduleSaveLoad(); refreshMemoryLive(); syncPerformanceFeatureUi(); });
+  el.addEventListener('input', () => { scheduleSaveLoad(); scheduleLiveMemory(); syncTensorSplitPctLabel(); syncPerformanceFeatureUi(); });
 }
 
 // Advanced: mark values that differ from Llama AIO defaults, filter by label or flag.
@@ -1905,7 +1905,7 @@ const ADV_KEYS = new Set([
   'unifiedKvCache', 'contextCheckpoints', 'cacheReuse', 'reasoningFormat', 'reasoningBudget',
   'chatTemplateSource', 'chatTemplateName', 'chatTemplateFile', 'chatTemplateJinja',
   'ropeFreqBase', 'ropeFreqScale', 'seed', 'speculativeMode', 'ngramVariant', 'ngramSizeN',
-  'ngramSizeM', 'ngramMinHits', 'maxDraftTokens', 'minDraftTokens', 'draftProbability', 'draftGpuOffload',
+  'ngramSizeM', 'ngramMinHits', 'maxDraftTokens', 'minDraftTokens', 'draftProbability', 'draftGpuOffload', 'draftSampling', 'draftBatchSize',
 ]);
 const ADV_ALIAS = {
   reasoningBudgetUnlimited: 'reasoningBudget', ropeBaseAuto: 'ropeFreqBase', ropeScaleAuto: 'ropeFreqScale',
@@ -2091,6 +2091,7 @@ function readLoad() {
     physicalBatchSize: Number($('physicalBatchSize').value),
     maxConcurrentPredictions: Number($('maxConcurrentPredictions').value),
     nCpuMoe: Number($('nCpuMoe').value),
+    moeCacheMiB: Number($('moeCacheMiB').value),
     nCpuFfn: Number($('nCpuFfn').value),
     offloadKvCacheToGpu: $('offloadKvCacheToGpu').checked,
     mmprojOffloadToGpu: $('mmprojOffloadToGpu') ? $('mmprojOffloadToGpu').checked : true,
@@ -2118,6 +2119,8 @@ function readLoad() {
     maxDraftTokens: Number($('maxDraftTokens').value),
     minDraftTokens: Number($('minDraftTokens').value),
     draftProbability: Number($('draftProbability').value),
+    draftSampling: $('draftSampling').value || 'auto',
+    draftBatchSize: Number($('draftBatchSize').value),
     ngramVariant: ($('ngramVariant') && $('ngramVariant').value) || 'simple',
     ngramSizeN: Number(($('ngramSizeN') && $('ngramSizeN').value) || 12),
     ngramSizeM: Number(($('ngramSizeM') && $('ngramSizeM').value) || 48),
@@ -2288,6 +2291,10 @@ function applySpecUi(bakedMtp, sidecarMtp) {
   const isNgram = mode === 'ngram' || mode === 'ngram-mtp' || mode === 'ngram-dflash';
   const showMtpKnobs = isMtp && mtpCapable;
   const showDraftKnobs = isMtp || isDflash;
+  for (const id of ['specDraftSamplingRow', 'specDraftBatchRow']) {
+    const row = $(id);
+    if (row) row.classList.toggle('hidden', !showDraftKnobs);
+  }
   const showDraftPicker = isDflash || (isMtp && sidecarMtp && !bakedMtp);
   const ngramGroup = $('specNgramGroup');
   if (ngramGroup) ngramGroup.classList.toggle('hidden', !isNgram);
@@ -2381,6 +2388,41 @@ function applySpecUi(bakedMtp, sidecarMtp) {
       hint.textContent =
         'This GGUF has no MTP / nextn_predict_layers and no sibling mtp-*.gguf — MTP is unavailable. Use DFlash with a separate draft GGUF, N-gram (no draft model), or an MTP-tagged main model.';
     }
+  }
+  syncPerformanceFeatureUi();
+}
+
+/** Preserve saved values while clearly marking settings the active binary cannot apply. */
+function syncPerformanceFeatureUi() {
+  const p = lastPayload || {};
+  const f = p.serverFeatures || {};
+  const remote = p.serverMode === 'remote';
+  const suffix = remote ? 'The remote server controls this setting.'
+    : f.probed ? 'Inactive on this llama.cpp build. Update llama.cpp to use it.'
+      : 'Inactive until support is verified. Install or select a runnable llama.cpp build.';
+  const cache = $('moeCacheMiB');
+  const cacheHint = $('moeCacheHint');
+  const layers = Number($('nCpuMoe').value) || 0;
+  const ngl = Number($('gpuOffload').value) || 0;
+  const blocks = modelBlockCount || 0;
+  const split = $('splitMode').value || 'layer';
+  const eligible = modelIsMoe && !cpuOnlyLive() && ngl > 0 &&
+    layers > Math.max(0, blocks - (ngl >= 99 ? blocks : ngl)) && split !== 'tensor';
+  if (cache) cache.disabled = remote || !f.moeCache || !eligible;
+  if (cacheHint) cacheHint.textContent = remote ? suffix : !f.moeCache
+    ? 'Inactive: requires a compatible llama.cpp GPU build with a usable GPU device.' : !eligible
+    ? 'Inactive: requires CPU MoE experts in GPU-assigned layers; Tensor split is unsupported.'
+    : '0 = off. Adds VRAM; host experts remain in RAM. Included in the memory estimate.';
+  for (const [id, feature, hintId, help] of [
+    ['draftSampling', 'draftSampling', 'draftSamplingHint', 'Auto: probabilistic for MTP when supported; DFlash keeps its default.'],
+    ['draftBatchSize', 'draftUbatch', 'draftBatchHint', '0 = inherit the main physical batch size. Smaller can save draft VRAM.'],
+  ]) {
+    const el = $(id);
+    const mtpOnly = id === 'draftSampling' && !['mtp', 'ngram-mtp'].includes($('speculativeMode').value);
+    if (el) el.disabled = remote || !f[feature] || mtpOnly;
+    const hint = $(hintId);
+    if (hint) hint.textContent = remote || !f[feature] ? suffix : mtpOnly
+      ? 'Applies to MTP only. DFlash keeps its default; flag support alone cannot verify DFlash2 compatibility.' : help;
   }
 }
 
@@ -2701,6 +2743,7 @@ function applyState(payload) {
   setField('physicalBatchSize', L.physicalBatchSize);
   setField('maxConcurrentPredictions', L.maxConcurrentPredictions);
   setPair('nCpuMoe', 'nCpuMoeRange', moe);
+  setField('moeCacheMiB', L.moeCacheMiB ?? 0);
   setPair('nCpuFfn', 'nCpuFfnRange', ffn);
   setChecked('offloadKvCacheToGpu', !!L.offloadKvCacheToGpu);
   setChecked('mmprojOffloadToGpu', L.mmprojOffloadToGpu !== false);
@@ -2758,6 +2801,8 @@ function applyState(payload) {
   setField('maxDraftTokens', L.maxDraftTokens);
   setField('minDraftTokens', L.minDraftTokens);
   setField('draftProbability', L.draftProbability);
+  setField('draftSampling', L.draftSampling || 'auto');
+  setField('draftBatchSize', L.draftBatchSize ?? 0);
   setField('ngramVariant', L.ngramVariant || 'simple');
   if (!fieldFocused('ngramSizeN') && !fieldFocused('ngramSizeNRange')) {
     setField('ngramSizeN', L.ngramSizeN ?? 12);
@@ -2789,6 +2834,7 @@ function applyState(payload) {
   memInputs = payload.memInputs || null;
   const splitDirty = applyDualGpuUi(L);
   applyCpuOnlyUi(!!payload.cpuOnly || payload.selectedUiBackend === 'cpu');
+  syncPerformanceFeatureUi();
   // Core already estimated the saved settings; newer live requests still win.
   renderedSeq = estimateSeq;
   renderMemoryView(payload.memoryView || null);
