@@ -782,7 +782,7 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
     if (modeSet) {
       const { modeName, params } = resolveModeParams(modeSet, modelConfiguration);
       appliedModeName = modeName;
-      if (params.chat_template_kwargs?.clear_thinking === true) {
+      if (params.chat_template_kwargs?.clear_thinking === true || params.chat_template_kwargs?.preserve_thinking === false) {
         converted = clearEarlierReasoning(converted);
         body.messages = converted;
       }

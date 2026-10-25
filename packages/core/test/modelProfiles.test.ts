@@ -5,6 +5,9 @@ import { applyModeToRequestBody, buildModeConfigurationSchema, resolveModeParams
 
 // Contract expectations taken from the author recipes linked in docs/model-profiles.md.
 const cases: Array<[string, string, string, string[]]> = [
+  ["Nanbeige/Nanbeige4.3-33B", "Nanbeige4.3 33B", "Think (Agent)", ["Think (Agent)", "Think (Chat)", "No Think"]],
+  ["bartowski/Nanbeige_Nanbeige4.3-33B-GGUF", "Nanbeige4.3 33B", "Think (Agent)", ["Think (Agent)", "Think (Chat)", "No Think"]],
+  ["Nanbeige4.3-33B-Q4_K_M.gguf", "Nanbeige4.3 33B", "Think (Agent)", ["Think (Agent)", "Think (Chat)", "No Think"]],
   ["Qwen/Qwen2.5-0.5B-Instruct", "Qwen2.5 0.5B Instruct", "No Think", ["No Think"]],
   ["Tiel-Coder-35B-A3B-MTP-UD-Q4_K_XL.gguf", "Tiel-Coder 35B-A3B", "Think", ["Think", "No Think"]],
   ["MiniCPM5-2B-GGUF", "MiniCPM5 2B", "Think", ["Think", "No Think"]],
@@ -84,6 +87,24 @@ function params(id: string, mode?: string) {
 }
 
 describe("model-specific sampler and reasoning differences", () => {
+  it("uses Nanbeige4.3's agent/chat recipes and binary thinking control", () => {
+    const set = resolveModelModes(undefined, "Nanbeige/Nanbeige4.3-33B")!;
+    assert.equal(set.preserveReasoning, true);
+    for (const [effort, temperature, thinking, preserve] of [
+      ["high", 1, true, true], ["medium", 0.6, true, false], ["none", 0.6, false, false],
+    ] as const) {
+      const p = params("Nanbeige4.3-33B", effort);
+      assert.equal(p.temperature, temperature);
+      assert.equal(p.top_p, 0.95);
+      assert.equal(p.top_k, -1);
+      assert.equal(p.min_p, 0);
+      assert.equal(p.presence_penalty, 0);
+      assert.equal(p.frequency_penalty, 0);
+      assert.equal(p.repetition_penalty, 1);
+      assert.deepEqual(p.chat_template_kwargs, { enable_thinking: thinking, preserve_thinking: preserve, tool_call_format: "xml" });
+      assert.equal("reasoning_effort" in (p.chat_template_kwargs || {}), false, "agent/chat are recipes, not effort levels");
+    }
+  });
   it("maps DeepSeek's numeric budgets and keeps checkpoint-specific top-p", () => {
     for (const [mode, budget] of [["max", 100], ["high", 75], ["low", 50]] as const) {
       assert.deepEqual(params("DeepSeek-V4.1-Flash-1017", mode).chat_template_kwargs,
@@ -153,6 +174,8 @@ describe("profile identity boundaries", () => {
     assert.equal(resolveModelModes(undefined, "Swift-1.5-Qwen3.8-27B-GSQ-RCO-GGUF")?.familyLabel, "Qwen3.8");
   });
   for (const id of ["Spark-X2.7-4B", "LFM2.5-7B", "Ornith-1.5-31B", "Ornith-2.0-9B", "GLM-4.7-Flash",
+    "Nanbeige4.3-33B-Base-Q4_K_M.gguf", "Nanbeige4.2-3B", "Nanbeige4.3-3B", "Nanbeige4.4-33B",
+    "Nanbeige4.3-33B0", "Nanbeige4.3-33B-Unverified", "mtp-Nanbeige4.3-33B.gguf", "Nanbeige4.3-33B-DSpark.gguf",
     "MiniCPM5-2B-DSpark-GGUF", "Mellum2.1-12B-A2.5B-Base", "DeepSeek-V4.1-Flash-1018", "GLM-5.4",
     "gpt-oss-20b-Base", "Spark-X2.6-4B-Base", "mtp-Qwen3.8-27B.gguf", "mmproj-Qwen3.8.gguf",
     "Qwen3.8-Flash-Next-DFlash2", "/models/Qwen3.8/unknown.gguf", "C:\\models\\Qwen3.8\\unknown.gguf"]) {
@@ -174,6 +197,12 @@ describe("profile identity boundaries", () => {
 
 describe("remote profile lookup shared with the sidebar", () => {
   it("uses aliases, portable filenames, labels, then IDs without local metadata", () => {
+    for (const identity of [
+      { modelAlias: "Nanbeige/Nanbeige4.3-33B" },
+      { modelPath: "C:\\models\\Nanbeige_Nanbeige4.3-33B-Q4_K_M.gguf" },
+      { modelName: "Nanbeige4.3 33B" },
+      { modelAliases: ["Nanbeige4.3-33B"] },
+    ]) assert.equal(resolveRemoteModelModes({ modelId: "private-id", ...identity })?.familyLabel, "Nanbeige4.3 33B");
     assert.equal(resolveRemoteModelModes({ modelId: "opaque", modelName: "Spark-X2.6-4B" })?.familyLabel, "Spark X2.6");
     assert.equal(resolveRemoteModelModes({ modelId: "Spark-X2.6-4B", modelAlias: "gpt-oss-20b" })?.familyLabel, "GPT-OSS");
     assert.equal(resolveRemoteModelModes({ modelId: "Spark-X2.6-4B", modelPath: "C:\\models\\gpt-oss-20b.gguf" })?.familyLabel, "GPT-OSS");

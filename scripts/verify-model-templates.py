@@ -169,7 +169,16 @@ def main():
         for index, (left, lp) in enumerate(modes):
             for right, rp in modes[index + 1:]:
                 if lp.get("chat_template_kwargs") != rp.get("chat_template_kwargs"):
-                    assert outputs[left, "plain"] != outputs[right, "plain"], (source["id"], left, right)
+                    assert any(outputs[left, fixture] != outputs[right, fixture] for fixture in ["plain", "tools"]), (source["id"], left, right)
+        if source["id"] == "Nanbeige/Nanbeige4.3-33B":
+            assert "I need the file." in outputs["Think (Agent)", "tools"]
+            assert "I need the file." not in outputs["Think (Chat)", "tools"]
+            assert "I need the file." not in outputs["No Think", "tools"]
+            for mode in profile["modes"]:
+                assert "<function=read_file>" in outputs[mode, "tools"]
+                assert "<parameter=path>" in outputs[mode, "tools"]
+                assert "<tool_response>" in outputs[mode, "tools"]
+                assert outputs[mode, "plain"].rstrip().endswith("</think>" if mode == "No Think" else "<think>")
         digest = hashlib.sha256(template.encode()).hexdigest()[:12]
         print(f'{source["id"]}@{source["revision"][:12]} template={digest}: {len(modes)} modes OK', flush=True)
     print(f"PASS: {count} template renders across {len(sources)} checkpoints")
