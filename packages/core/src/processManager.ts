@@ -49,7 +49,8 @@ import {
   REMOTE_HEALTH_TIMEOUT_MS,
 } from "./remoteServer";
 import { joinServerUrl, serverJson, serverRequest } from "./serverHttp";
-import { formatCommandDisplay, normalizeLoadSettingsForCpuBackend } from "./serverArgs";
+import { formatCommandDisplay, normalizeLoadSettingsForCpuBackend, performanceFeatureNotes } from "./serverArgs";
+import { NO_SERVER_FEATURES, probeLlamaServerFeatures, probeLlamaServerFeaturesSync, type LlamaServerFeatures } from "./llamaFeatures";
 import { LlamaLoadSettings, ServerStatus } from "./types";
 import { activeInstallLock } from "./installSwap";
 import { acquireLaunchLock, activeLaunchLock, LaunchLockHandle } from "./launchLock";
@@ -580,6 +581,18 @@ export class ProcessManager {
     });
   }
 
+  async getServerFeatures(): Promise<LlamaServerFeatures> {
+    if (this.store.isRemote() || activeInstallLock()) return { ...NO_SERVER_FEATURES };
+    try { return await probeLlamaServerFeatures(this.resolveLaunch()); }
+    catch { return { ...NO_SERVER_FEATURES }; }
+  }
+
+  getServerFeaturesSync(): LlamaServerFeatures {
+    if (this.store.isRemote() || activeInstallLock()) return { ...NO_SERVER_FEATURES };
+    try { return probeLlamaServerFeaturesSync(this.resolveLaunch()); }
+    catch { return { ...NO_SERVER_FEATURES }; }
+  }
+
   /**
    * Command line the next start would run, for the sidebar “Copy command” button.
    * Does not launch anything and does not write the log.
@@ -600,10 +613,12 @@ export class ProcessManager {
       loadSettings = normalizeLoadSettingsForCpuBackend(loadSettings);
     }
     const gpus = this.isCpuBackend() ? [] : detectGpus(false, launch.binary);
+    const features = probeLlamaServerFeaturesSync(launch);
     const args = buildServerArgs(model, this.store.getHost(), this.store.getPort(), loadSettings, {
       gpus,
       requestSampling: state.requestSettings,
       caps,
+      features,
     });
     return formatCommandDisplay([launch.command, ...launch.prefixArgs, ...args]);
   }
@@ -772,12 +787,14 @@ export class ProcessManager {
       loadSettings = normalizeLoadSettingsForCpuBackend(loadSettings);
     }
     const gpus = this.isCpuBackend() ? [] : await detectGpusAsync(false, binary);
+    const features = await probeLlamaServerFeatures(launch);
     const args = buildServerArgs(model, host, port, loadSettings, {
       gpus,
       // Ship request sampling defaults as CLI flags so raw clients pointing at
       // the endpoint inherit them too (our frontends send per-request values).
       requestSampling: state.requestSettings,
       caps,
+      features,
     });
     const launchMode = resolveLaunchMode(this.store.getConfig().get<string>("launchMode"));
     const configFingerprint = serverConfigFingerprint(model, loadSettings, launchMode);
@@ -793,7 +810,8 @@ export class ProcessManager {
       `# llama-aio-vs start ${new Date().toISOString()}\n` +
         `# mode=${launchMode} method=${launch.method}\n` +
         `# ${launch.command} ${spawnArgv.join(" ")}\n` +
-        (launch.note ? `# note: ${launch.note}\n` : ""),
+        (launch.note ? `# note: ${launch.note}\n` : "") +
+        performanceFeatureNotes(loadSettings, features, caps).map((note) => `# note: ${note}\n`).join(""),
       "utf8"
     );
 

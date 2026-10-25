@@ -22,6 +22,7 @@ import {
 } from "@llama-aio/core";
 import { LlamaInstaller, UiBackend } from "@llama-aio/core";
 import { clampLoadSettingsToModel, computeMemoryView, diffLoadSettings, fittingContextLength, memoryEstimateInputs, mmprojFileSize, resolveDraftCapabilities, shortGpuName, type SettingChange } from "@llama-aio/core";
+import { NO_SERVER_FEATURES, supportedPerformanceSettings, type LlamaServerFeatures } from "@llama-aio/core";
 import { resolveModelModes, resolveRemoteModelModes } from "@llama-aio/core";
 import {
   buildLibraryGroupsAsync,
@@ -141,6 +142,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
   private updateCheckInFlight = false;
   /** GPUs from the last full state push; live estimates reuse them instead of re-probing. */
   private lastGpus: GpuMemoryInfo[] = [];
+  private serverFeatures: LlamaServerFeatures = { ...NO_SERVER_FEATURES };
   /** Drops fit-badge work from an older library scan when a newer state arrives. */
   private libraryFitGen = 0;
   /** What the last posted fit badges were computed from (see postLibraryFits). */
@@ -241,6 +243,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               cpuThreads: d.cpuThreads,
               evalBatchSize: d.evalBatchSize,
               physicalBatchSize: d.physicalBatchSize,
+              moeCacheMiB: d.moeCacheMiB,
               maxConcurrentPredictions: d.maxConcurrentPredictions,
               offloadKvCacheToGpu: d.offloadKvCacheToGpu,
               cacheTypeK: d.cacheTypeK,
@@ -265,6 +268,8 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               maxDraftTokens: d.maxDraftTokens,
               minDraftTokens: d.minDraftTokens,
               draftProbability: d.draftProbability,
+              draftSampling: d.draftSampling,
+              draftBatchSize: d.draftBatchSize,
               ngramVariant: d.ngramVariant,
               ngramSizeN: d.ngramSizeN,
               ngramSizeM: d.ngramSizeM,
@@ -288,7 +293,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             };
             const cpuOnly = !!msg.cpuOnly;
             const gpus = cpuOnly ? [] : this.lastGpus;
-            const { view } = computeMemoryView(this.store.getState().modelCapabilities, draft, gpus, {
+            const { view } = computeMemoryView(this.store.getState().modelCapabilities, supportedPerformanceSettings(draft, this.serverFeatures), gpus, {
               cpuOnly,
               withFixes: true,
             });
@@ -302,7 +307,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               if (caps) {
                 patch.contextLength = fittingContextLength(
                   caps,
-                  { ...this.store.getState().loadSettings, ...patch },
+                  supportedPerformanceSettings({ ...this.store.getState().loadSettings, ...patch }, this.serverFeatures),
                   { cpuOnly: !!msg.cpuOnly, gpus: msg.cpuOnly ? [] : this.lastGpus }
                 );
               }
@@ -688,12 +693,15 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
    * through `computeMemoryView`, so the bars and the dialog cannot disagree.
    */
   private async memoryForSaved(cpuOnly: boolean) {
-    const gpus = await this.detectGpusForEstimate(cpuOnly);
+    const [gpus, features] = await Promise.all([
+      this.detectGpusForEstimate(cpuOnly), this.processManager.getServerFeatures(),
+    ]);
+    this.serverFeatures = features;
     const state = this.store.getState();
     this.lastGpus = gpus;
     return {
       gpus,
-      ...computeMemoryView(state.modelCapabilities, state.loadSettings, gpus, {
+      ...computeMemoryView(state.modelCapabilities, supportedPerformanceSettings(state.loadSettings, features), gpus, {
         cpuOnly,
         draftCaps: resolveDraftCapabilities(state.loadSettings),
         withFixes: true,
@@ -1135,6 +1143,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         startedAt: launched?.startedAt,
         launchedSettings: launched?.loadSettings ?? null,
         defaults: DEFAULT_LOAD_SETTINGS,
+        serverFeatures: remoteMode ? NO_SERVER_FEATURES : this.serverFeatures,
         chatTemplateProblem: chatTemplateFileProblem(state.loadSettings) || "",
         build,
         backendOptions,
@@ -1457,6 +1466,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     const signature = JSON.stringify([
       paths,
       state.loadSettings,
+      this.serverFeatures,
       state.selectedModelPath,
       cpuOnly,
       cpuOnly ? [] : this.lastGpus.map((g) => [g.totalBytes, Math.round((g.usedBytes || 0) / bucket)]),
@@ -1470,7 +1480,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     const ratios: Record<string, number> = {};
     const drafts: Record<string, boolean> = {};
     let capacityBytes = 0;
-    const settings = this.store.getState().loadSettings;
+    const settings = supportedPerformanceSettings(this.store.getState().loadSettings, this.serverFeatures);
     for (const filePath of paths) {
       if (gen !== this.libraryFitGen) {
         return;

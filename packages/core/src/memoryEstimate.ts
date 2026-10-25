@@ -15,7 +15,7 @@ import {
   readModelCapabilities,
 } from "./ggufMetadata";
 import { mmprojFileSize, isMtpSidecarFile, usesSidecarMtp } from "./modelLibrary";
-import { resolveLoadMode } from "./serverArgs";
+import { effectiveMoeCacheMiB, resolveLoadMode } from "./serverArgs";
 import {
   KvCacheType,
   lazyModeReadsFromDisk,
@@ -68,6 +68,8 @@ export interface MemoryEstimate {
   kvOnGpu: boolean;
   /** MoE expert weight fraction used for --n-cpu-moe accounting. */
   moeExpertShare?: number;
+  /** Additional GPU allocation; CPU expert weights remain resident in RAM. */
+  moeCacheBytes?: number;
   /** DFlash draft GGUF size when speculativeMode is dflash and a draft is set. */
   draftFileSizeBytes?: number;
   /** Draft weights attributed to GPU (0 when CPU-only / ngl 0). */
@@ -275,9 +277,10 @@ function buildGpuBarChart(
   spec: number,
   specLabel: string,
   labeled = false,
-  vision = 0
+  vision = 0,
+  expertCache = 0
 ): MemoryBarChart {
-  const totalBytes = weights + kv + overhead + spec + vision;
+  const totalBytes = weights + kv + overhead + spec + vision + expertCache;
   const igpu = isIntegratedGpu(gpu);
   const title = labeled && gpu
     ? `${igpu ? "iGPU GTT" : "VRAM"} · ${gpuLabel(gpu, index)} · est. at full context`
@@ -287,7 +290,7 @@ function buildGpuBarChart(
   return {
     title,
     segments: [
-      { key: "weights" as const, label: "Weights", bytes: weights },
+      { key: "weights" as const, label: expertCache > 0 ? "Weights + GPU expert cache" : "Weights", bytes: weights + expertCache },
       { key: "vision" as const, label: "Vision (CLIP)", bytes: vision },
       { key: "draft" as const, label: specLabel, bytes: spec },
       { key: "kv" as const, label: "KV cache (full ctx)", bytes: kv },
@@ -1169,6 +1172,20 @@ export function estimateMemory(
     : undefined;
   const peerCount = gpus.filter((_, i) => i !== mainGpuIndex && (shares[i] || 0) > 0).length;
   const totalPeerBytes = peerOverheadEach * peerCount;
+  // The cache duplicates host experts; it never replaces their CPU allocation.
+  // Budget only devices with eligible host experts (not every weight-bearing GPU).
+  const moeCacheBytes = cpuOnly ? 0 : effectiveMoeCacheMiB(settings, caps) * MiB;
+  const cacheDeviceShares = shares.map((share, dev) => {
+    if (!moeCacheBytes) return 0;
+    if (settings.splitMode === "row") return dev === mainGpuIndex ? 1 : 0;
+    const eligible = !layerAssign || layerAssign.some((owner, layer) => owner === dev && layer < settings.nCpuMoe);
+    if (!eligible) return 0;
+    return parseTensorSplit(settings.tensorSplit).length >= 2
+      ? share : Math.max(1, (gpus[dev]?.totalBytes || 0) - (gpus[dev]?.usedBytes || 0));
+  });
+  const cacheSharesSum = cacheDeviceShares.reduce((a, b) => a + b, 0);
+  const cacheOnDevice = (dev: number): number => cacheSharesSum > 0
+    ? moeCacheBytes * (cacheDeviceShares[dev] || 0) / cacheSharesSum : 0;
   const kvOnDevice = (dev: number): number => {
     if (!kvOnGpu) {
       return 0;
@@ -1223,10 +1240,10 @@ export function estimateMemory(
       : "Speculative";
 
   const totalGpuBytes =
-    gpuWeights + gpuKvBytes + gpuOverheadBytes + totalPeerBytes + specGpuBundle + gpuVisionBytes;
+    gpuWeights + gpuKvBytes + gpuOverheadBytes + totalPeerBytes + specGpuBundle + gpuVisionBytes + moeCacheBytes;
   const totalCpuBytes = cpuWeights + cpuKvBytes + cpuOverheadBytes + specCpuBundle + cpuVisionBytes;
   const totalGpuBytesWarm =
-    gpuWeights + gpuKvWarm + gpuOverheadBytes + totalPeerBytes + specGpuWarmBundle + gpuVisionBytes;
+    gpuWeights + gpuKvWarm + gpuOverheadBytes + totalPeerBytes + specGpuWarmBundle + gpuVisionBytes + moeCacheBytes;
   const totalCpuBytesWarm = cpuWeights + cpuKvWarm + cpuOverheadBytes + specCpuWarmBundle + cpuVisionBytes;
   const systemRamTotalBytes = os.totalmem();
 
@@ -1286,6 +1303,9 @@ export function estimateMemory(
         "Layer split + CPU MoE: llama.cpp assigns the first layers (cheap after --n-cpu-moe) to earlier GPUs, so later cards hold more expert weight than the tensor-split percentages suggest."
       );
     }
+  }
+  if (moeCacheBytes > 0) {
+    warnings.push(`GPU expert cache budget: ${formatBytes(moeCacheBytes)} of additional VRAM; host experts remain in system RAM. Included in the Weights bars. Actual allocation depends on expert layout.`);
   }
   if (!cpuOnly && !caps.isMoe && settings.nCpuFfn > 0) {
     warnings.push(
@@ -1348,7 +1368,8 @@ export function estimateMemory(
     const spec = specGpuBundle * (weightShares[i] || 0);
     // `--mmproj` is a separate model and is genuinely not tensor-split.
     const vision = isMain ? gpuVisionBytes : 0;
-    return { weights, kv, overhead, spec, vision, used: weights + kv + overhead + spec + vision };
+    const expertCache = cacheOnDevice(i);
+    return { weights, kv, overhead, spec, vision, expertCache, used: weights + kv + overhead + spec + vision + expertCache };
   });
 
   if (mmprojBytes > 0) {
@@ -1626,7 +1647,8 @@ export function estimateMemory(
       p.spec,
       specLabel,
       gpus.length >= 2,
-      p.vision
+      p.vision,
+      p.expertCache
     );
   });
   const charts = {
@@ -1641,7 +1663,8 @@ export function estimateMemory(
         specGpuBundle,
         specLabel,
         false,
-        gpuVisionBytes
+        gpuVisionBytes,
+        moeCacheBytes
       ),
     vram2: gpuCharts[1],
     ram: {
@@ -1676,6 +1699,7 @@ export function estimateMemory(
     kvOnGpu,
     recurrentStateBytes: recurrentStateBytes > 0 ? recurrentStateBytes : undefined,
     moeExpertShare: caps.isMoe ? moeExpertShare : undefined,
+    moeCacheBytes: moeCacheBytes || undefined,
     draftFileSizeBytes: draft?.fileSizeBytes,
     draftGpuWeightsBytes: draft?.gpuWeightsBytes,
     draftCpuWeightsBytes: draft?.cpuWeightsBytes,
