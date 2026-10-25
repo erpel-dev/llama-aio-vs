@@ -35,12 +35,14 @@ describe("probeRemoteServer", () => {
   let nativeBody: unknown;
   let nativeStatus: number;
   let seenPaths: string[];
+  let modelsBody: unknown;
 
   beforeEach(() => {
     modelOverrides = {};
     nativeBody = undefined;
     nativeStatus = 200;
     seenPaths = [];
+    modelsBody = undefined;
   });
 
   afterEach(async () => {
@@ -53,6 +55,14 @@ describe("probeRemoteServer", () => {
     server = createServer((req, res) => {
       const path = req.url || "";
       seenPaths.push(path);
+      if (mode === "desktop") {
+        res.setHeader("access-control-allow-headers", "content-type, authorization, x-strata-client");
+      }
+      if (mode === "desktop" && path === "/api/health") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true, backend: { kind: "native" }, engine: {} }));
+        return;
+      }
       if (path === "/api/native" && nativeBody !== undefined) {
         res.writeHead(nativeStatus, { "content-type": "application/json" });
         res.end(JSON.stringify(nativeBody));
@@ -70,13 +80,13 @@ describe("probeRemoteServer", () => {
       }
       if (path === "/health") {
         res.writeHead(200);
-        res.end('{"status":"ok"}');
+        res.end(mode === "desktop" ? "<!doctype html><html>Strata Desktop</html>" : '{"status":"ok"}');
         return;
       }
       if (path === "/v1/models") {
         res.writeHead(200, { "content-type": "application/json" });
         res.end(
-          JSON.stringify({
+          JSON.stringify(modelsBody ?? {
             data: [
               {
                 id: mode === "desktop" ? "q2_0" : "qwythos-9b.gguf",
@@ -149,7 +159,12 @@ describe("probeRemoteServer", () => {
         return;
       }
       if (path === "/props") {
-        if (mode === "auth" || mode === "limited" || mode === "vllm" || mode === "desktop") {
+        if (mode === "desktop") {
+          res.writeHead(200, { "content-type": "text/html" });
+          res.end("<!doctype html><html>Strata Desktop</html>");
+          return;
+        }
+        if (mode === "auth" || mode === "limited" || mode === "vllm") {
           res.writeHead(mode === "auth" ? 401 : 404);
           res.end(mode === "auth" ? "unauthorized" : "missing");
           return;
@@ -351,6 +366,125 @@ describe("probeRemoteServer", () => {
       monitor.dispose();
     }
   });
+
+  it("keeps the last runtime context when telemetry disappears from the same loaded Strata engine", async () => {
+    useStrataDesktop();
+    const instance = { id: "target", apiModelId: "q2_0", status: "ready", loadedAt: "2026-10-25T16:00:00Z",
+      context: 65536, metrics: { engine: { max_context: 262144 } } as unknown };
+    nativeBody = { instances: [instance] };
+    await listen();
+    const monitor = new RemoteServerMonitor(() => base);
+    const limits: number[] = [];
+    monitor.onDidChange(info => limits.push(remoteSlotContext(info)));
+    try {
+      assert.equal(remoteSlotContext(await monitor.refresh(true)), 262144);
+      // Strata's native-control poll clears metrics on any failed engine/MCP request.
+      instance.metrics = null;
+      const missing = await monitor.refresh(true);
+      assert.equal(remoteSlotContext(missing), 262144);
+      assert.match(formatRemoteDiagnostics(missing, { url: base, hasApiKey: false }), /last reported context 262144 \(same loaded engine\)/);
+      assert.deepEqual(limits, [262144]);
+      // A valid lower runtime value always replaces the remembered limit.
+      instance.metrics = { engine: { max_context: 131072 } };
+      assert.equal(remoteSlotContext(await monitor.refresh(true)), 131072);
+      assert.deepEqual(limits, [262144, 131072]);
+    } finally {
+      monitor.dispose();
+    }
+  });
+
+  it("recovers runtime context and profile identity when Desktop's model list is temporarily empty", async () => {
+    useStrataDesktop();
+    modelsBody = { data: [] };
+    nativeBody = { instances: [{ id: "target", apiModelId: "unsloth-ud-iq4_xs", status: "ready",
+      label: "Qwen3.8-Flash-Next (Unsloth) UD-IQ4_XS", aliases: ["qwen3.8-flash-next-unsloth-ud-iq4_xs"],
+      loadedAt: "2026-10-25T16:00:00Z", context: 65536, metrics: { engine: { max_context: 262144 } } }] };
+    await listen();
+    const info = await probeRemoteServer(base);
+    assert.equal(info.state, "limited");
+    assert.equal(info.modelId, "unsloth-ud-iq4_xs");
+    assert.equal(info.modelName, "Qwen3.8-Flash-Next (Unsloth) UD-IQ4_XS");
+    assert.deepEqual(info.modelAliases, ["qwen3.8-flash-next-unsloth-ud-iq4_xs"]);
+    assert.equal(remoteSlotContext(info), 262144);
+  });
+
+  for (const outage of ["empty", "loading", "down"]) {
+    it(`keeps the previous model/context during a Strata ${outage} interval and accepts a smaller context on recovery`, async () => {
+      useStrataDesktop();
+      const instance = { id: "target", apiModelId: "q2_0", label: "Qwen3.8-Flash-Next Q2_0",
+        status: "ready", loadedAt: "2026-10-25T16:00:00Z", metrics: { engine: { max_context: 262144 } } };
+      nativeBody = { instances: [instance] };
+      await listen();
+      const monitor = new RemoteServerMonitor(() => base);
+      try {
+        const first = await monitor.refresh(true);
+        assert.equal(remoteSlotContext(first), 262144);
+        modelsBody = { data: [] };
+        nativeBody = { instances: outage === "loading" ? [{ ...instance, status: "loading", metrics: null }] : [] };
+        if (outage === "down") mode = "loading";
+        const missing = await monitor.refresh(true);
+        assert.equal(missing?.state, outage === "empty" ? "no-model" : "loading");
+        assert.equal(remoteStateUsable(missing?.state), false);
+        assert.equal(missing?.modelId, first?.modelId);
+        assert.equal(missing?.modelName, first?.modelName);
+        assert.equal(remoteSlotContext(missing), 262144);
+        assert.equal(missing?.lastKnownModel, true);
+        assert.match(formatRemoteDiagnostics(missing, { url: base, hasApiKey: false }), /last known/);
+        mode = "desktop";
+        modelsBody = undefined;
+        instance.loadedAt = "2026-10-25T16:01:00Z";
+        instance.metrics.engine.max_context = 65536;
+        nativeBody = { instances: [instance] };
+        const recovered = await monitor.refresh(true);
+        assert.equal(remoteSlotContext(recovered), 65536);
+        assert.equal(recovered?.lastKnownModel, undefined);
+        assert.equal(remoteStateUsable(recovered?.state), true);
+      } finally {
+        monitor.dispose();
+      }
+    });
+  }
+
+  it("does not pick an arbitrary model from multiple ready engines when /v1/models is empty", async () => {
+    useStrataDesktop();
+    modelsBody = { data: [] };
+    nativeBody = { instances: ["first", "second"].map(id => ({ id, apiModelId: id, status: "ready",
+      metrics: { engine: { max_context: 262144 } } })) };
+    await listen();
+    const info = await probeRemoteServer(base);
+    assert.equal(info.modelId, undefined);
+    assert.equal(info.servedContext, undefined);
+  });
+
+  for (const change of ["reload", "instance", "model", "no timestamp", "loading", "unavailable"]) {
+    it(`does not reuse an old Strata context after ${change}`, async () => {
+      useStrataDesktop();
+      const instance: Record<string, unknown> = { id: "target", apiModelId: "q2_0", status: "ready",
+        loadedAt: "2026-10-25T16:00:00Z", metrics: { engine: { max_context: 262144 } } };
+      nativeBody = { instances: [instance] };
+      await listen();
+      const monitor = new RemoteServerMonitor(() => base);
+      try {
+        assert.equal(remoteSlotContext(await monitor.refresh(true)), 262144);
+        instance.metrics = null;
+        if (change === "reload") instance.loadedAt = "2026-10-25T16:01:00Z";
+        if (change === "instance") instance.id = "replacement";
+        if (change === "model") instance.apiModelId = "other-model";
+        if (change === "no timestamp") delete instance.loadedAt;
+        if (change === "loading") instance.status = "loading";
+        if (change === "unavailable") nativeStatus = 503;
+        assert.equal(remoteSlotContext(await monitor.refresh(true)), 32768);
+        instance.metrics = { engine: { max_context: 65536 } };
+        instance.id = "target";
+        instance.apiModelId = "q2_0";
+        instance.status = "ready";
+        nativeStatus = 200;
+        assert.equal(remoteSlotContext(await monitor.refresh(true)), 65536);
+      } finally {
+        monitor.dispose();
+      }
+    });
+  }
 
   it("marks every slot busy and keeps the queue from /metrics", async () => {
     mode = "busy";

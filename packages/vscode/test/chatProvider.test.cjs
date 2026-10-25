@@ -65,6 +65,8 @@ let servedProps;
 let servedMetadata;
 let propsStatus;
 let servedNative;
+let servedModels;
+let strataHost;
 let expectedApiKey;
 let seenRequests = [];
 /** How /v1/chat/completions answers: array of SSE data objects, optional per-event delay. */
@@ -73,6 +75,7 @@ let reply = { events: [], delayMs: 0 };
 before(async () => {
   server = http.createServer((req, res) => {
     seenRequests.push({ url: req.url, authorization: req.headers.authorization });
+    if (strataHost) res.setHeader("access-control-allow-headers", "content-type, authorization, x-strata-client");
     if (expectedApiKey && req.headers.authorization !== `Bearer ${expectedApiKey}`) {
       res.writeHead(401); res.end("unauthorized"); return;
     }
@@ -85,6 +88,11 @@ before(async () => {
         res.end("{}");
         return;
       }
+      if (req.url === "/api/health" && strataHost) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, backend: { kind: "native" }, engine: {} }));
+        return;
+      }
       if (req.url === "/props") {
         res.writeHead(propsStatus || 200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ default_generation_settings: { n_ctx: 32768 }, total_slots: 1, ...servedProps }));
@@ -92,7 +100,7 @@ before(async () => {
       }
       if (req.url === "/v1/models") {
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ data: [{ id: servedModelId || "test-model", ...servedMetadata }] }));
+        res.end(JSON.stringify(servedModels || { data: [{ id: servedModelId || "test-model", ...servedMetadata }] }));
         return;
       }
       if (req.url === "/api/native") {
@@ -150,7 +158,7 @@ function setup({ guard = false, remote = false, remoteInfo = {} } = {}) {
   };
   const perf = new Proxy({}, { get: (_t, name) => (...args) => perfCalls.push([name, args]) });
   const provider = new LlamaAioChatProvider(store, pm, perf, path.join(__dirname, ".."));
-  return { provider, perfCalls, state };
+  return { provider, perfCalls, state, pm };
 }
 
 function cancelToken() {
@@ -183,6 +191,8 @@ describe("LlamaAioChatProvider requests", () => {
     servedMetadata = undefined;
     propsStatus = undefined;
     servedNative = undefined;
+    servedModels = undefined;
+    strataHost = false;
     expectedApiKey = undefined;
     seenRequests = [];
   });
@@ -394,6 +404,61 @@ describe("LlamaAioChatProvider requests", () => {
       assert.equal(lastBody.messages.at(-1).content.length, 200000);
     });
   }
+
+  it("keeps Strata's last known 256K context and profile through an empty model list, then adopts a smaller limit", async () => {
+    strataHost = true;
+    propsStatus = 404;
+    servedModelId = "unsloth-ud-iq4_xs";
+    servedMetadata = { owned_by: "strata", meta: {
+      label: "Qwen3.8-Flash-Next (Unsloth) UD-IQ4_XS", instanceId: "target",
+    } };
+    const instance = { id: "target", apiModelId: servedModelId, status: "ready",
+      loadedAt: "2026-10-25T16:00:00Z", metrics: { engine: { max_context: 262144 } } };
+    servedNative = { instances: [instance] };
+    const monitor = new core.RemoteServerMonitor(() => endpoint);
+    const { provider, pm } = setup({ remote: true });
+    pm.remote = monitor;
+    // Match the actual extension's remote-model-information subscription.
+    monitor.onDidChange(() => provider.notifyChanged());
+    try {
+      const [initial] = await provider.provideLanguageModelChatInformation({}, cancelToken().token);
+      assert.equal(initial.maxInputTokens + initial.maxOutputTokens, 262144);
+      assert.equal(initial.configurationSchema.properties.reasoningEffort.default, "xhigh");
+      servedModels = { data: [] };
+      servedNative = { instances: [] };
+      await monitor.refresh(true);
+      const [offline] = await provider.provideLanguageModelChatInformation({}, cancelToken().token);
+      assert.equal(offline.id, servedModelId);
+      assert.equal(offline.maxInputTokens + offline.maxOutputTokens, 262144);
+      assert.equal(offline.configurationSchema.properties.reasoningEffort.default, "xhigh");
+      assert.match(offline.tooltip, /last known model/);
+      await assert.rejects(() => provider.provideLanguageModelChatResponse(offline,
+        [msg(Role.User, new TextPart("hello"))], {}, { report() {} }, cancelToken().token), /no loaded model/);
+      assert.equal(lastBody, undefined);
+      servedModels = undefined;
+      instance.loadedAt = "2026-10-25T16:01:00Z";
+      instance.metrics.engine.max_context = 65536;
+      servedNative = { instances: [instance] };
+      await monitor.refresh(true);
+      const [recovered] = await provider.provideLanguageModelChatInformation({}, cancelToken().token);
+      assert.equal(recovered.maxInputTokens + recovered.maxOutputTokens, 65536);
+      assert.doesNotMatch(recovered.tooltip, /last known model/);
+    } finally {
+      monitor.dispose();
+    }
+  });
+
+  it("stops reusing a cached ready result when the remote monitor reports no loaded model", async () => {
+    servedModelId = "unsloth-ud-iq4_xs";
+    const remoteInfo = { state: "limited", isLlamaCpp: false, servedContext: 262144 };
+    const { provider } = setup({ remote: true, remoteInfo });
+    const [model] = await provider.provideLanguageModelChatInformation({}, cancelToken().token);
+    assert.ok(provider.readyProbe);
+    remoteInfo.state = "no-model";
+    await assert.rejects(() => provider.provideLanguageModelChatResponse(model,
+      [msg(Role.User, new TextPart("hello"))], {}, { report() {} }, cancelToken().token), /no loaded model/);
+    assert.equal(lastBody, undefined);
+  });
 
   for (const [id, label, family, defaultMode] of [
     ["q2_0", "Qwen3.8-Flash-Next Q2_0", "Qwen3.8 Flash-Next", "xhigh"],

@@ -166,6 +166,10 @@ function renderRemoteModel() {
         : 'This server is not llama.cpp. Chat works; slots, vision, and the overthinking penalty stay off.';
     } else if (info.state === 'auth') {
       hint.textContent = 'Slots, context, and vision need the API key (/props).';
+    } else if (info.lastKnownModel) {
+      hint.textContent = 'Last known model and context. Waiting for the server to report a loaded model.';
+    } else if (info.state === 'no-model') {
+      hint.textContent = 'Load a model in Strata to use chat.';
     } else if (info.state === 'unreachable') {
       hint.textContent = info.modelId ? 'Last model this server reported.' : '';
     } else if (lastPayload && lastPayload.remoteLabel) {
@@ -185,6 +189,7 @@ function renderRemoteStatus() {
   else if (state === 'busy') { kind = 'ok'; label = 'Connected · busy'; }
   else if (state === 'limited') { kind = 'ok'; label = 'Connected · limited'; }
   else if (state === 'loading') { kind = 'starting'; label = 'Loading model'; }
+  else if (state === 'no-model') { kind = 'starting'; label = 'No model loaded'; }
   else if (state === 'auth') { kind = 'dirty'; label = 'API key required'; }
   else if (state === 'unreachable') { kind = 'error'; label = 'Not reachable'; }
   setServerCardKind(kind);
