@@ -2,6 +2,16 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { PerfStats } from "../src/perfStats";
 
+it("keeps thinking counts and finish reasons in response diagnostics", () => {
+  const perf = new PerfStats();
+  perf.recordResponseTrace({ model: "Flint", toolsEnabled: true, assembledText: "", assembledReasoning: "Still thinking",
+    visibleText: "", structuredToolCalls: [], xmlToolCalls: [], emittedTextChars: 0, emittedReasoningChars: 14,
+    emittedToolCallCount: 0, finishReason: "length" });
+  assert.equal(perf.getLastResponseTrace()?.finishReason, "length");
+  assert.match(perf.formatLastResponseTrace() || "", /Thinking emitted: 14 chars/);
+  assert.match(perf.formatLastResponseTrace() || "", /Finish reason: length/);
+});
+
 describe("PerfStats live generation rate", () => {
   it("does not publish a tok/s spike in the first few hundred milliseconds", () => {
     const perf = new PerfStats();

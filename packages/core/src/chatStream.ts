@@ -32,6 +32,7 @@ export interface ChatStreamStats {
 
 export interface ChatStreamTrace {
   kind: "trace";
+  finishReason?: string;
   assembledText: string;
   assembledReasoning: string;
   visibleText: string;
@@ -164,16 +165,32 @@ type SseChunk = {
  */
 export async function* parseChatStream(
   chunks: AsyncIterable<Uint8Array | string>,
-  options: { toolsEnabled: boolean; signal?: AbortSignal; separateReasoning?: boolean }
+  options: { toolsEnabled: boolean; signal?: AbortSignal; separateReasoning?: boolean; onProgress?: (trace: ChatStreamTrace) => void }
 ): AsyncGenerator<ChatStreamPart> {
   const { toolsEnabled, signal } = options;
   let assembledText = "";
   let assembledReasoning = "";
-  const liveGate = toolsEnabled || options.separateReasoning ? new LiveTextGate() : undefined;
+  const liveGate = toolsEnabled || options.separateReasoning ? new LiveTextGate(!!options.separateReasoning) : undefined;
+  let inlineReasoning = "";
+  let emittedReasoning = "";
+  let reasoningSource: "inline" | "structured" | undefined;
+  function reasoningDelta(increment: string, source: "inline" | "structured"): string {
+    if (source === "inline" && assembledReasoning) return "";
+    const target = source === "structured" ? assembledReasoning : inlineReasoning;
+    // Compare full prefixes only when switching channels. Checking the entire
+    // accumulated thought on every token makes long reasoning quadratic.
+    if (source !== reasoningSource && !target.startsWith(emittedReasoning)) return "";
+    const delta = source === reasoningSource ? increment : target.slice(emittedReasoning.length);
+    emittedReasoning = target;
+    reasoningSource = source;
+    return delta;
+  }
   const toolCalls: Array<{ id: string; name: string; arguments: string }> = [];
   let lastTimings: LlamaTimings | undefined;
   let lastUsage: LlamaUsage | undefined;
   let completionChars = 0;
+  let finishReason: string | undefined;
+  let lastTraceAt = -Infinity;
 
   for await (const line of decodeSseLines(chunks)) {
     if (signal?.aborted) {
@@ -189,7 +206,7 @@ export async function* parseChatStream(
     }
     const data = trimmed.slice(5).trim();
     if (data === "[DONE]") {
-      continue;
+      break;
     }
     let json: SseChunk;
     try {
@@ -215,6 +232,7 @@ export async function* parseChatStream(
     }
 
     const choice = json.choices?.[0];
+    if (typeof choice?.finish_reason === "string") finishReason = choice.finish_reason;
     const delta = choice?.delta;
     let progressed = false;
 
@@ -223,7 +241,8 @@ export async function* parseChatStream(
       completionChars += delta.reasoning_content.length;
       progressed = true;
       if (options.separateReasoning) {
-        yield { kind: "reasoning", text: delta.reasoning_content };
+        const text = reasoningDelta(delta.reasoning_content, "structured");
+        if (text) yield { kind: "reasoning", text };
       } else if (!toolsEnabled && !delta.content) {
         // Live-stream reasoning when the server only emits reasoning_content
         // (deepseek format). deepseek-legacy also puts tags in content.
@@ -237,6 +256,12 @@ export async function* parseChatStream(
       // Tools enabled: stream everything except a short tail that could
       // still become a <tool_call> / <think> opener.
       const live = liveGate ? liveGate.push(delta.content) : delta.content;
+      const inline = liveGate?.takeReasoning() || "";
+      inlineReasoning += inline;
+      if (options.separateReasoning) {
+        const text = reasoningDelta(inline, "inline");
+        if (text) yield { kind: "reasoning", text };
+      }
       if (live) {
         yield { kind: "text", text: live };
       }
@@ -268,7 +293,8 @@ export async function* parseChatStream(
       completionChars += choice.message.reasoning_content.length;
       progressed = true;
       if (options.separateReasoning) {
-        yield { kind: "reasoning", text: choice.message.reasoning_content };
+        const text = reasoningDelta(choice.message.reasoning_content, "structured");
+        if (text) yield { kind: "reasoning", text };
       } else if (!toolsEnabled && !choice.message.content && !assembledText) {
         yield { kind: "text", text: choice.message.reasoning_content };
       }
@@ -278,6 +304,12 @@ export async function* parseChatStream(
       completionChars += choice.message.content.length;
       progressed = true;
       const live = liveGate ? liveGate.push(choice.message.content) : choice.message.content;
+      const inline = liveGate?.takeReasoning() || "";
+      inlineReasoning += inline;
+      if (options.separateReasoning) {
+        const text = reasoningDelta(inline, "inline");
+        if (text) yield { kind: "reasoning", text };
+      }
       if (live) yield { kind: "text", text: live };
     }
     if (Array.isArray(choice?.message?.tool_calls)) {
@@ -295,6 +327,14 @@ export async function* parseChatStream(
       }
     }
 
+    // Keep partial diagnostics available if the stream fails or is cancelled.
+    if (options.onProgress && progressed && Date.now() - lastTraceAt >= 1000) {
+      lastTraceAt = Date.now();
+      options.onProgress({ kind: "trace", assembledText, assembledReasoning: assembledReasoning || inlineReasoning,
+        visibleText: liveGate ? liveGate.emittedText : assembledText,
+        structuredToolCalls: toolCalls.filter(tc => !!tc?.name).map(tc => ({ ...tc })),
+        xmlToolCalls: [], toolsEnabled, ...(finishReason ? { finishReason } : {}) });
+    }
     // Live tok/s ticks even while tools buffer the text.
     if (progressed || json.timings || json.usage) {
       const live = statsFromTimings(json.timings, lastUsage, completionChars);
@@ -312,7 +352,8 @@ export async function* parseChatStream(
   const inlineThinking = /<think(?:ing)?\b[^>]*>([\s\S]*?)(?:<\/think(?:ing)?\s*>|$)/gi;
   if (options.separateReasoning && !assembledReasoning) {
     assembledReasoning = [...assembledText.matchAll(inlineThinking)].map(match => match[1]).join("").trim();
-    if (assembledReasoning) yield { kind: "reasoning", text: assembledReasoning };
+    const text = reasoningDelta(assembledReasoning, "structured");
+    if (text) yield { kind: "reasoning", text };
   }
 
   if (lastTimings || lastUsage) {
@@ -368,6 +409,7 @@ export async function* parseChatStream(
 
   yield {
     kind: "trace",
+    ...(finishReason ? { finishReason } : {}),
     assembledText,
     assembledReasoning,
     visibleText: visible,

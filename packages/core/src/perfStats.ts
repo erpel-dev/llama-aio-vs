@@ -112,7 +112,9 @@ export interface LastChatResponseTrace {
   xmlToolCalls: Array<{ name: string; input: object; raw: string }>;
   /** Parts actually reported to Copilot Chat. */
   emittedTextChars: number;
+  emittedReasoningChars?: number;
   emittedToolCallCount: number;
+  finishReason?: string;
   emptyToChat: boolean;
   note?: string;
 }
@@ -240,7 +242,9 @@ export class PerfStats {
       structuredToolCalls: trace.structuredToolCalls,
       xmlToolCalls: trace.xmlToolCalls,
       emittedTextChars: trace.emittedTextChars,
+      emittedReasoningChars: trace.emittedReasoningChars,
       emittedToolCallCount: trace.emittedToolCallCount,
+      finishReason: trace.finishReason,
       emptyToChat,
       note: trace.note,
     };
@@ -366,6 +370,8 @@ export class PerfStats {
       `- Model: ${ctx.model}`,
       `- Tools enabled: ${ctx.toolsEnabled ? "yes" : "no"}`,
       `- Emitted to Chat: ${ctx.emittedTextChars.toLocaleString()} text chars, ${ctx.emittedToolCallCount} tool call(s)`,
+      `- Thinking emitted: ${(ctx.emittedReasoningChars ?? 0).toLocaleString()} chars`,
+      `- Finish reason: ${ctx.finishReason || "not reported"}`,
       `- Empty to Chat: ${ctx.emptyToChat ? "yes" : "no"}`,
     ];
     if (ctx.note) {

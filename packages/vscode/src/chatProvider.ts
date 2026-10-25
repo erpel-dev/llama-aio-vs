@@ -328,7 +328,8 @@ async function* streamChatCompletions(
   endpoint: string,
   body: Record<string, unknown>,
   token: vscode.CancellationToken,
-  extras?: { maxContext?: number; hasImages?: boolean; operatorLabel?: string; separateReasoning?: boolean }
+  extras?: { maxContext?: number; hasImages?: boolean; operatorLabel?: string; separateReasoning?: boolean;
+    onProgress?: (trace: Extract<ChatStreamPart, { kind: "trace" }>) => void }
 ): AsyncGenerator<ChatStreamPart> {
   const toolsEnabled = Array.isArray(body.tools) && (body.tools as unknown[]).length > 0;
   const abort = new AbortController();
@@ -344,7 +345,8 @@ async function* streamChatCompletions(
       throw describeRequestError(err, endpoint, extras);
     }
     try {
-      yield* parseChatStream(stream, { toolsEnabled, signal: abort.signal, separateReasoning: extras?.separateReasoning });
+      yield* parseChatStream(stream, { toolsEnabled, signal: abort.signal, separateReasoning: extras?.separateReasoning,
+        onProgress: extras?.onProgress });
     } catch (err) {
       if (abort.signal.aborted) {
         return;
@@ -857,6 +859,7 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
     let lastPromptTokens: number | undefined;
     let lastTickAt = 0;
     let emittedTextChars = 0;
+    let hasVisibleText = false;
     let emittedReasoningChars = 0;
     let emittedToolCallCount = 0;
     const priorToolCalls = guardDuplicates
@@ -872,6 +875,7 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
           structuredToolCalls: Array<{ id: string; name: string; arguments: string }>;
           xmlToolCalls: Array<{ name: string; input: object; raw: string }>;
           toolsEnabled: boolean;
+          finishReason?: string;
         }
       | undefined;
     // After mode sampling, so a Copilot mode that rewrites temperature does not
@@ -888,15 +892,34 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
     if (markerBias) {
       body.logit_bias = markerBias;
     }
+    const recordTrace = (note?: string) => this.perf.recordResponseTrace({
+      model: model.id,
+      toolsEnabled: lastTrace?.toolsEnabled ?? !!tools?.length,
+      assembledText: lastTrace?.assembledText ?? "",
+      assembledReasoning: lastTrace?.assembledReasoning ?? "",
+      visibleText: lastTrace?.visibleText ?? "",
+      structuredToolCalls: lastTrace?.structuredToolCalls ?? [],
+      xmlToolCalls: lastTrace?.xmlToolCalls ?? [],
+      emittedTextChars, emittedReasoningChars, emittedToolCallCount,
+      finishReason: lastTrace?.finishReason,
+      emptyToChat: !hasVisibleText && emittedToolCallCount <= 0,
+      note,
+    });
+    recordTrace("Request in progress; waiting for server output.");
     try {
       for await (const event of streamChatCompletions(this.store.getEndpoint(), body, token, {
         maxContext: remote ? remoteInfo?.trainedContext : state.modelCapabilities?.maxContextLength,
         hasImages: messagesHaveImageParts(converted),
         operatorLabel: remote ? serverLabel : undefined,
         separateReasoning: !!Thinking,
+        onProgress: trace => {
+          lastTrace = trace;
+          recordTrace("Response in progress; stream has not completed.");
+        },
       })) {
         if (event.kind === "text") {
           emittedTextChars += event.text.length;
+          hasVisibleText ||= !!event.text.trim();
           progress.report(new vscode.LanguageModelTextPart(event.text));
         } else if (event.kind === "reasoning" && Thinking) {
           emittedReasoningChars += event.text.length;
@@ -909,6 +932,7 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
               skippedDuplicateHint = true;
               const hint = duplicateToolCallHint(event.name, input);
               emittedTextChars += hint.length;
+              hasVisibleText = true;
               progress.report(new vscode.LanguageModelTextPart(hint));
             }
             continue;
@@ -963,6 +987,7 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
       }
       if (token.isCancellationRequested) {
         // User stopped the request: no stats, no "empty reply" error.
+        recordTrace("Request cancelled before the stream completed; partial output retained.");
         this.perf.abort();
         return;
       }
@@ -989,45 +1014,27 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
         });
       }
 
-      const emptyToChat = emittedTextChars <= 0 && emittedReasoningChars <= 0 && emittedToolCallCount <= 0;
-      if (lastTrace) {
-        this.perf.recordResponseTrace({
-          model: model.id,
-          toolsEnabled: lastTrace.toolsEnabled,
-          assembledText: lastTrace.assembledText,
-          assembledReasoning: lastTrace.assembledReasoning,
-          visibleText: lastTrace.visibleText,
-          structuredToolCalls: lastTrace.structuredToolCalls,
-          xmlToolCalls: lastTrace.xmlToolCalls,
-          emittedTextChars,
-          emittedToolCallCount,
-          emptyToChat,
-          note: emptyToChat
-            ? "No text/tool calls emitted to Chat."
-            : undefined,
-        });
-      } else if (emptyToChat) {
-        this.perf.recordResponseTrace({
-          model: model.id,
-          toolsEnabled: !!(tools && tools.length),
-          assembledText: "",
-          assembledReasoning: "",
-          visibleText: "",
-          structuredToolCalls: [],
-          xmlToolCalls: [],
-          emittedTextChars,
-          emittedToolCallCount,
-          emptyToChat: true,
-          note: "Stream ended without a response trace (cancelled or failed before completion).",
-        });
-      }
+      // Thinking alone is not an answer: the SDK bridge requires visible text
+      // or a tool call and otherwise replaces it with "No response returned".
+      const emptyToChat = !hasVisibleText && emittedToolCallCount <= 0;
+      const thinkingOnly = emptyToChat && emittedReasoningChars > 0;
+      recordTrace(emptyToChat
+        ? thinkingOnly ? "Thinking returned without an answer or tool call." : "No text/tool calls emitted to Chat."
+        : undefined);
 
       if (emptyToChat) {
+        if (thinkingOnly) {
+          throw new vscode.LanguageModelError(lastTrace?.finishReason === "length"
+            ? `The model used its ${body.max_tokens}-token output limit on thinking without producing an answer or tool call. Increase Max tokens in Chat Requests, then try again.`
+            : "The model returned thinking but no answer or tool call. Try again, or open Llama AIO → View last response to inspect the output.");
+        }
         throw new Error(
           "Empty reply to Chat (no text or tool calls). Open Llama AIO → View last response."
         );
       }
     } catch (e) {
+      recordTrace(token.isCancellationRequested ? "Request cancelled; partial output retained."
+        : `Request failed: ${e instanceof Error ? e.message : String(e)}`);
       this.perf.abort();
       if (token.isCancellationRequested) {
         return;

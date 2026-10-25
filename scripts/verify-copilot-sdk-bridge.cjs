@@ -87,6 +87,23 @@ async function main() {
       if (effort === "none") assert.equal(selected.modeName, "No Think");
       count++;
     }
+    if (id === "RecursiveSI/flint") {
+      handler._logService = { warn() {} };
+      for (const message of ["The model used its output limit on thinking without producing an answer or tool call.",
+        "The model returned thinking but no answer or tool call."]) {
+        handler._languageModelsService.sendChatRequest = async () => ({
+          result: Promise.reject(new Error(message)),
+          stream: (async function* () { yield { type: "thinking", value: "Still working." }; })(),
+        });
+        const request = translation.responsesRequestToBridge("llama-aio", {
+          model: "opaque-instance", input: [{ type: "message", role: "user", content: "Hello" }],
+        });
+        const result = await handler.chat(request, {});
+        assert.ok(result.error.includes(message));
+        assert.equal(result.output.length, 0);
+        count++;
+      }
+    }
   }
   console.log(`PASS: ${count} SDK Responses/renderer bridge cases at VS Code ${revision}`);
 }
