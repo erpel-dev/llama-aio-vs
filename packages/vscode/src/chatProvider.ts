@@ -680,7 +680,10 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
     const previous = this.announcedModels;
     this.announcedModels = signature;
     if (previous !== undefined && previous !== signature) {
-      setTimeout(() => this.notifyChanged(), 0);
+      // These probes already contain the new identity. Invalidating them in
+      // the queued announcement can erase a newer /models answer while its
+      // /props probe is still pending, resurrecting an old remembered profile.
+      setTimeout(() => this._onDidChangeModelInformation.fire(), 0);
     }
   }
 

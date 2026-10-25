@@ -276,6 +276,13 @@ describe("LlamaAioChatProvider requests", () => {
     servedMetadata = { owned_by: "strata", meta: { label: "Qwen3.8-Flash-Next" } };
     propsStatus = 404;
     const { provider } = setup({ remote: true });
+    // Force a queued model-information announcement to run between /models
+    // and mode resolution, reproducing the former self-invalidation race.
+    const fetchProps = provider.fetchServerProps.bind(provider);
+    provider.fetchServerProps = async () => {
+      await new Promise(resolve => setTimeout(resolve, 10));
+      return fetchProps();
+    };
     const [first] = await provider.provideLanguageModelChatInformation({}, cancelToken().token);
     assert.equal(first.configurationSchema.properties.reasoningEffort.default, "xhigh");
     servedMetadata = { meta: { aliases: ["glm-5.3-flash"] } };
@@ -574,7 +581,7 @@ describe("LlamaAioChatProvider requests", () => {
     const remoteInfo = { isLlamaCpp: false, modelId: servedModelId, servedContext: 262144 };
     const { provider } = setup({ remote: true, remoteInfo });
     const announcements = [];
-    provider.notifyChanged = () => announcements.push("changed");
+    provider._onDidChangeModelInformation.fire = () => announcements.push("changed");
 
     const [degraded] = await provider.provideLanguageModelChatInformation({}, cancelToken().token);
     assert.equal(degraded.configurationSchema, undefined);
