@@ -859,6 +859,7 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
     let lastPromptTokens: number | undefined;
     let lastTickAt = 0;
     let emittedTextChars = 0;
+    let hasVisibleText = false;
     let emittedReasoningChars = 0;
     let emittedToolCallCount = 0;
     const priorToolCalls = guardDuplicates
@@ -901,7 +902,7 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
       xmlToolCalls: lastTrace?.xmlToolCalls ?? [],
       emittedTextChars, emittedReasoningChars, emittedToolCallCount,
       finishReason: lastTrace?.finishReason,
-      emptyToChat: emittedTextChars <= 0 && emittedToolCallCount <= 0,
+      emptyToChat: !hasVisibleText && emittedToolCallCount <= 0,
       note,
     });
     recordTrace("Request in progress; waiting for server output.");
@@ -918,6 +919,7 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
       })) {
         if (event.kind === "text") {
           emittedTextChars += event.text.length;
+          hasVisibleText ||= !!event.text.trim();
           progress.report(new vscode.LanguageModelTextPart(event.text));
         } else if (event.kind === "reasoning" && Thinking) {
           emittedReasoningChars += event.text.length;
@@ -930,6 +932,7 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
               skippedDuplicateHint = true;
               const hint = duplicateToolCallHint(event.name, input);
               emittedTextChars += hint.length;
+              hasVisibleText = true;
               progress.report(new vscode.LanguageModelTextPart(hint));
             }
             continue;
@@ -1013,7 +1016,7 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
 
       // Thinking alone is not an answer: the SDK bridge requires visible text
       // or a tool call and otherwise replaces it with "No response returned".
-      const emptyToChat = emittedTextChars <= 0 && emittedToolCallCount <= 0;
+      const emptyToChat = !hasVisibleText && emittedToolCallCount <= 0;
       const thinkingOnly = emptyToChat && emittedReasoningChars > 0;
       recordTrace(emptyToChat
         ? thinkingOnly ? "Thinking returned without an answer or tool call." : "No text/tool calls emitted to Chat."

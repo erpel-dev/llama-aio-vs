@@ -825,6 +825,13 @@ describe("LlamaAioChatProvider requests", () => {
     );
   });
 
+  it("rejects whitespace-only output instead of passing an empty answer to the SDK", async () => {
+    reply = { events: [delta({ content: " \n\t " })], delayMs: 0 };
+    const { provider } = setup();
+    await assert.rejects(() => provider.provideLanguageModelChatResponse({ id: "FrogNano" },
+      [msg(Role.User, new TextPart("Hello"))], {}, { report() {} }, cancelToken().token), /Empty reply/);
+  });
+
   for (const servedName of ["Flint Preview", "FrogNano-4B-2609-Q4_K_L.gguf"]) {
     it(`completes ${servedName} when the server keeps the SSE connection open after [DONE]`, async () => {
       servedModelId = servedName;
