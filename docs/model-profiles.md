@@ -9,7 +9,8 @@ The picker exposes only the controls supported by each verified model version.
 CLI effort values select the same presets as VS Code labels; saved labels from
 older extension versions remain accepted where that mode is still supported. A missing or unsupported selection
 uses that profile's default. General/Coding are sampling recipes, not claims
-that the model has different reasoning effort levels.
+that the model has different reasoning effort levels. Nanbeige's Agent/Chat
+presets are likewise scenario recipes, not an effort ladder.
 
 | Checkpoint family | Available modes (default in bold) | Sampling / distinctions |
 | --- | --- | --- |
@@ -21,6 +22,7 @@ that the model has different reasoning effort levels.
 | DeepSeek V4.1 Flash / 1017 | Max, **High**, Low, No Think | Temperature 1, top-p 1; numeric budgets 100/75/50 |
 | Tiel-Coder 35B-A3B | **Think**, No Think | Coding recipe .6/.95/20; off follows the Qwen base's .7/.8/20, presence 1.5 |
 | MiniCPM5 2B | **Think**, No Think | 1/.95, min-p 0; no top-k filtering |
+| Nanbeige4.3 33B | **Agent**, Chat, No Think | Agent: 1/.95, preserve thinking. Chat/off: .6/.95, clear earlier thinking. XML tools; no top-k filtering |
 | Mellum2.1 12B-A2.5B Thinking | **Think** only | Author's quickstart recipe .6/.95/20 |
 | MiMo V2.6 Distill Qwen 9B | **Think** only | .6/.95/20; no invented effort ladder |
 | Underdog Saluki 27B 1.0 | **Think**, No Think | Think .6/.95/20; direct tool calls use temperature 0 |
@@ -62,6 +64,20 @@ uses temperature .6 although its agent benchmark description uses 1; the
 profile deliberately follows the quickstart. Sage's specialized verification
 protocol is not enabled by a normal chat preset.
 
+Nanbeige4.3 matches only the verified 33B chat checkpoint, including published
+GGUF names such as `Nanbeige_Nanbeige4.3-33B-Q4_K_M.gguf`. Base, 4.2, future
+3B/4.4 versions, and prediction sidecars do not inherit this profile. Agent is
+the default recipe for coding/tool use and preserves prior reasoning. Chat
+clears reasoning from earlier user turns while retaining the current tool
+turn. No Think uses the chat sampler with `enable_thinking: false`; the author
+does not prescribe a separate off-mode sampler. `tool_call_format: xml` follows
+the publisher's recommendation. Undocumented top-k/min-p filters and penalties
+are neutralized. The profile keeps the user's context and output-token limits.
+
+Copilot SDK/CLI effort values `high`, `medium`, and `none` select Nanbeige Agent,
+Chat, and No Think respectively; these values select presets rather than setting
+an unsupported `reasoning_effort` template parameter.
+
 DeepSeek requires a V4.1-compatible engine that forwards `enable_thinking` and
 numeric `reasoning_effort` from `chat_template_kwargs` into its template or
 reference encoder and parses DSML tool calls into structured OpenAI tool calls.
@@ -98,7 +114,9 @@ Strata and Maya publish an undated DeepSeek ID for the 1017 checkpoint. Top-p 1
 is supported by both cards and matches both native servers. They ignore the
 incoming `thinking_mode` field, so No Think uses `enable_thinking: false` instead.
 GLM's old-reasoning cleanup is also applied on the client, since these adapters
-can discard `clear_thinking`; reasoning within the current tool turn is retained.
+can discard `clear_thinking`. The client likewise clears earlier reasoning when
+a profile sends `preserve_thinking: false`, including Nanbeige Chat and No Think;
+reasoning within the current tool turn is retained.
 
 ## Copilot SDK harness
 
@@ -110,7 +128,7 @@ The backend still receives Chat Completions with template controls nested in
 `chat_template_kwargs`; it does not need a Responses endpoint. Missing effort
 selections use the advertised profile default.
 
-Flint and DeepSeek reasoning is streamed as separate thinking parts on newer
+Nanbeige4.3, Flint, and DeepSeek reasoning is streamed as separate thinking parts on newer
 hosts and sent back as assistant `reasoning_content` on later tool turns.
 It is counted in context estimates and kept out of the final answer text.
 Older hosts without thinking-part support keep the existing text fallback;
@@ -146,6 +164,7 @@ model repositories. Each entry can be inspected at
 
 Additional author cards:
 
+- [Nanbeige4.3 33B, pinned](https://huggingface.co/Nanbeige/Nanbeige4.3-33B/blob/c1093c501cc6460427c0ac634db7223d0450c0ee/README.md): agent/chat samplers, binary thinking control, reasoning-history policy, XML tools, and 512K model context.
 - [Bonsai 2 27B, pinned](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/blob/b072e1d3b35a0a630cece372c2127528e0994386/README.md): sampler and supported efforts; the repository publishes GGUFs, so template verification uses its Qwen3.8 base rather than claiming a direct Bonsai template render.
 - [Muse Glimmer, pinned](https://huggingface.co/meta-models/Muse-Glimmer-30B-GGUF/blob/b44f1072cf75e918a1b82a3a17b45c4389b076e7/README.md): existing reasoning_strength controls and sampler; no standalone author template was available for this check.
 
@@ -166,7 +185,10 @@ Validation also includes real CPU inference with Spark X2.6 4B Q4_K_M on
 llama.cpp b11729: High, Low, and No Think, with plain chat and tool history.
 These are short output-budget smoke checks, not quality or throughput benchmarks.
 MiniCPM5 2B Q4_K_M also passes CPU inference on b11729 with thinking on/off and
-a native structured tool call. Other profiles have contract/request/template coverage, not a claim that every
+a native structured tool call. Nanbeige4.3's pinned template passes native b11729
+`/apply-template` checks for all three presets, XML tool history, and reasoning
+retention (an existing MiniCPM model supplies server startup; no Nanbeige weight
+inference is claimed). Other profiles have contract/request/template coverage, not a claim that every
 checkpoint was loaded on every backend. Use a recent compatible server; Bonsai's
 ternary weights specifically require Prism's fork, which the standard installer
 does not supply. DeepSeek's 1017 encoder check executes pinned, reviewed author

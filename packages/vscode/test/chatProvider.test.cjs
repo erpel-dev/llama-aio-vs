@@ -271,11 +271,58 @@ describe("LlamaAioChatProvider requests", () => {
     assert.equal(assistants[1].tool_calls[0].id, "call_1");
   });
 
+  for (const remote of [false, true]) {
+    for (const [effort, temperature, thinking, preserve] of [
+      ["high", 1, true, true], ["medium", 0.6, true, false], ["none", 0.6, false, false],
+    ]) {
+      it(`applies Nanbeige4.3 ${effort} sampling and reasoning retention (remote=${remote})`, async () => {
+        servedModelId = remote ? "private-model" : "Nanbeige_Nanbeige4.3-33B-Q4_K_M.gguf";
+        servedMetadata = remote ? { alias_of: "Nanbeige/Nanbeige4.3-33B" } : undefined;
+        propsStatus = 404;
+        const { provider, state, perfCalls } = setup({ remote });
+        Object.assign(state.requestSettings, { temperature: 0, topP: 0.1, topK: 1,
+          minP: 0.9, repeatPenalty: 2, presencePenalty: 2, frequencyPenalty: 2 });
+        const [model] = await provider.provideLanguageModelChatInformation({}, cancelToken().token);
+        assert.deepEqual(model.configurationSchema.properties.reasoningEffort.enum, ["high", "medium", "none"]);
+        assert.equal(model.configurationSchema.properties.reasoningEffort.default, "high");
+        await provider.provideLanguageModelChatResponse(model, [
+          msg(Role.User, new TextPart("old question")),
+          msg(Role.Assistant, new ThinkingPart("Old private reasoning"), new TextPart("<think>Legacy reasoning</think>Answer")),
+          msg(Role.User, new TextPart("new question")),
+          msg(Role.Assistant, new ThinkingPart("Current reasoning"), new ToolCallPart("call_1", "read_file", { path: "README.md" })),
+          msg(Role.User, new ToolResultPart("call_1", [new TextPart("file text")])),
+        ], { modelConfiguration: { reasoningEffort: effort }, tools: [
+          { name: "read_file", description: "read", inputSchema: { type: "object" } },
+        ] }, { report() {} }, cancelToken().token);
+        assert.equal(lastBody.model, servedModelId);
+        assert.deepEqual([lastBody.temperature, lastBody.top_p, lastBody.top_k, lastBody.min_p,
+          lastBody.presence_penalty, lastBody.frequency_penalty, lastBody.repeat_penalty], [temperature, 0.95, -1, 0, 0, 0, 1]);
+        assert.deepEqual(lastBody.chat_template_kwargs,
+          { enable_thinking: thinking, preserve_thinking: preserve, tool_call_format: "xml" });
+        assert.equal(lastBody.reasoning_effort, undefined);
+        assert.equal(lastBody.tools[0].function.name, "read_file");
+        const assistants = lastBody.messages.filter(message => message.role === "assistant");
+        assert.equal(assistants[0].reasoning_content, preserve ? "Old private reasoning" : undefined);
+        assert.equal(assistants[0].content, preserve ? "<think>Legacy reasoning</think>Answer" : "Answer");
+        assert.equal(assistants[1].reasoning_content, "Current reasoning");
+        assert.equal(assistants[1].tool_calls[0].id, "call_1");
+        assert.deepEqual(perfCalls.find(call => call[0] === "recordRequestContext")[1][0].messages, lastBody.messages);
+      });
+    }
+  }
+
   it("refreshes reused remote IDs from new aliases and does not resurrect an old profile after ambiguity", async () => {
     servedModelId = "private-model";
     servedMetadata = { owned_by: "strata", meta: { label: "Qwen3.8-Flash-Next" } };
     propsStatus = 404;
     const { provider } = setup({ remote: true });
+    // Force a queued model-information announcement to run between /models
+    // and mode resolution, reproducing the former self-invalidation race.
+    const fetchProps = provider.fetchServerProps.bind(provider);
+    provider.fetchServerProps = async () => {
+      await new Promise(resolve => setTimeout(resolve, 10));
+      return fetchProps();
+    };
     const [first] = await provider.provideLanguageModelChatInformation({}, cancelToken().token);
     assert.equal(first.configurationSchema.properties.reasoningEffort.default, "xhigh");
     servedMetadata = { meta: { aliases: ["glm-5.3-flash"] } };
@@ -501,7 +548,7 @@ describe("LlamaAioChatProvider requests", () => {
   }
 
   for (const remote of [false, true]) {
-    for (const label of ["Flint", "DeepSeek-V4.1-Flash-1017"]) {
+    for (const label of ["Nanbeige4.3-33B", "Flint", "DeepSeek-V4.1-Flash-1017"]) {
       it(`round-trips ${label} SDK thinking parts separately from text across tool turns (remote=${remote})`, async () => {
         servedModelId = remote ? "opaque-instance" : label;
         servedMetadata = { owned_by: "strata", meta: { label } };
@@ -574,7 +621,7 @@ describe("LlamaAioChatProvider requests", () => {
     const remoteInfo = { isLlamaCpp: false, modelId: servedModelId, servedContext: 262144 };
     const { provider } = setup({ remote: true, remoteInfo });
     const announcements = [];
-    provider.notifyChanged = () => announcements.push("changed");
+    provider._onDidChangeModelInformation.fire = () => announcements.push("changed");
 
     const [degraded] = await provider.provideLanguageModelChatInformation({}, cancelToken().token);
     assert.equal(degraded.configurationSchema, undefined);

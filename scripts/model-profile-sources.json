@@ -1,5 +1,9 @@
 [
   {
+    "id": "Nanbeige/Nanbeige4.3-33B",
+    "revision": "c1093c501cc6460427c0ac634db7223d0450c0ee"
+  },
+  {
     "id": "ConwayResearch/Underdog-Saluki-27B-1.0",
     "revision": "5acfd9218fa54731f237eea8b3243d430dd85a69",
     "gguf": "Underdog-Saluki-27B-1.0-IQ2-mix.gguf"

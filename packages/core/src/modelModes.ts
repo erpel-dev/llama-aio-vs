@@ -256,6 +256,19 @@ const GLM53_MODES = effortModes("GLM-5.3-Flash", ["max", "high", "low"], "max",
 const GLM53_FULL_MODES: ModelModeSet = { ...GLM53_MODES, familyLabel: "GLM-5.3" };
 
 const MINICPM5_MODES = binaryModes("MiniCPM5 2B", { ...OPEN_SAMPLING, top_p: 0.95 });
+/** Nanbeige4.3-33B: author agent/chat recipes, not distinct reasoning depths. */
+const NANBEIGE43_MODES: ModelModeSet = {
+  familyLabel: "Nanbeige4.3 33B", defaultMode: "Think (Agent)", preserveReasoning: true,
+  modes: {
+    "Think (Agent)": { ...OPEN_SAMPLING, temperature: 1, top_p: 0.95,
+      chat_template_kwargs: { enable_thinking: true, preserve_thinking: true, tool_call_format: "xml" } },
+    "Think (Chat)": { ...OPEN_SAMPLING, temperature: 0.6, top_p: 0.95,
+      chat_template_kwargs: { enable_thinking: true, preserve_thinking: false, tool_call_format: "xml" } },
+    // No separate off-mode sampler is published; use the chat recipe.
+    "No Think": { ...OPEN_SAMPLING, temperature: 0.6, top_p: 0.95,
+      chat_template_kwargs: { enable_thinking: false, preserve_thinking: false, tool_call_format: "xml" } },
+  },
+};
 const MELLUM21_MODES = fixedMode("Mellum 2.1 Thinking", "Think", {
   ...OPEN_SAMPLING, temperature: 0.6, top_p: 0.95, top_k: 20,
 });
@@ -361,6 +374,7 @@ function haystack(caps?: ModelCapabilities, modelId?: string): string {
 }
 
 function namedProfile(h: string): ModelModeSet | undefined {
+  if (/(?:^|[-_\s])nanbeige[-_ ]?4[._]3[-_ ]33b(?=$|[.\s]|[-_](?:gguf|(?:ud[-_ ])?(?:iq|q|fp|bf|mxfp|gsq)[\w.-]*)(?:$|[-_.\s]))/.test(h)) return NANBEIGE43_MODES;
   if (/\bqwen[-_ ]?2[._]5[-_ ]0[._]5b[-_ ]instruct(?:\b|_)/.test(h)) return QWEN25_STARTER_MODES;
   if (/\btiel[-_ ]coder[-_ ]35b[-_ ]a3b(?:\b|_)/.test(h)) return TIEL_CODER_MODES;
   if (/\bminicpm[-_ ]?5[-_ ]2b(?:\b|_)/.test(h)) return MINICPM5_MODES;
@@ -506,6 +520,8 @@ export function resolveRemoteModelModes(
 // Copilot CLI filters reasoningEffort against its standard effort values. Keep
 // our preset names as labels only; using them as enum values hides the picker.
 const MODE_EFFORT_VALUES: Record<string, string> = {
+  "Think (Agent)": "high",
+  "Think (Chat)": "medium",
   "Think (Max)": "max",
   "Think (XHigh)": "xhigh",
   "Think (High)": "high",

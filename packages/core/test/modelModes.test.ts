@@ -14,7 +14,7 @@ import {
 
 describe("Copilot CLI reasoning compatibility", () => {
   const allowed = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
-  for (const id of ["Qwen3.8-Flash-Next", "Qwen3.8-27B", "Qwen3.6-35B", "Muse-Glimmer-30B", "gemma-4-12B-it"]) {
+  for (const id of ["Nanbeige4.3-33B", "Qwen3.8-Flash-Next", "Qwen3.8-27B", "Qwen3.6-35B", "Muse-Glimmer-30B", "gemma-4-12B-it"]) {
     it(`keeps every ${id} preset through the CLI effort filter and maps it back`, () => {
       const set = resolveModelModes(undefined, id)!;
       const property = buildModeConfigurationSchema(set).properties.reasoningEffort as {
