@@ -20,6 +20,7 @@ export * from "./installSwap";
 export * from "./launchLock";
 export * from "./localServers";
 export * from "./llamaInstaller";
+export * from "./llamaFeatures";
 export * from "./llamaTimings";
 export * from "./memoryEstimate";
 export * from "./memoryView";

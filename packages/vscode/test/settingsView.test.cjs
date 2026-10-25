@@ -156,10 +156,10 @@ const gpus = [
   { totalBytes: 16 * GiB, usedBytes: 0, name: "AMD Radeon RX 9060 XT", index: 1, llamaDeviceId: "Vulkan1", source: "test" },
 ];
 
-function setup(loadOverrides = {}, remoteInfo) {
+function setup(loadOverrides = {}, remoteInfo, serverFeatures = core.NO_SERVER_FEATURES, modelCaps = caps) {
   let state = {
     selectedModelPath: caps.path,
-    modelCapabilities: caps,
+    modelCapabilities: modelCaps,
     loadSettings: { ...core.DEFAULT_LOAD_SETTINGS, contextLength: 65536, splitMode: "none", ...loadOverrides },
     requestSettings: { ...core.DEFAULT_REQUEST_SETTINGS },
   };
@@ -197,6 +197,7 @@ function setup(loadOverrides = {}, remoteInfo) {
     refreshStatus: async () => pm.getStatus(),
     isHttpReady: async () => true,
     resolveBinary: () => "",
+    getServerFeatures: async () => ({ ...serverFeatures }),
     isCpuBackend: () => false,
     getLaunchedConfig: () => launched,
     claimLaunch: () => ({}),
@@ -300,6 +301,36 @@ describe("SettingsViewProvider memory path", () => {
     assert.equal(state.payload.memoryView.headline, expected.headline);
     assert.equal(state.payload.memory, undefined, "no second estimate object for the webview");
     assert.equal(state.payload.gpus[0].shortName, "RX 9070");
+  });
+
+  for (const supported of [false, true]) {
+    it(`accounts for expert caching only on a supporting binary (${supported}) and preserves saved choices`, async () => {
+      const features = { probed: true, moeCache: supported, draftSampling: supported, draftUbatch: supported };
+      const model = { ...caps, isMoe: true, expertCount: 128, expertUsedCount: 8, moeExpertShare: 0.9 };
+      const t = setup({ nCpuMoe: 48, moeCacheMiB: 2048, draftSampling: "probabilistic", draftBatchSize: 64 },
+        undefined, features, model);
+      await t.send({ type: "ready" });
+      const state = t.posted.find(m => m.type === "state").payload;
+      assert.deepEqual(state.serverFeatures, features);
+      const expected = core.computeMemoryView(model,
+        { ...t.getState().loadSettings, moeCacheMiB: supported ? 2048 : 0 }, gpus, { withFixes: true }).view;
+      assert.deepEqual(state.memoryView, expected);
+      await t.send({ type: "estimate", seq: 15, payload: { moeCacheMiB: 4096 } });
+      const live = t.posted.find(m => m.type === "memoryEstimate" && m.seq === 15);
+      assert.deepEqual(live.view, core.computeMemoryView(model,
+        { ...t.getState().loadSettings, moeCacheMiB: supported ? 4096 : 0 }, gpus, { withFixes: true }).view);
+      assert.equal(t.getState().loadSettings.moeCacheMiB, 2048);
+      assert.equal(t.getState().loadSettings.draftSampling, "probabilistic");
+      assert.equal(t.getState().loadSettings.draftBatchSize, 64);
+    });
+  }
+
+  it("resets the new controls with advanced settings", async () => {
+    const t = setup({ moeCacheMiB: 4096, draftSampling: "greedy", draftBatchSize: 64 });
+    await t.send({ type: "resetAdvancedLoad" });
+    assert.equal(t.getState().loadSettings.moeCacheMiB, 0);
+    assert.equal(t.getState().loadSettings.draftSampling, "auto");
+    assert.equal(t.getState().loadSettings.draftBatchSize, 0);
   });
 
   it("answers a live estimate for unsaved values with the same seq, without saving them", async () => {

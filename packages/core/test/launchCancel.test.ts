@@ -42,7 +42,7 @@ describe("ProcessManager stop during start", { skip: process.platform === "win32
       fake,
       [
         "#!/bin/sh",
-        'case "$1" in --version|--list-devices) echo "version: 1 (fake)"; exit 0;; esac',
+        'case "$1" in --help) echo "--ctx-size N"; exit 0;; --version|--list-devices) echo "version: 1 (fake)"; exit 0;; esac',
         `echo $$ > "${pidFile}"`,
         `echo "\${LLAMA_API_KEY:-}" > "${keyFile}"`,
         'echo "loading model"',

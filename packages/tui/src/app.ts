@@ -23,6 +23,8 @@ import {
 import {
   clampLoadSettingsToModel,
   estimateMemory,
+  performanceFeatureNotes,
+  supportedPerformanceSettings,
   fittingContextLength,
   formatBytes,
   formatGpuDeviceLabel,
@@ -858,9 +860,10 @@ export async function runApp(services: AppServices): Promise<void> {
       if (f.id === "maxDraftTokens" && !speculativeUsesMtp(spec) && !speculativeUsesDflash(spec)) {
         return false;
       }
-      if (f.id === "draftGpuOffload" && !speculativeUsesMtp(spec) && !speculativeUsesDflash(spec)) {
+      if (["draftGpuOffload", "draftSampling", "draftBatchSize"].includes(f.id) && !speculativeUsesMtp(spec) && !speculativeUsesDflash(spec)) {
         return false;
       }
+      if (f.id === "draftSampling" && !speculativeUsesMtp(spec)) return false;
       return true;
     });
   }
@@ -887,6 +890,8 @@ export async function runApp(services: AppServices): Promise<void> {
         "ngramMinHits",
         "maxDraftTokens",
         "draftGpuOffload",
+        "draftSampling",
+        "draftBatchSize",
       ],
     },
     {
@@ -911,6 +916,7 @@ export async function runApp(services: AppServices): Promise<void> {
       fields: [
         "cpuThreads",
         "nCpuMoe",
+        "moeCacheMiB",
         "nCpuFfn",
         "flashAttention",
         "lazyMode",
@@ -1101,6 +1107,7 @@ export async function runApp(services: AppServices): Promise<void> {
       if (field.key === "speculativeMode") {
         return load.speculativeMode || "off";
       }
+      if (field.key === "draftSampling") return load.draftSampling || "auto";
       if (field.key === "ngramVariant") {
         return load.ngramVariant || "simple";
       }
@@ -1131,11 +1138,13 @@ export async function runApp(services: AppServices): Promise<void> {
     if (field.key === "cpuThreads") return load.cpuThreads;
     if (field.key === "maxConcurrentPredictions") return load.maxConcurrentPredictions;
     if (field.key === "nCpuMoe") return load.nCpuMoe;
+    if (field.key === "moeCacheMiB") return load.moeCacheMiB;
     if (field.key === "nCpuFfn") return load.nCpuFfn;
     if (field.key === "evalBatchSize") return load.evalBatchSize;
     if (field.key === "physicalBatchSize") return load.physicalBatchSize;
     if (field.key === "maxDraftTokens") return load.maxDraftTokens;
     if (field.key === "draftGpuOffload") return load.draftGpuOffload;
+    if (field.key === "draftBatchSize") return load.draftBatchSize;
     if (field.key === "ngramSizeN") return load.ngramSizeN;
     if (field.key === "ngramSizeM") return load.ngramSizeM;
     if (field.key === "ngramMinHits") return load.ngramMinHits;
@@ -2301,7 +2310,8 @@ export async function runApp(services: AppServices): Promise<void> {
     const cpuOnly = services.installer.resolveActiveUiBackend() === "cpu";
     const gpus = cpuOnly ? [] : detectGpus(false, services.processManager.resolveBinary());
     const gpu = gpus[0];
-    const est = estimateMemory(caps, state.loadSettings, gpu, {
+    const features = services.processManager.getServerFeaturesSync();
+    const est = estimateMemory(caps, supportedPerformanceSettings(state.loadSettings, features), gpu, {
       cpuOnly,
       gpus: cpuOnly ? undefined : gpus,
     });
@@ -2356,7 +2366,7 @@ export async function runApp(services: AppServices): Promise<void> {
     homeFitText = `${est.willSpill ? "Does not fit." : "Fits."}  ${sub.text}\n${bar}`;
     homeFitKey = `${state.selectedModelPath}|${state.loadSettings.contextLength}|${state.loadSettings.gpuOffload}|${state.loadSettings.cacheTypeK}|${state.loadSettings.maxConcurrentPredictions}`;
 
-    const warnLine = est.warnings[0] || "";
+    const warnLine = [...performanceFeatureNotes(state.loadSettings, features, caps), ...est.warnings][0] || "";
     loadMemWarn.content = warnLine;
     loadMemWarn.fg = (est.willSpill ? theme.bad : theme.warn) as never;
   }

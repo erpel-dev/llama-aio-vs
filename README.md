@@ -28,6 +28,8 @@ The **Memory & load** card estimates VRAM and RAM at full context and gives one 
 - **Main controls:** context length, GPU layers, multi-GPU split, CPU offload for MoE/FFN layers.
 - **Advanced:** threads, batch sizes, KV cache types, flash attention, reasoning, RoPE and speculative decoding (MTP, DFlash, n-gram). Filter by name or flag, or show only what you changed.
 
+Newer llama.cpp builds also support a **GPU expert cache**, **draft sampling**, and a separate **draft batch size**. Llama AIO checks the active binary before using these flags. Expert caching defaults to off because it needs extra VRAM; draft batch size defaults to inheriting the main batch. Draft sampling defaults to Auto, which enables probabilistic MTP when supported and keeps DFlash's existing behavior. See [performance settings](docs/performance-settings.md) for compatibility and tuning details.
+
 ## See what's running
 
 The header always shows the loaded model, context, GPU layers, speed and memory. Change a setting while the server runs and it lists exactly what will change — apply with **Reload**, or **Discard** to go back.

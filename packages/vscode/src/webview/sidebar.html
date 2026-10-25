@@ -256,6 +256,8 @@
       <div class="label"><label for="nCpuMoe" class="name tip" data-flag="-ncmoe, --n-cpu-moe" data-help="Keep the Mixture of Experts (MoE) weights of the first N layers in the CPU.">CPU MoE layers</label><span class="badge">MoE only</span><input type="number" id="nCpuMoe" min="0" max="256" /></div>
       <input type="range" id="nCpuMoeRange" aria-label="CPU MoE layers slider" min="0" max="128" step="1" />
       <div class="hint" id="moeHint">Only applies to MoE models.</div>
+      <div class="label" style="margin-top:8px"><label for="moeCacheMiB" class="name tip" data-flag="--moe-cache-mib" data-help="VRAM budget in MiB for caching CPU MoE experts in GPU-assigned layers. 0 = off. Requires a supporting llama.cpp binary (upstream October 2026). Adds VRAM; experts still occupy RAM. Tensor split mode is unsupported.">GPU expert cache (MiB)</label><input type="number" id="moeCacheMiB" min="0" max="1048576" step="256" /></div>
+      <div class="hint" id="moeCacheHint">0 = off. Reserve VRAM before enabling.</div>
     </div>
     <div id="ffnFields">
       <div class="label"><label for="nCpuFfn" class="name tip" data-flag="-ncffn, --n-cpu-ffn" data-help="Keep the dense FFN weights of the first N layers in the CPU (dense models; for MoE expert weights use --n-cpu-moe).">CPU FFN layers</label><span class="badge">Dense only</span><input type="number" id="nCpuFfn" min="0" max="256" /></div>
@@ -499,10 +501,20 @@
     <div class="row hidden" id="specDraftPRow">
       <div class="label"><label for="draftProbability" class="name tip" id="specDraftPName" data-flag="--spec-draft-p-min" data-help="Stop drafting when the next-token probability drops below this (default here: 0.75). llama.cpp's own default of 0.00 never stops and collapses acceptance. Used by MTP and DFlash.">Draft probability</label><input type="number" id="draftProbability" min="0" max="1" step="0.01" /></div>
     </div>
+    <div class="row" id="specDraftSamplingRow">
+      <div class="label"><label for="draftSampling" class="name tip" data-flag="--spec-draft-sampling" data-help="Auto uses probabilistic sampling for MTP on supporting llama.cpp builds. Probabilistic can improve acceptance above temperature zero. This control applies to MTP only; DFlash keeps its default because the shared flag does not establish DFlash2 support.">Draft sampling</label>
+        <select id="draftSampling"><option value="auto">Auto (recommended)</option><option value="greedy">Greedy</option><option value="probabilistic">Probabilistic</option></select>
+      </div>
+      <div class="hint" id="draftSamplingHint">Auto enables probabilistic drafting for MTP when supported.</div>
+    </div>
+    <div class="row" id="specDraftBatchRow">
+      <div class="label"><label for="draftBatchSize" class="name tip" data-flag="--spec-draft-n-ubatch" data-help="Physical batch size of the draft context. 0 inherits the main physical batch size. A smaller value can reduce draft VRAM use, with a possible speed tradeoff. Requires a supporting llama.cpp binary (upstream October 14, 2026).">Draft batch size</label><input type="number" id="draftBatchSize" min="0" max="1048576" step="32" /></div>
+      <div class="hint" id="draftBatchHint">0 = inherit the main physical batch size.</div>
+    </div>
   </div>
 
   <div class="btn-col" style="margin:12px 0 8px">
-    <button class="secondary" id="resetAdvancedBtn" title="Restore Advanced Settings to Llama AIO defaults (does not change Context Length / GPU Offload / MoE)">Reset advanced to defaults</button>
+    <button class="secondary" id="resetAdvancedBtn" title="Restore Advanced Settings to Llama AIO defaults (keeps context length, GPU layers, and CPU offload layers)">Reset advanced to defaults</button>
   </div>
 
   </div>
