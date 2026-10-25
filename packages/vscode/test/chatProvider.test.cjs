@@ -120,6 +120,10 @@ before(async () => {
         res.write(`data: ${JSON.stringify(ev)}\n\n`);
         if (reply.delayMs) await new Promise((r) => setTimeout(r, reply.delayMs));
       }
+      if (reply.keepOpen) {
+        res.write("data: [DONE]\n\n");
+        return;
+      }
       res.end("data: [DONE]\n\n");
     });
   });
@@ -821,9 +825,73 @@ describe("LlamaAioChatProvider requests", () => {
     );
   });
 
+  for (const servedName of ["Flint Preview", "FrogNano-4B-2609-Q4_K_L.gguf"]) {
+    it(`completes ${servedName} when the server keeps the SSE connection open after [DONE]`, async () => {
+      servedModelId = servedName;
+      reply = { events: [...(servedName === "Flint Preview" ? [delta({ reasoning_content: "Check the repository." })] : []),
+        delta({ content: "A TypeScript extension." }), { choices: [{ delta: {}, finish_reason: "stop" }] }],
+        delayMs: 0, keepOpen: true };
+      const { provider, perfCalls } = setup();
+      const parts = [];
+      const { token, cancel } = cancelToken();
+      const timeout = setTimeout(cancel, 2000);
+      try {
+        await provider.provideLanguageModelChatResponse({ id: servedModelId }, [msg(Role.User, new TextPart("What project?"))],
+          {}, { report: part => parts.push(part) }, token);
+        assert.equal(parts.filter(p => p instanceof TextPart).map(p => p.value).join(""), "A TypeScript extension.");
+        assert.ok(perfCalls.some(([name]) => name === "complete"));
+        assert.ok(!perfCalls.some(([name]) => name === "abort"));
+      } finally {
+        clearTimeout(timeout);
+      }
+    });
+  }
+
+  for (const finishReason of ["length", "stop"]) {
+    it(`reports a useful Flint thinking-only error (finish=${finishReason}) instead of succeeding with no answer`, async () => {
+      servedModelId = "Flint Preview";
+      reply = { events: [delta({ reasoning_content: "I need to inspect the repository." }),
+        { choices: [{ delta: {}, finish_reason: finishReason }] }], delayMs: 0 };
+      const { provider, perfCalls } = setup();
+      const parts = [];
+      await assert.rejects(() => provider.provideLanguageModelChatResponse({ id: servedModelId },
+        [msg(Role.User, new TextPart("What project?"))], {}, { report: part => parts.push(part) }, cancelToken().token),
+      finishReason === "length" ? /output limit on thinking.*Increase Max tokens/ : /thinking but no answer or tool call/);
+      assert.ok(parts.some(p => p instanceof ThinkingPart));
+      assert.ok(!parts.some(p => p instanceof TextPart));
+      const trace = perfCalls.findLast(([name]) => name === "recordResponseTrace")[1][0];
+      assert.equal(trace.emptyToChat, true);
+      assert.equal(trace.finishReason, finishReason);
+      assert.equal(trace.emittedReasoningChars, "I need to inspect the repository.".length);
+    });
+  }
+
+  it("keeps a response trace available before completion and after cancellation", async () => {
+    reply = { events: [delta({ content: "Partial answer" })], delayMs: 100 };
+    const { provider, perfCalls } = setup();
+    const { token, cancel } = cancelToken();
+    let firstPart;
+    const received = new Promise(resolve => { firstPart = resolve; });
+    const running = provider.provideLanguageModelChatResponse({ id: "test-model" },
+      [msg(Role.User, new TextPart("hello"))], {}, { report: () => firstPart() }, token);
+    try {
+      await received;
+      await new Promise(resolve => setImmediate(resolve));
+      const live = perfCalls.findLast(([name]) => name === "recordResponseTrace")[1][0];
+      assert.equal(live.assembledText, "Partial answer");
+      assert.match(live.note, /in progress/);
+    } finally {
+      cancel();
+      await running;
+    }
+    const cancelled = perfCalls.findLast(([name]) => name === "recordResponseTrace")[1][0];
+    assert.equal(cancelled.assembledText, "Partial answer");
+    assert.match(cancelled.note, /cancelled/);
+  });
+
   it("turns a mid-stream server error into a LanguageModelError", async () => {
     reply = { events: [delta({ content: "par" }), { error: { message: "slot crashed" } }], delayMs: 0 };
-    const { provider } = setup();
+    const { provider, perfCalls } = setup();
     await assert.rejects(
       () =>
         provider.provideLanguageModelChatResponse(
@@ -835,5 +903,8 @@ describe("LlamaAioChatProvider requests", () => {
         ),
       (e) => e instanceof LanguageModelError && /slot crashed/.test(e.message)
     );
+    const trace = perfCalls.findLast(([name]) => name === "recordResponseTrace")[1][0];
+    assert.equal(trace.assembledText, "par");
+    assert.match(trace.note, /slot crashed/);
   });
 });

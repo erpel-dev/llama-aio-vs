@@ -135,6 +135,12 @@ Older hosts without thinking-part support keep the existing text fallback;
 use a recent VS Code host for reasoning-preserving agent sessions.
 Consecutive streamed tool turns use fresh HTTP connections to avoid reusing
 SSE sockets that llama-server is closing; chat POSTs are not retried.
+The SSE `[DONE]` marker completes a reply even if the HTTP connection stays
+open. Inline `<think>` blocks stream into the thinking channel as they arrive.
+A completed thinking-only reply reports a useful error instead of succeeding
+without an answer; an output-limit error points to Chat Requests → Max tokens.
+View last response includes partial output while a request is running and after
+cancellation or failure, along with the finish reason and thinking character count.
 
 This applies through VS Code's Llama AIO provider. A standalone SDK configured
 to contact a server directly bypasses the extension: configure that client's

@@ -35,6 +35,38 @@ const delta = (d: object) => ({ choices: [{ delta: d }] });
 const timings = { prompt_n: 12, prompt_ms: 100, predicted_n: 5, predicted_ms: 250, cache_n: 30 };
 
 describe("parseChatStream", () => {
+  it("finishes at [DONE] without waiting for the connection to close or consuming later events", async () => {
+    let readAfterDone = false;
+    async function* persistentStream() {
+      yield 'data: {"choices":[{"delta":{"content":"Answer"},"finish_reason":"stop"}]}\n\n';
+      yield 'data: [DONE]\n\n';
+      readAfterDone = true;
+      throw new Error("The HTTP connection stayed open after the completed response");
+    }
+    const parts: ChatStreamPart[] = [];
+    for await (const event of parseChatStream(persistentStream(), { toolsEnabled: true })) parts.push(event);
+    assert.equal(text(parts), "Answer");
+    assert.equal(readAfterDone, false);
+    assert.equal(parts.at(-1)?.kind, "trace");
+    assert.equal((parts.at(-1) as Extract<ChatStreamPart, {kind: "trace"}>).finishReason, "stop");
+  });
+
+  it("streams inline thinking before the model finishes and does not duplicate a later reasoning channel", async () => {
+    async function* tokens() {
+      yield `data: ${JSON.stringify(delta({ content: "<think>I need " }))}\n\n`;
+      yield `data: ${JSON.stringify(delta({ content: "the file.</thi" }))}\n\n`;
+      yield `data: ${JSON.stringify(delta({ content: "nk>Answer" }))}\n\n`;
+      yield `data: ${JSON.stringify(delta({ reasoning_content: "I need the file." }))}\n\n`;
+      yield "data: [DONE]\n\n";
+    }
+    const stream = parseChatStream(tokens(), { toolsEnabled: true, separateReasoning: true });
+    assert.deepEqual((await stream.next()).value, { kind: "reasoning", text: "I need " });
+    const remaining: ChatStreamPart[] = [];
+    for await (const part of stream) remaining.push(part);
+    assert.equal(remaining.filter(p => p.kind === "reasoning").map(p => p.text).join(""), "the file.");
+    assert.equal(text(remaining), "Answer");
+  });
+
   it("completes consecutive tool turns when an SSE connection cannot serve another POST", async () => {
     const seen = new Set<http.IncomingMessage["socket"]>();
     let rejectedReuse = 0;

@@ -48,6 +48,16 @@ export class LiveTextGate {
   private inThink = false;
   private halted = false;
   private emitted = "";
+  private reasoning = "";
+
+  constructor(private readonly captureReasoning = false) {}
+
+  /** Inline thoughts consumed by the last pushes, for hosts with a thinking channel. */
+  takeReasoning(): string {
+    const text = this.reasoning;
+    this.reasoning = "";
+    return text;
+  }
 
   /** True once a `<tool_call` opener was seen; nothing more is streamed live. */
   get isHalted(): boolean {
@@ -71,9 +81,11 @@ export class LiveTextGate {
         const close = THINK_CLOSE_RE.exec(this.pending);
         if (!close) {
           const hold = partialTagTailLength(this.pending);
+          if (this.captureReasoning) this.reasoning += this.pending.slice(0, this.pending.length - hold);
           this.pending = hold ? this.pending.slice(-hold) : "";
           break;
         }
+        if (this.captureReasoning) this.reasoning += this.pending.slice(0, close.index);
         this.pending = this.pending.slice(close.index + close[0].length);
         this.inThink = false;
         continue;
