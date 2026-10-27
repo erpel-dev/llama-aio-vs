@@ -164,7 +164,7 @@ Public Language Model API calls may pass `modelOptions.reasoningEffort`.
 That explicit request choice takes precedence over the editor-injected
 `modelConfiguration` default. SDK/schema selections remain the fallback.
 
-LFM3, MiniCPM5, Spark X2.6, Nanbeige4.3, Flint, and DeepSeek reasoning is streamed as separate thinking parts on newer
+Qwen3, Qwen3.5/3.6, LFM3, MiniCPM5, Spark X2.6, Nanbeige4.3, Flint, and DeepSeek reasoning is streamed as separate thinking parts on newer
 hosts and sent back as assistant `reasoning_content` on later tool turns.
 It is counted in context estimates and kept out of the final answer text.
 Older hosts without thinking-part support keep the existing text fallback;

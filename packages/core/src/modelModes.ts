@@ -63,6 +63,7 @@ const QWEN_NO_THINK: ModelModeParams = {
 const QWEN35_THINKING_MODES: ModelModeSet = {
   familyLabel: "Qwen3.5 / 3.6",
   defaultMode: "Think (Coding)",
+  preserveReasoning: true,
   modes: {
     "Think (General)": {
       chat_template_kwargs: {
@@ -92,6 +93,7 @@ const QWEN35_THINKING_MODES: ModelModeSet = {
 const QWEN3_THINKING_MODES: ModelModeSet = {
   familyLabel: "Qwen3",
   defaultMode: "Think",
+  preserveReasoning: true,
   modes: {
     Think: { ...QWEN_THINK_SAMPLING, temperature: 0.6, chat_template_kwargs: { enable_thinking: true } },
     "No Think": { ...QWEN_NO_THINK, presence_penalty: 0.0 },

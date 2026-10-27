@@ -763,7 +763,7 @@ describe("LlamaAioChatProvider requests", () => {
   }
 
   for (const remote of [false, true]) {
-    for (const label of ["Nanbeige4.3-33B", "Flint", "DeepSeek-V4.1-Flash-1017", "LFM3-1.7B", "Spark-X2.6-1.7B", "MiniCPM5-2B"]) {
+    for (const label of ["Nanbeige4.3-33B", "Flint", "DeepSeek-V4.1-Flash-1017", "LFM3-1.7B", "Spark-X2.6-1.7B", "MiniCPM5-2B", "Qwen3-0.6B", "Qwen3.5-0.8B"]) {
       it(`round-trips ${label} SDK thinking parts separately from text across tool turns (remote=${remote})`, async () => {
         servedModelId = remote ? "opaque-instance" : label;
         servedMetadata = { owned_by: "strata", meta: { label } };
