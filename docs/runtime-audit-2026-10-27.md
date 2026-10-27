@@ -53,9 +53,12 @@ and the server cancelled it. The fixed UI displayed the full 50K prompt count
 and waiting phase during prefill. End-to-end completion of a 50K native prompt
 on representative GPU hardware remains unverified.
 
-The initial editor session ran from approximately 04:20 to 05:14 UTC; its
-interruption is excluded from active test time. A further live editor pass
-starts at 08:03 UTC. The final PR records the completed cumulative duration.
+Recorded live editor intervals were 04:21:59–05:14:05 and 08:04:05–08:13:04
+UTC: **61 minutes 5 seconds cumulatively**. The interruption is excluded.
+After the long request's cancellation, two native LFM follow-up requests
+completed in about 2.1 and 0.5 seconds. A fixture reconnect retained 256K
+through empty/loading states and accepted the recovered server's smaller 64K
+context. An incorrect API key produced an actionable 401 screen.
 
 A 312-case identity matrix passed across canonical IDs, filenames, publisher
 prefixes, metadata, and negative cases. Ten remote model transitions exercised
@@ -69,3 +72,15 @@ pretending to load 601 distinct models. The library rendered 50 rows and about
 widths were checked in Chromium. Native long-prompt prefill dominated CPU use;
 no inference speed or default-setting changes are inferred from shared-load
 microbenchmarks. GPU throughput and display-memory reservations were not tested.
+
+The main long-running extension host had median CPU use of about 1.1% of one
+core and RSS of 177–245 MiB; median per-sample p95 event-loop delay was 22 ms
+with a 20 ms sampling resolution. These measurements include all extensions
+in that host and are a bounded smoke test, not proof against longer-term leaks.
+The final local and remote width sweeps had no document overflow at 207, 247,
+297, or 347 pixels. Live filename search returned the previously missed file.
+
+Final validation: 970 core + 192 extension tests pass; lint, compilation, and
+local VSIX packaging/integrity checks pass. PR CI also builds and uploads a
+VSIX artifact. The environment blocks downloading GitHub's artifact storage
+URL, so that uploaded copy was not installed separately.
