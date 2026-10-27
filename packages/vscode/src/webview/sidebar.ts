@@ -1371,8 +1371,10 @@ function renderPerfStats(perf, perfLines) {
 
   const bits = [];
   if (p.generating) {
-    const live = fmtRate(p.genTokPerSec);
-    bits.push('<span class="ok">● Generating…' + (live ? ' ' + live + ' tok/s' : '') + '</span>');
+    const hasTokens = typeof p.completionTokens === 'number' && p.completionTokens > 0;
+    const live = hasTokens && !stale ? fmtRate(p.genTokPerSec) : '';
+    bits.push('<span class="ok">● ' + (hasTokens ? 'Generating…' : 'Waiting for first token…') +
+      (live ? ' ' + live + ' tok/s' : '') + '</span>');
   }
   if (typeof completionTokens === 'number') {
     const dur = typeof durationMs === 'number' && durationMs > 0 && !p.generating
@@ -3115,6 +3117,10 @@ if (setupStarterBtn) {
   setupStarterBtn.addEventListener('click', () => vscode.postMessage({ type: 'downloadStarter' }));
 }
 $('openFileBtn').addEventListener('click', () => vscode.postMessage({ type: 'openModelFile' }));
+$('libraryRefreshBtn').addEventListener('click', () => {
+  $('libraryRefreshBtn').disabled = true;
+  vscode.postMessage({ type: 'refreshLibrary' });
+});
 $('installLlamaBtn').addEventListener('click', () => {
   const action = $('installLlamaBtn').dataset.action;
   if (action === 'check') {
@@ -3421,6 +3427,7 @@ $('libraryDialog').addEventListener('click', function (e) {
 
 window.addEventListener('message', (event: MessageEvent<ToWebviewMessage>) => {
   const msg = event.data;
+  if (msg.type === 'libraryRefreshComplete') $('libraryRefreshBtn').disabled = false;
   if (msg.type === 'state') applyState(msg.payload);
   if (msg.type === 'openConnect') {
     openConnectForm(lastPayload && lastPayload.serverMode === 'remote' ? undefined : { url: '', label: '' });

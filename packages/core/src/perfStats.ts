@@ -83,6 +83,8 @@ export interface LastChatRequestContext {
   model: string;
   slotContext: number;
   estimatedPromptTokens: number;
+  /** Present when the rendered text was counted by the server before inference. */
+  promptTokenSource?: "server-tokenizer";
   messageCount: number;
   toolCount: number;
   /** OpenAI-style messages forwarded to llama.cpp. */
@@ -212,6 +214,7 @@ export class PerfStats {
       model: ctx.model,
       slotContext: ctx.slotContext,
       estimatedPromptTokens: ctx.estimatedPromptTokens,
+      ...(ctx.promptTokenSource ? { promptTokenSource: ctx.promptTokenSource } : {}),
       messageCount: Array.isArray(ctx.messages) ? ctx.messages.length : 0,
       toolCount: Array.isArray(ctx.tools) ? ctx.tools.length : 0,
       messages: ctx.messages,
@@ -263,7 +266,9 @@ export class PerfStats {
       `- Captured: ${ctx.capturedAt}`,
       `- Model: ${ctx.model}`,
       `- Slot context: ${ctx.slotContext.toLocaleString()} tokens`,
-      `- Estimated prompt tokens: ${ctx.estimatedPromptTokens.toLocaleString()}`,
+      ctx.promptTokenSource === "server-tokenizer"
+        ? `- Prompt tokens: ${ctx.estimatedPromptTokens.toLocaleString()} (server tokenizer)`
+        : `- Estimated prompt tokens: ${ctx.estimatedPromptTokens.toLocaleString()}`,
       `- Messages: ${ctx.messageCount}`,
       `- Tools: ${ctx.toolCount}`,
     ];
@@ -903,7 +908,8 @@ export class PerfStats {
     }
     const lines: string[] = [];
     if (p.generating) {
-      lines.push(p.showingPreviousCall ? "Generating… (rates from last call until timings arrive)" : "Generating…");
+      lines.push(!p.completionTokens ? "Waiting for first token…"
+        : p.showingPreviousCall ? "Generating… (rates from last call until timings arrive)" : "Generating…");
     }
     if (
       typeof p.promptTokens === "number" &&

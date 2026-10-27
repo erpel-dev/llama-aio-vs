@@ -311,7 +311,8 @@ export function renderLibraryList() {
       const blob = (g.title + ' ' + g.detail + ' ' + g.source).toLowerCase();
       const quants = (g.quants || []).filter(function (x) {
         if (!passesLibraryFilter(g, x)) return false;
-        return !q || (blob + ' ' + x.label.toLowerCase()).indexOf(q) !== -1;
+        const filename = x.path.split(/[/\\]/).pop() || '';
+        return !q || (blob + ' ' + x.label.toLowerCase() + ' ' + filename.toLowerCase()).indexOf(q) !== -1;
       });
       return { g: g, quants: quants };
     }).filter(function (x) { return x.quants.length; });

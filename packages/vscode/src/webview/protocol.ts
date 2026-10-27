@@ -59,6 +59,7 @@ export type ToHostMessage =
   | { type: "forgetApiKey" }
   | { type: "copyDiagnostics" }
   // Model library
+  | { type: "refreshLibrary" }
   | { type: "useLibraryModel"; path: string }
   | { type: "useLibraryDraft"; path: string }
   | { type: "copyPath"; path: string }
@@ -89,6 +90,7 @@ type ViewModel = any;
 
 /** Extension host → webview. */
 export type ToWebviewMessage =
+  | { type: "libraryRefreshComplete" }
   | { type: "state"; payload: ViewModel }
   | { type: "statusPatch"; payload: ViewModel }
   | { type: "bootProgress"; payload: { starting: boolean; message: string; running: boolean; configDirty: boolean } }

@@ -70,3 +70,15 @@ it('pages a 600-model library without losing access to its last model', () => {
   assert.equal((rendered().match(/class="lib-quant/g) || []).length, 1);
   assert.match(rendered(), /data-path="\/models\/599.gguf"/);
 });
+
+it('finds a model by filename even when GGUF metadata supplies its display name', () => {
+  const t = setup();
+  t.lib.payload.groups = [{ title: 'LFM2.5', detail: '', source: 'Local',
+    quants: [{ path: 'C:\\models\\audit-0599-LFM2.5-Q8_0.gguf', label: 'Q8_0', sizeBytes: 1 }], companions: [] }];
+  t.element('libraryFilter').value = 'AUDIT-0599';
+  t.renderLibraryList();
+  assert.match(t.element('libraryList').innerHTML, /class="lib-quant/);
+  t.element('libraryFilter').value = 'nonexistent';
+  t.renderLibraryList();
+  assert.match(t.element('libraryList').innerHTML, /No local model matches/);
+});
