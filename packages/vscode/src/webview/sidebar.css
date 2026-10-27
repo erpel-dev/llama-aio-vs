@@ -381,7 +381,7 @@ h2:first-child { margin-top: 4px; }
   margin: 4px 0 2px;
 }
 .spec-group .row { margin: 8px 0 10px; }
-.auto-field { display: flex; align-items: center; gap: 10px; }
+.auto-field { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; max-width: 100%; min-width: 0; }
 .auto-field .auto {
   display: inline-flex;
   align-items: center;
@@ -390,7 +390,7 @@ h2:first-child { margin-top: 4px; }
   font-weight: 400;
   color: var(--muted);
 }
-.auto-field input[type="number"] { width: 78px; }
+.auto-field input[type="number"] { width: 78px; max-width: 100%; min-width: 0; }
 input:disabled, select:disabled { opacity: 0.5; }
 .mem-charts { margin-top: 10px; display: flex; flex-direction: column; gap: 10px; }
 .mem-chart-title {
@@ -453,6 +453,7 @@ input:disabled, select:disabled { opacity: 0.5; }
 .row { margin: 10px 0 14px; }
 .label {
   display: flex;
+  flex-wrap: wrap;
   justify-content: space-between;
   align-items: baseline;
   gap: 8px;
@@ -894,9 +895,20 @@ button.link-btn:hover { text-decoration: underline; }
 .kpi b { display: block; font-size: 14px; font-variant-numeric: tabular-nums; }
 .kpi b.muted { color: var(--muted); }
 .kpi i { font-style: normal; font-size: 10px; color: var(--muted); white-space: nowrap; }
+@media (max-width: 340px) {
+  .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .kpi { min-width: 0; overflow-wrap: anywhere; }
+  .kpi i { white-space: normal; }
+}
+@media (max-width: 250px) {
+  .srv-top { flex-wrap: wrap; }
+  .srv-icons { margin-left: auto; }
+  .menu-body { min-width: min(210px, calc(100vw - 24px)); }
+  .seg { flex-wrap: wrap; max-width: 100%; }
+}
 /* ---- Advanced ---- */
-.adv-tools { display: flex; gap: 8px; align-items: center; margin: 2px 0 6px; }
-.adv-tools input[type="text"] { flex: 1; width: auto; padding: 4px 6px; }
+.adv-tools { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 2px 0 6px; }
+.adv-tools input[type="text"] { flex: 1 1 120px; min-width: 0; width: auto; padding: 4px 6px; }
 .adv-tools .auto { display: inline-flex; gap: 4px; align-items: center; font-size: 11px; color: var(--muted); white-space: nowrap; }
 /* Two markers with two meanings:
    muted ● = differs from the default (informational, Advanced only);

@@ -256,6 +256,9 @@ const GLM53_MODES = effortModes("GLM-5.3-Flash", ["max", "high", "low"], "max",
 const GLM53_FULL_MODES: ModelModeSet = { ...GLM53_MODES, familyLabel: "GLM-5.3" };
 
 const MINICPM5_MODES = binaryModes("MiniCPM5 2B", { ...OPEN_SAMPLING, top_p: 0.95 });
+// FrogNano's author evaluates at temperature 0.6 and repeat penalty 1.
+// Its inherited Qwen3.5 template supports the binary thinking switch.
+const FROGNANO_MODES = binaryModes("FrogNano 4B 2609", { ...OPEN_SAMPLING, temperature: 0.6 });
 /** Nanbeige4.3-33B: author agent/chat recipes, not distinct reasoning depths. */
 const NANBEIGE43_MODES: ModelModeSet = {
   familyLabel: "Nanbeige4.3 33B", defaultMode: "Think (Agent)", preserveReasoning: true,
@@ -370,14 +373,18 @@ BONSAI2_MODES.modes["No Think"] = QWEN_NO_THINK;
 /** Only actual model identity, excluding parent directories named for other models. */
 function haystack(caps?: ModelCapabilities, modelId?: string): string {
   const basename = (value?: string) => value?.split(/[/\\]/).pop();
-  return [caps?.name, basename(caps?.path), basename(modelId)].filter(Boolean).join(" ").toLowerCase();
+  return [caps?.name, basename(caps?.path), basename(modelId)].filter(Boolean).join(" ").toLowerCase()
+    // GGUF publishers commonly prefix names with `author_`. Treat that as a
+    // word boundary, while preserving numeric versions such as Qwen3_8.
+    .replace(/(?<!\d)_|_(?!\d)/g, "-");
 }
 
 function namedProfile(h: string): ModelModeSet | undefined {
   if (/(?:^|[-_\s])nanbeige[-_ ]?4[._]3[-_ ]33b(?=$|[.\s]|[-_](?:gguf|(?:ud[-_ ])?(?:iq|q|fp|bf|mxfp|gsq)[\w.-]*)(?:$|[-_.\s]))/.test(h)) return NANBEIGE43_MODES;
   if (/\bqwen[-_ ]?2[._]5[-_ ]0[._]5b[-_ ]instruct(?:\b|_)/.test(h)) return QWEN25_STARTER_MODES;
   if (/\btiel[-_ ]coder[-_ ]35b[-_ ]a3b(?:\b|_)/.test(h)) return TIEL_CODER_MODES;
-  if (/\bminicpm[-_ ]?5[-_ ]2b(?:\b|_)/.test(h)) return MINICPM5_MODES;
+  if (/\bminicpm[-_ ]?5[-_ ]2(?:[._]6)?b(?:\b|_)/.test(h)) return MINICPM5_MODES;
+  if (/\bfrognano[-_ ]4b[-_ ]2609(?:\b|_)/.test(h)) return FROGNANO_MODES;
   if (/\bmellum[-_ ]?2[._]1[-_ ]12b[-_ ]a2[._]5b[-_ ]thinking(?:\b|_)/.test(h)) return MELLUM21_MODES;
   if (/\bmimo[-_ ]v2[._]6[-_ ]distill[-_ ]qwen[-_ ]9b(?:\b|_)/.test(h)) return MIMO26_DISTILL_MODES;
   if (/\b(?:underdog[-_ ])?saluki[-_ ]27b[-_ ]1[._]0(?:\b|_)/.test(h)) return SALUKI_MODES;
@@ -478,18 +485,12 @@ export function resolveModelModes(
 ): ModelModeSet | undefined {
   const h = haystack(caps, modelId);
   const arch = (caps?.architecture || "").toLowerCase();
-  if (/^(?:dflash|gemma4[-_]assistant)$/.test(arch)
-    || /(?:^|[\s])(?:mmproj|mtp)[-_.]/.test(h)
-    || /(?:^|[-_.\s])mmproj(?:$|[-_.\s])/.test(h)
-    || /-mtp\.gguf(?:$|\s)/.test(h)
-    || /(?:^|[-_.\s])dflash\d*(?:$|[-_.\s])/.test(h)
-    || /(?:^|[-_.\s])dspark\d*(?:$|[-_.\s])/.test(h)
-    || /(?:^|[-_.\s])base(?:$|[-_.\s])/.test(h)) return undefined;
+  if (/^(?:dflash|gemma4[-_]assistant)$/.test(arch) || profileVariantExcluded(h)) return undefined;
   const named = namedProfile(h);
   if (named) return named;
   // An explicitly named, unverified variant must not inherit a misleading
   // profile just because its base architecture is supported.
-  if (/\b(?:spark[-_ ]?x?\d|ornith[-_ ]\d|lfm2[._]\d|nemotron[-_ ]\d|(?:ternary[-_ ])?bonsai[-_ ]?\d|qwen3[-_ ]coder)/.test(h)) return undefined;
+  if (/\b(?:frognano|spark[-_ ]?x?\d|ornith[-_ ]\d|lfm2[._]\d|nemotron[-_ ]\d|(?:ternary[-_ ])?bonsai[-_ ]?\d|qwen3[-_ ]coder)/.test(h)) return undefined;
   if (/^gpt[-_]oss$/.test(arch)) return GPT_OSS_MODES;
   if (arch === "qwen4exp" || arch === "qwen4_exp") return QWEN4EXP_THINKING_MODES;
   if (/^qwen(?:35|3_5)/.test(arch)) return QWEN35_THINKING_MODES;
@@ -500,12 +501,25 @@ export function resolveModelModes(
   return undefined;
 }
 
+function profileVariantExcluded(h: string): boolean {
+  return /(?:^|[\s])(?:mmproj|mtp)[-_.]/.test(h)
+    || /(?:^|[-_.\s])mmproj(?:$|[-_.\s])/.test(h)
+    || /-mtp\.gguf(?:$|\s)/.test(h)
+    || /(?:^|[-_.\s])dflash\d*(?:$|[-_.\s])/.test(h)
+    || /(?:^|[-_.\s])dspark\d*(?:$|[-_.\s])/.test(h)
+    || /(?:^|[-_.\s])draft(?:$|[-_.\s])/.test(h)
+    || /(?:^|[-_.\s])base(?:$|[-_.\s])/.test(h);
+}
+
 /** Shared by remote chat and the sidebar; never consult local model settings. */
 export function resolveRemoteModelModes(
   info: Pick<RemoteServerInfo, "modelAlias" | "modelPath" | "modelName" | "modelId" | "modelAliases"> | undefined
 ): ModelModeSet | undefined {
   if (!info) return undefined;
-  for (const identity of [info.modelAlias, info.modelPath, info.modelName, info.modelId]) {
+  const identities = [info.modelAlias, info.modelPath, info.modelName, info.modelId];
+  // Canonical Base/draft identities take precedence over generic chat aliases.
+  if (identities.some(identity => identity && profileVariantExcluded(haystack(undefined, identity)))) return undefined;
+  for (const identity of identities) {
     const profile = resolveModelModes(undefined, identity);
     if (profile) return profile;
   }

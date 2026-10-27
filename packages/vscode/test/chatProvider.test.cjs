@@ -68,6 +68,9 @@ let servedNative;
 let servedModels;
 let strataHost;
 let expectedApiKey;
+let tokenizerTokens;
+let lastTemplateBody;
+let templateDelay;
 let seenRequests = [];
 /** How /v1/chat/completions answers: array of SSE data objects, optional per-event delay. */
 let reply = { events: [], delayMs: 0 };
@@ -106,6 +109,17 @@ before(async () => {
       if (req.url === "/api/native") {
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify(servedNative || {}));
+        return;
+      }
+      if (req.url === "/apply-template" || req.url === "/tokenize") {
+        if (tokenizerTokens === undefined) { res.writeHead(404); res.end("missing"); return; }
+        if (req.url === "/apply-template") {
+          lastTemplateBody = JSON.parse(body);
+          if (templateDelay) await new Promise(resolve => setTimeout(resolve, templateDelay));
+        }
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(req.url === "/apply-template" ? { prompt: "rendered prompt" }
+          : { tokens: Array(tokenizerTokens).fill(1) }));
         return;
       }
       if (req.method === "GET") {
@@ -198,6 +212,9 @@ describe("LlamaAioChatProvider requests", () => {
     servedModels = undefined;
     strataHost = false;
     expectedApiKey = undefined;
+    tokenizerTokens = undefined;
+    lastTemplateBody = undefined;
+    templateDelay = undefined;
     seenRequests = [];
   });
 
@@ -449,6 +466,112 @@ describe("LlamaAioChatProvider requests", () => {
       assert.doesNotMatch(recovered.tooltip, /last known model/);
     } finally {
       monitor.dispose();
+    }
+  });
+
+  for (const remote of [false, true]) {
+    it(`counts a 50K first request with the server template and caps the reply to the remaining context (remote=${remote})`, async () => {
+      servedModelId = "Qwen3.8-27B";
+      servedProps = { default_generation_settings: { n_ctx: 65536 } };
+      tokenizerTokens = 50000;
+      const { provider, perfCalls, state } = setup({ remote, remoteInfo: { isLlamaCpp: true } });
+      state.requestSettings.maxTokens = 16384;
+      await provider.provideLanguageModelChatResponse({ id: servedModelId },
+        [msg(Role.User, new TextPart("code ".repeat(20000)))],
+        { tools: [{ name: "read_file", description: "read", inputSchema: { type: "object" } }] },
+        { report() {} }, cancelToken().token);
+      assert.equal(lastBody.max_tokens, 15536);
+      assert.equal(lastTemplateBody.messages[0].content, lastBody.messages[0].content);
+      assert.deepEqual(lastTemplateBody.tools, lastBody.tools);
+      assert.deepEqual(lastTemplateBody.chat_template_kwargs, lastBody.chat_template_kwargs);
+      const context = perfCalls.find(([name]) => name === "recordRequestContext")[1][0];
+      assert.equal(context.estimatedPromptTokens, 50000);
+      assert.equal(context.promptTokenSource, "server-tokenizer");
+      assert.ok(perfCalls.some(([name, args]) => name === "updateContext" && args[0].promptTokens === 50000 && args[0].estimated === false));
+    });
+  }
+
+  it("accepts a fitting 50K prompt even when a character estimate exceeds the slot", async () => {
+    servedProps = { default_generation_settings: { n_ctx: 65536 } };
+    tokenizerTokens = 50000;
+    const { provider } = setup();
+    await provider.provideLanguageModelChatResponse({ id: "test-model" },
+      [msg(Role.User, new TextPart("long_identifier_1234567890".repeat(14000)))], {}, { report() {} }, cancelToken().token);
+    assert.ok(lastBody);
+  });
+
+  it("counts token-dense large prompts even when their character estimate appears small", async () => {
+    servedProps = { default_generation_settings: { n_ctx: 65536 } };
+    tokenizerTokens = 50000;
+    const { provider, state } = setup();
+    state.requestSettings.maxTokens = 16384;
+    await provider.provideLanguageModelChatResponse({ id: "test-model" },
+      [msg(Role.User, new TextPart("漢字".repeat(25000)))], {}, { report() {} }, cancelToken().token);
+    assert.equal(lastBody.max_tokens, 15536);
+  });
+
+  it("rejects an actually oversized prompt before inference even when the character estimate fits", async () => {
+    servedProps = { default_generation_settings: { n_ctx: 65536 } };
+    tokenizerTokens = 70000;
+    const { provider } = setup();
+    await assert.rejects(() => provider.provideLanguageModelChatResponse({ id: "test-model" },
+      [msg(Role.User, new TextPart("1 ".repeat(35000)))], {}, { report() {} }, cancelToken().token), /70000 tokens/);
+    assert.equal(lastBody, undefined);
+  });
+
+  it("defers approximate overflow to the server when tokenizer endpoints are unavailable", async () => {
+    const { provider } = setup();
+    await provider.provideLanguageModelChatResponse({ id: "test-model" },
+      [msg(Role.User, new TextPart("longword ".repeat(20000)))], {}, { report() {} }, cancelToken().token);
+    assert.ok(lastBody);
+  });
+
+  it("cancels a large-prompt preflight without starting inference", async () => {
+    tokenizerTokens = 50000;
+    templateDelay = 100;
+    const { provider } = setup();
+    const { token, cancel } = cancelToken();
+    const running = provider.provideLanguageModelChatResponse({ id: "test-model" },
+      [msg(Role.User, new TextPart("word ".repeat(20000)))], {}, { report() {} }, token);
+    while (!lastTemplateBody) await new Promise(resolve => setTimeout(resolve, 1));
+    cancel();
+    await running;
+    assert.equal(lastBody, undefined);
+  });
+
+  it("uses the server tokenizer for large public token counts and shares repeated counts", async () => {
+    tokenizerTokens = 50000;
+    const { provider } = setup();
+    const model = { id: "test-model" }, token = cancelToken().token;
+    const content = "code ".repeat(20000);
+    assert.deepEqual(await Promise.all([provider.provideTokenCount(model, content, token),
+      provider.provideTokenCount(model, content, token)]), [50000, 50000]);
+    assert.equal(seenRequests.filter(r => r.url === "/tokenize").length, 1);
+    tokenizerTokens = 51000;
+    provider.notifyChanged();
+    assert.equal(await provider.provideTokenCount(model, content, token), 51000);
+    assert.equal(await provider.provideTokenCount(model, "Hello", token), 2);
+  });
+
+  it("renders large message token counts with the actual model template", async () => {
+    tokenizerTokens = 50000;
+    const { provider } = setup();
+    const message = msg(Role.User, new TextPart("code ".repeat(20000)));
+    assert.equal(await provider.provideTokenCount({ id: "MiniCPM5-2B" }, message, cancelToken().token), 50000);
+    assert.equal(lastTemplateBody.messages[0].content, message.content[0].value);
+  });
+
+  it("lets an explicit public API mode override VS Code's injected default and retains schema-only selection", async () => {
+    servedModelId = "FrogNano-4B-2609";
+    const { provider } = setup();
+    for (const [options, thinking] of [
+      [{ modelOptions: { reasoningEffort: "none" } }, false],
+      [{ modelOptions: { reasoningEffort: "none" }, modelConfiguration: { reasoningEffort: "high" } }, false],
+      [{ modelConfiguration: { reasoningEffort: "high" } }, true],
+    ]) {
+      await provider.provideLanguageModelChatResponse({ id: servedModelId }, [msg(Role.User, new TextPart("Hello"))],
+        options, { report() {} }, cancelToken().token);
+      assert.equal(lastBody.chat_template_kwargs.enable_thinking, thinking);
     }
   });
 

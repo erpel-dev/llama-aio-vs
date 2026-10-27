@@ -254,6 +254,16 @@ function setup(loadOverrides = {}, remoteInfo, serverFeatures = core.NO_SERVER_F
 }
 
 describe("SettingsViewProvider memory path", () => {
+  for (const fail of [false, true]) {
+    it(`finishes a library rescan and restores the refresh control (failure=${fail})`, async () => {
+      const { provider, send, posted } = setup();
+      let scans = 0;
+      provider.pushState = async () => { scans++; if (fail) throw new Error("scan failed"); };
+      await send({ type: "refreshLibrary" });
+      assert.equal(scans, 1);
+      assert.ok(posted.some(message => message.type === "libraryRefreshComplete"));
+    });
+  }
   beforeEach(() => {
     shown.length = 0;
     copilotChatInstalled = true;

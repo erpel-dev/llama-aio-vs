@@ -237,6 +237,16 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             // Don't pushState — the webview already shows the edited values, and a
             // full state round-trip can overwrite in-progress typing.
             break;
+          case "refreshLibrary":
+            try {
+              invalidateModelLibraryCache();
+              await this.pushState();
+            } catch (e) {
+              vscode.window.showErrorMessage(`Llama AIO: Could not refresh the model library: ${e instanceof Error ? e.message : String(e)}`);
+            } finally {
+              this.post({ type: "libraryRefreshComplete" });
+            }
+            break;
           case "resetAdvancedLoad": {
             const d = DEFAULT_LOAD_SETTINGS;
             await this.store.updateLoadSettings({

@@ -11,6 +11,8 @@ const cases: Array<[string, string, string, string[]]> = [
   ["Qwen/Qwen2.5-0.5B-Instruct", "Qwen2.5 0.5B Instruct", "No Think", ["No Think"]],
   ["Tiel-Coder-35B-A3B-MTP-UD-Q4_K_XL.gguf", "Tiel-Coder 35B-A3B", "Think", ["Think", "No Think"]],
   ["MiniCPM5-2B-GGUF", "MiniCPM5 2B", "Think", ["Think", "No Think"]],
+  ["MiniCPM5 2.6B", "MiniCPM5 2B", "Think", ["Think", "No Think"]],
+  ["microsoft/FrogNano-4B-2609", "FrogNano 4B 2609", "Think", ["Think", "No Think"]],
   ["Mellum2.1-12B-A2.5B-Thinking-GGUF", "Mellum 2.1 Thinking", "Think", ["Think"]],
   ["MiMo-V2.6-Distill-Qwen-9B-Q4_K_M.gguf", "MiMo V2.6 Distill Qwen 9B", "Think", ["Think"]],
   ["Underdog-Saluki-27B-1.0-IQ2-mix.gguf", "Underdog Saluki 27B", "Think", ["Think", "No Think"]],
@@ -168,6 +170,31 @@ describe("model-specific sampler and reasoning differences", () => {
 });
 
 describe("profile identity boundaries", () => {
+  for (const [id, family] of cases) {
+    const file = `publisher_${id.split("/").pop()}-Q4_K_M.gguf`;
+    it(`recognizes publisher-prefixed ${id} across local and remote identities`, () => {
+      assert.equal(resolveModelModes(undefined, file)?.familyLabel, family);
+      for (const identity of [{ modelId: file }, { modelId: "opaque", modelPath: `C:\\models\\${file}` },
+        { modelId: "opaque", modelAlias: file }, { modelId: "opaque", modelName: file }]) {
+        assert.equal(resolveRemoteModelModes(identity)?.familyLabel, family);
+      }
+      assert.equal(resolveModelModes(undefined, file.replace(".gguf", "-draft.gguf")), undefined);
+    });
+  }
+  it("preserves numeric underscores and rejects canonical draft/Base identities before request aliases", () => {
+    assert.equal(resolveModelModes(undefined, "publisher_Qwen3_8-27B-Q4_K_M.gguf")?.familyLabel, "Qwen3.8");
+    assert.equal(resolveModelModes(undefined, "publisher_Spark-X2_6-4B-Q4_K_M.gguf")?.familyLabel, "Spark X2.6");
+    assert.equal(resolveModelModes(undefined, "publisher_Qwen3-8B-Q4_K_M.gguf")?.familyLabel, "Qwen3");
+    for (const name of ["Qwen3.8-27B-Base", "draft-Qwen3.8-27B", "mmproj-Qwen3.8-27B"]) {
+      assert.equal(resolveRemoteModelModes({ modelAlias: name, modelId: "Qwen3.8-27B" }), undefined);
+      assert.equal(resolveRemoteModelModes({ modelAlias: "Qwen3.8-27B", modelPath: `/models/${name}.gguf`, modelId: "opaque" }), undefined);
+    }
+    assert.equal(resolveModelModes(denseCaps({ path: "/m/renamed.gguf", name: "MiniCPM5 2.6B" }))?.familyLabel, "MiniCPM5 2B");
+    assert.equal(params("FrogNano-4B-2609").temperature, 0.6);
+    assert.equal(params("FrogNano-4B-2609").repetition_penalty, 1);
+    assert.deepEqual(params("FrogNano-4B-2609", "none").chat_template_kwargs, { enable_thinking: false });
+    assert.equal(resolveModelModes(denseCaps({ architecture: "qwen35", path: "/m/FrogNano-4B-2610.gguf" })), undefined);
+  });
   it("keeps main models with embedded MTP heads distinct from prediction sidecars", () => {
     assert.equal(resolveModelModes(undefined, "Qwen3.8-27B-iMatrix-NVFP4-MTP-GGUF")?.familyLabel, "Qwen3.8");
     assert.equal(resolveModelModes(undefined, "Qwen3.8-27B-MTP-Q4_K_M.gguf")?.familyLabel, "Qwen3.8");

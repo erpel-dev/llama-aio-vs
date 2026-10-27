@@ -1,4 +1,5 @@
 import type * as http from "http";
+import { createHash } from "crypto";
 import * as path from "path";
 import * as vscode from "vscode";
 import {
@@ -364,6 +365,7 @@ async function* streamChatCompletions(
 }
 
 export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
+  private readonly tokenCounts = new Map<string, { at: number; value: Promise<number> }>();
   private readonly _onDidChangeModelInformation = new vscode.EventEmitter<void>();
   readonly onDidChangeLanguageModelChatInformation = this._onDidChangeModelInformation.event;
 
@@ -448,6 +450,7 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
   }
 
   notifyChanged(): void {
+    this.tokenCounts.clear();
     this.modelProbe = undefined;
     this.propsProbe = undefined;
     this.readyProbe = undefined;
@@ -533,6 +536,34 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
       return remoteSlotContext(this.remoteInfo());
     }
     return this.store.getSlotContextSize(this.store.getState().loadSettings);
+  }
+
+  /** Count the rendered prompt only for large text requests; optional on compatible servers. */
+  private async countLargePrompt(body: Record<string, unknown>, token: vscode.CancellationToken): Promise<number | undefined> {
+    if ((this.store.isRemote() && this.remoteInfo()?.isLlamaCpp !== true)
+      || messagesHaveImageParts(body.messages as OpenAiChatMessage[])) return undefined;
+    const abort = new AbortController();
+    const sub = token.onCancellationRequested(() => abort.abort());
+    if (token.isCancellationRequested) abort.abort();
+    const endpoint = this.store.getEndpoint();
+    const options = { method: "POST" as const, timeoutMs: 5000, signal: abort.signal };
+    try {
+      const rendered = await serverJson<{ prompt?: unknown }>(joinServerUrl(endpoint, "/apply-template"), {
+        ...options, body: JSON.stringify({ messages: body.messages, tools: body.tools,
+          tool_choice: body.tool_choice, chat_template_kwargs: body.chat_template_kwargs }),
+      });
+      if (typeof rendered?.prompt !== "string" || !rendered.prompt) return undefined;
+      const result = await serverJson<{ tokens?: unknown }>(joinServerUrl(endpoint, "/tokenize"), {
+        ...options, body: JSON.stringify({ content: rendered.prompt, add_special: true, parse_special: true }),
+      });
+      return Array.isArray(result?.tokens) && result.tokens.length > 0 ? result.tokens.length : undefined;
+    } catch {
+      // Strata and some proxies do not expose these optional endpoints. The
+      // inference server must then decide whether an estimated prompt fits.
+      return undefined;
+    } finally {
+      sub.dispose();
+    }
   }
 
   /**
@@ -782,8 +813,13 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
 
     const modeSet = this.modeSetFor(model.id, props);
     const Thinking = modeSet?.preserveReasoning ? thinkingPartConstructor() : undefined;
-    const modelConfiguration = (options as { modelConfiguration?: Record<string, unknown> })
-      .modelConfiguration;
+    // VS Code supplies modelConfiguration even for public API calls, filling
+    // it from editor defaults. An explicit per-request effort must override
+    // that default; SDK/schema selection remains the fallback.
+    const modelConfiguration = {
+      ...(options as { modelConfiguration?: Record<string, unknown> }).modelConfiguration,
+      ...options.modelOptions,
+    };
     let appliedModeName: string | undefined;
     if (modeSet) {
       const { modeName, params } = resolveModeParams(modeSet, modelConfiguration);
@@ -812,15 +848,23 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
       tokensAfter,
       matchedRuleNames: prepared.matchedRuleNames,
     });
-    const estimatedPromptTokens = tokensAfter;
-    if (estimatedPromptTokens >= slotCtx) {
+    // Use characters for this trigger: token-dense languages and code can
+    // already be near the limit while the four-characters estimate looks low.
+    const countedPromptTokens = requestChars >= Math.min(16384, Math.floor(slotCtx / 2))
+      ? await this.countLargePrompt(body, token) : undefined;
+    if (token.isCancellationRequested) return;
+    const estimatedPromptTokens = countedPromptTokens ?? tokensAfter;
+    if (countedPromptTokens !== undefined && countedPromptTokens >= slotCtx) {
       throw new vscode.LanguageModelError(
         remote
-          ? `This prompt is about ${estimatedPromptTokens} tokens and ${serverLabel}'s context window is ${slotCtx} per slot. ` +
+          ? `This prompt is ${estimatedPromptTokens} tokens and ${serverLabel}'s context window is ${slotCtx} per slot. ` +
               `The server must be restarted with a larger --ctx-size or fewer -np slots.`
-          : `This prompt is about ${estimatedPromptTokens} tokens and the context window is ${slotCtx} per slot. ` +
+          : `This prompt is ${estimatedPromptTokens} tokens and the context window is ${slotCtx} per slot. ` +
               `It does not fit. Raise the Context window or set Max Concurrent Predictions to 1, then Reload.`
       );
+    }
+    if (countedPromptTokens !== undefined && typeof body.max_tokens === "number") {
+      body.max_tokens = Math.min(body.max_tokens, slotCtx - countedPromptTokens);
     }
     if (slotCtx < 16384 && !this.warnedSmallSlot) {
       this.warnedSmallSlot = true;
@@ -841,6 +885,7 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
       model: model.id,
       slotContext: slotCtx,
       estimatedPromptTokens,
+      ...(countedPromptTokens !== undefined ? { promptTokenSource: "server-tokenizer" as const } : {}),
       messages: converted,
       tools: tools ?? [],
       promptReplacements: replacementStats,
@@ -854,9 +899,12 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
       speculativeMode: remote ? undefined : state.loadSettings.speculativeMode || "off",
       contextBreakdown,
     });
+    if (countedPromptTokens !== undefined) {
+      this.perf.updateContext({ promptTokens: countedPromptTokens, contextLimit: slotCtx, estimated: false });
+    }
     let lastServerStats: StatsEvent | undefined;
     let lastCompletionTokens = 0;
-    let lastPromptTokens: number | undefined;
+    let lastPromptTokens: number | undefined = countedPromptTokens;
     let lastTickAt = 0;
     let emittedTextChars = 0;
     let hasVisibleText = false;
@@ -1044,14 +1092,46 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
   }
 
   async provideTokenCount(
-    _model: vscode.LanguageModelChatInformation,
+    model: vscode.LanguageModelChatInformation,
     text: string | vscode.LanguageModelChatRequestMessage,
-    _token: vscode.CancellationToken
+    token: vscode.CancellationToken
   ): Promise<number> {
-    if (typeof text === "string") {
-      return Math.ceil(text.length / 4);
+    const messages = typeof text === "string" ? undefined : toOpenAiMessages([text]);
+    const chars = typeof text === "string" ? text.length : messageContentChars(messages!);
+    const estimate = Math.ceil(chars / 4);
+    if (chars < 4096 || token.isCancellationRequested
+      || (this.store.isRemote() && this.remoteInfo()?.isLlamaCpp !== true)
+      || (messages && messagesHaveImageParts(messages))) return estimate;
+    const endpoint = this.store.getEndpoint();
+    const key = `${endpoint}|${model.id}|${typeof text === "string" ? "text" : "message"}|${createHash("sha256").update(typeof text === "string" ? text : JSON.stringify(messages)).digest("hex")}`;
+    const hit = this.tokenCounts.get(key);
+    if (hit && Date.now() - hit.at < 5000) {
+      this.tokenCounts.delete(key);
+      this.tokenCounts.set(key, hit);
+      return hit.value;
     }
-    // Same serialization the request uses, so tool calls and tool results count.
-    return Math.ceil(messageContentChars(toOpenAiMessages([text])) / 4);
+    const value = (async () => {
+      if (messages) {
+        const profile = this.modeSetFor(model.id, undefined);
+        return await this.countLargePrompt({ messages,
+          chat_template_kwargs: profile ? resolveModeParams(profile, undefined).params.chat_template_kwargs : undefined }, token) ?? estimate;
+      }
+      const abort = new AbortController();
+      const sub = token.onCancellationRequested(() => abort.abort());
+      try {
+        const result = await serverJson<{ tokens?: unknown }>(joinServerUrl(endpoint, "/tokenize"), {
+          method: "POST", body: JSON.stringify({ content: text, add_special: false, parse_special: true }),
+          timeoutMs: 5000, signal: abort.signal,
+        });
+        return Array.isArray(result?.tokens) ? result.tokens.length : estimate;
+      } catch {
+        return estimate;
+      } finally {
+        sub.dispose();
+      }
+    })();
+    this.tokenCounts.set(key, { at: Date.now(), value });
+    while (this.tokenCounts.size > 128) this.tokenCounts.delete(this.tokenCounts.keys().next().value!);
+    return value;
   }
 }

@@ -22,6 +22,7 @@ presets are likewise scenario recipes, not an effort ladder.
 | DeepSeek V4.1 Flash / 1017 | Max, **High**, Low, No Think | Temperature 1, top-p 1; numeric budgets 100/75/50 |
 | Tiel-Coder 35B-A3B | **Think**, No Think | Coding recipe .6/.95/20; off follows the Qwen base's .7/.8/20, presence 1.5 |
 | MiniCPM5 2B | **Think**, No Think | 1/.95, min-p 0; no top-k filtering |
+| FrogNano 4B 2609 | **Think**, No Think | Author temperature .6, repeat penalty 1; other sampler filters neutralized |
 | Nanbeige4.3 33B | **Agent**, Chat, No Think | Agent: 1/.95, preserve thinking. Chat/off: .6/.95, clear earlier thinking. XML tools; no top-k filtering |
 | Mellum2.1 12B-A2.5B Thinking | **Think** only | Author's quickstart recipe .6/.95/20 |
 | MiMo V2.6 Distill Qwen 9B | **Think** only | .6/.95/20; no invented effort ladder |
@@ -94,6 +95,13 @@ and unverified named variants are excluded. Architecture fallback is used only
 where it identifies an established profile; Spark's shared architecture cannot
 distinguish X2.5 from X2.6, so a versioned name takes precedence.
 
+Publisher prefixes such as `unsloth_` are accepted without changing numeric
+versions written with underscores. MiniCPM5's `MiniCPM5 2.6B` GGUF metadata name
+selects the published MiniCPM5 2B recipe. FrogNano matches only the verified
+`FrogNano-4B-2609` checkpoint; it uses its inherited Qwen3.5 thinking switch.
+An explicit Base/draft identity prevents a generic remote alias from assigning
+the main chat model's profile.
+
 Remote connections use the same alias → filename → model label → served ID
 lookup in chat and the sidebar, including Windows paths when the extension runs
 on another OS. Local GGUF selections do not determine a remote model's profile.
@@ -127,6 +135,10 @@ presets therefore apply to local and remote servers, including No Think (`none`)
 The backend still receives Chat Completions with template controls nested in
 `chat_template_kwargs`; it does not need a Responses endpoint. Missing effort
 selections use the advertised profile default.
+
+Public Language Model API calls may pass `modelOptions.reasoningEffort`.
+That explicit request choice takes precedence over the editor-injected
+`modelConfiguration` default. SDK/schema selections remain the fallback.
 
 Nanbeige4.3, Flint, and DeepSeek reasoning is streamed as separate thinking parts on newer
 hosts and sent back as assistant `reasoning_content` on later tool turns.
@@ -170,6 +182,7 @@ model repositories. Each entry can be inspected at
 
 Additional author cards:
 
+- [FrogNano 4B 2609, pinned](https://huggingface.co/microsoft/FrogNano-4B-2609/blob/b90468c11a913c1916b4542b4b7a530ec42024a4/README.md): evaluation temperature .6 and repeat penalty 1; inherited Qwen3.5 template verified in both thinking modes.
 - [Nanbeige4.3 33B, pinned](https://huggingface.co/Nanbeige/Nanbeige4.3-33B/blob/c1093c501cc6460427c0ac634db7223d0450c0ee/README.md): agent/chat samplers, binary thinking control, reasoning-history policy, XML tools, and 512K model context.
 - [Bonsai 2 27B, pinned](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/blob/b072e1d3b35a0a630cece372c2127528e0994386/README.md): sampler and supported efforts; the repository publishes GGUFs, so template verification uses its Qwen3.8 base rather than claiming a direct Bonsai template render.
 - [Muse Glimmer, pinned](https://huggingface.co/meta-models/Muse-Glimmer-30B-GGUF/blob/b44f1072cf75e918a1b82a3a17b45c4389b076e7/README.md): existing reasoning_strength controls and sampler; no standalone author template was available for this check.
