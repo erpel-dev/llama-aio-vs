@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { denseCaps } from "./helpers";
-import { applyModeToRequestBody, buildModeConfigurationSchema, resolveModeParams, resolveModelModes, resolveRemoteModelModes } from "../src/modelModes";
+import { applyModeToRequestBody, buildModeConfigurationSchema, resolveModeParams, resolveModelModes, resolveLocalModelModes, resolveRemoteModelModes } from "../src/modelModes";
 
 // Contract expectations taken from the author recipes linked in docs/model-profiles.md.
 const cases: Array<[string, string, string, string[]]> = [
@@ -24,6 +24,7 @@ const cases: Array<[string, string, string, string[]]> = [
   ["XHToken/Spark-X2.5-1.7B-GGUF", "Spark X2.5", "Think", ["Think", "No Think"]],
   ["Spark-X2.5-4B-Q4_K_M.gguf", "Spark X2.5", "Think", ["Think", "No Think"]],
   ["Spark-X2.6-4B-Q4_K_M.gguf", "Spark X2.6", "Think (High)", ["Think (High)", "Think (Low)", "No Think"]],
+  ["XHToken/Spark-X2.6-1.7B-GGUF", "Spark X2.6", "Think (High)", ["Think (High)", "Think (Low)", "No Think"]],
   ["openai/gpt-oss-20b", "GPT-OSS", "Think (Medium)", ["Think (High)", "Think (Medium)", "Think (Low)"]],
   ["gpt-oss-120b-MXFP4.gguf", "GPT-OSS", "Think (Medium)", ["Think (High)", "Think (Medium)", "Think (Low)"]],
   ["GLM-5.3-Flash-Q4_K_M.gguf", "GLM-5.3-Flash", "Think (Max)", ["Think (Max)", "Think (High)", "Think (Low)"]],
@@ -37,6 +38,10 @@ const cases: Array<[string, string, string, string[]]> = [
   ["LFM2.5-1.2B-Instruct-Q4_0.gguf", "LFM2.5 Instruct", "No Think", ["No Think"]],
   ["LFM2.5-2.6B-Q4_0.gguf", "LFM2.5 2.6B", "Think", ["Think"]],
   ["LFM2.5-24B-A2B-GGUF", "LFM2.5 24B-A2B", "Think", ["Think"]],
+  ["LiquidAI/LFM3-1.7B", "LFM3 1.7B", "Think (General)", ["Think (General)", "Think (Math / STEM)", "No Think"]],
+  ["LFM3-1.7B-QAD-Q4_0.gguf", "LFM3 1.7B", "Think (General)", ["Think (General)", "Think (Math / STEM)", "No Think"]],
+  ["LiquidAI/LFM3-1.7B-NVFP4", "LFM3 1.7B", "Think (General)", ["Think (General)", "Think (Math / STEM)", "No Think"]],
+  ["LiquidAI/LFM3-1.7B-MLX-4bit", "LFM3 1.7B", "Think (General)", ["Think (General)", "Think (Math / STEM)", "No Think"]],
   ["Ternary-Bonsai-2-27B-PQ2_0.gguf", "Ternary Bonsai 2 27B", "Think (XHigh)", ["Think (XHigh)", "Think (Medium)", "No Think"]],
   ["Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf", "Qwen3-Coder Instruct", "No Think", ["No Think"]],
   ["Qwen3-Coder-480B-A35B-Instruct", "Qwen3-Coder Instruct", "No Think", ["No Think"]],
@@ -133,6 +138,32 @@ describe("model-specific sampler and reasoning differences", () => {
     assert.equal(params("Spark-X2.6-4B", "medium").chat_template_kwargs?.reasoning_effort, "high");
     assert.equal(params("Spark-X2.5-4B").chat_template_kwargs?.reasoning_effort, undefined);
     assert.equal(resolveModelModes(denseCaps({ architecture: "spark2_5", path: "/m/Spark-X2.6-4B.gguf" }))?.familyLabel, "Spark X2.6");
+    for (const mode of ["high", "low", "none"]) {
+      assert.deepEqual(params("XHToken/Spark-X2.6-1.7B", mode), params("Spark-X2.6-4B", mode));
+    }
+    assert.equal(resolveModelModes(undefined, "Spark-X2.6-1.7B")?.preserveReasoning, true);
+  });
+
+  it("uses LFM3's general/STEM recipes, binary thinking and current-turn reasoning policy", () => {
+    const general = params("LFM3-1.7B", "high");
+    const math = params("LFM3-1.7B", "medium");
+    const off = params("LFM3-1.7B", "none");
+    assert.deepEqual([general.temperature, general.top_p, general.top_k, general.repetition_penalty], [0.1, 1, 50, 1.1]);
+    assert.deepEqual([math.temperature, math.top_p, math.top_k, math.repetition_penalty], [1, 0.95, 20, 1.1]);
+    assert.deepEqual(off, { ...general, chat_template_kwargs: { enable_thinking: false, preserve_thinking: false } });
+    assert.equal(resolveModelModes(undefined, "LFM3-1.7B")?.preserveReasoning, true);
+    for (const p of [general, math, off]) {
+      assert.equal(p.min_p, 0);
+      assert.equal(p.presence_penalty, 0);
+      assert.equal(p.frequency_penalty, 0);
+      assert.equal(p.chat_template_kwargs?.preserve_thinking, false);
+      assert.equal("reasoning_effort" in (p.chat_template_kwargs || {}), false);
+    }
+    assert.equal(resolveModelModes(denseCaps({ architecture: "lfm3", name: "LFM3 1.7B", path: "/m/renamed.gguf" }))?.familyLabel, "LFM3 1.7B");
+  });
+
+  it("retains MiniCPM5 reasoning separately across tool turns", () => {
+    assert.equal(resolveModelModes(undefined, "MiniCPM5-2B")?.preserveReasoning, true);
   });
 
   it("uses the actual GPT-OSS and GLM effort vocabularies", () => {
@@ -170,6 +201,13 @@ describe("model-specific sampler and reasoning differences", () => {
 });
 
 describe("profile identity boundaries", () => {
+  it("keeps local pending selections separate from loaded model recipes", () => {
+    const pending = denseCaps({ path: "/m/Spark-X2.6-1.7B.gguf", name: "Dense F32", architecture: "spark2_5" });
+    assert.equal(resolveLocalModelModes(pending, "/m/LFM3-1.7B.gguf", "/m/LFM3-1.7B.gguf")?.familyLabel, "LFM3 1.7B");
+    assert.equal(resolveLocalModelModes(pending, "opaque", "/m/unknown.gguf"), undefined);
+    assert.equal(resolveLocalModelModes(pending, "LFM3-1.7B", "/m/LFM3-1.7B-Base.gguf"), undefined);
+    assert.equal(resolveLocalModelModes(pending, pending.path)?.familyLabel, "Spark X2.6");
+  });
   for (const [id, family] of cases) {
     const file = `publisher_${id.split("/").pop()}-Q4_K_M.gguf`;
     it(`recognizes publisher-prefixed ${id} across local and remote identities`, () => {
@@ -201,6 +239,7 @@ describe("profile identity boundaries", () => {
     assert.equal(resolveModelModes(undefined, "Swift-1.5-Qwen3.8-27B-GSQ-RCO-GGUF")?.familyLabel, "Qwen3.8");
   });
   for (const id of ["Spark-X2.7-4B", "LFM2.5-7B", "Ornith-1.5-31B", "Ornith-2.0-9B", "GLM-4.7-Flash",
+    "LFM3-1.7B-Base", "LFM3-1.7B-Unverified", "LFM3-7B", "LFM3-VL-2B", "LFM3-Audio-2B", "LFM3-Omni-2B",
     "Nanbeige4.3-33B-Base-Q4_K_M.gguf", "Nanbeige4.2-3B", "Nanbeige4.3-3B", "Nanbeige4.4-33B",
     "Nanbeige4.3-33B0", "Nanbeige4.3-33B-Unverified", "mtp-Nanbeige4.3-33B.gguf", "Nanbeige4.3-33B-DSpark.gguf",
     "MiniCPM5-2B-DSpark-GGUF", "Mellum2.1-12B-A2.5B-Base", "DeepSeek-V4.1-Flash-1018", "GLM-5.4",
@@ -217,6 +256,10 @@ describe("profile identity boundaries", () => {
     assert.equal(resolveModelModes(denseCaps({ architecture: "qwen3", path: "/models/Qwen3-Coder-Unknown.gguf" })), undefined);
     assert.equal(resolveModelModes(denseCaps({ architecture: "gemma4", path: "/models/Ornith-1.5-31B.gguf" })), undefined);
     assert.equal(resolveModelModes(denseCaps({ architecture: "spark2_5", path: "/models/Spark-X2.7-4B.gguf" })), undefined);
+    assert.equal(resolveModelModes(denseCaps({ architecture: "spark2_5", name: "Dense F32", path: "/models/renamed.gguf" })), undefined);
+    assert.equal(resolveRemoteModelModes({ modelId: "opaque", modelName: "Dense F32" }), undefined);
+    assert.equal(resolveModelModes(denseCaps({ architecture: "lfm3", path: "/models/renamed.gguf" })), undefined);
+    assert.equal(resolveModelModes(denseCaps({ architecture: "qwen35", path: "/models/LFM3-Omni-2B.gguf" })), undefined);
     assert.equal(resolveModelModes(denseCaps({ architecture: "gemma4", path: "/models/gemma-4-12B-it-Q4_0-MTP.gguf" })), undefined);
     assert.equal(resolveModelModes(denseCaps({ architecture: "gemma4", path: "/models/gemma-4-12B-it-mmproj.gguf" })), undefined);
   });
