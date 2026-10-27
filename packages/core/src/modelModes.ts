@@ -257,6 +257,7 @@ const GLM53_MODES = effortModes("GLM-5.3-Flash", ["max", "high", "low"], "max",
 const GLM53_FULL_MODES: ModelModeSet = { ...GLM53_MODES, familyLabel: "GLM-5.3" };
 
 const MINICPM5_MODES = binaryModes("MiniCPM5 2B", { ...OPEN_SAMPLING, top_p: 0.95 });
+MINICPM5_MODES.preserveReasoning = true;
 // FrogNano's author evaluates at temperature 0.6 and repeat penalty 1.
 // Its inherited Qwen3.5 template supports the binary thinking switch.
 const FROGNANO_MODES = binaryModes("FrogNano 4B 2609", { ...OPEN_SAMPLING, temperature: 0.6 });

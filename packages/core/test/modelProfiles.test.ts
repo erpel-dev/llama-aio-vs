@@ -162,6 +162,10 @@ describe("model-specific sampler and reasoning differences", () => {
     assert.equal(resolveModelModes(denseCaps({ architecture: "lfm3", name: "LFM3 1.7B", path: "/m/renamed.gguf" }))?.familyLabel, "LFM3 1.7B");
   });
 
+  it("retains MiniCPM5 reasoning separately across tool turns", () => {
+    assert.equal(resolveModelModes(undefined, "MiniCPM5-2B")?.preserveReasoning, true);
+  });
+
   it("uses the actual GPT-OSS and GLM effort vocabularies", () => {
     assert.deepEqual(params("gpt-oss-20b", "low").chat_template_kwargs, { reasoning_effort: "low" });
     assert.deepEqual(params("GLM-5.3-Flash", "max").chat_template_kwargs, { reasoning_effort: "max", clear_thinking: true });

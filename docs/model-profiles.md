@@ -164,7 +164,7 @@ Public Language Model API calls may pass `modelOptions.reasoningEffort`.
 That explicit request choice takes precedence over the editor-injected
 `modelConfiguration` default. SDK/schema selections remain the fallback.
 
-LFM3, Spark X2.6, Nanbeige4.3, Flint, and DeepSeek reasoning is streamed as separate thinking parts on newer
+LFM3, MiniCPM5, Spark X2.6, Nanbeige4.3, Flint, and DeepSeek reasoning is streamed as separate thinking parts on newer
 hosts and sent back as assistant `reasoning_content` on later tool turns.
 It is counted in context estimates and kept out of the final answer text.
 Older hosts without thinking-part support keep the existing text fallback;
@@ -241,7 +241,12 @@ instruction also elicited extra text. These are observed model/runtime quality
 limits, not a claim of comprehensive answer accuracy. Audio/VL/Omni weights,
 GPU throughput, and a signed-in Copilot harness were not tested in this check.
 MiniCPM5 2B Q4_K_M also passes CPU inference on b11729 with thinking on/off and
-a native structured tool call. Nanbeige4.3's pinned template passes native b11729
+a native structured tool call. A further VS Code Language Model API check on
+b11938 switched between LFM2.5 230M Q8_0, MiniCPM5 2B Q4_K_M, and Spark X2.6
+4B Q4_K_M, confirmed their displayed profiles and short replies, and exercised
+MiniCPM5 thinking and a complete structured tool-result turn. Model reloads
+took roughly 3–5 seconds on the two-core CPU test host; those figures are not
+GPU benchmarks. Nanbeige4.3's pinned template passes native b11729
 `/apply-template` checks for all three presets, XML tool history, and reasoning
 retention (an existing MiniCPM model supplies server startup; no Nanbeige weight
 inference is claimed). Other profiles have contract/request/template coverage, not a claim that every
