@@ -23,7 +23,7 @@ import {
 import { LlamaInstaller, UiBackend } from "@llama-aio/core";
 import { clampLoadSettingsToModel, computeMemoryView, diffLoadSettings, fittingContextLength, memoryEstimateInputs, mmprojFileSize, resolveDraftCapabilities, shortGpuName, type SettingChange } from "@llama-aio/core";
 import { NO_SERVER_FEATURES, supportedPerformanceSettings, type LlamaServerFeatures } from "@llama-aio/core";
-import { resolveModelModes, resolveRemoteModelModes } from "@llama-aio/core";
+import { resolveLocalModelModes, resolveModelModes, resolveRemoteModelModes } from "@llama-aio/core";
 import {
   buildLibraryGroupsAsync,
   canonicalModelPath,
@@ -1164,7 +1164,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         memoryView: memoryView ?? null,
         modeSampling: remoteMode
           ? describeModeSampling(resolveRemoteModelModes(this.processManager.remote.current()))
-          : describeModeSampling(resolveModelModes(caps, state.selectedModelPath)),
+          : describeModeSampling(resolveLocalModelModes(caps, launched?.modelPath || state.selectedModelPath, launched?.modelPath)),
         memInputs: memoryEstimateInputs(
           caps,
           draftCaps,

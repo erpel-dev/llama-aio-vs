@@ -179,6 +179,14 @@ def main():
                 assert "<parameter=path>" in outputs[mode, "tools"]
                 assert "<tool_response>" in outputs[mode, "tools"]
                 assert outputs[mode, "plain"].rstrip().endswith("</think>" if mode == "No Think" else "<think>")
+        if source["id"] == "LiquidAI/LFM3-1.7B":
+            for mode in profile["modes"]:
+                assert "I need the file." not in outputs[mode, "tools"]
+                assert "<function=read_file>" in outputs[mode, "tools"]
+                assert "<parameter=path>" in outputs[mode, "tools"]
+                assert outputs[mode, "plain"].rstrip().endswith("<think></think>" if mode == "No Think" else "<think>")
+            context.update(messages=history[:-1], **profile["modes"]["Think (General)"]["chat_template_kwargs"])
+            assert "I need the file." in compiled.render(**context), "current tool-turn reasoning must survive"
         digest = hashlib.sha256(template.encode()).hexdigest()[:12]
         print(f'{source["id"]}@{source["revision"][:12]} template={digest}: {len(modes)} modes OK', flush=True)
     print(f"PASS: {count} template renders across {len(sources)} checkpoints")

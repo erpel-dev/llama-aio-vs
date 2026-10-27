@@ -161,5 +161,13 @@
   {
     "id": "microsoft/FrogNano-4B-2609",
     "revision": "b90468c11a913c1916b4542b4b7a530ec42024a4"
+  },
+  {
+    "id": "LiquidAI/LFM3-1.7B",
+    "revision": "40ebe0aa6662c9d40389c2f5d565b6a2c6aebacd"
+  },
+  {
+    "id": "XHToken/Spark-X2.6-1.7B",
+    "revision": "f18c032c7675f807c0fdffe281dbe124edba2605"
   }
 ]

@@ -302,6 +302,18 @@ describe("SettingsViewProvider memory path", () => {
     assert.equal(t.posted.find(m => m.type === "state").payload.modeSampling, null);
   });
 
+  it("shows the loaded LFM3 recipe while Spark is pending reload", async () => {
+    const t = setup();
+    t.launched.modelPath = "/models/LFM3-1.7B.gguf";
+    const state = t.getState();
+    state.selectedModelPath = "/models/Spark-X2.6-1.7B.gguf";
+    state.modelCapabilities = { ...caps, path: state.selectedModelPath, name: "Dense F32", architecture: "spark2_5" };
+    await t.send({ type: "ready" });
+    const mode = t.posted.find(m => m.type === "state").payload.modeSampling;
+    assert.equal(mode.familyLabel, "LFM3 1.7B");
+    assert.equal(mode.defaultMode, "Think (General)");
+  });
+
   it("state push carries core's verdict for the saved settings", async () => {
     const t = setup();
     await t.send({ type: "ready" });

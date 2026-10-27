@@ -15,7 +15,7 @@ presets are likewise scenario recipes, not an effort ladder.
 | Checkpoint family | Available modes (default in bold) | Sampling / distinctions |
 | --- | --- | --- |
 | Spark X2.5 | **Think**, No Think | Temperature 1, top-p .95, no top-k filtering |
-| Spark X2.6 | **High**, Low, No Think | Same sampler; only high/low reasoning efforts are valid |
+| Spark X2.6 1.7B / 4B | **High**, Low, No Think | Same sampler; only high/low reasoning efforts are valid |
 | GPT-OSS 20B / 120B | High, **Medium**, Low | Temperature 1, unfiltered top-p/k; requires Harmony support |
 | GLM-5.3-Flash | **Max**, High, Low | Temperature 1, top-p .95; clear old thinking on each turn |
 | GLM-5.3 full | **Max**, High, Low | Same controls and sampler as Flash; requires a compatible large-model server |
@@ -35,6 +35,7 @@ presets are likewise scenario recipes, not an effort ladder.
 | LFM2.5 230M / 1.2B Instruct | **No Think** only | Temperature .1, top-k 50, repeat penalty 1.05 |
 | LFM2.5 2.6B | **Think** only | Temperature .1, top-k 50, repeat penalty 1.1 |
 | LFM2.5 24B-A2B | **Think** only | Temperature .1, top-k 50, repeat penalty 1.05 |
+| LFM3 1.7B | **General**, Math / STEM, No Think | General/off: .1/1/50; STEM: 1/.95/20. Repeat penalty 1.1; clear reasoning from earlier turns |
 | Ternary Bonsai 2 27B | **XHigh**, Medium, No Think | Thinking min-p .05; no Low mode; requires Prism's llama.cpp fork |
 | Qwen3 original | **Think**, No Think | Think: .6/.95/20; off: .7/.8/20; presence penalty 0 |
 | Qwen2.5 0.5B Instruct (legacy Strata starter) | **No Think** only | .7/.8/20, repeat penalty 1.1 |
@@ -79,6 +80,26 @@ Copilot SDK/CLI effort values `high`, `medium`, and `none` select Nanbeige Agent
 Chat, and No Think respectively; these values select presets rather than setting
 an unsupported `reasoning_effort` template parameter.
 
+LFM3's `high`, `medium`, and `none` likewise select General, Math / STEM, and
+No Think recipes. They do not set a reasoning-depth parameter. General follows
+the author's low-temperature chat/tool recipe; Math / STEM changes temperature,
+top-p, and top-k while retaining the generation config's repeat penalty 1.1.
+No Think uses General sampling with `enable_thinking: false`; the author warns
+that thinking-off behavior can be inconsistent on reasoning-heavy tasks.
+Earlier-turn reasoning is cleared while the current tool-turn reasoning is
+kept. Only the verified text `LFM3-1.7B` checkpoint and its GGUF/QAD quants match;
+Base, VL, Audio, Omni, and unknown sizes do not inherit this profile.
+
+LFM3 needs a llama.cpp build containing [the LFM3 support commit](https://github.com/ggml-org/llama.cpp/commit/19cce6919992fdffd92e0ac152caaf1e2b8f254e).
+The latest downloadable build checked here, b11936, predates that commit and
+fails with `unknown model architecture: lfm3`. Installing this profile does not
+upgrade the engine or add audio/video support. Spark X2.6 1.7B uses the existing
+Spark X2.6 recipe; its pinned template accepts High, Low, and No Think.
+Its published Q4_K_M GGUF has the generic metadata name `Dense F32`, so keep a
+versioned filename or configure a canonical served alias such as
+`Spark-X2.6-1.7B`. The shared `spark2_5` architecture cannot distinguish X2.5
+from X2.6 and no longer silently assigns the X2.5 profile to renamed files.
+
 DeepSeek requires a V4.1-compatible engine that forwards `enable_thinking` and
 numeric `reasoning_effort` from `chat_template_kwargs` into its template or
 reference encoder and parses DSML tool calls into structured OpenAI tool calls.
@@ -105,6 +126,9 @@ the main chat model's profile.
 Remote connections use the same alias → filename → model label → served ID
 lookup in chat and the sidebar, including Windows paths when the extension runs
 on another OS. Local GGUF selections do not determine a remote model's profile.
+Selecting another local model also keeps the running model's recipe advertised
+in the chat picker and sidebar until the server is reloaded. The existing
+reload-required guard blocks chat requests while load changes are pending.
 The sidebar shows the default preset; each chat request uses the choice made
 in its model picker. Profile-owned sampling controls are hidden because the
 preset overrides them. Main models advertising embedded MTP heads remain valid;
@@ -140,7 +164,7 @@ Public Language Model API calls may pass `modelOptions.reasoningEffort`.
 That explicit request choice takes precedence over the editor-injected
 `modelConfiguration` default. SDK/schema selections remain the fallback.
 
-Nanbeige4.3, Flint, and DeepSeek reasoning is streamed as separate thinking parts on newer
+LFM3, Spark X2.6, Nanbeige4.3, Flint, and DeepSeek reasoning is streamed as separate thinking parts on newer
 hosts and sent back as assistant `reasoning_content` on later tool turns.
 It is counted in context estimates and kept out of the final answer text.
 Older hosts without thinking-part support keep the existing text fallback;
@@ -182,6 +206,8 @@ model repositories. Each entry can be inspected at
 
 Additional author cards:
 
+- [LFM3 1.7B, pinned](https://huggingface.co/LiquidAI/LFM3-1.7B/blob/40ebe0aa6662c9d40389c2f5d565b6a2c6aebacd/README.md): General/STEM samplers, binary thinking, reasoning-history policy, and XML tools.
+- [Spark X2.6 1.7B, pinned](https://huggingface.co/XHToken/Spark-X2.6-1.7B/blob/f18c032c7675f807c0fdffe281dbe124edba2605/README.md): sampler and runtime instructions; the pinned template verifies its High/Low reasoning controls.
 - [FrogNano 4B 2609, pinned](https://huggingface.co/microsoft/FrogNano-4B-2609/blob/b90468c11a913c1916b4542b4b7a530ec42024a4/README.md): evaluation temperature .6 and repeat penalty 1; inherited Qwen3.5 template verified in both thinking modes.
 - [Nanbeige4.3 33B, pinned](https://huggingface.co/Nanbeige/Nanbeige4.3-33B/blob/c1093c501cc6460427c0ac634db7223d0450c0ee/README.md): agent/chat samplers, binary thinking control, reasoning-history policy, XML tools, and 512K model context.
 - [Bonsai 2 27B, pinned](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/blob/b072e1d3b35a0a630cece372c2127528e0994386/README.md): sampler and supported efforts; the repository publishes GGUFs, so template verification uses its Qwen3.8 base rather than claiming a direct Bonsai template render.
@@ -203,6 +229,17 @@ python3 -m venv /tmp/llama-aio-template-check
 Validation also includes real CPU inference with Spark X2.6 4B Q4_K_M on
 llama.cpp b11729: High, Low, and No Think, with plain chat and tool history.
 These are short output-budget smoke checks, not quality or throughput benchmarks.
+Spark X2.6 1.7B Q4_K_M also passes all three modes, Chinese output, structured
+tools, tool-result history, and cancellation/recovery through the real VS Code
+Language Model API on b11936. LFM3 1.7B Q4_K_M passes General, Math / STEM,
+No Think, structured tools, and thinking/tool-result history using a source
+build at `19cce6919` (reported b11938), including managed-local and remote
+connections. One No Think arithmetic prompt (`What is 2+2? Answer with one
+number.`) returned `2`; it reproduced directly against the native server with
+prompt caching disabled, while thinking returned `4`. A Chinese exact-output
+instruction also elicited extra text. These are observed model/runtime quality
+limits, not a claim of comprehensive answer accuracy. Audio/VL/Omni weights,
+GPU throughput, and a signed-in Copilot harness were not tested in this check.
 MiniCPM5 2B Q4_K_M also passes CPU inference on b11729 with thinking on/off and
 a native structured tool call. Nanbeige4.3's pinned template passes native b11729
 `/apply-template` checks for all three presets, XML tool history, and reasoning

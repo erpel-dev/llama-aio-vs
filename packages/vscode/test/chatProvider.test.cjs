@@ -169,6 +169,7 @@ function setup({ guard = false, remote = false, remoteInfo = {} } = {}) {
   const pm = {
     isHttpReady: async () => true,
     getStatus: () => ({ starting: false, configDirty: false }),
+    getLaunchedConfig: () => undefined,
     remote: {
       current: () => remote ? { state: "ready", ...remoteInfo } : undefined,
       refresh: async () => ({ state: "ready", ...remoteInfo }),
@@ -639,6 +640,23 @@ describe("LlamaAioChatProvider requests", () => {
     });
   }
 
+  it("uses the loaded LFM3 recipe while a Spark selection is pending reload", async () => {
+    servedModelId = "/models/LFM3-1.7B.gguf";
+    servedProps = { model_path: servedModelId };
+    const { provider, state, pm } = setup();
+    state.modelCapabilities = { name: "Dense F32", architecture: "spark2_5", path: "/models/Spark-X2.6-1.7B.gguf" };
+    state.selectedModelPath = state.modelCapabilities.path;
+    pm.getLaunchedConfig = () => ({ modelPath: servedModelId });
+    const [model] = await provider.provideLanguageModelChatInformation({}, cancelToken().token);
+    assert.deepEqual(model.configurationSchema.properties.reasoningEffort.enum, ["high", "medium", "none"]);
+    await provider.provideLanguageModelChatResponse(model, [msg(Role.User, new TextPart("hello"))],
+      { modelOptions: { reasoningEffort: "medium" } }, { report() {} }, cancelToken().token);
+    assert.equal(lastBody.temperature, 1);
+    assert.equal(lastBody.top_k, 20);
+    assert.equal(lastBody.repeat_penalty, 1.1);
+    assert.deepEqual(lastBody.chat_template_kwargs, { enable_thinking: true, preserve_thinking: false });
+  });
+
   for (const [label, efforts, sampling, kwargs] of [
     ["MiniCPM5-2B", ["high", "none"], [1, 0.95, -1, 1],
       [{ enable_thinking: true }, { enable_thinking: false }]],
@@ -651,6 +669,8 @@ describe("LlamaAioChatProvider requests", () => {
     ["Spark-X2.5-4B", ["high", "none"], [1, 0.95, -1, 1],
       [{ enable_thinking: true }, { enable_thinking: false }]],
     ["Spark-X2.6-4B", ["high", "low", "none"], [1, 0.95, -1, 1],
+      [{ enable_thinking: true, reasoning_effort: "high" }, { enable_thinking: true, reasoning_effort: "low" }, { enable_thinking: false }]],
+    ["Spark-X2.6-1.7B", ["high", "low", "none"], [1, 0.95, -1, 1],
       [{ enable_thinking: true, reasoning_effort: "high" }, { enable_thinking: true, reasoning_effort: "low" }, { enable_thinking: false }]],
     ["gpt-oss-20b", ["high", "medium", "low"], [1, 1, -1, 1],
       [{ reasoning_effort: "high" }, { reasoning_effort: "medium" }, { reasoning_effort: "low" }]],
@@ -694,6 +714,9 @@ describe("LlamaAioChatProvider requests", () => {
   }
 
   for (const [label, effort, temperature, topP, topK, presence, minP, kwargs] of [
+    ["LFM3-1.7B", "high", 0.1, 1, 50, 0, 0, { enable_thinking: true, preserve_thinking: false }],
+    ["LFM3-1.7B", "medium", 1, 0.95, 20, 0, 0, { enable_thinking: true, preserve_thinking: false }],
+    ["LFM3-1.7B", "none", 0.1, 1, 50, 0, 0, { enable_thinking: false, preserve_thinking: false }],
     ["Tiel-Coder-35B-A3B-MTP-UD-Q4_K_XL", "high", 0.6, 0.95, 20, 0, 0, { enable_thinking: true }],
     ["Tiel-Coder-35B-A3B-MTP-UD-Q4_K_XL", "none", 0.7, 0.8, 20, 1.5, 0, { enable_thinking: false }],
     ["Underdog-Saluki-27B-1.0", "high", 0.6, 0.95, 20, 0, 0, { enable_thinking: true }],
@@ -740,7 +763,7 @@ describe("LlamaAioChatProvider requests", () => {
   }
 
   for (const remote of [false, true]) {
-    for (const label of ["Nanbeige4.3-33B", "Flint", "DeepSeek-V4.1-Flash-1017"]) {
+    for (const label of ["Nanbeige4.3-33B", "Flint", "DeepSeek-V4.1-Flash-1017", "LFM3-1.7B", "Spark-X2.6-1.7B"]) {
       it(`round-trips ${label} SDK thinking parts separately from text across tool turns (remote=${remote})`, async () => {
         servedModelId = remote ? "opaque-instance" : label;
         servedMetadata = { owned_by: "strata", meta: { label } };

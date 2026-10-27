@@ -29,6 +29,7 @@ import {
   remoteModelIdentity,
   remoteStateUsable,
   resolveModelModes,
+  resolveLocalModelModes,
   resolveRemoteModelModes,
   resolveModeParams,
   rewriteToolInput,
@@ -578,7 +579,8 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
   private modeSetFor(modelId: string, props: ServerProps | undefined): ModelModeSet | undefined {
     const endpoint = this.store.getEndpoint();
     if (!this.store.isRemote()) {
-      return resolveModelModes(this.store.getState().modelCapabilities, modelId);
+      return resolveLocalModelModes(this.store.getState().modelCapabilities, modelId,
+        props?.model_path || this.processManager.getLaunchedConfig()?.modelPath);
     }
     const remote = this.remoteInfo();
     const cached = this.modelProbe;

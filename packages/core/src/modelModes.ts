@@ -248,6 +248,7 @@ function fixedMode(familyLabel: string, mode: "Think" | "No Think", sampling: Mo
 const SPARK_SAMPLING = { ...OPEN_SAMPLING, top_p: 0.95 };
 const SPARK25_MODES = binaryModes("Spark X2.5", SPARK_SAMPLING);
 const SPARK26_MODES = effortModes("Spark X2.6", ["high", "low"], "high", SPARK_SAMPLING, { enable_thinking: true });
+SPARK26_MODES.preserveReasoning = true;
 SPARK26_MODES.modes["No Think"] = { ...SPARK_SAMPLING, chat_template_kwargs: { enable_thinking: false } };
 
 const GPT_OSS_MODES = effortModes("GPT-OSS", ["high", "medium", "low"], "medium", OPEN_SAMPLING);
@@ -366,6 +367,21 @@ const LFM25_DENSE_MODES = fixedMode("LFM2.5 2.6B", "Think", {
 const LFM25_MOE_MODES = fixedMode("LFM2.5 24B-A2B", "Think", {
   ...OPEN_SAMPLING, temperature: 0.1, top_k: 50, repetition_penalty: 1.05,
 });
+// LFM3's General and Math/STEM settings are recipes, not reasoning depths.
+// Keep the generation config's repeat penalty in both recipes. The template
+// clears old reasoning while retaining the current assistant/tool turn.
+const LFM3_GENERAL_SAMPLING = { ...OPEN_SAMPLING, temperature: 0.1, top_k: 50, repetition_penalty: 1.1 };
+const LFM3_MODES: ModelModeSet = {
+  familyLabel: "LFM3 1.7B", defaultMode: "Think (General)", preserveReasoning: true,
+  modes: {
+    "Think (General)": { ...LFM3_GENERAL_SAMPLING,
+      chat_template_kwargs: { enable_thinking: true, preserve_thinking: false } },
+    "Think (Math / STEM)": { ...LFM3_GENERAL_SAMPLING, temperature: 1, top_p: 0.95, top_k: 20,
+      chat_template_kwargs: { enable_thinking: true, preserve_thinking: false } },
+    "No Think": { ...LFM3_GENERAL_SAMPLING,
+      chat_template_kwargs: { enable_thinking: false, preserve_thinking: false } },
+  },
+};
 const BONSAI2_MODES = effortModes("Ternary Bonsai 2 27B", ["xhigh", "medium"], "xhigh",
   { ...QWEN_THINK_SAMPLING, min_p: 0.05 }, { enable_thinking: true });
 BONSAI2_MODES.modes["No Think"] = QWEN_NO_THINK;
@@ -408,6 +424,7 @@ function namedProfile(h: string): ModelModeSet | undefined {
   if (/\blfm2[._]5[-_ ]230m(?:\b|_)/.test(h)) return LFM25_INSTRUCT_MODES;
   if (/\blfm2[._]5[-_ ]2[._]6b(?:\b|_)/.test(h)) return LFM25_DENSE_MODES;
   if (/\blfm2[._]5[-_ ]24b[-_ ]a2b(?:\b|_)/.test(h)) return LFM25_MOE_MODES;
+  if (/\blfm[-_ ]?3[-_ ]1[._]7b(?=$|[.\s]|[-_](?:gguf|qad|mlx|onnx|(?:ud[-_ ])?(?:iq|q|fp|bf|mxfp|nvfp)[\w.-]*)(?:$|[-_.\s]))/.test(h)) return LFM3_MODES;
   if (/\bqwen3[-_ ]coder[-_ ]next(?:\b|_)/.test(h)) return QWEN_CODER_NEXT_MODES;
   if (/\bqwen3[-_ ]coder[-_ ](?:30b[-_ ]a3b|480b[-_ ]a35b)[-_ ]instruct(?:\b|_)/.test(h)) return QWEN_CODER_MODES;
   if (/\bqwen3[-_ ].*?[-_ ]instruct[-_ ]2507(?:\b|_)/.test(h)) return QWEN3_INSTRUCT_MODES;
@@ -490,12 +507,13 @@ export function resolveModelModes(
   if (named) return named;
   // An explicitly named, unverified variant must not inherit a misleading
   // profile just because its base architecture is supported.
-  if (/\b(?:frognano|spark[-_ ]?x?\d|ornith[-_ ]\d|lfm2[._]\d|nemotron[-_ ]\d|(?:ternary[-_ ])?bonsai[-_ ]?\d|qwen3[-_ ]coder)/.test(h)) return undefined;
+  if (/\b(?:frognano|spark[-_ ]?x?\d|ornith[-_ ]\d|lfm(?:2[._]\d|[-_ ]?3)|nemotron[-_ ]\d|(?:ternary[-_ ])?bonsai[-_ ]?\d|qwen3[-_ ]coder)/.test(h)) return undefined;
   if (/^gpt[-_]oss$/.test(arch)) return GPT_OSS_MODES;
   if (arch === "qwen4exp" || arch === "qwen4_exp") return QWEN4EXP_THINKING_MODES;
   if (/^qwen(?:35|3_5)/.test(arch)) return QWEN35_THINKING_MODES;
   if (/^qwen3(?:moe)?$/.test(arch)) return QWEN3_THINKING_MODES;
-  if (/^spark2_5$/.test(arch) && !/spark[-_ ]?x?2[._]\d/.test(h)) return SPARK25_MODES;
+  // Spark X2.5 and X2.6 share spark2_5; architecture alone cannot select
+  // their different controls (some published GGUF names are just "Dense F32").
   if (isGlimmerFamily(arch)) return GLIMMER_THINKING_MODES;
   if (isGemma4Family(arch)) return GEMMA4_THINKING_MODES;
   return undefined;
@@ -509,6 +527,18 @@ function profileVariantExcluded(h: string): boolean {
     || /(?:^|[-_.\s])dspark\d*(?:$|[-_.\s])/.test(h)
     || /(?:^|[-_.\s])draft(?:$|[-_.\s])/.test(h)
     || /(?:^|[-_.\s])base(?:$|[-_.\s])/.test(h);
+}
+
+/** Pending local selections must not change the running server's request recipe. */
+export function resolveLocalModelModes(
+  caps: ModelCapabilities | undefined,
+  modelId: string | undefined,
+  loadedModelPath?: string
+): ModelModeSet | undefined {
+  if (loadedModelPath && loadedModelPath !== caps?.path) {
+    return resolveRemoteModelModes({ modelPath: loadedModelPath, modelId });
+  }
+  return resolveModelModes(caps, modelId);
 }
 
 /** Shared by remote chat and the sidebar; never consult local model settings. */
@@ -542,6 +572,7 @@ const MODE_EFFORT_VALUES: Record<string, string> = {
   "Think (Medium)": "medium",
   "Think (Low)": "low",
   "Think (General)": "high",
+  "Think (Math / STEM)": "medium",
   "Think (Coding)": "medium",
   Think: "high",
   "No Think": "none",
