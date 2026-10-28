@@ -169,5 +169,37 @@
   {
     "id": "XHToken/Spark-X2.6-1.7B",
     "revision": "f18c032c7675f807c0fdffe281dbe124edba2605"
+  },
+  {
+    "id": "Qwen/Qwen2.5-3B-Instruct",
+    "revision": "aa8e72537993ba99e69dfaafa59ed015b17504d1"
+  },
+  {
+    "id": "LiquidAI/LFM2-350M",
+    "revision": "f37d3f5c8c5484bc01dad379a595cf4c68c4e70e"
+  },
+  {
+    "id": "LiquidAI/LFM2-700M",
+    "revision": "86f49fc9a3800c3a325b7320bde179c318062583"
+  },
+  {
+    "id": "LiquidAI/LFM2-1.2B",
+    "revision": "40f3da0d0164913923aee9462c23077868b816a3"
+  },
+  {
+    "id": "HuggingFaceTB/SmolLM3-3B",
+    "revision": "a07cc9a04f16550a088caea529712d1d335b0ac1"
+  },
+  {
+    "id": "LiquidAI/LFM2-2.6B",
+    "revision": "36ed799f7024ef169ba92ffe184821835e15cc66"
+  },
+  {
+    "id": "Qwen/Qwen2.5-Coder-0.5B-Instruct",
+    "revision": "ea3f2471cf1b1f0db85067f1ef93848e38e88c25"
+  },
+  {
+    "id": "Qwen/Qwen2.5-Coder-1.5B-Instruct",
+    "revision": "2e1fd397ee46e1388853d2af2c993145b0f1098a"
   }
 ]

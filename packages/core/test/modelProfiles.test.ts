@@ -9,9 +9,15 @@ const cases: Array<[string, string, string, string[]]> = [
   ["bartowski/Nanbeige_Nanbeige4.3-33B-GGUF", "Nanbeige4.3 33B", "Think (Agent)", ["Think (Agent)", "Think (Chat)", "No Think"]],
   ["Nanbeige4.3-33B-Q4_K_M.gguf", "Nanbeige4.3 33B", "Think (Agent)", ["Think (Agent)", "Think (Chat)", "No Think"]],
   ["Qwen/Qwen2.5-0.5B-Instruct", "Qwen2.5 0.5B Instruct", "No Think", ["No Think"]],
+  ["Qwen/Qwen2.5-3B-Instruct", "Qwen2.5 3B Instruct", "No Think", ["No Think"]],
+  ["Qwen/Qwen2.5-Coder-0.5B-Instruct", "Qwen2.5 Coder 0.5B", "No Think", ["No Think"]],
+  ["qwen2.5-coder-1.5b-instruct-q4_k_m.gguf", "Qwen2.5 Coder 1.5B", "No Think", ["No Think"]],
   ["Tiel-Coder-35B-A3B-MTP-UD-Q4_K_XL.gguf", "Tiel-Coder 35B-A3B", "Think", ["Think", "No Think"]],
   ["MiniCPM5-2B-GGUF", "MiniCPM5 2B", "Think", ["Think", "No Think"]],
   ["MiniCPM5 2.6B", "MiniCPM5 2B", "Think", ["Think", "No Think"]],
+  ["HuggingFaceTB/SmolLM3-3B", "SmolLM3 3B", "Think", ["Think", "No Think"]],
+  ["SmolLM3-3B-Q4_K_M.gguf", "SmolLM3 3B", "Think", ["Think", "No Think"]],
+  ["SmolLM3-Q4_K_M.gguf", "SmolLM3 3B", "Think", ["Think", "No Think"]],
   ["microsoft/FrogNano-4B-2609", "FrogNano 4B 2609", "Think", ["Think", "No Think"]],
   ["Mellum2.1-12B-A2.5B-Thinking-GGUF", "Mellum 2.1 Thinking", "Think", ["Think"]],
   ["MiMo-V2.6-Distill-Qwen-9B-Q4_K_M.gguf", "MiMo V2.6 Distill Qwen 9B", "Think", ["Think"]],
@@ -35,6 +41,10 @@ const cases: Array<[string, string, string, string[]]> = [
   ["Nemotron-3-Nano-30B-A3B-Q4_K_M.gguf", "Nemotron 3 Nano 30B", "Think (Coding)", ["Think (General)", "Think (Coding)", "No Think"]],
   ["NVIDIA-Nemotron-3.5-Bolt-E4B-4GB", "Nemotron 3.5 Bolt E4B", "Think", ["Think", "No Think"]],
   ["LiquidAI/LFM2.5-230M-GGUF", "LFM2.5 Instruct", "No Think", ["No Think"]],
+  ["LiquidAI/LFM2-350M-GGUF", "LFM2", "No Think", ["No Think"]],
+  ["LFM2-700M-Q4_K_M.gguf", "LFM2", "No Think", ["No Think"]],
+  ["LFM2-1.2B-Q4_K_M.gguf", "LFM2", "No Think", ["No Think"]],
+  ["LFM2-2.6B-Q4_K_M.gguf", "LFM2", "No Think", ["No Think"]],
   ["LFM2.5-1.2B-Instruct-Q4_0.gguf", "LFM2.5 Instruct", "No Think", ["No Think"]],
   ["LFM2.5-2.6B-Q4_0.gguf", "LFM2.5 2.6B", "Think", ["Think"]],
   ["LFM2.5-24B-A2B-GGUF", "LFM2.5 24B-A2B", "Think", ["Think"]],
@@ -94,6 +104,21 @@ function params(id: string, mode?: string) {
 }
 
 describe("model-specific sampler and reasoning differences", () => {
+  it("applies SmolLM3's published settings and thinking toggle", () => {
+    const think = params("SmolLM3-3B", "high"), off = params("SmolLM3-3B", "none");
+    assert.deepEqual([think.temperature, think.top_p, think.top_k], [0.6, 0.95, -1]);
+    assert.deepEqual(think.chat_template_kwargs, { enable_thinking: true });
+    assert.deepEqual(off.chat_template_kwargs, { enable_thinking: false });
+    assert.equal(resolveModelModes(undefined, "SmolLM3-3B-128K"), undefined);
+  });
+  it("uses the published LFM2 sampler only for the verified models", () => {
+    for (const id of ["LFM2-350M", "LFM2-700M", "LFM2-1.2B", "LFM2-2.6B"]) {
+      const p = params(id);
+      assert.deepEqual([p.temperature, p.top_p, p.top_k, p.min_p, p.repetition_penalty], [0.3, 1, -1, 0.15, 1.05]);
+    }
+    assert.equal(resolveModelModes(undefined, "LFM2-1.2B-Base"), undefined);
+    assert.equal(resolveModelModes(undefined, "LFM2-1.2B-Extract"), undefined);
+  });
   it("uses Nanbeige4.3's agent/chat recipes and binary thinking control", () => {
     const set = resolveModelModes(undefined, "Nanbeige/Nanbeige4.3-33B")!;
     assert.equal(set.preserveReasoning, true);
@@ -170,6 +195,16 @@ describe("model-specific sampler and reasoning differences", () => {
     assert.deepEqual(params("gpt-oss-20b", "low").chat_template_kwargs, { reasoning_effort: "low" });
     assert.deepEqual(params("GLM-5.3-Flash", "max").chat_template_kwargs, { reasoning_effort: "max", clear_thinking: true });
     assert.equal(params("gpt-oss-20b", "none").chat_template_kwargs?.reasoning_effort, "medium");
+  });
+
+  it("uses the 3B Instruct author's recipe without changing the 0.5B starter", () => {
+    const p = params("Qwen2.5-3B-Instruct");
+    assert.deepEqual([p.temperature, p.top_p, p.top_k, p.repetition_penalty], [0.7, 0.8, 20, 1.05]);
+    assert.equal(params("Qwen2.5-0.5B-Instruct").repetition_penalty, 1.1);
+    assert.equal(resolveModelModes(undefined, "Qwen2.5-Coder-3B-Instruct"), undefined);
+    assert.equal(resolveModelModes(undefined, "Qwen2.5-3B-Base"), undefined);
+    assert.equal(params("Qwen2.5-Coder-0.5B-Instruct").repetition_penalty, 1.05);
+    assert.equal(params("Qwen2.5-Coder-1.5B-Instruct").repetition_penalty, 1.1);
   });
 
   it("separates original Qwen3, later Qwen recipes, and Coder recipes", () => {

@@ -660,6 +660,8 @@ describe("LlamaAioChatProvider requests", () => {
   for (const [label, efforts, sampling, kwargs] of [
     ["MiniCPM5-2B", ["high", "none"], [1, 0.95, -1, 1],
       [{ enable_thinking: true }, { enable_thinking: false }]],
+    ["SmolLM3-3B", ["high", "none"], [0.6, 0.95, -1, 1],
+      [{ enable_thinking: true }, { enable_thinking: false }]],
     ["Mellum2.1-12B-A2.5B-Thinking", ["high"], [0.6, 0.95, 20, 1], [{}]],
     ["MiMo-V2.6-Distill-Qwen-9B", ["high"], [0.6, 0.95, 20, 1], [{}]],
     ["Flint", ["high"], [1, 0.95, 20, 1], [{}]],
@@ -679,6 +681,9 @@ describe("LlamaAioChatProvider requests", () => {
     ["LFM2.5-2.6B", ["high"], [0.1, 1, 50, 1.1], [{}]],
     ["LFM2.5-24B-A2B", ["high"], [0.1, 1, 50, 1.05], [{}]],
     ["LFM2.5-1.2B-Instruct", ["none"], [0.1, 1, 50, 1.05], [{}]],
+    ["Qwen2.5-3B-Instruct", ["none"], [0.7, 0.8, 20, 1.05], [{}]],
+    ["Qwen2.5-Coder-0.5B-Instruct", ["none"], [0.7, 0.8, 20, 1.05], [{}]],
+    ["Qwen2.5-Coder-1.5B-Instruct", ["none"], [0.7, 0.8, 20, 1.1], [{}]],
     ["Qwen3-4B-Instruct-2507", ["none"], [0.7, 0.8, 20, 1], [{}]],
     ["Qwen3-4B-Thinking-2507", ["high"], [0.6, 0.95, 20, 1], [{}]],
     ["Qwen3.8-35B-A3B-Distill", ["high"], [0.6, 0.95, 20, 1], [{ enable_thinking: true }]],
@@ -714,6 +719,7 @@ describe("LlamaAioChatProvider requests", () => {
   }
 
   for (const [label, effort, temperature, topP, topK, presence, minP, kwargs] of [
+    ["LFM2-350M", "none", 0.3, 1, -1, 0, 0.15, {}],
     ["LFM3-1.7B", "high", 0.1, 1, 50, 0, 0, { enable_thinking: true, preserve_thinking: false }],
     ["LFM3-1.7B", "medium", 1, 0.95, 20, 0, 0, { enable_thinking: true, preserve_thinking: false }],
     ["LFM3-1.7B", "none", 0.1, 1, 50, 0, 0, { enable_thinking: false, preserve_thinking: false }],
@@ -763,7 +769,7 @@ describe("LlamaAioChatProvider requests", () => {
   }
 
   for (const remote of [false, true]) {
-    for (const label of ["Nanbeige4.3-33B", "Flint", "DeepSeek-V4.1-Flash-1017", "LFM3-1.7B", "Spark-X2.6-1.7B", "MiniCPM5-2B", "Qwen3-0.6B", "Qwen3.5-0.8B"]) {
+    for (const label of ["Nanbeige4.3-33B", "Flint", "DeepSeek-V4.1-Flash-1017", "LFM3-1.7B", "LFM2.5-2.6B", "Spark-X2.6-1.7B", "MiniCPM5-2B", "SmolLM3-3B", "Qwen3-0.6B", "Qwen3.5-0.8B", "gemma-4-E4B-it"]) {
       it(`round-trips ${label} SDK thinking parts separately from text across tool turns (remote=${remote})`, async () => {
         servedModelId = remote ? "opaque-instance" : label;
         servedMetadata = { owned_by: "strata", meta: { label } };

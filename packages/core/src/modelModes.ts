@@ -197,6 +197,7 @@ const GLIMMER_THINKING_MODES: ModelModeSet = {
 const GEMMA4_THINKING_MODES: ModelModeSet = {
   familyLabel: "Gemma 4",
   defaultMode: "Think",
+  preserveReasoning: true,
   modes: {
     Think: {
       chat_template_kwargs: { enable_thinking: true },
@@ -260,6 +261,8 @@ const GLM53_FULL_MODES: ModelModeSet = { ...GLM53_MODES, familyLabel: "GLM-5.3" 
 
 const MINICPM5_MODES = binaryModes("MiniCPM5 2B", { ...OPEN_SAMPLING, top_p: 0.95 });
 MINICPM5_MODES.preserveReasoning = true;
+const SMOLLM3_MODES = binaryModes("SmolLM3 3B", { ...OPEN_SAMPLING, temperature: 0.6, top_p: 0.95 });
+SMOLLM3_MODES.preserveReasoning = true;
 // FrogNano's author evaluates at temperature 0.6 and repeat penalty 1.
 // Its inherited Qwen3.5 template supports the binary thinking switch.
 const FROGNANO_MODES = binaryModes("FrogNano 4B 2609", { ...OPEN_SAMPLING, temperature: 0.6 });
@@ -322,6 +325,15 @@ const QWEN_CODER_MODES = fixedMode("Qwen3-Coder Instruct", "No Think", {
 const QWEN25_STARTER_MODES = fixedMode("Qwen2.5 0.5B Instruct", "No Think", {
   ...OPEN_SAMPLING, temperature: 0.7, top_p: 0.8, top_k: 20, repetition_penalty: 1.1,
 });
+const QWEN25_3B_MODES = fixedMode("Qwen2.5 3B Instruct", "No Think", {
+  ...OPEN_SAMPLING, temperature: 0.7, top_p: 0.8, top_k: 20, repetition_penalty: 1.05,
+});
+const QWEN25_CODER_05B_MODES = fixedMode("Qwen2.5 Coder 0.5B", "No Think", {
+  ...OPEN_SAMPLING, temperature: 0.7, top_p: 0.8, top_k: 20, repetition_penalty: 1.05,
+});
+const QWEN25_CODER_15B_MODES = fixedMode("Qwen2.5 Coder 1.5B", "No Think", {
+  ...OPEN_SAMPLING, temperature: 0.7, top_p: 0.8, top_k: 20, repetition_penalty: 1.1,
+});
 const QWEN_CODER_NEXT_MODES = fixedMode("Qwen3-Coder-Next", "No Think", {
   ...OPEN_SAMPLING, top_p: 0.95, top_k: 40,
 });
@@ -361,12 +373,16 @@ const NEMOTRON_NANO4_MODES = nemotronNanoModes("Nemotron 3 Nano 4B", 0.95);
 const NEMOTRON_NANO30_MODES = nemotronNanoModes("Nemotron 3 Nano 30B", 1.0);
 const NEMOTRON_BOLT_MODES = binaryModes("Nemotron 3.5 Bolt E4B", GEMMA4_GLIMMER_SAMPLING);
 
+const LFM2_MODES = fixedMode("LFM2", "No Think", {
+  ...OPEN_SAMPLING, temperature: 0.3, min_p: 0.15, repetition_penalty: 1.05,
+});
 const LFM25_INSTRUCT_MODES = fixedMode("LFM2.5 Instruct", "No Think", {
   ...OPEN_SAMPLING, temperature: 0.1, top_k: 50, repetition_penalty: 1.05,
 });
 const LFM25_DENSE_MODES = fixedMode("LFM2.5 2.6B", "Think", {
   ...OPEN_SAMPLING, temperature: 0.1, top_k: 50, repetition_penalty: 1.1,
 });
+LFM25_DENSE_MODES.preserveReasoning = true;
 const LFM25_MOE_MODES = fixedMode("LFM2.5 24B-A2B", "Think", {
   ...OPEN_SAMPLING, temperature: 0.1, top_k: 50, repetition_penalty: 1.05,
 });
@@ -401,8 +417,12 @@ function haystack(caps?: ModelCapabilities, modelId?: string): string {
 function namedProfile(h: string): ModelModeSet | undefined {
   if (/(?:^|[-_\s])nanbeige[-_ ]?4[._]3[-_ ]33b(?=$|[.\s]|[-_](?:gguf|(?:ud[-_ ])?(?:iq|q|fp|bf|mxfp|gsq)[\w.-]*)(?:$|[-_.\s]))/.test(h)) return NANBEIGE43_MODES;
   if (/\bqwen[-_ ]?2[._]5[-_ ]0[._]5b[-_ ]instruct(?:\b|_)/.test(h)) return QWEN25_STARTER_MODES;
+  if (/\bqwen[-_ ]?2[._]5[-_ ]3b[-_ ]instruct(?:\b|_)/.test(h)) return QWEN25_3B_MODES;
+  if (/\bqwen[-_ ]?2[._]5[-_ ]coder[-_ ]0[._]5b[-_ ]instruct(?:\b|_)/.test(h)) return QWEN25_CODER_05B_MODES;
+  if (/\bqwen[-_ ]?2[._]5[-_ ]coder[-_ ]1[._]5b[-_ ]instruct(?:\b|_)/.test(h)) return QWEN25_CODER_15B_MODES;
   if (/\btiel[-_ ]coder[-_ ]35b[-_ ]a3b(?:\b|_)/.test(h)) return TIEL_CODER_MODES;
   if (/\bminicpm[-_ ]?5[-_ ]2(?:[._]6)?b(?:\b|_)/.test(h)) return MINICPM5_MODES;
+  if (/\bsmollm3(?:[-_ ]3b)?(?=$|[.\s]|[-_](?:gguf|(?:iq|q|fp|bf)[\w.-]*)(?:$|[-_.\s]))/.test(h)) return SMOLLM3_MODES;
   if (/\bfrognano[-_ ]4b[-_ ]2609(?:\b|_)/.test(h)) return FROGNANO_MODES;
   if (/\bmellum[-_ ]?2[._]1[-_ ]12b[-_ ]a2[._]5b[-_ ]thinking(?:\b|_)/.test(h)) return MELLUM21_MODES;
   if (/\bmimo[-_ ]v2[._]6[-_ ]distill[-_ ]qwen[-_ ]9b(?:\b|_)/.test(h)) return MIMO26_DISTILL_MODES;
@@ -423,6 +443,7 @@ function namedProfile(h: string): ModelModeSet | undefined {
   if (/\bnemotron[-_ ]3[._]5[-_ ]bolt[-_ ]e4b(?:\b|_)/.test(h)) return NEMOTRON_BOLT_MODES;
   if (/\bnemotron[-_ ]3[-_ ]nano[-_ ]4b(?:\b|_)/.test(h)) return NEMOTRON_NANO4_MODES;
   if (/\bnemotron[-_ ]3[-_ ]nano[-_ ]30b[-_ ]a3b(?:\b|_)/.test(h)) return NEMOTRON_NANO30_MODES;
+  if (/\blfm2[-_ ](?:350m|700m|1[._]2b|2[._]6b)(?=$|[.\s]|[-_](?:gguf|(?:iq|q|fp|bf)[\w.-]*)(?:$|[-_.\s]))/.test(h)) return LFM2_MODES;
   if (/\blfm2[._]5[-_ ]1[._]2b[-_ ]instruct(?:\b|_)/.test(h)) return LFM25_INSTRUCT_MODES;
   if (/\blfm2[._]5[-_ ]230m(?:\b|_)/.test(h)) return LFM25_INSTRUCT_MODES;
   if (/\blfm2[._]5[-_ ]2[._]6b(?:\b|_)/.test(h)) return LFM25_DENSE_MODES;
