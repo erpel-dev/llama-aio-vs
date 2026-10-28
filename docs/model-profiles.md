@@ -33,7 +33,7 @@ presets are likewise scenario recipes, not an effort ladder.
 | Nemotron 3 Nano 4B / 30B-A3B | General, **Coding**, No Think | General: temperature 1, top-p .95 (4B) or 1 (30B). Coding/off: .6/.95 |
 | Nemotron 3.5 Bolt E4B | **Think**, No Think | Gemma-based, temperature 1, top-p .95, top-k 64 |
 | LFM2 350M / 700M / 1.2B / 2.6B | **No Think** only | Temperature .3, min-p .15, repeat penalty 1.05 |
-| SmolLM3 3B | **Think**, No Think | Temperature .6, top-p .95; separate reasoning when thinking. Tool support depends on the GGUF's embedded template; the tested Unsloth GGUF does not expose tools to llama.cpp. |
+| SmolLM3 3B | **Think**, No Think | Temperature .6, top-p .95; separate reasoning when thinking. Tool support depends on the GGUF's embedded template; the tested Unsloth and ggml-org GGUFs do not expose tools to llama.cpp. |
 | LFM2.5 230M / 1.2B Instruct | **No Think** only | Temperature .1, top-k 50, repeat penalty 1.05 |
 | LFM2.5 2.6B | **Think** only | Temperature .1, top-k 50, repeat penalty 1.1 |
 | LFM2.5 24B-A2B | **Think** only | Temperature .1, top-k 50, repeat penalty 1.05 |
