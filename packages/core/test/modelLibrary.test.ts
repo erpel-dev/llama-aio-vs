@@ -271,6 +271,22 @@ describe("library groups and removal", () => {
     assert.ok(partials[0]!.path.endsWith(".partial"));
   });
 
+  it("associates each flat-folder model only with its named projector", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "llama-aio-projector-families-"));
+    dirs.push(root);
+    const entries = ["VL", "Audio", "Omni"].map(kind => {
+      const model = path.join(root, `LFM3-${kind}-2B-Q4_K_M.gguf`);
+      writeSparseGguf(model);
+      writeSparseGguf(path.join(root, `mmproj-LFM3-${kind}-2B-Q8_0.gguf`), 1024 * 1024);
+      return { path: model, source: "Llama AIO" as const, sizeBytes: LANGUAGE_MIN };
+    });
+    const groups = buildLibraryGroups(entries, root);
+    for (const kind of ["VL", "Audio", "Omni"]) {
+      const group = groups.find(g => g.quants.some(q => q.path.includes(`LFM3-${kind}-2B`)));
+      assert.equal(path.basename(group!.companions[0]!.path), `mmproj-LFM3-${kind}-2B-Q8_0.gguf`);
+    }
+  });
+
   it("lists every shard and drops hidden paths from a visible list", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "llama-aio-shard-"));
     dirs.push(root);

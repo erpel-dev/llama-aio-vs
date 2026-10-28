@@ -106,8 +106,16 @@ export function refreshLibrarySum() {
   el.textContent = dl && label ? dl + ' · ' + label : (dl || label || '—');
 }
 
+export function isLfm3AudioIdentity(value) {
+  return /\blfm3[-_ ]audio[-_ ]2b\b/i.test(value || '');
+}
+
 export function groupHasVision(g) {
-  return (g.companions || []).some(function (c) { return c.role === 'mmproj'; });
+  if (isLfm3AudioIdentity(g.title) || (g.quants || []).some(function (q) { return isLfm3AudioIdentity(q.path); })) return false;
+  return (g.companions || []).some(function (c) {
+    // LFM3 Audio's projector is audio-only; its presence does not imply vision.
+    return c.role === 'mmproj' && !isLfm3AudioIdentity(c.path || c.name);
+  });
 }
 
 export function allLibraryGroups() {

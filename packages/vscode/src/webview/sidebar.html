@@ -143,14 +143,14 @@
         <div class="hint hidden" id="starterModelHint" style="margin-top:0">{{starterSize}} · {{starterDetail}}</div>
       </div>
       <div class="mm-attach hidden" id="mmprojAttach">
-        <span class="tip mm-label" data-flag="-mm, --mmproj" data-help="Multimodal projector GGUF. llama-server loads it with the language model so Copilot Chat can send images. Auto-attached when a sibling mmproj-*.gguf sits next to the model. Reload the server to apply.">Vision</span>
+        <span class="tip mm-label" data-flag="-mm, --mmproj" data-help="Multimodal projector GGUF. llama-server loads it with the language model. Supported inputs depend on the projector and client. Reload the server to apply.">Projector</span>
         <span class="mm-name" id="mmprojName"></span>
-        <span class="seg" id="mmprojSeg" title="--mmproj-offload / --no-mmproj-offload&#10;Where the CLIP vision projector runs (llama.cpp default: GPU). RAM frees VRAM on the Main GPU; image encode becomes CPU-bound."><button class="seg-btn" type="button" data-mm="gpu">GPU</button><button class="seg-btn" type="button" data-mm="ram">RAM</button></span>
+        <span class="seg" id="mmprojSeg" title="--mmproj-offload / --no-mmproj-offload&#10;Where the multimodal projector runs (llama.cpp default: GPU). RAM frees VRAM on the Main GPU."><button class="seg-btn" type="button" data-mm="gpu">GPU</button><button class="seg-btn" type="button" data-mm="ram">RAM</button></span>
         <button class="icon-btn" id="pickMmprojBtn" type="button" title="Choose another mmproj…">✎</button>
         <button class="icon-btn" id="clearMmprojBtn" type="button" title="Detach (text only)">✕</button>
-        <input type="checkbox" id="mmprojOffloadToGpu" aria-label="Offload vision projector to GPU" class="hidden" checked />
+        <input type="checkbox" id="mmprojOffloadToGpu" aria-label="Offload multimodal projector to GPU" class="hidden" checked />
       </div>
-      <button class="link-btn hidden" id="attachMmprojBtn" type="button" title="Attach a multimodal projector (--mmproj) so Copilot Chat can send images">+ Attach vision projector…</button>
+      <button class="link-btn hidden" id="attachMmprojBtn" type="button" title="Attach a multimodal projector (--mmproj)">+ Attach projector…</button>
       <details class="fold" id="libraryFold">
         <summary><span>Library</span><span class="sum" id="librarySum">—</span></summary>
         <div class="fold-body">

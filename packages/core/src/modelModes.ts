@@ -34,6 +34,8 @@ export interface ModelModeSet {
   familyLabel: string;
   /** Reasoning must survive assistant/tool turns on hosts with thinking parts. */
   preserveReasoning?: boolean;
+  /** This model's template reads reasoning from assistant content rather than reasoning_content. */
+  inlineReasoningHistory?: boolean;
 }
 
 const QWEN_THINK_SAMPLING = {
@@ -401,6 +403,22 @@ const LFM3_MODES: ModelModeSet = {
       chat_template_kwargs: { enable_thinking: false, preserve_thinking: false } },
   },
 };
+const LFM3_VL_MODES = binaryModes("LFM3 VL 2B", LFM3_GENERAL_SAMPLING);
+LFM3_VL_MODES.preserveReasoning = true;
+for (const mode of Object.values(LFM3_VL_MODES.modes)) {
+  mode.chat_template_kwargs = { ...mode.chat_template_kwargs, preserve_thinking: false };
+}
+const LFM3_OMNI_MODES = fixedMode("LFM3 Omni 2B", "No Think", {
+  ...OPEN_SAMPLING, temperature: 0, top_k: 1,
+});
+LFM3_OMNI_MODES.modes["No Think"]!.chat_template_kwargs = { enable_thinking: false, preserve_thinking: false };
+// Audio's GGUF template does not expose a thinking switch; retain its native
+// text generation behavior and separate any reasoning it chooses to emit.
+const LFM3_AUDIO_MODES: ModelModeSet = {
+  familyLabel: "LFM3 Audio 2B", defaultMode: "Default", preserveReasoning: true, inlineReasoningHistory: true,
+  modes: { Default: { ...OPEN_SAMPLING, temperature: 0, top_k: 1,
+    chat_template_kwargs: { preserve_thinking: false } } },
+};
 const BONSAI2_MODES = effortModes("Ternary Bonsai 2 27B", ["xhigh", "medium"], "xhigh",
   { ...QWEN_THINK_SAMPLING, min_p: 0.05 }, { enable_thinking: true });
 BONSAI2_MODES.modes["No Think"] = QWEN_NO_THINK;
@@ -448,6 +466,9 @@ function namedProfile(h: string): ModelModeSet | undefined {
   if (/\blfm2[._]5[-_ ]230m(?:\b|_)/.test(h)) return LFM25_INSTRUCT_MODES;
   if (/\blfm2[._]5[-_ ]2[._]6b(?:\b|_)/.test(h)) return LFM25_DENSE_MODES;
   if (/\blfm2[._]5[-_ ]24b[-_ ]a2b(?:\b|_)/.test(h)) return LFM25_MOE_MODES;
+  if (/\blfm[-_ ]?3[-_ ]vl[-_ ]2b(?=$|[.\s]|[-_](?:gguf|qad|mlx|onnx|(?:ud[-_ ])?(?:iq|q|fp|bf|mxfp|nvfp)[\w.-]*)(?:$|[-_.\s]))/.test(h)) return LFM3_VL_MODES;
+  if (/\blfm[-_ ]?3[-_ ]audio[-_ ]2b(?=$|[.\s]|[-_](?:gguf|mlx|onnx|(?:ud[-_ ])?(?:iq|q|fp|bf|mxfp|nvfp)[\w.-]*)(?:$|[-_.\s]))/.test(h)) return LFM3_AUDIO_MODES;
+  if (/\blfm[-_ ]?3[-_ ]omni[-_ ]2b(?=$|[.\s]|[-_](?:gguf|mlx|onnx|(?:ud[-_ ])?(?:iq|q|fp|bf|mxfp|nvfp)[\w.-]*)(?:$|[-_.\s]))/.test(h)) return LFM3_OMNI_MODES;
   if (/\blfm[-_ ]?3[-_ ]1[._]7b(?=$|[.\s]|[-_](?:gguf|qad|mlx|onnx|(?:ud[-_ ])?(?:iq|q|fp|bf|mxfp|nvfp)[\w.-]*)(?:$|[-_.\s]))/.test(h)) return LFM3_MODES;
   if (/\bqwen3[-_ ]coder[-_ ]next(?:\b|_)/.test(h)) return QWEN_CODER_NEXT_MODES;
   if (/\bqwen3[-_ ]coder[-_ ](?:30b[-_ ]a3b|480b[-_ ]a35b)[-_ ]instruct(?:\b|_)/.test(h)) return QWEN_CODER_MODES;
@@ -588,6 +609,7 @@ export function resolveRemoteModelModes(
 // Copilot CLI filters reasoningEffort against its standard effort values. Keep
 // our preset names as labels only; using them as enum values hides the picker.
 const MODE_EFFORT_VALUES: Record<string, string> = {
+  Default: "high",
   "Think (Agent)": "high",
   "Think (Chat)": "medium",
   "Think (Max)": "max",

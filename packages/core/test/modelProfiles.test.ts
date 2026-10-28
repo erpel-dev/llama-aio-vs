@@ -49,6 +49,12 @@ const cases: Array<[string, string, string, string[]]> = [
   ["LFM2.5-2.6B-Q4_0.gguf", "LFM2.5 2.6B", "Think", ["Think"]],
   ["LFM2.5-24B-A2B-GGUF", "LFM2.5 24B-A2B", "Think", ["Think"]],
   ["LiquidAI/LFM3-1.7B", "LFM3 1.7B", "Think (General)", ["Think (General)", "Think (Math / STEM)", "No Think"]],
+  ["LiquidAI/LFM3-VL-2B", "LFM3 VL 2B", "Think", ["Think", "No Think"]],
+  ["LiquidAI/LFM3-Audio-2B", "LFM3 Audio 2B", "Default", ["Default"]],
+  ["LFM3-Audio-2B-Q4_K_M.gguf", "LFM3 Audio 2B", "Default", ["Default"]],
+  ["LFM3-VL-2B-Q4_K_M.gguf", "LFM3 VL 2B", "Think", ["Think", "No Think"]],
+  ["LiquidAI/LFM3-Omni-2B", "LFM3 Omni 2B", "No Think", ["No Think"]],
+  ["LFM3-Omni-2B-Q4_K_M.gguf", "LFM3 Omni 2B", "No Think", ["No Think"]],
   ["LFM3-1.7B-QAD-Q4_0.gguf", "LFM3 1.7B", "Think (General)", ["Think (General)", "Think (Math / STEM)", "No Think"]],
   ["LiquidAI/LFM3-1.7B-NVFP4", "LFM3 1.7B", "Think (General)", ["Think (General)", "Think (Math / STEM)", "No Think"]],
   ["LiquidAI/LFM3-1.7B-MLX-4bit", "LFM3 1.7B", "Think (General)", ["Think (General)", "Think (Math / STEM)", "No Think"]],
@@ -87,7 +93,7 @@ describe("author profile contracts and Copilot effort compatibility", () => {
           chat_template_kwargs: { reasoning_effort: "unsupported-stale-value" } };
         applyModeToRequestBody(body, selected.params);
         assert.equal(body.frequency_penalty, 0);
-        assert.notEqual(body.top_k, 1);
+        assert.equal(body.top_k, selected.params.top_k);
         assert.equal(body.reasoning_effort, undefined);
         assert.equal(body.repetition_penalty, undefined);
         assert.notEqual((body.chat_template_kwargs as Record<string, unknown>).reasoning_effort, "unsupported-stale-value");
@@ -104,6 +110,17 @@ function params(id: string, mode?: string) {
 }
 
 describe("model-specific sampler and reasoning differences", () => {
+  it("uses distinct LFM3 vision and non-thinking omni recipes", () => {
+    assert.deepEqual(params("LFM3-VL-2B", "high").chat_template_kwargs, { enable_thinking: true, preserve_thinking: false });
+    assert.deepEqual(params("LFM3-VL-2B", "none").chat_template_kwargs, { enable_thinking: false, preserve_thinking: false });
+    const omni = params("LFM3-Omni-2B");
+    assert.deepEqual([omni.temperature, omni.top_k, omni.repetition_penalty], [0, 1, 1]);
+    assert.deepEqual(omni.chat_template_kwargs, { enable_thinking: false, preserve_thinking: false });
+    const audio = params("LFM3-Audio-2B");
+    assert.deepEqual([audio.temperature, audio.top_k, audio.repetition_penalty], [0, 1, 1]);
+    assert.deepEqual(audio.chat_template_kwargs, { preserve_thinking: false });
+    assert.equal(resolveModelModes(undefined, "LFM3-Audio-2B")?.preserveReasoning, true);
+  });
   it("applies SmolLM3's published settings and thinking toggle", () => {
     const think = params("SmolLM3-3B", "high"), off = params("SmolLM3-3B", "none");
     assert.deepEqual([think.temperature, think.top_p, think.top_k], [0.6, 0.95, -1]);
@@ -274,7 +291,7 @@ describe("profile identity boundaries", () => {
     assert.equal(resolveModelModes(undefined, "Swift-1.5-Qwen3.8-27B-GSQ-RCO-GGUF")?.familyLabel, "Qwen3.8");
   });
   for (const id of ["Spark-X2.7-4B", "LFM2.5-7B", "Ornith-1.5-31B", "Ornith-2.0-9B", "GLM-4.7-Flash",
-    "LFM3-1.7B-Base", "LFM3-1.7B-Unverified", "LFM3-7B", "LFM3-VL-2B", "LFM3-Audio-2B", "LFM3-Omni-2B",
+    "LFM3-1.7B-Base", "LFM3-1.7B-Unverified", "LFM3-7B", "LFM3-VL-2B-Base", "LFM3-Audio-2B-Base", "LFM3-Omni-2B-Base",
     "Nanbeige4.3-33B-Base-Q4_K_M.gguf", "Nanbeige4.2-3B", "Nanbeige4.3-3B", "Nanbeige4.4-33B",
     "Nanbeige4.3-33B0", "Nanbeige4.3-33B-Unverified", "mtp-Nanbeige4.3-33B.gguf", "Nanbeige4.3-33B-DSpark.gguf",
     "MiniCPM5-2B-DSpark-GGUF", "Mellum2.1-12B-A2.5B-Base", "DeepSeek-V4.1-Flash-1018", "GLM-5.4",
@@ -294,7 +311,7 @@ describe("profile identity boundaries", () => {
     assert.equal(resolveModelModes(denseCaps({ architecture: "spark2_5", name: "Dense F32", path: "/models/renamed.gguf" })), undefined);
     assert.equal(resolveRemoteModelModes({ modelId: "opaque", modelName: "Dense F32" }), undefined);
     assert.equal(resolveModelModes(denseCaps({ architecture: "lfm3", path: "/models/renamed.gguf" })), undefined);
-    assert.equal(resolveModelModes(denseCaps({ architecture: "qwen35", path: "/models/LFM3-Omni-2B.gguf" })), undefined);
+    assert.equal(resolveModelModes(denseCaps({ architecture: "qwen35", path: "/models/LFM3-Omni-2B.gguf" }))?.familyLabel, "LFM3 Omni 2B");
     assert.equal(resolveModelModes(denseCaps({ architecture: "gemma4", path: "/models/gemma-4-12B-it-Q4_0-MTP.gguf" })), undefined);
     assert.equal(resolveModelModes(denseCaps({ architecture: "gemma4", path: "/models/gemma-4-12B-it-mmproj.gguf" })), undefined);
   });

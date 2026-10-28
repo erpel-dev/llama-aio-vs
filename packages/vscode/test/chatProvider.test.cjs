@@ -219,6 +219,25 @@ describe("LlamaAioChatProvider requests", () => {
     seenRequests = [];
   });
 
+  it("uses the server's actual image capability for an audio-only projector", async () => {
+    servedProps = { modalities: { vision: false, audio: true } };
+    const { provider, state } = setup();
+    state.loadSettings.mmprojPath = "/models/mmproj-LFM3-Audio-2B-Q8_0.gguf";
+    const [model] = await provider.provideLanguageModelChatInformation({}, cancelToken().token);
+    assert.equal(model.capabilities.imageInput, false);
+  });
+
+  for (const mimeType of ["audio/wav", "video/mp4"]) {
+    it(`rejects unsupported ${mimeType} input instead of silently discarding it`, async () => {
+      const { provider } = setup();
+      const [model] = await provider.provideLanguageModelChatInformation({}, cancelToken().token);
+      await assert.rejects(provider.provideLanguageModelChatResponse(model,
+        [msg(Role.User, new TextPart("Describe this"), { mimeType, data: Buffer.from([1, 2, 3]) })],
+        {}, { report() {} }, cancelToken().token), /does not currently support audio or video input/);
+      assert.equal(lastBody, undefined);
+    });
+  }
+
   for (const row of catalogs.rows) {
     for (const source of row.provider === "strata" ? ["desktop", "standalone"] : ["standalone"]) {
       it(`selects the remote ${row.provider}/${row.installId} ${source} profile and preserves its served ID`, async () => {
@@ -342,6 +361,26 @@ describe("LlamaAioChatProvider requests", () => {
       });
     }
   }
+
+  it("inlines only current-turn Audio reasoning and clears earlier-turn reasoning", async () => {
+    servedModelId = "LFM3-Audio-2B";
+    const { provider } = setup();
+    const [model] = await provider.provideLanguageModelChatInformation({}, cancelToken().token);
+    await provider.provideLanguageModelChatResponse(model, [
+      msg(Role.User, new TextPart("Earlier question")),
+      msg(Role.Assistant, new ThinkingPart("old reasoning"), new TextPart("Earlier answer")),
+      msg(Role.User, new TextPart("Use a tool")),
+      msg(Role.Assistant, new ThinkingPart("current reasoning"), new ToolCallPart("call_1", "read_file", { path: "README.md" })),
+      msg(Role.User, new ToolResultPart("call_1", [new TextPart("Project text")])),
+    ], { tools: [{ name: "read_file", description: "read", inputSchema: { type: "object" } }] },
+    { report() {} }, cancelToken().token);
+    const assistants = lastBody.messages.filter(m => m.role === "assistant");
+    assert.equal(assistants[0].content, "Earlier answer");
+    assert.equal(assistants[0].reasoning_content, undefined);
+    assert.equal(assistants[1].content, "<think>current reasoning</think>");
+    assert.equal(assistants[1].reasoning_content, undefined);
+    assert.equal(assistants[1].tool_calls[0].id, "call_1");
+  });
 
   it("refreshes reused remote IDs from new aliases and does not resurrect an old profile after ambiguity", async () => {
     servedModelId = "private-model";
@@ -719,6 +758,10 @@ describe("LlamaAioChatProvider requests", () => {
   }
 
   for (const [label, effort, temperature, topP, topK, presence, minP, kwargs] of [
+    ["LFM3-VL-2B", "high", 0.1, 1, 50, 0, 0, { enable_thinking: true, preserve_thinking: false }],
+    ["LFM3-VL-2B", "none", 0.1, 1, 50, 0, 0, { enable_thinking: false, preserve_thinking: false }],
+    ["LFM3-Audio-2B", "high", 0, 1, 1, 0, 0, { preserve_thinking: false }],
+    ["LFM3-Omni-2B", "none", 0, 1, 1, 0, 0, { enable_thinking: false, preserve_thinking: false }],
     ["LFM2-350M", "none", 0.3, 1, -1, 0, 0.15, {}],
     ["LFM3-1.7B", "high", 0.1, 1, 50, 0, 0, { enable_thinking: true, preserve_thinking: false }],
     ["LFM3-1.7B", "medium", 1, 0.95, 20, 0, 0, { enable_thinking: true, preserve_thinking: false }],
@@ -769,7 +812,7 @@ describe("LlamaAioChatProvider requests", () => {
   }
 
   for (const remote of [false, true]) {
-    for (const label of ["Nanbeige4.3-33B", "Flint", "DeepSeek-V4.1-Flash-1017", "LFM3-1.7B", "LFM2.5-2.6B", "Spark-X2.6-1.7B", "MiniCPM5-2B", "SmolLM3-3B", "Qwen3-0.6B", "Qwen3.5-0.8B", "gemma-4-E4B-it"]) {
+    for (const label of ["Nanbeige4.3-33B", "Flint", "DeepSeek-V4.1-Flash-1017", "LFM3-1.7B", "LFM3-VL-2B", "LFM3-Audio-2B", "LFM2.5-2.6B", "Spark-X2.6-1.7B", "MiniCPM5-2B", "SmolLM3-3B", "Qwen3-0.6B", "Qwen3.5-0.8B", "gemma-4-E4B-it"]) {
       it(`round-trips ${label} SDK thinking parts separately from text across tool turns (remote=${remote})`, async () => {
         servedModelId = remote ? "opaque-instance" : label;
         servedMetadata = { owned_by: "strata", meta: { label } };
@@ -790,8 +833,8 @@ describe("LlamaAioChatProvider requests", () => {
           msg(Role.Assistant, ...parts), msg(Role.User, new ToolResultPart("call_1", [new TextPart("Project text")]))],
           options, { report() {} }, cancelToken().token);
         const assistant = lastBody.messages.find(m => m.role === "assistant");
-        assert.equal(assistant.reasoning_content, "I need the file.");
-        assert.equal(assistant.content, null);
+        assert.equal(assistant.reasoning_content, label === "LFM3-Audio-2B" ? undefined : "I need the file.");
+        assert.equal(assistant.content, label === "LFM3-Audio-2B" ? "<think>I need the file.</think>" : null);
         assert.equal(assistant.tool_calls[0].id, "call_1");
       });
     }

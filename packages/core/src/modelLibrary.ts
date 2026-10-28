@@ -93,6 +93,23 @@ export function preferMmprojPath(paths: string[]): string | undefined {
   return [...paths].sort((a, b) => score(a) - score(b) || a.localeCompare(b))[0];
 }
 
+/** Prefer projectors explicitly named for the selected model over unrelated siblings. */
+function mmprojForModel(paths: string[], modelPath: string, repoScoped: boolean): string | undefined {
+  const stem = (file: string, projector: boolean): string => {
+    let name = path.basename(file).replace(/\.gguf$/i, "");
+    if (projector) name = name.replace(/(?:^|[-_.])mmproj(?:[-_.]|$)/ig, "-");
+    name = name.replace(/(?:^|[-_.])(?:ud[-_.])?(?:iq\d[\w.-]*|q\d[\w.-]*|bf16|f16|f32)$/i, "");
+    return name.toLowerCase().replace(/[^a-z0-9]/g, "");
+  };
+  const wanted = stem(modelPath, false);
+  const named = paths.filter(p => stem(p, true) === wanted && wanted.length > 0);
+  if (named.length) return preferMmprojPath(named);
+  const generic = paths.filter(p => !stem(p, true));
+  if (generic.length) return preferMmprojPath(generic);
+  // A downloaded repo's own directory can use different publisher naming.
+  return repoScoped ? preferMmprojPath(paths) : undefined;
+}
+
 /** Current directory, then ancestors up to an enclosing downloaded HF repo. */
 function companionDirectories(modelPath: string): string[] {
   const here = path.dirname(modelPath);
@@ -123,7 +140,7 @@ export function findSiblingMmproj(modelPath: string): string | undefined {
         if (st.isFile() && st.size >= MIN_MMPROJ_BYTES) found.push(full);
       } catch { /* skip unreadable */ }
     }
-    const best = preferMmprojPath(found);
+    const best = mmprojForModel(found, trimmed, path.basename(dir).includes("__"));
     if (best) return best;
   }
   return undefined;
@@ -1270,9 +1287,9 @@ function buildLibraryGroupsFromInventory(
     const rel = path.relative(root, canonical(file));
     return !!rel && rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel);
   };
-  // Companion classification, projector selection and shard indexing are shared
-  // across every family in a flat directory, not repeated per model.
-  const directories = new Map<string, { mmproj?: GgufListedFile; mtp: GgufListedFile[]; shards: Map<string, string[]> }>();
+  // Companion inventory and shard indexing are shared across each directory;
+  // projector selection remains model-specific when groups share a folder.
+  const directories = new Map<string, { mmprojs: Array<{ dir: string; files: GgufListedFile[] }>; mtp: GgufListedFile[]; shards: Map<string, string[]> }>();
   const directory = (dir: string) => {
     let indexed = directories.get(dir);
     if (indexed) return indexed;
@@ -1281,9 +1298,8 @@ function buildLibraryGroupsFromInventory(
     const siblings = parents.flatMap((parent) =>
       (inventory.get(parent) || []).concat(inventory.get(path.join(parent, "MTP")) || [])
     );
-    const mmproj = parents.map((parent) => preferMmprojPath(
-      (inventory.get(parent) || []).filter((f) => f.size >= MIN_MMPROJ_BYTES && isMmprojFileName(f.path)).map((f) => f.path)
-    )).find(Boolean);
+    const mmprojs = parents.map((parent) => ({ dir: parent,
+      files: (inventory.get(parent) || []).filter((f) => f.size >= MIN_MMPROJ_BYTES && isMmprojFileName(f.path)) }));
     const mtp = siblings.filter((f) => f.size >= MIN_MTP_BYTES && classifyGgufFile(f, siblings) === "mtp-sidecar");
     const shards = new Map<string, string[]>();
     for (const file of here) {
@@ -1295,7 +1311,7 @@ function buildLibraryGroupsFromInventory(
       }
     }
     for (const group of shards.values()) group.sort();
-    indexed = { mmproj: siblings.find((f) => f.path === mmproj), mtp, shards };
+    indexed = { mmprojs, mtp, shards };
     directories.set(dir, indexed);
     return indexed;
   };
@@ -1332,13 +1348,15 @@ function buildLibraryGroupsFromInventory(
     });
     const companions: LibraryCompanion[] = [];
     const indexed = directory(dir);
-    const mmproj = indexed.mmproj?.path;
+    const mmproj = indexed.mmprojs.map(({ dir: parent, files }) =>
+      mmprojForModel(files.map(f => f.path), first.path, path.basename(parent).includes("__"))).find(Boolean);
     if (mmproj) {
+      const projector = indexed.mmprojs.flatMap(group => group.files).find(f => f.path === mmproj)!;
       companions.push({
         path: mmproj,
         name: path.basename(mmproj),
         role: "mmproj",
-        sizeBytes: indexed.mmproj!.size,
+        sizeBytes: projector.size,
         shared: quants.length > 1,
       });
     }
