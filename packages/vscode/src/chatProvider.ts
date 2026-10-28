@@ -262,6 +262,11 @@ function toOpenAiMessages(
         imageParts.push(image);
         continue;
       }
+      const mime = part && typeof part === "object" && "mimeType" in part
+        ? (part as { mimeType?: unknown }).mimeType : undefined;
+      if (typeof mime === "string" && /^(?:audio|video)\//i.test(mime)) {
+        throw new Error("Llama AIO chat does not currently support audio or video input. Use text or a supported image instead.");
+      }
       const text = extractTextFromPart(part);
       if (text) {
         textParts.push(text);
@@ -674,7 +679,7 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
     const shortName = modelId.split(/[/\\]/).pop() || modelId;
     const vision = remote
       ? !!(props?.modalities?.vision ?? remoteInfo?.vision)
-      : !!(state.loadSettings.mmprojPath || "").trim();
+      : (props?.modalities?.vision ?? !!(state.loadSettings.mmprojPath || "").trim());
     const modeSet = this.modeSetFor(modelId, props);
     const where = remote
       ? `${remoteInfo?.isLlamaCpp === false ? "OpenAI-compatible server" : "llama.cpp"} on ${target.label} · ${target.baseUrl}`
@@ -828,6 +833,14 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
       appliedModeName = modeName;
       if (params.chat_template_kwargs?.clear_thinking === true || params.chat_template_kwargs?.preserve_thinking === false) {
         converted = clearEarlierReasoning(converted);
+        body.messages = converted;
+      }
+      if (modeSet.inlineReasoningHistory) {
+        converted = converted.map(message => {
+          if (message.role !== "assistant" || !message.reasoning_content || Array.isArray(message.content)) return message;
+          const { reasoning_content, ...rest } = message;
+          return { ...rest, content: `<think>${reasoning_content}</think>${message.content || ""}` };
+        });
         body.messages = converted;
       }
       applyModeToRequestBody(body, params);

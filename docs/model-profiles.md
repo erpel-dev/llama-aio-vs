@@ -38,6 +38,9 @@ presets are likewise scenario recipes, not an effort ladder.
 | LFM2.5 2.6B | **Think** only | Temperature .1, top-k 50, repeat penalty 1.1 |
 | LFM2.5 24B-A2B | **Think** only | Temperature .1, top-k 50, repeat penalty 1.05 |
 | LFM3 1.7B | **General**, Math / STEM, No Think | General/off: .1/1/50; STEM: 1/.95/20. Repeat penalty 1.1; clear reasoning from earlier turns |
+| LFM3 VL 2B | **Think**, No Think | Temperature .1, top-k 50, repeat penalty 1.1; separate reasoning |
+| LFM3 Audio 2B | **Default** only | Greedy text sampling; the template does not expose a thinking toggle |
+| LFM3 Omni 2B | **No Think** only | Greedy text sampling; the author does not support thinking mode |
 | Ternary Bonsai 2 27B | **XHigh**, Medium, No Think | Thinking min-p .05; no Low mode; requires Prism's llama.cpp fork |
 | Qwen3 original | **Think**, No Think | Think: .6/.95/20; off: .7/.8/20; presence penalty 0 |
 | Qwen2.5 0.5B Instruct (legacy Strata starter) | **No Think** only | .7/.8/20, repeat penalty 1.1 |
@@ -92,12 +95,24 @@ No Think uses General sampling with `enable_thinking: false`; the author warns
 that thinking-off behavior can be inconsistent on reasoning-heavy tasks.
 Earlier-turn reasoning is cleared while the current tool-turn reasoning is
 kept. Only the verified text `LFM3-1.7B` checkpoint and its GGUF/QAD quants match;
-Base, VL, Audio, Omni, and unknown sizes do not inherit this profile.
+Base, VL, Audio, Omni, and unknown sizes do not inherit the text profile. VL,
+Audio, and Omni have their own narrowly matched profiles. VL has a binary
+thinking toggle; Audio's Default keeps the template's native behavior and
+separates reasoning when emitted, without promising a thinking switch. Omni is
+non-thinking. Audio and Omni use their published greedy text sampler. The Audio
+Default picker value maps to SDK effort `high` for compatibility; it does not
+set a reasoning effort in the model template. Audio's template reads thinking
+from assistant content rather than `reasoning_content`, so current-turn thinking
+is sent inline in `<think>` tags when continuing a tool call.
 
 LFM3 needs a llama.cpp build containing [the LFM3 support commit](https://github.com/ggml-org/llama.cpp/commit/19cce6919992fdffd92e0ac152caaf1e2b8f254e).
-The latest downloadable build checked here, b11936, predates that commit and
-fails with `unknown model architecture: lfm3`. Installing this profile does not
-upgrade the engine or add audio/video support. Spark X2.6 1.7B uses the existing
+Official b11936 predates that commit and fails with `unknown model architecture:
+lfm3`; official b11938 contains it and supports text and VL image inference.
+Audio and Omni projector support requires [the later audio/omni commit](https://github.com/ggml-org/llama.cpp/commit/19ff817fb25e9a1b838b1d7f9f4325f7bf9779c4),
+first included in official b11941. Installing a profile does not upgrade the
+engine. The extension's Language Model provider forwards images, but does not
+currently expose audio or video input or speech output. Native llama.cpp audio
+and TTS are separate capabilities. Spark X2.6 1.7B uses the existing
 Spark X2.6 recipe; its pinned template accepts High, Low, and No Think.
 Its published Q4_K_M GGUF has the generic metadata name `Dense F32`, so keep a
 versioned filename or configure a canonical served alias such as
@@ -211,6 +226,8 @@ model repositories. Each entry can be inspected at
 Additional author cards:
 
 - [LFM3 1.7B, pinned](https://huggingface.co/LiquidAI/LFM3-1.7B/blob/40ebe0aa6662c9d40389c2f5d565b6a2c6aebacd/README.md): General/STEM samplers, binary thinking, reasoning-history policy, and XML tools.
+- [LFM3 VL 2B, pinned](https://huggingface.co/LiquidAI/LFM3-VL-2B/blob/f83d2b0a2296aaa277f394990a9b8b949ddf9691/README.md): sampler, thinking controls, and projector.
+- [LFM3 Audio 2B, pinned](https://huggingface.co/LiquidAI/LFM3-Audio-2B/blob/9d49701c372d6011d900f6abb40c6b296fb706dd/README.md) and [Omni 2B, pinned](https://huggingface.co/LiquidAI/LFM3-Omni-2B/blob/ce2458cbce4ad970f92032ed94e3d18d30b04f9c/README.md): text generation and modality limitations.
 - [Spark X2.6 1.7B, pinned](https://huggingface.co/XHToken/Spark-X2.6-1.7B/blob/f18c032c7675f807c0fdffe281dbe124edba2605/README.md): sampler and runtime instructions; the pinned template verifies its High/Low reasoning controls.
 - [FrogNano 4B 2609, pinned](https://huggingface.co/microsoft/FrogNano-4B-2609/blob/b90468c11a913c1916b4542b4b7a530ec42024a4/README.md): evaluation temperature .6 and repeat penalty 1; inherited Qwen3.5 template verified in both thinking modes.
 - [Nanbeige4.3 33B, pinned](https://huggingface.co/Nanbeige/Nanbeige4.3-33B/blob/c1093c501cc6460427c0ac634db7223d0450c0ee/README.md): agent/chat samplers, binary thinking control, reasoning-history policy, XML tools, and 512K model context.
@@ -242,8 +259,14 @@ connections. One No Think arithmetic prompt (`What is 2+2? Answer with one
 number.`) returned `2`; it reproduced directly against the native server with
 prompt caching disabled, while thinking returned `4`. A Chinese exact-output
 instruction also elicited extra text. These are observed model/runtime quality
-limits, not a claim of comprehensive answer accuracy. Audio/VL/Omni weights,
-GPU throughput, and a signed-in Copilot harness were not tested in this check.
+limits, not a claim of comprehensive answer accuracy. In a subsequent CPU check
+with official b11951, the VL, Audio, and Omni Q4_K_M models and Q8 projectors
+answered text prompts and completed a structured tool-call/result exchange via
+the extension. VL and Omni also identified a simple red image through that API.
+Native llama.cpp transcribed a known audio clip with Audio and Omni, and both
+produced non-silent WAV files; speech intelligibility was not evaluated. Those
+audio tests did not use the extension. GPU throughput, video, and a signed-in
+Copilot harness were not tested.
 MiniCPM5 2B Q4_K_M also passes CPU inference on b11729 with thinking on/off and
 a native structured tool call. A further VS Code Language Model API check on
 b11938 switched between LFM2.5 230M Q8_0, MiniCPM5 2B Q4_K_M, and Spark X2.6

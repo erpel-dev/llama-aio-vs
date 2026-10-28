@@ -68,6 +68,20 @@ describe("findSiblingMmproj / resolveMmprojPath", () => {
   it("does not auto-attach when the same model is reapplied with vision cleared", () => {
     assert.equal(resolveMmprojPath(path.join(dir, "model-Q4_K_M.gguf"), "", false), "");
   });
+
+  it("matches a model-specific projector instead of another model's projector in a flat folder", () => {
+    const mixed = fs.mkdtempSync(path.join(os.tmpdir(), "llama-aio-mmproj-mixed-"));
+    try {
+      for (const n of ["mmproj-LFM3-Audio-2B-Q8_0.gguf", "mmproj-LFM3-VL-2B-Q8_0.gguf", "mmproj-LFM3-Omni-2B-Q8_0.gguf"]) {
+        fs.writeFileSync(path.join(mixed, n), Buffer.alloc(1024 * 1024));
+      }
+      for (const kind of ["VL", "Audio", "Omni"]) {
+        const model = path.join(mixed, `LFM3-${kind}-2B-Q4_K_M.gguf`);
+        assert.equal(path.basename(findSiblingMmproj(model)!), `mmproj-LFM3-${kind}-2B-Q8_0.gguf`);
+      }
+      assert.equal(findSiblingMmproj(path.join(mixed, "LFM3-1.7B-Q4_K_M.gguf")), undefined);
+    } finally { fs.rmSync(mixed, { recursive: true, force: true }); }
+  });
 });
 
 describe("HF mmproj helpers", () => {

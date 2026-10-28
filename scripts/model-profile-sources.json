@@ -201,5 +201,17 @@
   {
     "id": "Qwen/Qwen2.5-Coder-1.5B-Instruct",
     "revision": "2e1fd397ee46e1388853d2af2c993145b0f1098a"
+  },
+  {
+    "id": "LiquidAI/LFM3-VL-2B",
+    "revision": "f83d2b0a2296aaa277f394990a9b8b949ddf9691"
+  },
+  {
+    "id": "LiquidAI/LFM3-Omni-2B",
+    "revision": "ce2458cbce4ad970f92032ed94e3d18d30b04f9c"
+  },
+  {
+    "id": "LiquidAI/LFM3-Audio-2B",
+    "revision": "9d49701c372d6011d900f6abb40c6b296fb706dd"
   }
 ]

@@ -28,6 +28,14 @@ function setup() {
   return { ...api, element, messages, click };
 }
 
+it('does not mark an audio-only LFM3 projector as vision', () => {
+  const t = setup();
+  assert.equal(t.groupHasVision({ companions: [{ role: 'mmproj', path: '/m/mmproj-LFM3-Audio-2B-Q8_0.gguf' }] }), false);
+  assert.equal(t.groupHasVision({ title: 'LFM3 Audio 2B', companions: [{ role: 'mmproj', path: '/m/mmproj-Q8_0.gguf' }] }), false);
+  assert.equal(t.groupHasVision({ companions: [{ role: 'mmproj', path: '/m/mmproj-LFM3-VL-2B-Q8_0.gguf' }] }), true);
+  assert.equal(t.groupHasVision({ companions: [{ role: 'mmproj', path: '/m/mmproj-LFM3-Omni-2B-Q8_0.gguf' }] }), true);
+});
+
 it('ignores late repo files and errors after returning to a local filter', () => {
   const t = setup();
   t.resetLibraryNavigation('files');

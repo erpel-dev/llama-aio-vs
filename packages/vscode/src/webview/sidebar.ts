@@ -26,6 +26,7 @@ import {
   closeLibraryMenu,
   findLibraryQuant,
   fitText,
+  isLfm3AudioIdentity,
   onLibraryClick,
   openLibraryMenu,
   refreshLibrarySum,
@@ -754,7 +755,7 @@ function renderModelStatus() {
   const bits = [];
   if (found && found.quant.sizeLabel) bits.push(found.quant.sizeLabel);
   const L = (p.state && p.state.loadSettings) || {};
-  if (L.mmprojPath) bits.push('vision');
+  if (L.mmprojPath) bits.push(isLfm3AudioIdentity(sel) || isLfm3AudioIdentity(L.mmprojPath) ? 'audio projector' : 'vision');
   if (L.chatTemplateSource === 'builtin' && L.chatTemplateName) bits.push('template ' + L.chatTemplateName);
   else if (L.chatTemplateSource === 'file') bits.push('template file');
   else if (L.chatTemplateJinja === false) bits.push('jinja off');
@@ -1532,7 +1533,7 @@ function requestEstimate() {
 function refreshMemoryLive() { requestEstimate(); }
 function scheduleLiveMemory() { requestEstimate(); }
 
-const SEG_LABEL = { weights: 'Weights', vision: 'Vision', draft: 'Spec', kv: 'KV', overhead: 'Overhead' };
+const SEG_LABEL = { weights: 'Weights', vision: 'Projector', draft: 'Spec', kv: 'KV', overhead: 'Overhead' };
 
 function memBar(device, targetFree) {
   const bar = document.createElement('div');
@@ -2172,7 +2173,7 @@ function setMmprojHint(mmprojPath) {
       ? ' <span class="sub">· ' + escText(fmtBytes(inputs.mmprojFileSizeBytes)) + '</span>'
       : '';
     name.innerHTML = escText(base) + size;
-    name.title = p ? p + '\nCopilot Chat can send images. Reload the server to apply changes.' : '';
+    name.title = p ? p + '\nReload the server to apply changes. Input support depends on the projector and client.' : '';
   }
   syncMmprojOffloadUi(cpuOnlyLive());
 }
