@@ -39,6 +39,7 @@ presets are likewise scenario recipes, not an effort ladder.
 | Ternary Bonsai 2 27B | **XHigh**, Medium, No Think | Thinking min-p .05; no Low mode; requires Prism's llama.cpp fork |
 | Qwen3 original | **Think**, No Think | Think: .6/.95/20; off: .7/.8/20; presence penalty 0 |
 | Qwen2.5 0.5B Instruct (legacy Strata starter) | **No Think** only | .7/.8/20, repeat penalty 1.1 |
+| Qwen2.5 3B Instruct | **No Think** only | .7/.8/20, repeat penalty 1.05 |
 | Qwen3 Instruct 2507 | **No Think** only | .7/.8/20 |
 | Qwen3 Thinking 2507 | **Think** only | .6/.95/20 |
 | Empero Qwen3.8 35B-A3B Distill | **Think** only | .6/.95/20; Qwen3.6-based template, no effort ladder |
@@ -164,7 +165,7 @@ Public Language Model API calls may pass `modelOptions.reasoningEffort`.
 That explicit request choice takes precedence over the editor-injected
 `modelConfiguration` default. SDK/schema selections remain the fallback.
 
-Qwen3, Qwen3.5/3.6, LFM3, MiniCPM5, Spark X2.6, Nanbeige4.3, Flint, and DeepSeek reasoning is streamed as separate thinking parts on newer
+Gemma 4, Qwen3, Qwen3.5/3.6, LFM2.5 2.6B, LFM3, MiniCPM5, Spark X2.6, Nanbeige4.3, Flint, and DeepSeek reasoning is streamed as separate thinking parts on newer
 hosts and sent back as assistant `reasoning_content` on later tool turns.
 It is counted in context estimates and kept out of the final answer text.
 Older hosts without thinking-part support keep the existing text fallback;

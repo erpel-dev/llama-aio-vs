@@ -169,5 +169,9 @@
   {
     "id": "XHToken/Spark-X2.6-1.7B",
     "revision": "f18c032c7675f807c0fdffe281dbe124edba2605"
+  },
+  {
+    "id": "Qwen/Qwen2.5-3B-Instruct",
+    "revision": "aa8e72537993ba99e69dfaafa59ed015b17504d1"
   }
 ]

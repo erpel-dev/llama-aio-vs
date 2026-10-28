@@ -197,6 +197,7 @@ const GLIMMER_THINKING_MODES: ModelModeSet = {
 const GEMMA4_THINKING_MODES: ModelModeSet = {
   familyLabel: "Gemma 4",
   defaultMode: "Think",
+  preserveReasoning: true,
   modes: {
     Think: {
       chat_template_kwargs: { enable_thinking: true },
@@ -322,6 +323,9 @@ const QWEN_CODER_MODES = fixedMode("Qwen3-Coder Instruct", "No Think", {
 const QWEN25_STARTER_MODES = fixedMode("Qwen2.5 0.5B Instruct", "No Think", {
   ...OPEN_SAMPLING, temperature: 0.7, top_p: 0.8, top_k: 20, repetition_penalty: 1.1,
 });
+const QWEN25_3B_MODES = fixedMode("Qwen2.5 3B Instruct", "No Think", {
+  ...OPEN_SAMPLING, temperature: 0.7, top_p: 0.8, top_k: 20, repetition_penalty: 1.05,
+});
 const QWEN_CODER_NEXT_MODES = fixedMode("Qwen3-Coder-Next", "No Think", {
   ...OPEN_SAMPLING, top_p: 0.95, top_k: 40,
 });
@@ -367,6 +371,7 @@ const LFM25_INSTRUCT_MODES = fixedMode("LFM2.5 Instruct", "No Think", {
 const LFM25_DENSE_MODES = fixedMode("LFM2.5 2.6B", "Think", {
   ...OPEN_SAMPLING, temperature: 0.1, top_k: 50, repetition_penalty: 1.1,
 });
+LFM25_DENSE_MODES.preserveReasoning = true;
 const LFM25_MOE_MODES = fixedMode("LFM2.5 24B-A2B", "Think", {
   ...OPEN_SAMPLING, temperature: 0.1, top_k: 50, repetition_penalty: 1.05,
 });
@@ -401,6 +406,7 @@ function haystack(caps?: ModelCapabilities, modelId?: string): string {
 function namedProfile(h: string): ModelModeSet | undefined {
   if (/(?:^|[-_\s])nanbeige[-_ ]?4[._]3[-_ ]33b(?=$|[.\s]|[-_](?:gguf|(?:ud[-_ ])?(?:iq|q|fp|bf|mxfp|gsq)[\w.-]*)(?:$|[-_.\s]))/.test(h)) return NANBEIGE43_MODES;
   if (/\bqwen[-_ ]?2[._]5[-_ ]0[._]5b[-_ ]instruct(?:\b|_)/.test(h)) return QWEN25_STARTER_MODES;
+  if (/\bqwen[-_ ]?2[._]5[-_ ]3b[-_ ]instruct(?:\b|_)/.test(h)) return QWEN25_3B_MODES;
   if (/\btiel[-_ ]coder[-_ ]35b[-_ ]a3b(?:\b|_)/.test(h)) return TIEL_CODER_MODES;
   if (/\bminicpm[-_ ]?5[-_ ]2(?:[._]6)?b(?:\b|_)/.test(h)) return MINICPM5_MODES;
   if (/\bfrognano[-_ ]4b[-_ ]2609(?:\b|_)/.test(h)) return FROGNANO_MODES;

@@ -9,6 +9,7 @@ const cases: Array<[string, string, string, string[]]> = [
   ["bartowski/Nanbeige_Nanbeige4.3-33B-GGUF", "Nanbeige4.3 33B", "Think (Agent)", ["Think (Agent)", "Think (Chat)", "No Think"]],
   ["Nanbeige4.3-33B-Q4_K_M.gguf", "Nanbeige4.3 33B", "Think (Agent)", ["Think (Agent)", "Think (Chat)", "No Think"]],
   ["Qwen/Qwen2.5-0.5B-Instruct", "Qwen2.5 0.5B Instruct", "No Think", ["No Think"]],
+  ["Qwen/Qwen2.5-3B-Instruct", "Qwen2.5 3B Instruct", "No Think", ["No Think"]],
   ["Tiel-Coder-35B-A3B-MTP-UD-Q4_K_XL.gguf", "Tiel-Coder 35B-A3B", "Think", ["Think", "No Think"]],
   ["MiniCPM5-2B-GGUF", "MiniCPM5 2B", "Think", ["Think", "No Think"]],
   ["MiniCPM5 2.6B", "MiniCPM5 2B", "Think", ["Think", "No Think"]],
@@ -170,6 +171,14 @@ describe("model-specific sampler and reasoning differences", () => {
     assert.deepEqual(params("gpt-oss-20b", "low").chat_template_kwargs, { reasoning_effort: "low" });
     assert.deepEqual(params("GLM-5.3-Flash", "max").chat_template_kwargs, { reasoning_effort: "max", clear_thinking: true });
     assert.equal(params("gpt-oss-20b", "none").chat_template_kwargs?.reasoning_effort, "medium");
+  });
+
+  it("uses the 3B Instruct author's recipe without changing the 0.5B starter", () => {
+    const p = params("Qwen2.5-3B-Instruct");
+    assert.deepEqual([p.temperature, p.top_p, p.top_k, p.repetition_penalty], [0.7, 0.8, 20, 1.05]);
+    assert.equal(params("Qwen2.5-0.5B-Instruct").repetition_penalty, 1.1);
+    assert.equal(resolveModelModes(undefined, "Qwen2.5-Coder-3B-Instruct"), undefined);
+    assert.equal(resolveModelModes(undefined, "Qwen2.5-3B-Base"), undefined);
   });
 
   it("separates original Qwen3, later Qwen recipes, and Coder recipes", () => {

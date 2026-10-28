@@ -679,6 +679,7 @@ describe("LlamaAioChatProvider requests", () => {
     ["LFM2.5-2.6B", ["high"], [0.1, 1, 50, 1.1], [{}]],
     ["LFM2.5-24B-A2B", ["high"], [0.1, 1, 50, 1.05], [{}]],
     ["LFM2.5-1.2B-Instruct", ["none"], [0.1, 1, 50, 1.05], [{}]],
+    ["Qwen2.5-3B-Instruct", ["none"], [0.7, 0.8, 20, 1.05], [{}]],
     ["Qwen3-4B-Instruct-2507", ["none"], [0.7, 0.8, 20, 1], [{}]],
     ["Qwen3-4B-Thinking-2507", ["high"], [0.6, 0.95, 20, 1], [{}]],
     ["Qwen3.8-35B-A3B-Distill", ["high"], [0.6, 0.95, 20, 1], [{ enable_thinking: true }]],
@@ -763,7 +764,7 @@ describe("LlamaAioChatProvider requests", () => {
   }
 
   for (const remote of [false, true]) {
-    for (const label of ["Nanbeige4.3-33B", "Flint", "DeepSeek-V4.1-Flash-1017", "LFM3-1.7B", "Spark-X2.6-1.7B", "MiniCPM5-2B", "Qwen3-0.6B", "Qwen3.5-0.8B"]) {
+    for (const label of ["Nanbeige4.3-33B", "Flint", "DeepSeek-V4.1-Flash-1017", "LFM3-1.7B", "LFM2.5-2.6B", "Spark-X2.6-1.7B", "MiniCPM5-2B", "Qwen3-0.6B", "Qwen3.5-0.8B", "gemma-4-E4B-it"]) {
       it(`round-trips ${label} SDK thinking parts separately from text across tool turns (remote=${remote})`, async () => {
         servedModelId = remote ? "opaque-instance" : label;
         servedMetadata = { owned_by: "strata", meta: { label } };
