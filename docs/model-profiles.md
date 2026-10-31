@@ -20,6 +20,10 @@ presets are likewise scenario recipes, not an effort ladder.
 | GLM-5.3-Flash | **Max**, High, Low | Temperature 1, top-p .95; clear old thinking on each turn |
 | GLM-5.3 full | **Max**, High, Low | Same controls and sampler as Flash; requires a compatible large-model server |
 | DeepSeek V4.1 Flash / 1017 | Max, **High**, Low, No Think | Temperature 1, top-p 1; numeric budgets 100/75/50 |
+| Groot 19B-A3B 261023 | **General**, Coding, No Think | General 1/.95/20, presence 1.5; Coding .6/.95/20, presence 0; off .7/.8/20, presence 1.5 |
+| Groot 65B-A6B 261023 | **XHigh**, Medium, Low, No Think | Think 1/.95/20, presence 0; off .7/.8/20, presence 1.5 |
+| Groot 238B-A18B 261023 | **Max**, High, Low | 1/.95; clear earlier thinking |
+| Groot 280B-A16B 261023 | Max, **High**, Low, No Think | 1/1, numeric budgets 100/75/50 |
 | Tiel-Coder 35B-A3B | **Think**, No Think | Coding recipe .6/.95/20; off follows the Qwen base's .7/.8/20, presence 1.5 |
 | MiniCPM5 2B | **Think**, No Think | 1/.95, min-p 0; no top-k filtering |
 | FrogNano 4B 2609 | **Think**, No Think | Author temperature .6, repeat penalty 1; other sampler filters neutralized |
@@ -64,6 +68,21 @@ or server sampler defaults from silently changing a selected recipe. GPT-OSS
 has no numeric sampler prescribed in its generation config: its unfiltered
 recipe is an extension choice. Nemotron's No Think preset uses the tool-calling
 sampler; Ornith's No Think sampler follows its Qwen base recipe.
+
+Groot profiles target the 261023 releases: [19B](https://huggingface.co/GrootTeam/Groot-19B-A3B-261023),
+[65B](https://huggingface.co/GrootTeam/Groot-65B-A6B-261023),
+[238B](https://huggingface.co/GrootTeam/Groot-238B-A18B-261023), and
+[280B](https://huggingface.co/GrootTeam/Groot-280B-A16B-261023). The 19B
+General and Coding modes are sampler recipes, not reasoning levels. The 65B
+effort levels follow the released GGUF template. The 238B's template accepts
+max/high/low, while the 280B's supports numeric budgets. Its publisher uses
+100 for benchmarks; High (75) is the embedded template's default. Groot models
+need a llama.cpp build that supports their respective GGUF architectures;
+profile selection alone does not establish runtime, vision, or tool compatibility.
+The 19B profile was smoke-tested with the bartowski IQ2_S GGUF and F16 projector
+using llama.cpp b11938 on CPU: thinking, non-thinking, tool round trip, and an
+image question worked. This does not validate Q4 quality, GPU performance, or
+long-context behavior. The three larger profiles have not been run here.
 
 Tiel uses the coding sampler without overriding its embedded template's default
 reasoning effort. The MTP checkpoint contains a custom template; it is checked
