@@ -5,6 +5,11 @@ import { applyModeToRequestBody, buildModeConfigurationSchema, resolveModeParams
 
 // Contract expectations taken from the author recipes linked in docs/model-profiles.md.
 const cases: Array<[string, string, string, string[]]> = [
+  ["GrootTeam/Groot-19B-A3B-261023", "Groot 19B-A3B", "Think (General)", ["Think (General)", "Think (Coding)", "No Think"]],
+  ["bartowski/GrootTeam_Groot-19B-A3B-261023-IQ2_S.gguf", "Groot 19B-A3B", "Think (General)", ["Think (General)", "Think (Coding)", "No Think"]],
+  ["Groot-65B-A6B-261023-Q4_K_M-00001-of-00004.gguf", "Groot 65B-A6B", "Think (XHigh)", ["Think (XHigh)", "Think (Medium)", "Think (Low)", "No Think"]],
+  ["GrootTeam/Groot-238B-A18B-261023", "Groot 238B-A18B", "Think (Max)", ["Think (Max)", "Think (High)", "Think (Low)"]],
+  ["Groot-280B-A16B-261023-UD-Q4_K_XL-00001-of-00009.gguf", "Groot 280B-A16B", "Think (High)", ["Think (Max)", "Think (High)", "Think (Low)", "No Think"]],
   ["Nanbeige/Nanbeige4.3-33B", "Nanbeige4.3 33B", "Think (Agent)", ["Think (Agent)", "Think (Chat)", "No Think"]],
   ["bartowski/Nanbeige_Nanbeige4.3-33B-GGUF", "Nanbeige4.3 33B", "Think (Agent)", ["Think (Agent)", "Think (Chat)", "No Think"]],
   ["Nanbeige4.3-33B-Q4_K_M.gguf", "Nanbeige4.3 33B", "Think (Agent)", ["Think (Agent)", "Think (Chat)", "No Think"]],
@@ -110,6 +115,20 @@ function params(id: string, mode?: string) {
 }
 
 describe("model-specific sampler and reasoning differences", () => {
+  it("uses Groot-specific sampling and the correct template controls", () => {
+    const small = params("Groot-19B-A3B-261023");
+    assert.deepEqual([small.temperature, small.top_p, small.top_k, small.presence_penalty], [1, 0.95, 20, 1.5]);
+    const coding = params("Groot-19B-A3B-261023", "Think (Coding)");
+    assert.deepEqual([coding.temperature, coding.presence_penalty], [0.6, 0]);
+    const medium = params("Groot-65B-A6B-261023", "Think (Medium)");
+    assert.equal(medium.presence_penalty, 0);
+    assert.equal(medium.chat_template_kwargs?.reasoning_effort, "medium");
+    const glm = params("Groot-238B-A18B-261023", "Think (Low)");
+    assert.deepEqual(glm.chat_template_kwargs, { clear_thinking: true, reasoning_effort: "low" });
+    const deepseek = params("Groot-280B-A16B-261023", "Think (Max)");
+    assert.deepEqual(deepseek.chat_template_kwargs, { enable_thinking: true, reasoning_effort: 100 });
+    assert.equal(deepseek.top_p, 1);
+  });
   it("uses distinct LFM3 vision and non-thinking omni recipes", () => {
     assert.deepEqual(params("LFM3-VL-2B", "high").chat_template_kwargs, { enable_thinking: true, preserve_thinking: false });
     assert.deepEqual(params("LFM3-VL-2B", "none").chat_template_kwargs, { enable_thinking: false, preserve_thinking: false });
@@ -318,6 +337,16 @@ describe("profile identity boundaries", () => {
 });
 
 describe("remote profile lookup shared with the sidebar", () => {
+  it("recognizes Groot model IDs and paths even when remote IDs are opaque", () => {
+    for (const [id, family] of [
+      ["Groot-19B-A3B-261023", "Groot 19B-A3B"], ["Groot-65B-A6B-261023", "Groot 65B-A6B"],
+      ["Groot-238B-A18B-261023", "Groot 238B-A18B"], ["Groot-280B-A16B-261023", "Groot 280B-A16B"],
+    ]) {
+      assert.equal(resolveRemoteModelModes({ modelId: id })?.familyLabel, family);
+      assert.equal(resolveRemoteModelModes({ modelId: "opaque", modelPath: `/models/${id}-Q4_K_M.gguf` })?.familyLabel, family);
+      assert.equal(resolveModelModes(undefined, `mtp-${id}-BF16.gguf`), undefined);
+    }
+  });
   it("uses aliases, portable filenames, labels, then IDs without local metadata", () => {
     for (const identity of [
       { modelAlias: "Nanbeige/Nanbeige4.3-33B" },

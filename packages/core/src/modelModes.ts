@@ -321,6 +321,18 @@ function deepSeek41Modes(familyLabel: string, topP: number): ModelModeSet {
 const DEEPSEEK41_MODES = deepSeek41Modes("DeepSeek V4.1 Flash", 1);
 const DEEPSEEK41_1017_MODES = deepSeek41Modes("DeepSeek V4.1 Flash 1017", 1);
 
+// GrootTeam's four releases use different templates and sampling recipes.
+const GROOT19_MODES: ModelModeSet = {
+  ...QWEN35_THINKING_MODES, familyLabel: "Groot 19B-A3B", defaultMode: "Think (General)",
+};
+const GROOT65_MODES: ModelModeSet = {
+  ...QWEN4EXP_THINKING_MODES, familyLabel: "Groot 65B-A6B", preserveReasoning: true,
+};
+const GROOT238_MODES: ModelModeSet = {
+  ...GLM53_MODES, familyLabel: "Groot 238B-A18B", preserveReasoning: true,
+};
+const GROOT280_MODES = deepSeek41Modes("Groot 280B-A16B", 1);
+
 const QWEN_CODER_MODES = fixedMode("Qwen3-Coder Instruct", "No Think", {
   ...OPEN_SAMPLING, temperature: 0.7, top_p: 0.8, top_k: 20, repetition_penalty: 1.05,
 });
@@ -433,6 +445,12 @@ function haystack(caps?: ModelCapabilities, modelId?: string): string {
 }
 
 function namedProfile(h: string): ModelModeSet | undefined {
+  const groot = /\bgroot[-_ ](19b[-_ ]a3b|65b[-_ ]a6b|238b[-_ ]a18b|280b[-_ ]a16b)[-_ ]261023(?=$|[.\s]|[-_](?:gguf|(?:ud[-_ ])?(?:iq|q|fp|bf|mxfp|nvfp)[\w.-]*)(?:$|[-_.\s]))/.exec(h);
+  if (groot) {
+    const size = groot[1].replace(/[-_ ]/g, "");
+    return ({ "19ba3b": GROOT19_MODES, "65ba6b": GROOT65_MODES,
+      "238ba18b": GROOT238_MODES, "280ba16b": GROOT280_MODES } as Record<string, ModelModeSet>)[size];
+  }
   if (/(?:^|[-_\s])nanbeige[-_ ]?4[._]3[-_ ]33b(?=$|[.\s]|[-_](?:gguf|(?:ud[-_ ])?(?:iq|q|fp|bf|mxfp|gsq)[\w.-]*)(?:$|[-_.\s]))/.test(h)) return NANBEIGE43_MODES;
   if (/\bqwen[-_ ]?2[._]5[-_ ]0[._]5b[-_ ]instruct(?:\b|_)/.test(h)) return QWEN25_STARTER_MODES;
   if (/\bqwen[-_ ]?2[._]5[-_ ]3b[-_ ]instruct(?:\b|_)/.test(h)) return QWEN25_3B_MODES;
