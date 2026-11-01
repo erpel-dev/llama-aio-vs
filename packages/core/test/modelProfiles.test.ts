@@ -309,6 +309,26 @@ describe("profile identity boundaries", () => {
     assert.equal(resolveModelModes(undefined, "Qwen3.8-27B-MTP-Q4_K_M.gguf")?.familyLabel, "Qwen3.8");
     assert.equal(resolveModelModes(undefined, "Swift-1.5-Qwen3.8-27B-GSQ-RCO-GGUF")?.familyLabel, "Qwen3.8");
   });
+  it("keeps reasoning controls for the published full Swift GSQ-RCO MTP packages", () => {
+    for (const quant of ["IQ2_XS", "IQ2_S", "IQ3_XXS", "IQ3_S"]) {
+      const filename = `Swift-1.5-Qwen3.8-27B-GSQ-RCO-${quant}-mtp.gguf`;
+      for (const identity of [filename, `ukisai_${filename}`]) {
+        const local = resolveLocalModelModes(denseCaps({ name: "Swift", architecture: "qwen35", path: `/models/${identity}` }), identity);
+        const remote = resolveRemoteModelModes({ modelId: "opaque", modelName: "Swift", modelPath: `C:\\models\\${identity}` });
+        for (const set of [local, remote]) {
+          assert.equal(set?.familyLabel, "Qwen3.8");
+          const effort = buildModeConfigurationSchema(set!).properties.reasoningEffort as { enum: string[] };
+          assert.deepEqual(effort.enum, ["xhigh", "medium", "low", "none"]);
+        }
+        assert.equal(resolveRemoteModelModes({ modelId: identity })?.familyLabel, "Qwen3.8");
+        for (const prefix of ["mtp-", "mmproj-", "draft-", "dflash2-"]) {
+          assert.equal(resolveModelModes(undefined, prefix + identity), undefined);
+        }
+      }
+    }
+    assert.equal(resolveModelModes(undefined, "Swift-1.5-Qwen3.8-27B-Unverified-mtp.gguf"), undefined);
+    assert.equal(resolveModelModes(undefined, "Swift-2.0-Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf"), undefined);
+  });
   for (const id of ["Spark-X2.7-4B", "LFM2.5-7B", "Ornith-1.5-31B", "Ornith-2.0-9B", "GLM-4.7-Flash",
     "LFM3-1.7B-Base", "LFM3-1.7B-Unverified", "LFM3-7B", "LFM3-VL-2B-Base", "LFM3-Audio-2B-Base", "LFM3-Omni-2B-Base",
     "Nanbeige4.3-33B-Base-Q4_K_M.gguf", "Nanbeige4.2-3B", "Nanbeige4.3-3B", "Nanbeige4.4-33B",

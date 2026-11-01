@@ -627,10 +627,29 @@ describe("LlamaAioChatProvider requests", () => {
     assert.equal(lastBody, undefined);
   });
 
+  for (const remote of [false, true]) {
+    it(`advertises and applies all reasoning modes for the full Swift MTP model (${remote ? "remote" : "local"})`, async () => {
+      servedModelId = "Swift-1.5-Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf";
+      servedProps = { model_path: `/models/${servedModelId}` };
+      const { provider, state } = setup({ remote });
+      state.selectedModelPath = servedProps.model_path;
+      state.modelCapabilities = { path: servedProps.model_path, name: "Swift", architecture: "qwen35" };
+      const [model] = await provider.provideLanguageModelChatInformation({}, cancelToken().token);
+      assert.deepEqual(model.configurationSchema.properties.reasoningEffort.enum, ["xhigh", "medium", "low", "none"]);
+      for (const effort of ["xhigh", "medium", "low", "none"]) {
+        await provider.provideLanguageModelChatResponse(model, [msg(Role.User, new TextPart("hello"))],
+          { modelOptions: { reasoningEffort: effort } }, { report() {} }, cancelToken().token);
+        assert.equal(lastBody.chat_template_kwargs.enable_thinking, effort !== "none");
+        assert.equal(lastBody.chat_template_kwargs.reasoning_effort, effort === "none" ? undefined : effort);
+      }
+    });
+  }
+
   for (const [id, label, family, defaultMode] of [
     ["q2_0", "Qwen3.8-Flash-Next Q2_0", "Qwen3.8 Flash-Next", "xhigh"],
     ["unsloth-ud-iq4_xs", "Qwen3.8-Flash-Next (Unsloth) UD-IQ4_XS", "Qwen3.8 Flash-Next", "xhigh"],
     ["swift-iq3_s", "Swift 1.5 IQ3_S", "Qwen3.8 Flash-Next", "xhigh"],
+    ["Swift-1.5-Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf", "Swift 1.5 Qwen3.8 27B", "Qwen3.8", "xhigh"],
     ["gyro-gyro-m", "Qwen3.8-Flash-Next Gyro-M", "Qwen3.8 Flash-Next", "xhigh"],
     ["qwen36-ud-q4_k_xl", "Qwen3.6-35B-A3B UD-Q4_K_XL", "Qwen3.5 / 3.6", "medium"],
   ]) {

@@ -583,9 +583,12 @@ export function resolveModelModes(
 }
 
 function profileVariantExcluded(h: string): boolean {
+  // These published Swift packages contain the full model plus an MTP head,
+  // not a standalone prediction sidecar. Keep all other draft exclusions.
+  const withoutBundledSwiftMtp = h.replace(/\bswift-1\.5-qwen3\.8-27b-gsq-rco-(?:iq2[-_]xs|iq2[-_]s|iq3[-_]xxs|iq3[-_]s)-mtp\.gguf(?=$|\s)/g, "");
   return /(?:^|[\s])(?:mmproj|mtp)[-_.]/.test(h)
     || /(?:^|[-_.\s])mmproj(?:$|[-_.\s])/.test(h)
-    || /-mtp\.gguf(?:$|\s)/.test(h)
+    || /-mtp\.gguf(?:$|\s)/.test(withoutBundledSwiftMtp)
     || /(?:^|[-_.\s])dflash\d*(?:$|[-_.\s])/.test(h)
     || /(?:^|[-_.\s])dspark\d*(?:$|[-_.\s])/.test(h)
     || /(?:^|[-_.\s])draft(?:$|[-_.\s])/.test(h)

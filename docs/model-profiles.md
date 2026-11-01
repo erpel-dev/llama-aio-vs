@@ -172,6 +172,10 @@ in its model picker. Profile-owned sampling controls are hidden because the
 preset overrides them. Main models advertising embedded MTP heads remain valid;
 prediction sidecars are excluded. Explicit dense Swift checkpoint names take
 precedence over Strata's shortened Swift alias for Flash-Next.
+The published Swift 1.5 Qwen3.8-27B GSQ-RCO IQ2_XS, IQ2_S, IQ3_XXS and
+IQ3_S `-mtp.gguf` packages contain the full chat model plus its prediction
+head, so they retain the Qwen3.8 reasoning picker. This exception does not
+apply to standalone `mtp-` sidecars or other unverified `-mtp.gguf` files.
 
 Published `alias_of`, `aliases`, and `meta.aliases` can identify an opaque model
 too; conflicting alias families leave sampling free. Human-readable `meta.label`
