@@ -51,3 +51,14 @@ describe("local API key", () => {
     assert.equal(isLoopbackOrigin("not a url"), false);
   });
 });
+
+describe("external terminal command line", () => {
+  it("never writes the API key into the terminal's argv; the shell reads it from the key file", async () => {
+    const { terminalExportLines } = await import("../src/externalTerminal");
+    const key = ensureLocalApiKey();
+    const lines = terminalExportLines({ LLAMA_API_KEY: key, GGML_X: "1" });
+    assert.ok(lines.every((l) => !l.includes(key)), "key must not appear in the command");
+    assert.ok(lines.some((l) => l.startsWith("export LLAMA_API_KEY=\"$(cat ") && l.includes(getLocalApiKeyPath())));
+    assert.ok(lines.includes("export GGML_X='1'") || lines.some((l) => l.startsWith("export GGML_X=")));
+  });
+});

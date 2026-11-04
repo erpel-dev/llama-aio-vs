@@ -132,3 +132,14 @@ describe("appleScriptTerminalLaunch", () => {
     assert.equal(launched.includes("'\''"), false);
   });
 });
+
+describe("externalTerminalUnavailableReason", () => {
+  it("Linux without a display or without a terminal cannot show a window", async () => {
+    const { externalTerminalUnavailableReason } = await import("../src/externalTerminal");
+    assert.match(externalTerminalUnavailableReason({}, "linux", () => true) || "", /no graphical display/);
+    assert.match(externalTerminalUnavailableReason({ DISPLAY: ":0" }, "linux", () => false) || "", /no terminal/);
+    assert.equal(externalTerminalUnavailableReason({ WAYLAND_DISPLAY: "wayland-0" }, "linux", () => true), undefined);
+    assert.equal(externalTerminalUnavailableReason({}, "darwin", () => false), undefined);
+    assert.equal(externalTerminalUnavailableReason({}, "win32", () => false), undefined);
+  });
+});

@@ -5,7 +5,7 @@
  */
 import { $, vscode } from "./api";
 import type { ToWebviewMessage } from "./protocol";
-import { escAttr, escText, fmtBytes, fmtEta, fmtNum, fmtParams, fmtRate, fmtServerRate, fmtTokK, fmtTokShort, fmtUptime, pickNum } from "./format";
+import { escAttr, escText, fmtBytes, fmtEta, fmtNum, fmtParams, fmtRate, fmtServerRate, fmtTokK, fmtTokShort, fmtUptime, friendlyNetworkError, pickNum } from "./format";
 import {
   clampMainGpu,
   denseFfnShareOf,
@@ -66,6 +66,10 @@ let llamaInstall = null;
 /** Settings the running server has not picked up yet ({ label, from, to }). */
 let pendingChanges = [];
 let lastPayload = null;
+/** True once any request on the current target completed (perf history). */
+let sawCompletedReply = false;
+/** Whether the Get started checklist is showing (it then owns the next action). */
+let setupVisible = false;
 let lastMemoryView = null;
 let loadDefaults = {};
 /** "Custom" GPU layers stays open while the user works with the slider. */
@@ -521,6 +525,208 @@ function renderStatusUi(opts) {
 }
 
 /**
+ * Get started checklist: runtime → model → start → first reply. Each step is
+ * done / now / busy / error / next, and only the current step offers the
+ * primary action. Remote mode and finished onboarding hide it.
+ */
+function setupSteps() {
+  const p = lastPayload || {};
+  const hasModel = !!(p.state && p.state.selectedModelPath);
+  const build = p.build || {};
+  const runtimeOk = !!p.binaryExists && build.binaryRunnable !== false;
+  const installing = llamaInstallRunning();
+  const installFailed = !!(llamaInstall && llamaInstall.status === 'error');
+  const jobs = (lib.downloads || []).filter(function (j) { return j && j.state !== 'error' && j.state !== 'gated'; });
+  const modelJob = jobs.find(function (j) { return !/mmproj|mtp|draft/i.test(String(j.label || '')); }) || jobs[0];
+  const resumable = ((lib.payload && lib.payload.partials) || []).some(function (x) { return x && x.resumable; });
+  const tried = !!p.onboardingDone || sawCompletedReply;
+  return { p, hasModel, build, runtimeOk, installing, installFailed, modelJob, resumable, tried };
+}
+
+function setupButton(action, label, primary = false) {
+  return '<button type="button" class="' + (primary ? 'primary' : 'secondary') + ' small" data-setup="' + escAttr(action) + '">' + escText(label) + '</button>';
+}
+
+function renderSetup() {
+  const box = $('setupBox');
+  if (!box || !lastPayload) return;
+  const st = setupSteps();
+  const visible = !remoteMode && !connectOpen && (!st.runtimeOk || !st.hasModel || !st.tried);
+  setupVisible = visible;
+  box.classList.toggle('hidden', !visible);
+  document.body.classList.toggle('onboarding', visible && !(st.runtimeOk && st.hasModel));
+  document.body.classList.toggle('awaiting-first-reply', visible && serverRunning && !st.tried);
+  if (!visible) return;
+
+  const starterLabel = box.dataset.starterLabel || 'starter';
+  const starterSize = box.dataset.starterSize || '';
+  const backendName = String((lastPayload.selectedUiBackend || st.build.activeBackend || 'cpu')).toUpperCase()
+    .replace('VULKAN', 'Vulkan').replace('PATH', 'System PATH');
+  const steps = {
+    runtime: { state: 'next', detail: '' },
+    model: { state: 'next', detail: '' },
+    start: { state: 'next', detail: '' },
+    try: { state: 'next', detail: '' },
+  };
+  // Runtime
+  if (st.runtimeOk) {
+    const bin = String(st.p.binary || '');
+    const managed = !!st.build.tag && !/^(path|system)/i.test(String(st.build.activeBackend || ''));
+    steps.runtime = {
+      state: 'done',
+      detail: managed
+        ? 'llama.cpp ' + st.build.tag + ' · ' + backendName
+        : 'Using ' + (bin ? bin.replace(/^.*[\\/]([^\\/]+[\\/][^\\/]+)$/, '…/$1') : 'llama-server from PATH'),
+    };
+  } else if (st.installing) {
+    const pct = llamaInstall && llamaInstall.percent != null ? ' ' + Math.round(llamaInstall.percent) + '%' : '';
+    steps.runtime = { state: 'busy', detail: 'Installing the ' + backendName + ' build…' + pct };
+  } else if (st.installFailed) {
+    steps.runtime = { state: 'error', detail: friendlyNetworkError(llamaInstall.error || llamaInstall.message, 'github') };
+  } else if (st.build.binaryRunnable === false) {
+    steps.runtime = { state: 'error', detail: 'The installed llama-server does not run on this system. Try another backend below.' };
+  } else {
+    steps.runtime = { state: 'now', detail: 'Runs models on this machine. ' + backendName + ' build picked for your hardware.' };
+  }
+  // Model
+  if (st.hasModel) {
+    steps.model = { state: 'done', detail: lastPayload.modelName || 'Model selected' };
+  } else if (st.modelJob) {
+    const j = st.modelJob;
+    const pct = j.total > 0 ? Math.min(100, Math.round((j.received / j.total) * 100)) + '%' : '';
+    steps.model = { state: j.state === 'paused' ? 'now' : 'busy', detail: (j.state === 'paused' ? 'Paused: ' : 'Downloading ') + (j.label || 'model') + (pct ? ' · ' + pct : '') + (j.etaSeconds ? ' · ' + fmtEta(j.etaSeconds) : '') };
+  } else if (st.resumable) {
+    steps.model = { state: 'now', detail: 'A download was interrupted. Resume it, or pick another model.' };
+  } else {
+    steps.model = { state: 'now', detail: 'Any GGUF works. The starter (' + starterLabel + ', ' + starterSize + ') runs on most machines.' };
+  }
+  // Start
+  if (serverRunning) {
+    steps.start = { state: 'done', detail: 'Running at ' + (lastEndpoint || lastPayload.endpoint || '') };
+  } else if (serverStarting) {
+    steps.start = { state: 'busy', detail: 'Loading the model…' };
+  } else if (st.runtimeOk && st.hasModel) {
+    steps.start = { state: 'now', detail: 'Starts llama-server with the settings below. You can change them any time.' };
+  }
+  // First reply
+  if (st.tried) {
+    steps.try = { state: 'done', detail: '' };
+  } else if (serverRunning) {
+    steps.try = {
+      state: 'now',
+      detail: lastPayload.copilotChatAvailable
+        ? 'In Copilot Chat, open the model picker and choose “Llama AIO: ' + (lastPayload.modelName || 'model') + '”.'
+        : 'Copilot Chat is not installed. Any OpenAI-compatible client can use ' + (lastEndpoint || lastPayload.endpoint || '') + ' with the local API key.',
+    };
+  }
+
+  const order = ['runtime', 'model', 'start', 'try'];
+  const ids = { runtime: 'stepRuntime', model: 'stepModel', start: 'stepStart', try: 'stepTry' };
+  // Only the step that owns the button reads as current; later open steps wait.
+  const now = order.find(function (k) { return steps[k].state === 'now' || steps[k].state === 'error'; });
+  for (const key of order) {
+    if (key !== now && steps[key].state === 'now') steps[key].state = 'next';
+  }
+  let done = 0;
+  for (const key of order) {
+    const li = $(ids[key]);
+    const step = steps[key];
+    if (step.state === 'done') done++;
+    li.className = 'setup-step ' + step.state;
+    li.setAttribute('aria-current', step.state === 'now' ? 'step' : 'false');
+    $(ids[key] + 'Detail').textContent = step.detail;
+  }
+  $('setupProgress').textContent = done + ' of 4 done';
+  $('setupTitle').textContent = done === 3 && serverRunning ? 'Almost there' : 'Get started';
+
+  // One primary action: the first step that needs the user. A busy runtime
+  // install does not block choosing a model meanwhile.
+  const primary = $('setupPrimaryBtn');
+  const secondary = [];
+  let action = '';
+  let label = '';
+  let disabled = false;
+  if (now === 'runtime') {
+    if (st.installFailed) {
+      action = 'install'; label = 'Retry install';
+      secondary.push(setupButton('installArchive', 'Install from archive…'), setupButton('backend', 'Other backends…'));
+    } else {
+      action = 'install'; label = 'Install llama.cpp (' + backendName + ')';
+      secondary.push(setupButton('backend', 'Other backends…'));
+    }
+  } else if (now === 'model') {
+    if (st.resumable && !st.modelJob) {
+      action = 'resume'; label = 'Resume download';
+    } else if (st.modelJob && st.modelJob.state === 'paused') {
+      action = 'library'; label = 'Show download';
+    } else {
+      action = 'starter'; label = 'Download ' + starterLabel + ' (' + starterSize + ')';
+    }
+    secondary.push(setupButton('library', 'Browse / search…'), setupButton('openFile', 'Open GGUF…'));
+  } else if (now === 'start') {
+    action = 'start'; label = 'Start server';
+  } else if (now === 'try') {
+    if (lastPayload.copilotChatAvailable) {
+      action = 'openChat'; label = 'Open Copilot Chat';
+    } else {
+      action = 'copyKey'; label = 'Copy local API key';
+      secondary.push(setupButton('copyEndpoint', 'Copy endpoint'));
+    }
+    secondary.push(setupButton('dismiss', 'Done'));
+  } else {
+    // Everything that needs the user is busy (installing / downloading / loading).
+    const busy = order.find(function (k) { return steps[k].state === 'busy'; });
+    label = busy === 'runtime' ? 'Installing llama.cpp…' : busy === 'model' ? 'Downloading model…' : busy === 'start' ? 'Loading model…' : 'Working…';
+    disabled = true;
+  }
+  primary.dataset.action = action;
+  primary.textContent = label;
+  primary.disabled = disabled;
+  $('setupSecondary').innerHTML = secondary.join('');
+  const foot = $('setupFoot');
+  if (foot) foot.classList.toggle('hidden', st.runtimeOk && st.hasModel);
+}
+
+function runSetupAction(action) {
+  if (action === 'install') {
+    const retry = !!(llamaInstall && llamaInstall.status === 'error');
+    if (!noteInstallStarting(retry ? 'Retrying…' : undefined)) return;
+    if (retry) vscode.postMessage({ type: 'retryLlamaInstall' });
+    else vscode.postMessage({ type: 'installLlamaCpp', payload: ($('backendSelect') && $('backendSelect').value) || (lastPayload && lastPayload.selectedUiBackend) || 'cpu' });
+  } else if (action === 'installArchive') {
+    vscode.postMessage({ type: 'installLlamaCppFromArchive' });
+  } else if (action === 'backend') {
+    const fold = $('backendFold');
+    if (fold) fold.open = true;
+    const card = $('backendCard');
+    if (card && card.scrollIntoView) card.scrollIntoView({ block: 'start', behavior: 'smooth' });
+  } else if (action === 'starter') {
+    vscode.postMessage({ type: 'downloadStarter' });
+  } else if (action === 'resume') {
+    vscode.postMessage({ type: 'resumePartialDownloads' });
+  } else if (action === 'library') {
+    const modelFold = $('modelFold');
+    if (modelFold) modelFold.open = true;
+    const fold = $('libraryFold');
+    if (fold) fold.open = true;
+    const filter = $('libraryFilter');
+    if (filter) { filter.focus(); if (filter.scrollIntoView) filter.scrollIntoView({ block: 'center' }); }
+  } else if (action === 'openFile') {
+    vscode.postMessage({ type: 'openModelFile' });
+  } else if (action === 'start') {
+    launch('start');
+  } else if (action === 'openChat') {
+    vscode.postMessage({ type: 'openCopilotChat' });
+  } else if (action === 'copyKey') {
+    vscode.postMessage({ type: 'copyLocalApiKey' });
+  } else if (action === 'copyEndpoint') {
+    vscode.postMessage({ type: 'copyText', text: lastEndpoint || (lastPayload && lastPayload.endpoint) || '' });
+  } else if (action === 'dismiss') {
+    vscode.postMessage({ type: 'dismissSetup' });
+  }
+}
+
+/**
  * The big button only appears when there is something to do: Start,
  * Loading…, or Reload to apply. A clean running server gets the small ⟳.
  */
@@ -530,7 +736,9 @@ function updatePrimaryAction() {
     const row = $('primaryRow');
     if (row) row.classList.add('hidden');
     const stop = $('stopBtn');
-    if (stop) stop.disabled = true;
+    if (stop) { stop.disabled = true; stop.classList.add('hidden'); }
+    const webUi = $('openWebUiBtn');
+    if (webUi) webUi.disabled = false;
     if (reloadIcon) {
       reloadIcon.classList.toggle('hidden', connectOpen);
       reloadIcon.title = 'Re-probe the remote server';
@@ -547,6 +755,8 @@ function updatePrimaryAction() {
   const row = $('primaryRow');
   if (!primary || !stop) return;
   stop.disabled = !serverRunning && !serverStarting;
+  const webUi = $('openWebUiBtn');
+  if (webUi) webUi.disabled = !serverRunning;
   primary.classList.remove('warn-primary');
   primary.classList.add('primary');
   let showRow = true;
@@ -566,7 +776,10 @@ function updatePrimaryAction() {
     showRow = false;
     primary.dataset.action = 'reload';
   }
-  if (row) row.classList.toggle('hidden', !showRow);
+  renderSetup();
+  // The checklist carries the single next action; no competing Start button.
+  if (row) row.classList.toggle('hidden', !showRow || setupVisible);
+  stop.classList.toggle('hidden', !serverRunning && !serverStarting);
   const discard = $('discardBtn');
   if (discard) discard.classList.toggle('hidden', !pendingChanges.length);
   if (reloadIcon) reloadIcon.classList.toggle('hidden', !(serverRunning && !serverStarting && !configDirty));
@@ -838,12 +1051,13 @@ function renderLlamaInstall() {
     const title = job.status === 'cancelled' ? 'Install cancelled' : 'Download failed';
     const detail = job.status === 'cancelled'
       ? ('The previous build is unchanged' + (installed ? (' (' + installed + ')') : '') + '.')
-      : String(job.error || job.message || 'Install failed').split('\n')[0];
+      : friendlyNetworkError(job.error || job.message || 'Install failed', 'github');
     let html = '<div class="install-err">' + escText(title) + '</div>';
-    html += '<div class="hint">' + escText(detail) + '</div>';
+    html += '<div class="hint" title="' + escAttr(String(job.error || job.message || '')) + '">' + escText(detail) + '</div>';
     html += '<div class="lib-job-meta"><span></span><span class="lib-actions" style="padding:0">';
     if (job.status === 'error') {
       html += '<button type="button" class="secondary small" data-act="install-retry">Retry</button>';
+      html += '<button type="button" class="secondary small" data-act="install-archive">From archive…</button>';
     }
     html += '<button type="button" class="secondary small" data-act="install-dismiss">Dismiss</button>';
     html += '</span></div>';
@@ -1283,9 +1497,18 @@ function renderPerfStats(perf, perfLines) {
   const metricsEl = $('perfMetrics');
   const tableEl = $('perfHistoryTable');
   const p = perf || {};
-  const stale = !!(p.generating && p.showingPreviousCall);
+  const ended = p.outcome === 'cancelled' || p.outcome === 'failed';
+  // Tiles still show the previous completed call while a request runs, or after
+  // one was cancelled/failed before llama.cpp sent its timings: dim them.
+  const stale = !!((p.generating || ended) && p.showingPreviousCall);
   const rows = Array.isArray(p.history) ? p.history.filter(function (h) { return h && typeof h === 'object'; }) : [];
-  const last = rows[0] || {};
+  if (rows.some(function (h) { return !h.outcome || h.outcome === 'completed'; }) && !sawCompletedReply) {
+    sawCompletedReply = true;
+    renderSetup();
+  }
+  // Fallbacks only ever come from a completed call; never mix one request's
+  // token count with another's duration.
+  const last = rows.find(function (h) { return !h.outcome || h.outcome === 'completed'; }) || {};
 
   if (tableEl) {
     if (!rows.length) {
@@ -1296,6 +1519,11 @@ function renderPerfStats(perf, perfLines) {
         const genH = fmtRate(h.genTokPerSec);
         const promptH = fmtRate(h.promptTokPerSec);
         const reuse = typeof h.cacheHitPct === 'number' ? h.cacheHitPct.toFixed(0) + '%' : '—';
+        if (h.outcome === 'cancelled' || h.outcome === 'failed') {
+          const dur = typeof h.durationMs === 'number' ? ' after ' + (h.durationMs / 1000).toFixed(1) + ' s' : '';
+          return '<tr class="muted"><td>' + (i === 0 ? when + ' <span class="muted">latest</span>' : when) +
+            '</td><td colspan="3">' + h.outcome + dur + '</td></tr>';
+        }
         return '<tr><td>' + (i === 0 ? when + ' <span class="muted">latest</span>' : when) +
           '</td><td>' + (genH || '—') +
           '</td><td>' + (promptH || '—') +
@@ -1307,16 +1535,19 @@ function renderPerfStats(perf, perfLines) {
   }
 
   const cacheHitPct = pickNum(p.cacheHitPct, last.cacheHitPct);
-  const completionTokens = pickNum(p.completionTokens, last.completionTokens);
+  // Same request for count and duration: the live one when it has started,
+  // else the last completed call (e.g. history restored without a live call).
+  const own = !!p.startedAt;
+  const completionTokens = own ? p.completionTokens : last.completionTokens;
   const draftAcceptancePct = pickNum(p.draftAcceptancePct, last.draftAcceptancePct);
-  const durationMs = (!p.generating && p.finishedAt && p.startedAt)
-    ? (p.finishedAt - p.startedAt)
+  const durationMs = own
+    ? (!p.generating && p.finishedAt ? p.finishedAt - p.startedAt : undefined)
     : last.durationMs;
   const genNow = p.generating ? p.genTokPerSec : pickNum(p.genTokPerSec, last.genTokPerSec);
   const promptNow = pickNum(p.promptTokPerSec, last.promptTokPerSec);
 
   // Oldest first for the sparklines; each tile scales its own series.
-  const chrono = rows.slice().reverse();
+  const chrono = rows.filter(function (h) { return !h.outcome || h.outcome === 'completed'; }).reverse();
   const genSeries = chrono.map((h) => h.genTokPerSec);
   const promptSeries = chrono.map((h) => h.promptTokPerSec);
   const reuseSeries = chrono.map((h) => h.cacheHitPct);
@@ -1377,8 +1608,15 @@ function renderPerfStats(perf, perfLines) {
     bits.push('<span class="ok">● ' + (hasTokens ? 'Generating…' : 'Waiting for first token…') +
       (live ? ' ' + live + ' tok/s' : '') + '</span>');
   }
-  if (typeof completionTokens === 'number') {
-    const dur = typeof durationMs === 'number' && durationMs > 0 && !p.generating
+  if (!p.generating && ended) {
+    const dur = typeof durationMs === 'number' && durationMs > 0 ? ' after ' + (durationMs / 1000).toFixed(1) + ' s' : '';
+    const out = typeof completionTokens === 'number' && completionTokens > 0
+      ? ' · ' + fmtNum(completionTokens) + ' tok received'
+      : ' · no output';
+    bits.push('<span class="muted">Last request ' + (p.outcome === 'failed' ? 'failed' : 'cancelled') + dur + out +
+      (p.showingPreviousCall ? '. Rates above are from the previous reply.' : '') + '</span>');
+  } else if (!p.generating && typeof completionTokens === 'number') {
+    const dur = typeof durationMs === 'number' && durationMs > 0
       ? ' in ' + (durationMs / 1000).toFixed(1) + ' s'
       : '';
     bits.push('<span class="muted">Last reply: ' + fmtNum(completionTokens) + ' tok' + dur + '</span>');
@@ -2537,8 +2775,15 @@ function applyState(payload) {
     message: starting ? startMessage : (status.message || ''),
   });
   const lm = $('launchMode');
+  if (lm) {
+    // No desktop terminal here: start uses Background, the saved choice stays.
+    const forced = String(payload.launchModeFallback || '');
+    const ext = lm.querySelector('option[value="externalTerminal"]');
+    if (ext) ext.textContent = forced ? 'External terminal (unavailable: ' + forced + ')' : 'External terminal (logs visible)';
+    lm.title = forced ? 'Using Background: ' + forced + '. Logs: ⋯ → Open log.' : 'How llama-server is started';
+  }
   if (lm && payload.launchMode && document.activeElement !== lm) {
-    lm.value = payload.launchMode === 'background' ? 'background' : 'externalTerminal';
+    lm.value = payload.launchMode === 'background' || payload.launchModeFallback ? 'background' : 'externalTerminal';
   }
   updatePrimaryAction();
 
@@ -2689,15 +2934,9 @@ function applyState(payload) {
   suppressBackendChange = false;
   updateBackendUi();
 
-  $('setupBox').classList.toggle('hidden', hasModel && payload.binaryExists);
-
   const localCount = payload.localModelCount || 0;
-  const showStarter = !hasModel;
-  const starterBtn = $('starterModelBtn');
-  const starterHint = $('starterModelHint');
-  $('starterCol').classList.toggle('hidden', !showStarter);
-  if (starterBtn) starterBtn.classList.toggle('hidden', !showStarter);
-  if (starterHint) starterHint.classList.toggle('hidden', !showStarter);
+  document.body.classList.toggle('no-model', !hasModel);
+  renderSetup();
   const titleHtml = modelTitleHtml(hasModel ? (payload.modelName || 'model') : 'No model selected');
   $('modelTitle').innerHTML = titleHtml;
   $('modelClosedName').innerHTML = hasModel ? titleHtml : 'No model selected';
@@ -3140,14 +3379,15 @@ if (dupToggle) {
     });
   });
 }
-const starterModelBtn = $('starterModelBtn');
-if (starterModelBtn) {
-  starterModelBtn.addEventListener('click', () => vscode.postMessage({ type: 'downloadStarter' }));
-}
-const setupStarterBtn = $('setupStarterBtn');
-if (setupStarterBtn) {
-  setupStarterBtn.addEventListener('click', () => vscode.postMessage({ type: 'downloadStarter' }));
-}
+$('setupPrimaryBtn').addEventListener('click', () => runSetupAction($('setupPrimaryBtn').dataset.action || ''));
+$('setupSecondary').addEventListener('click', (e) => {
+  const btn = e.target.closest ? e.target.closest('button[data-setup]') : null;
+  if (btn) runSetupAction(btn.getAttribute('data-setup') || '');
+});
+$('setupConnectLink').addEventListener('click', (e) => {
+  e.preventDefault();
+  openConnectForm({ url: '', label: '' });
+});
 $('openFileBtn').addEventListener('click', () => vscode.postMessage({ type: 'openModelFile' }));
 $('libraryRefreshBtn').addEventListener('click', () => {
   $('libraryRefreshBtn').disabled = true;
@@ -3238,8 +3478,9 @@ $('openLogBtn').addEventListener('click', () => { closeMenu(); vscode.postMessag
 $('copyCmdBtn').addEventListener('click', () => { closeMenu(); vscode.postMessage({ type: 'copyCommandLine' }); });
 $('openWebUiBtn').addEventListener('click', () => {
   closeMenu();
-  if (lastEndpoint) vscode.postMessage({ type: 'openExternal', url: lastEndpoint });
+  vscode.postMessage({ type: 'openWebUi' });
 });
+$('copyKeyBtn').addEventListener('click', () => { closeMenu(); vscode.postMessage({ type: 'copyLocalApiKey' }); });
 function scheduleProbe() {
   if (probeTimer) clearTimeout(probeTimer);
   const url = ($('remoteUrlInput') && $('remoteUrlInput').value || '').trim();
@@ -3409,6 +3650,8 @@ $('libraryPartials').addEventListener('click', function (e) {
   const btn = e.target.closest ? e.target.closest('[data-act]') : null;
   if (btn && btn.getAttribute('data-act') === 'clean-partials') {
     vscode.postMessage({ type: 'cleanPartialDownloads' });
+  } else if (btn && btn.getAttribute('data-act') === 'resume-partials') {
+    vscode.postMessage({ type: 'resumePartialDownloads' });
   }
 });
 $('llamaInstallBox').addEventListener('click', function (e) {
@@ -3420,9 +3663,12 @@ $('llamaInstallBox').addEventListener('click', function (e) {
   } else if (act === 'install-retry') {
     noteInstallStarting('Retrying…');
     vscode.postMessage({ type: 'retryLlamaInstall' });
+  } else if (act === 'install-archive') {
+    vscode.postMessage({ type: 'installLlamaCppFromArchive' });
   } else if (act === 'install-dismiss') {
     llamaInstall = null;
     renderLlamaInstall();
+    renderSetup();
   }
 });
 $('libraryDialog').addEventListener('change', function (e) {
@@ -3478,6 +3724,7 @@ window.addEventListener('message', (event: MessageEvent<ToWebviewMessage>) => {
   if (msg.type === 'libraryDownloads') {
     lib.downloads = msg.jobs || [];
     renderLibraryJobs();
+    renderSetup();
   }
   if (msg.type === 'libraryHfResults' || msg.type === 'libraryHfFiles' || msg.type === 'libraryHfError') {
     applyLibraryHfMessage(msg);
@@ -3515,6 +3762,7 @@ window.addEventListener('message', (event: MessageEvent<ToWebviewMessage>) => {
     llamaInstall = msg.payload || null;
     renderLlamaInstall();
     applyInstallLock();
+    renderSetup();
   }
   if (msg.type === 'perfPatch' && msg.payload) {
     const perf = msg.payload.perf || {};

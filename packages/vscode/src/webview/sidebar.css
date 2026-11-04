@@ -442,14 +442,45 @@ input:disabled, select:disabled { opacity: 0.5; }
 .mem-legend .seg-kv { background: #a855f7; }
 .mem-legend .seg-overhead { background: #64748b; }
 .setup {
-  background: var(--warn-bg);
-  border: 1px solid var(--border);
+  background: var(--input-bg);
+  border: 1px solid color-mix(in srgb, var(--accent) 55%, var(--border));
   border-radius: 6px;
   padding: 10px;
   margin-bottom: 10px;
 }
-.setup ol { margin: 6px 0 0 18px; padding: 0; }
-.setup li { margin: 4px 0; }
+.setup-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.setup-steps { list-style: none; margin: 8px 0 10px; padding: 0; }
+.setup-step { display: flex; gap: 8px; align-items: flex-start; margin: 6px 0; color: var(--muted); }
+.step-mark {
+  flex: 0 0 16px; height: 16px; margin-top: 1px; border-radius: 50%;
+  border: 1.5px solid var(--border); box-sizing: border-box;
+  font-size: 10px; line-height: 13px; text-align: center;
+}
+.setup-step.done .step-mark { border-color: var(--ok); color: var(--ok); }
+.setup-step.done .step-mark::before { content: "✓"; }
+.setup-step.now { color: var(--fg); }
+.setup-step.now .step-mark { border-color: var(--accent); background: var(--accent); }
+.setup-step.busy .step-mark { border-color: var(--starting); border-top-color: transparent; animation: step-spin 1s linear infinite; }
+.setup-step.error .step-mark { border-color: var(--bad); color: var(--bad); }
+.setup-step.error .step-mark::before { content: "!"; }
+.setup-step.now .step-title { font-weight: 600; }
+.step-body { min-width: 0; flex: 1; }
+.step-detail { font-size: 11px; overflow-wrap: anywhere; }
+.step-detail:empty { display: none; }
+.setup-step.error .step-detail { color: var(--vscode-errorForeground, var(--bad)); }
+.setup-actions .primary { width: 100%; }
+.setup-secondary { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.setup-secondary:empty { display: none; }
+.setup-secondary button { flex: 1 1 auto; }
+.setup-foot { margin-top: 8px; }
+@keyframes step-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .setup-step.busy .step-mark { animation: none; border-top-color: var(--starting); }
+}
+/* Onboarding: until llama.cpp and a model exist, hide cards that have nothing to show yet. */
+body.onboarding #perfCard,
+body.onboarding #copilotCard { display: none; }
+body.no-model #memCard > :not(.card-head):not(#memVerdict) { display: none; }
 .row { margin: 10px 0 14px; }
 .label {
   display: flex;
@@ -740,6 +771,7 @@ body:not(.remote-mode) #remoteLoad { display: none !important; }
   border-radius: 0;
 }
 .menu-item:hover { background: color-mix(in srgb, var(--fg) 10%, transparent); }
+.menu-item:disabled { opacity: 0.45; cursor: default; background: none; }
 .menu-sep { border-top: 1px solid var(--border); margin: 4px 0 6px; }
 .menu-label { display: block; font-size: 11px; color: var(--muted); padding: 0 12px 4px; }
 .menu-body select { margin: 0 12px; width: calc(100% - 24px); }
@@ -1043,6 +1075,8 @@ body { display: flex; flex-direction: column; }
 #backendCard { order: 7; }
 #perfCard { order: 8; }                       /* stopped: last session, at the bottom */
 body.layout-running #perfCard { order: 1; }   /* running: live numbers right under the header */
+body.layout-running #setupBox { order: 1; }   /* …except the last Get started step comes first */
+body.awaiting-first-reply #perfCard { display: none; }
 body.layout-remote #perfCard { order: 2; }
 /* Running: the header strip shows gen / prompt / reuse and the chat bar;
    the card keeps the composition legend, draft acceptance and history. */

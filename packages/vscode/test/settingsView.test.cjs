@@ -156,7 +156,7 @@ const gpus = [
   { totalBytes: 16 * GiB, usedBytes: 0, name: "AMD Radeon RX 9060 XT", index: 1, llamaDeviceId: "Vulkan1", source: "test" },
 ];
 
-function setup(loadOverrides = {}, remoteInfo, serverFeatures = core.NO_SERVER_FEATURES, modelCaps = caps) {
+function setup(loadOverrides = {}, remoteInfo, serverFeatures = core.NO_SERVER_FEATURES, modelCaps = caps, opts = {}) {
   let state = {
     selectedModelPath: caps.path,
     modelCapabilities: modelCaps,
@@ -166,7 +166,7 @@ function setup(loadOverrides = {}, remoteInfo, serverFeatures = core.NO_SERVER_F
   const config = new Map([["launchMode", "externalTerminal"]]);
   const launched = {
     modelPath: caps.path,
-    loadSettings: JSON.parse(JSON.stringify(state.loadSettings)),
+    loadSettings: JSON.parse(JSON.stringify(opts.cpu ? core.normalizeLoadSettingsForCpuBackend(state.loadSettings) : state.loadSettings)),
     launchMode: "externalTerminal",
     startedAt: new Date().toISOString(),
   };
@@ -198,7 +198,9 @@ function setup(loadOverrides = {}, remoteInfo, serverFeatures = core.NO_SERVER_F
     isHttpReady: async () => true,
     resolveBinary: () => "",
     getServerFeatures: async () => ({ ...serverFeatures }),
-    isCpuBackend: () => false,
+    isCpuBackend: () => !!opts.cpu,
+    effectiveLaunchMode: () => config.get("launchMode") === "background" ? "background" : "externalTerminal",
+    launchModeFallbackReason: () => undefined,
     getLaunchedConfig: () => launched,
     claimLaunch: () => ({}),
     releaseLaunch() {},
@@ -214,7 +216,7 @@ function setup(loadOverrides = {}, remoteInfo, serverFeatures = core.NO_SERVER_F
     peekUpdateCheck: () => ({ pending: false }),
     getUpdateCheck: async () => ({ pending: false }),
   };
-  const perf = { get: () => ({}), detailLines: () => [], hasLastRequestContext: () => false, hasLastResponseTrace: () => false, setSpeculativeMode() {} };
+  const perf = { get: () => ({}), detailLines: () => [], hasLastRequestContext: () => false, hasLastResponseTrace: () => false, setSpeculativeMode() {}, setTarget() {} };
   const posted = [];
   let handler;
   const provider = new SettingsViewProvider(
@@ -394,6 +396,28 @@ describe("SettingsViewProvider memory path", () => {
     assert.deepEqual(patch.payload.changes, [{ key: "contextLength", label: "context window", from: "64k", to: "32k" }]);
     await t.send({ type: "discardChanges" });
     assert.deepEqual(t.getState().loadSettings, core.normalizeLoadSettings(t.launched.loadSettings));
+  });
+
+  it("CPU backend: a context edit lists only the context, and discard keeps GPU preferences", async () => {
+    const t = setup({ gpuOffload: 999, offloadKvCacheToGpu: true, mmprojOffloadToGpu: true }, undefined, core.NO_SERVER_FEATURES, caps, { cpu: true });
+    await t.send({ type: "ready" });
+    await t.send({ type: "saveLoad", payload: { contextLength: 16384 }, silent: true });
+    const patch = t.posted.filter((m) => m.type === "statusPatch").pop();
+    assert.deepEqual(patch.payload.changes.map((c) => c.key), ["contextLength"]);
+    await t.send({ type: "discardChanges" });
+    const s = t.getState().loadSettings;
+    assert.equal(s.contextLength, 65536);
+    assert.equal(s.gpuOffload, 999);
+    assert.equal(s.offloadKvCacheToGpu, true);
+    assert.equal(s.mmprojOffloadToGpu, true);
+  });
+
+  it("GPU backend still lists real GPU changes", async () => {
+    const t = setup();
+    await t.send({ type: "ready" });
+    await t.send({ type: "saveLoad", payload: { gpuOffload: 10 }, silent: true });
+    const patch = t.posted.filter((m) => m.type === "statusPatch").pop();
+    assert.ok(patch.payload.changes.some((c) => c.key === "gpuOffload"));
   });
 
   it("spill confirmation uses the same verdict as the sidebar", async () => {

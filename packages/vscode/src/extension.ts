@@ -38,6 +38,7 @@ import {
   UiBackend,
 } from "@llama-aio/core";
 import * as os from "os";
+import { syncPerfTarget } from "./perfTarget";
 import { formatDownloadStatusLine } from "./downloadStatus";
 import { openModelFileDialog, pickDraftModelFromLibrary, pickMmprojFromLibrary } from "./modelPicker";
 import { SettingsViewProvider } from "./settingsView";
@@ -68,6 +69,14 @@ export function activate(context: vscode.ExtensionContext): void {
   ensureDirs(getInstallDir(config), getModelsDir(config), getLockDir());
 
   const processManager = new ProcessManager(store);
+  // A terminal window opened by a browser-hosted or remote extension host
+  // appears on that host, never in front of the user: start in Background.
+  processManager.externalTerminalBlocked = () =>
+    vscode.env.uiKind === vscode.UIKind.Web
+      ? "VS Code is running in a browser"
+      : vscode.env.remoteName
+        ? `the extension runs on a remote host (${vscode.env.remoteName})`
+        : undefined;
   context.subscriptions.push(initServerDiagnostics(processManager));
   const perf = new PerfStats();
   perf.setSpeculativeMode(
@@ -317,7 +326,10 @@ export function activate(context: vscode.ExtensionContext): void {
             );
       message = status.message;
     } catch (e) {
-      await reportLaunchFailure(opts.failurePrefix ?? (kind === "reload" ? "Reload failed" : "Start failed"), e);
+      await reportLaunchFailure(opts.failurePrefix ?? (kind === "reload" ? "Reload failed" : "Start failed"), e, async () => {
+        await store.getConfig().update("launchMode", "background");
+        await runLaunch(kind, opts);
+      });
       return false;
     } finally {
       processManager.releaseLaunch(token);
@@ -879,6 +891,7 @@ export function activate(context: vscode.ExtensionContext): void {
   const refreshStatusBar = async (forceBuildInfo = false) => {
     if (store.isRemote()) {
       await processManager.remote.refresh();
+      syncPerfTarget(perf, store, processManager);
       serverReadyCache = paintRemoteStatusBar();
       await settingsView.postStatusNow(serverReadyCache);
       statusBar.show();
@@ -886,6 +899,7 @@ export function activate(context: vscode.ExtensionContext): void {
     }
     const status = await processManager.refreshStatus();
     serverReadyCache = status.running || (await processManager.isHttpReady());
+    syncPerfTarget(perf, store, processManager);
     currentBuildInfo(forceBuildInfo);
     statusBar.text = perf.statusBarText(serverReadyCache);
     // Same probe feeds the sidebar so a crash or a TUI stop clears "Server ready".

@@ -25,8 +25,9 @@
           <summary class="icon-btn" title="More server actions" aria-label="More server actions">⋯</summary>
           <div class="menu-body">
             <button class="menu-item local-only" id="openLogBtn" type="button">Open log</button>
-            <button class="menu-item local-only" id="copyCmdBtn" type="button">Copy command line</button>
-            <button class="menu-item" id="openWebUiBtn" type="button">Open llama.cpp web UI</button>
+            <button class="menu-item local-only" id="copyCmdBtn" type="button" title="The llama-server command for the current settings (the API key is not included)">Copy command line</button>
+            <button class="menu-item" id="openWebUiBtn" type="button" title="Opens llama.cpp's own chat page. For this machine's server the local API key is copied first, so you can paste it when the page asks.">Open llama.cpp web UI</button>
+            <button class="menu-item local-only" id="copyKeyBtn" type="button" title="The key Llama AIO generated for its own llama-server. Paste it where the web UI or another client asks for an API key.">Copy local API key</button>
             <button class="menu-item remote-only" id="copyDiagBtn" type="button">Copy connection diagnostics</button>
             <div class="menu-sep local-only"></div>
             <label class="menu-label local-only" for="launchMode">Launch mode</label>
@@ -113,17 +114,34 @@
     <div class="hint" id="remoteModelHint"></div>
   </div>
 
-  <div class="setup hidden" id="setupBox">
-    <strong>Get a model first</strong>
-    <p class="hint" style="margin:8px 0">One-click starter: Unsloth {{starterLabel}} ({{starterSize}}, {{starterDetail}}).</p>
-    <div class="btn-col" style="margin-top:4px">
-      <button class="primary" id="setupStarterBtn">Download starter ({{starterLabel}})</button>
+  <div class="setup hidden" id="setupBox" role="region" aria-labelledby="setupTitle" data-starter-label="{{starterLabel}}" data-starter-size="{{starterSize}}">
+    <div class="setup-head">
+      <strong id="setupTitle">Get started</strong>
+      <span class="sub" id="setupProgress"></span>
     </div>
-    <ol>
-      <li>Install llama.cpp (once)</li>
-      <li>Download the starter <em>or</em> pick/open any GGUF</li>
-      <li>Start the server</li>
+    <ol class="setup-steps">
+      <li class="setup-step" id="stepRuntime" data-step="runtime">
+        <span class="step-mark" aria-hidden="true"></span>
+        <div class="step-body"><div class="step-title">Install llama.cpp</div><div class="step-detail" id="stepRuntimeDetail"></div></div>
+      </li>
+      <li class="setup-step" id="stepModel" data-step="model">
+        <span class="step-mark" aria-hidden="true"></span>
+        <div class="step-body"><div class="step-title">Choose a model</div><div class="step-detail" id="stepModelDetail"></div></div>
+      </li>
+      <li class="setup-step" id="stepStart" data-step="start">
+        <span class="step-mark" aria-hidden="true"></span>
+        <div class="step-body"><div class="step-title">Start the server</div><div class="step-detail" id="stepStartDetail"></div></div>
+      </li>
+      <li class="setup-step" id="stepTry" data-step="try">
+        <span class="step-mark" aria-hidden="true"></span>
+        <div class="step-body"><div class="step-title">Send a first message</div><div class="step-detail" id="stepTryDetail"></div></div>
+      </li>
     </ol>
+    <div class="setup-actions">
+      <button class="primary" id="setupPrimaryBtn" type="button">Continue</button>
+      <div class="setup-secondary" id="setupSecondary"></div>
+    </div>
+    <div class="hint setup-foot" id="setupFoot">Already running llama.cpp elsewhere? <a href="#" id="setupConnectLink">Connect to a server</a></div>
   </div>
 
   <div class="card" id="modelCard">

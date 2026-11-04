@@ -1,5 +1,6 @@
 import * as fs from "fs";
 import * as os from "os";
+import { getLocalApiKeyPath, readLocalApiKey } from "./localApiKey";
 import * as path from "path";
 import { spawn, spawnSync, ChildProcess } from "child_process";
 import { ensureDirs, whichOnPath } from "./paths";
@@ -264,6 +265,21 @@ export function missingLinuxTerminalMessage(opts?: { flatpak?: boolean; flatpakI
  * Closing that window kills the server process tree.
  * Returns the launcher PID (terminal/shell), not necessarily llama-server.
  */
+/**
+ * `export` lines for env entries that differ from ours. The terminal command
+ * line is visible to other local users (ps, /proc), so the API key is read
+ * from its 0600 key file by the shell instead of being written inline.
+ */
+export function terminalExportLines(env: NodeJS.ProcessEnv): string[] {
+  return Object.entries(env)
+    .filter(([key, value]) => value !== undefined && process.env[key] !== value)
+    .map(([key, value]) =>
+      key === "LLAMA_API_KEY" && readLocalApiKey() === value
+        ? `export LLAMA_API_KEY="$(cat ${shQuote(getLocalApiKeyPath())})"`
+        : `export ${key}=${shQuote(value as string)}`
+    );
+}
+
 export function spawnInExternalTerminal(options: {
   /** Path shown in the terminal banner / used for LD_LIBRARY_PATH. */
   binary: string;
@@ -308,9 +324,7 @@ function spawnLinux(
     ? [command, ...(prefixArgs || []), ...args]
     : [binary, ...args];
   const launchLine = launchArgv.map(shQuote).join(" ");
-  const extraExports = Object.entries(env)
-    .filter(([key, value]) => value !== undefined && process.env[key] !== value)
-    .map(([key, value]) => `export ${key}=${shQuote(value as string)}`);
+  const extraExports = terminalExportLines(env);
   const cmd = [
     `echo "Llama AIO · llama-server"`,
     `echo "Binary: ${shQuote(binary)}"`,
@@ -351,9 +365,7 @@ function spawnMac(
   const libDir = path.dirname(binary);
   // `do script` runs in Terminal's own shell, so env passed to osascript does
   // not reach llama-server: export the differing entries in the script itself.
-  const extraExports = Object.entries(env)
-    .filter(([key, value]) => value !== undefined && process.env[key] !== value)
-    .map(([key, value]) => `export ${key}=${shQuote(value as string)}`);
+  const extraExports = terminalExportLines(env);
   const script = [
     `echo "Llama AIO · llama-server"`,
     `export DYLD_LIBRARY_PATH=${shQuote(libDir)}\${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}`,
@@ -406,4 +418,34 @@ function spawnWindows(
 /** Resolve launch mode from settings string. */
 export function resolveLaunchMode(value: string | undefined): LaunchMode {
   return value === "background" ? "background" : "externalTerminal";
+}
+
+/**
+ * Why an external terminal window cannot be shown here, or undefined when it
+ * can. Linux without a display (containers, SSH, browser-hosted editors) or
+ * without any terminal emulator cannot open one; the window would never appear.
+ */
+export function externalTerminalUnavailableReason(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+  hasLinuxTerminal: () => boolean = () => !!resolveLinuxTerminalLauncher({ env })
+): string | undefined {
+  if (platform !== "linux") {
+    return undefined;
+  }
+  if (!env.DISPLAY && !env.WAYLAND_DISPLAY) {
+    return "no graphical display on this machine";
+  }
+  if (!hasLinuxTerminal()) {
+    return "no terminal emulator installed";
+  }
+  return undefined;
+}
+
+/** External-terminal start where the terminal never ran llama-server. */
+export class TerminalLaunchError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "TerminalLaunchError";
+  }
 }

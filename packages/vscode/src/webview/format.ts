@@ -108,3 +108,29 @@ export function maxPositive(values: ArrayLike<unknown>): number {
 export function pickNum(...values: unknown[]): number | undefined {
   return values.find((n): n is number => typeof n === 'number' && isFinite(n));
 }
+
+/**
+ * Turn a raw network / HTTP error into one plain sentence plus what to do.
+ * Never echoes response bodies (they can carry JSON noise or the user's IP).
+ */
+export function friendlyNetworkError(raw: unknown, service: 'github' | 'huggingface'): string {
+  const text = String(raw || '');
+  const status = Number((/\bHTTP\s+(\d{3})\b/i.exec(text) || [])[1] || 0);
+  const name = service === 'github' ? 'GitHub' : 'Hugging Face';
+  if (status === 429) {
+    return name + ' is rate-limiting this network (HTTP 429). Wait a minute and try again' +
+      (service === 'huggingface' ? ', or set a Hugging Face token for higher limits.' : '.');
+  }
+  if (status === 401 || status === 403) {
+    return service === 'github'
+      ? 'GitHub refused the download (HTTP ' + status + '). A firewall or proxy may block github.com: use “Install from archive…”, or the System (PATH) backend with your own llama-server.'
+      : 'Hugging Face refused the request (HTTP ' + status + '). The model may be gated: accept its license on huggingface.co and set a token.';
+  }
+  if (status === 404) return name + ' could not find that file (HTTP 404). It may have been renamed or removed.';
+  if (status >= 500) return name + ' is having problems (HTTP ' + status + '). Try again in a few minutes.';
+  if (/ENOTFOUND|EAI_AGAIN|getaddrinfo/i.test(text)) return 'Could not reach ' + name + ': no network or DNS. Check your connection or proxy settings.';
+  if (/ECONNRESET|ETIMEDOUT|ECONNREFUSED|socket hang up|timed? ?out/i.test(text)) return 'The connection to ' + name + ' dropped. Check your connection and try again.';
+  if (/certificate|self[- ]signed|UNABLE_TO_VERIFY/i.test(text)) return 'A proxy or firewall is intercepting HTTPS to ' + name + '. Configure VS Code’s proxy / certificates (http.proxy, http.systemCertificates).';
+  const first = text.split('\n')[0].replace(/\{[\s\S]*\}/, '').trim();
+  return first.length > 160 ? first.slice(0, 157) + '…' : (first || 'Request to ' + name + ' failed.');
+}

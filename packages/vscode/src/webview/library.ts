@@ -396,7 +396,10 @@ export function renderLibraryPartials() {
   }
   el.classList.remove('hidden');
   const label = lib.payload.partialSizeLabel || '';
-  el.innerHTML = '<span>' + n + ' partial download' + (n === 1 ? '' : 's') + (label ? ' · ' + escText(label) : '') + '</span><button type="button" class="secondary small" data-act="clean-partials">Clean</button>';
+  const resumable = (lib.payload.partials || []).some(function (p) { return p && p.resumable; });
+  el.innerHTML = '<span>' + n + ' interrupted download' + (n === 1 ? '' : 's') + (label ? ' · ' + escText(label) : '') + '</span><span class="lib-actions" style="padding:0">' +
+    (resumable ? '<button type="button" class="secondary small" data-act="resume-partials" title="Continue from where the download stopped">Resume</button>' : '') +
+    '<button type="button" class="secondary small" data-act="clean-partials" title="Move the incomplete files to the trash">Clean</button></span>';
 }
 
 export function renderLibraryDialog() {

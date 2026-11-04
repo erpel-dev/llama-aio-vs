@@ -1446,6 +1446,37 @@ export function listPartialDownloads(modelsDir: string): PartialDownload[] {
 }
 
 /**
+ * Hugging Face source of a partial download, recovered from its path:
+ * downloads land in `<modelsDir>/<owner>__<repo>/<file>.partial` (see
+ * `HuggingFaceClient.localDestFor`). Undefined for anything else.
+ */
+export function hfSourceForPartial(
+  modelsDir: string,
+  partialPath: string
+): { modelId: string; filePath: string } | undefined {
+  if (!partialPath.toLowerCase().endsWith(".partial")) {
+    return undefined;
+  }
+  const rel = path.relative(path.resolve(modelsDir), path.resolve(partialPath));
+  if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) {
+    return undefined;
+  }
+  const parts = rel.split(/[\\/]+/);
+  if (parts.length < 2) {
+    return undefined;
+  }
+  const repo = parts[0]!.split("__");
+  if (repo.length !== 2 || !repo[0] || !repo[1]) {
+    return undefined;
+  }
+  const filePath = parts.slice(1).join("/").replace(/\.partial$/i, "");
+  if (!/\.gguf$/i.test(filePath)) {
+    return undefined;
+  }
+  return { modelId: `${repo[0]}/${repo[1]}`, filePath };
+}
+
+/**
  * Paths that may be deleted for this quant. The quant and its shards must all
  * sit inside `modelsDir`. Companion paths are included only when they are owned
  * and live in the same directory.

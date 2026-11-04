@@ -133,3 +133,86 @@ describe("PerfStats live generation rate", () => {
     assert.equal(perf.get().generating, false);
   });
 });
+
+describe("PerfStats request and target identity (#33)", () => {
+  const done = (perf: PerfStats, tokens: number, gen: number, id?: number) =>
+    perf.complete({ completionTokens: tokens, genTokPerSec: gen, promptTokPerSec: 100, source: "server" }, id);
+
+  it("a target change clears the live numbers before the new model's first request", () => {
+    const perf = new PerfStats();
+    perf.setTarget("local|a|LFM3");
+    done(perf, 40, 10.1, perf.begin({ contextLimit: 8192, estimatedPromptTokens: 500 }));
+    assert.equal(perf.get().genTokPerSec, 10.1);
+    perf.setTarget("local|a|Spark");
+    const p = perf.get();
+    assert.equal(p.genTokPerSec, undefined);
+    assert.equal(p.contextPct, undefined);
+    assert.equal(p.completionTokens, undefined);
+    assert.deepEqual(p.history, []);
+  });
+
+  it("local → remote → local shows each target's own history, not the other's rate", () => {
+    const perf = new PerfStats();
+    perf.setTarget("local|Spark");
+    done(perf, 2, 9, perf.begin());
+    perf.setTarget("remote|LFM2.5");
+    done(perf, 30, 77.7, perf.begin());
+    perf.setTarget("local|Spark");
+    const p = perf.get();
+    assert.equal(p.genTokPerSec, undefined, "live tile must not show the remote 77.7 tok/s");
+    assert.deepEqual(p.history?.map((h) => h.genTokPerSec), [9]);
+  });
+
+  it("a request cancelled during prefill reports no tokens instead of the previous answer's", () => {
+    const perf = new PerfStats();
+    done(perf, 2, 20, perf.begin());
+    const id = perf.begin({ estimatedPromptTokens: 2600, contextLimit: 8192 });
+    perf.abort("cancelled", id);
+    const p = perf.get();
+    assert.equal(p.outcome, "cancelled");
+    assert.equal(p.completionTokens, 0);
+    assert.equal(p.history?.[0].outcome, "cancelled");
+    assert.equal(p.history?.[0].completionTokens, 0);
+    assert.equal(p.history?.[1].completionTokens, 2);
+  });
+
+  it("cancellation after partial output keeps only that request's tokens", () => {
+    const perf = new PerfStats();
+    const id = perf.begin();
+    perf.tick(7, { requestId: id });
+    perf.abort("cancelled", id);
+    assert.equal(perf.get().completionTokens, 7);
+    assert.equal(perf.get().outcome, "cancelled");
+  });
+
+  it("failed requests are distinguished from cancelled ones", () => {
+    const perf = new PerfStats();
+    perf.abort("failed", perf.begin());
+    assert.equal(perf.get().outcome, "failed");
+  });
+
+  it("ignores late events from a request superseded by a target switch", () => {
+    const perf = new PerfStats();
+    perf.setTarget("local|old");
+    const old = perf.begin();
+    perf.setTarget("local|new");
+    perf.tick(50, { genTokPerSec: 99, requestId: old });
+    done(perf, 50, 99, old);
+    perf.abort("cancelled", old);
+    const p = perf.get();
+    assert.equal(p.genTokPerSec, undefined);
+    assert.equal(p.outcome, undefined);
+    assert.deepEqual(p.history, []);
+  });
+
+  it("same target keeps last-call rates visible (flagged) during the next request", () => {
+    const perf = new PerfStats();
+    perf.setTarget("t");
+    done(perf, 10, 30, perf.begin());
+    perf.begin();
+    const p = perf.get();
+    assert.equal(p.genTokPerSec, 30);
+    assert.equal(p.showingPreviousCall, true);
+    assert.equal(p.outcome, undefined);
+  });
+});

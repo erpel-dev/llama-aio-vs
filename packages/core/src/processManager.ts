@@ -15,6 +15,9 @@ import {
   childSpawnError,
   resolveLaunchMode,
   spawnInExternalTerminal,
+  externalTerminalUnavailableReason,
+  TerminalLaunchError,
+  type LaunchMode,
 } from "./externalTerminal";
 import { clampLoadSettingsToModel, readModelCapabilities } from "./ggufMetadata";
 import { detectGpus, detectGpusAsync } from "./gpuInfo";
@@ -74,6 +77,17 @@ interface LockFile {
 }
 
 /** Model + settings of the running server, as recorded in the lock at start. */
+/** External terminal: no llama-server output by then means the window never ran it. */
+const TERMINAL_NO_OUTPUT_MS = 8_000;
+
+function fileSize(file: string): number {
+  try {
+    return fs.statSync(file).size;
+  } catch {
+    return 0;
+  }
+}
+
 export interface LaunchedConfig {
   modelPath: string;
   loadSettings?: LlamaLoadSettings;
@@ -277,6 +291,26 @@ export class ProcessManager {
 
   /** Probe state of the remote server; only polls while the store is in remote mode. */
   readonly remote: RemoteServerMonitor;
+
+  /**
+   * Host-specific reason an external terminal cannot be shown (e.g. a
+   * browser-hosted editor), checked before the core OS/display detection.
+   */
+  externalTerminalBlocked: () => string | undefined = () => undefined;
+
+  /** Why the configured external terminal is replaced by background, if it is. */
+  launchModeFallbackReason(): string | undefined {
+    if (resolveLaunchMode(this.store.getConfig().get<string>("launchMode")) !== "externalTerminal") {
+      return undefined;
+    }
+    return this.externalTerminalBlocked() || externalTerminalUnavailableReason();
+  }
+
+  /** Launch mode start will use: the setting, unless no terminal can be shown here. */
+  effectiveLaunchMode(): LaunchMode {
+    const configured = resolveLaunchMode(this.store.getConfig().get<string>("launchMode"));
+    return configured === "externalTerminal" && this.launchModeFallbackReason() ? "background" : configured;
+  }
 
   constructor(private readonly store: SettingsStore) {
     this.remote = new RemoteServerMonitor(() => (this.store.isRemote() ? this.store.getEndpoint() : undefined));
@@ -492,7 +526,7 @@ export class ProcessManager {
     if (this.isCpuBackend()) {
       loadSettings = normalizeLoadSettingsForCpuBackend(loadSettings);
     }
-    const launchMode = resolveLaunchMode(this.store.getConfig().get<string>("launchMode"));
+    const launchMode = this.effectiveLaunchMode();
     return serverConfigFingerprint(model, loadSettings, launchMode);
   }
 
@@ -796,7 +830,7 @@ export class ProcessManager {
       caps,
       features,
     });
-    const launchMode = resolveLaunchMode(this.store.getConfig().get<string>("launchMode"));
+    const launchMode = this.effectiveLaunchMode();
     const configFingerprint = serverConfigFingerprint(model, loadSettings, launchMode);
 
     // Last exit before anything is spawned: Stop may have landed during the awaits above.
@@ -898,6 +932,7 @@ export class ProcessManager {
     let sawLoading = false;
     let lastProgressAt = 0;
     const logTail = new IncrementalLog(logPath);
+    const headerBytes = fileSize(logPath);
 
     while (Date.now() - startedAt < maxWaitMs) {
       // Stop pressed while waiting: stop() already killed the process.
@@ -953,6 +988,22 @@ export class ProcessManager {
               ? `Started in external terminal (pid ${pid}). Close that window to stop the server.`
               : `Started in background (pid ${pid})`,
         };
+      }
+
+      // External terminal that never ran llama-server: its output is tee'd to
+      // the log, so a log that is still only our header after a few seconds
+      // means no window opened. A slow model load still prints immediately.
+      if (
+        launchMode === "externalTerminal" &&
+        Date.now() - startedAt > TERMINAL_NO_OUTPUT_MS &&
+        fileSize(logPath) <= headerBytes
+      ) {
+        this.throwIfCancelled();
+        await this.stopServer(true).catch(() => undefined);
+        throw new TerminalLaunchError(
+          `The external terminal did not start llama-server within ${Math.round(TERMINAL_NO_OUTPUT_MS / 1000)}s ` +
+            "(no window opened, or it closed). Background mode runs llama-server without a terminal; logs stay available under ⋯ → Open log."
+        );
       }
 
       if (launchMode === "background" && launcherPid && !isPidAlive(launcherPid)) {

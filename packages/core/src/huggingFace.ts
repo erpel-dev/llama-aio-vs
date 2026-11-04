@@ -571,6 +571,6 @@ export const STARTER_MODEL = {
   repoId: "unsloth/Qwen3.5-2B-GGUF",
   filePath: "Qwen3.5-2B-Q4_K_M.gguf",
   label: "Qwen3.5-2B",
-  approxSizeLabel: "~1.6 GB",
-  detail: "~2B · Q4_K_M · good for first run",
+  approxSizeLabel: "~1.9 GB",
+  detail: "~2B · Q4_K_M · includes vision projector · good for first run",
 } as const;

@@ -18,6 +18,7 @@ import {
   removalPathsForQuant,
   withoutHiddenModels,
 } from "../src/modelLibrary";
+import { hfSourceForPartial } from "../src/modelLibrary";
 
 const LANGUAGE_MIN = 32 * 1024 * 1024;
 
@@ -325,5 +326,25 @@ describe("library groups and removal", () => {
     assert.equal(isOwnedModelPath(link, root), false);
     const plan = removalPathsForQuant(link, root, []);
     assert.equal(plan.files.length, 0);
+  });
+});
+
+describe("hfSourceForPartial", () => {
+  const root = path.join(os.tmpdir(), "llama-aio-models");
+  it("recovers the HF repo and file from the managed download layout", () => {
+    assert.deepEqual(
+      hfSourceForPartial(root, path.join(root, "unsloth__Qwen3.5-2B-GGUF", "Qwen3.5-2B-Q4_K_M.gguf.partial")),
+      { modelId: "unsloth/Qwen3.5-2B-GGUF", filePath: "Qwen3.5-2B-Q4_K_M.gguf" }
+    );
+    assert.deepEqual(
+      hfSourceForPartial(root, path.join(root, "a__b", "sub", "m-00001-of-00002.gguf.partial")),
+      { modelId: "a/b", filePath: "sub/m-00001-of-00002.gguf" }
+    );
+  });
+  it("rejects paths outside the layout", () => {
+    assert.equal(hfSourceForPartial(root, path.join(root, "loose.gguf.partial")), undefined);
+    assert.equal(hfSourceForPartial(root, path.join(root, "noowner", "m.gguf.partial")), undefined);
+    assert.equal(hfSourceForPartial(root, path.join(os.tmpdir(), "x__y", "m.gguf.partial")), undefined);
+    assert.equal(hfSourceForPartial(root, path.join(root, "a__b", "m.gguf")), undefined);
   });
 });
