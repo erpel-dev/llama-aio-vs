@@ -5,6 +5,17 @@ and Copilot CLI. They do not install a model runtime or change its served contex
 size. Your server must already support the model, its GGUF architecture, its
 chat template, and its reasoning/tool-call format.
 
+Recent llama.cpp servers advertise `chat_template_caps.reasoning_effort_levels`
+through `/props`. Llama AIO uses these levels for unknown templates without
+overriding the user's sampling settings. The highest advertised level is the
+initial selection. For curated effort profiles it keeps the sampling recipe,
+filters out unsupported levels, and adds newly advertised ones. A curated
+default that the server probe omits as a fallback alias (such as GLM Max) keeps
+its verified recipe. A binary profile can gain
+the template's reported effort ladder using its default sampling recipe;
+numeric reasoning budgets and `reasoning_strength` profiles retain their own
+controls. Servers without this metadata continue to use curated name matching.
+
 The picker exposes only the controls supported by each verified model version.
 CLI effort values select the same presets as VS Code labels; saved labels from
 older extension versions remain accepted where that mode is still supported. A missing or unsupported selection

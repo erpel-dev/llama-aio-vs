@@ -348,11 +348,15 @@ describe("SettingsViewProvider memory path", () => {
   }
 
   it("resets the new controls with advanced settings", async () => {
-    const t = setup({ moeCacheMiB: 4096, draftSampling: "greedy", draftBatchSize: 64 });
+    const t = setup({ moeCacheMiB: 4096, draftSampling: "greedy", draftBatchSize: 64,
+      cacheRamMiB: 1024, mmprojDevice: "Vulkan1", draftDevice: "Vulkan1" });
     await t.send({ type: "resetAdvancedLoad" });
     assert.equal(t.getState().loadSettings.moeCacheMiB, 0);
     assert.equal(t.getState().loadSettings.draftSampling, "auto");
     assert.equal(t.getState().loadSettings.draftBatchSize, 0);
+    assert.equal(t.getState().loadSettings.cacheRamMiB, undefined);
+    assert.equal(t.getState().loadSettings.mmprojDevice, "");
+    assert.equal(t.getState().loadSettings.draftDevice, "");
   });
 
   it("answers a live estimate for unsaved values with the same seq, without saving them", async () => {
@@ -389,7 +393,7 @@ describe("SettingsViewProvider memory path", () => {
     const patch = t.posted.filter((m) => m.type === "statusPatch").pop();
     assert.deepEqual(patch.payload.changes, [{ key: "contextLength", label: "context window", from: "64k", to: "32k" }]);
     await t.send({ type: "discardChanges" });
-    assert.deepEqual(t.getState().loadSettings, t.launched.loadSettings);
+    assert.deepEqual(t.getState().loadSettings, core.normalizeLoadSettings(t.launched.loadSettings));
   });
 
   it("spill confirmation uses the same verdict as the sidebar", async () => {

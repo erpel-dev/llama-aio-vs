@@ -1042,7 +1042,7 @@ export function estimateMemory(
   // CLIP is a separate model: GPU-offloaded by default, not tensor-split with the LLM.
   // --no-mmproj-offload keeps the projector in system RAM.
   const gpuVisionBytes =
-    !cpuOnly && onGpu > 0 && mmprojBytes > 0 && settings.mmprojOffloadToGpu !== false
+    !cpuOnly && (onGpu > 0 || !!settings.mmprojDevice) && settings.mmprojDevice !== "none" && mmprojBytes > 0 && settings.mmprojOffloadToGpu !== false
       ? mmprojBytes
       : 0;
   const cpuVisionBytes = gpuVisionBytes > 0 ? 0 : Math.max(0, mmprojBytes);
@@ -1140,6 +1140,11 @@ export function estimateMemory(
   const mainGpuIndex = gpus.length
     ? Math.min(Math.max(0, settings.mainGpu || 0), gpus.length - 1)
     : 0;
+  const projectorIndex = settings.mmprojDevice
+    ? gpus.findIndex(g => g.llamaDeviceId === settings.mmprojDevice) : mainGpuIndex;
+  const visionGpuIndex = projectorIndex < 0 ? mainGpuIndex : projectorIndex;
+  const draftDeviceIndex = settings.draftDevice
+    ? gpus.findIndex(g => g.llamaDeviceId === settings.draftDevice) : -1;
   const layerMassOpts = {
     isMoe: !!caps.isMoe,
     nCpuMoe: settings.nCpuMoe,
@@ -1204,7 +1209,7 @@ export function estimateMemory(
 
   const draftCaps = resolveDraftCapabilities(settings, options?.draftCaps);
   const draft = draftCaps
-    ? estimateDraftFootprint(draftCaps, settings, settings.contextLength, warmCtx, cpuOnly)
+    ? estimateDraftFootprint(draftCaps, settings, settings.contextLength, warmCtx, cpuOnly || settings.draftDevice === "none")
     : undefined;
   const sidecarMtp = usesSidecarMtp(settings);
   const mtp = sidecarMtp
@@ -1248,6 +1253,11 @@ export function estimateMemory(
   const systemRamTotalBytes = os.totalmem();
 
   const warnings: string[] = [];
+  if (settings.cacheRamMiB !== undefined && settings.cacheRamMiB !== 0) {
+    warnings.push(settings.cacheRamMiB < 0
+      ? "Prompt-cache RAM is unlimited. Cached states grow on demand and are additional to this model estimate."
+      : `Prompt-cache states may use up to ${settings.cacheRamMiB} MiB of additional RAM on demand; this limit is not preallocated or included in the model estimate.`);
+  }
   let willSpill = false;
 
   const shardCount = caps.shardCount ?? 1;
@@ -1360,14 +1370,13 @@ export function estimateMemory(
     const weights = gpuWeights * (weightShares[i] || 0);
     const kv = kvOnDevice(i);
     const overhead = share <= 0 ? 0 : isMain ? gpuOverheadBytes : peerOverheadEach;
-    // The draft follows `--tensor-split` like the main model: there is no
-    // draft-specific split flag (`--spec-draft-device` only narrows the device
-    // list), so parking the whole draft on the main GPU overstated that card
-    // by the draft's full size — 1.3 GiB of weights plus KV on the measured
-    // 9070/9060 pair, enough to fake a spill on a card with 4 GiB free.
-    const spec = specGpuBundle * (weightShares[i] || 0);
+    // Auto follows the target split; an explicit draft device narrows its
+    // device list to one GPU. Embedded MTP state stays with the target.
+    const draftShare = draftDeviceIndex >= 0 ? (i === draftDeviceIndex ? 1 : 0) : (weightShares[i] || 0);
+    const spec = (draft ? draft.gpuWeightsBytes + draft.gpuKvBytes : 0) * draftShare
+      + (mtp ? mtp.gpuWeightsBytes + mtp.gpuKvBytes : 0) * (weightShares[i] || 0);
     // `--mmproj` is a separate model and is genuinely not tensor-split.
-    const vision = isMain ? gpuVisionBytes : 0;
+    const vision = i === visionGpuIndex ? gpuVisionBytes : 0;
     const expertCache = cacheOnDevice(i);
     return { weights, kv, overhead, spec, vision, expertCache, used: weights + kv + overhead + spec + vision + expertCache };
   });
@@ -1376,7 +1385,7 @@ export function estimateMemory(
     const where =
       gpuVisionBytes > 0
         ? gpus.length
-          ? ` on ${gpuLabel(gpus[mainGpuIndex]!, mainGpuIndex)} (CLIP / --mmproj, not tensor-split)`
+          ? ` on ${gpuLabel(gpus[visionGpuIndex]!, visionGpuIndex)} (CLIP / --mmproj, not tensor-split)`
           : " in VRAM (--mmproj, GPU offload on)"
         : settings.mmprojOffloadToGpu === false
           ? " in system RAM (--no-mmproj-offload)"
@@ -1564,7 +1573,7 @@ export function estimateMemory(
         `Vision projector: ~${formatBytes(mmprojBytes)}` +
           (gpuVisionBytes > 0
             ? gpus.length
-              ? ` (${gpuLabel(gpus[mainGpuIndex]!, mainGpuIndex)}, CLIP / --mmproj)`
+              ? ` (${gpuLabel(gpus[visionGpuIndex]!, visionGpuIndex)}, CLIP / --mmproj)`
               : " (GPU, --mmproj)"
             : settings.mmprojOffloadToGpu === false
               ? " (CPU RAM, --no-mmproj-offload)"

@@ -445,6 +445,10 @@ export interface LlamaLoadSettings {
   draftModelPath: string;
   /** Draft model GPU layers (`--spec-draft-ngl`); 99 ≈ all */
   draftGpuOffload: number;
+  /** Empty follows the target; otherwise a llama.cpp device ID or none (CPU). */
+  draftDevice: string;
+  /** Prompt-cache RAM in MiB: undefined inherits server default, 0 disables, -1 unlimited. */
+  cacheRamMiB?: number;
   /**
    * Vision projector GGUF (`-mm` / `--mmproj`). Empty = text-only.
    * Auto-filled from a sibling `mmproj*.gguf` when a model is selected.
@@ -455,6 +459,8 @@ export interface LlamaLoadSettings {
    * False passes `--no-mmproj-offload` so CLIP stays in system RAM.
    */
   mmprojOffloadToGpu: boolean;
+  /** Empty follows the target; otherwise a llama.cpp device ID. */
+  mmprojDevice: string;
   /**
    * How to split tensors across GPUs (`--tensor-split`). Empty = omit
    * (llama.cpp splits by VRAM, often 1:1). Stored in **device-index order**
@@ -560,8 +566,11 @@ export const DEFAULT_LOAD_SETTINGS: LlamaLoadSettings = {
   draftBatchSize: 0,
   draftModelPath: "",
   draftGpuOffload: 99,
+  draftDevice: "",
+  cacheRamMiB: undefined,
   mmprojPath: "",
   mmprojOffloadToGpu: true,
+  mmprojDevice: "",
   tensorSplit: "",
   splitMode: "layer",
   mainGpu: 0,
@@ -678,13 +687,23 @@ export function normalizeLoadSettings(raw: Partial<LlamaLoadSettings> | undefine
     draftBatchSize: int(s.draftBatchSize, 0, 1_048_576, d.draftBatchSize),
     draftModelPath: typeof s.draftModelPath === "string" ? s.draftModelPath.trim() : "",
     draftGpuOffload: int(s.draftGpuOffload, 0, 999, d.draftGpuOffload),
+    draftDevice: normalizeDeviceId(s.draftDevice),
+    cacheRamMiB: s.cacheRamMiB == null || String(s.cacheRamMiB).trim() === ""
+      ? undefined : int(s.cacheRamMiB, -1, 1_048_576, 8192),
     mmprojPath: typeof s.mmprojPath === "string" ? s.mmprojPath.trim() : "",
     mmprojOffloadToGpu: toBoolean(s.mmprojOffloadToGpu, d.mmprojOffloadToGpu),
+    mmprojDevice: normalizeDeviceId(s.mmprojDevice),
     tensorSplit: normalizeTensorSplit(s.tensorSplit),
     splitMode: normalizeGpuSplitMode(s.splitMode),
     mainGpu: int(s.mainGpu, 0, 7, d.mainGpu),
     ...chatTemplateLoadFields(s),
   };
+}
+
+/** Single backend device ID; never a device list or shell/flag fragment. */
+export function normalizeDeviceId(value: unknown): string {
+  const id = typeof value === "string" ? value.trim() : "";
+  return /^[a-zA-Z][\w./:-]{0,127}$/.test(id) ? id : "";
 }
 
 function chatTemplateLoadFields(

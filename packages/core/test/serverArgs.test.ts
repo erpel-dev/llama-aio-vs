@@ -12,6 +12,42 @@ import { argValue, argValues, denseCaps, loadSettings, moeCaps } from "./helpers
 const MODEL = "/models/test.gguf";
 const build = (over = {}) => buildServerArgs(MODEL, "127.0.0.1", 8742, loadSettings(over));
 
+describe("runtime memory and device controls", () => {
+  const features = { probed: true, moeCache: false, draftSampling: false, draftUbatch: false,
+    cacheRam: true, mmprojDevice: true, draftDevice: true };
+  const gpus = [0, 1].map(i => ({ llamaDeviceId: `Vulkan${i}`, name: `GPU ${i}`, totalBytes: 16 * 1024 ** 3, source: "test" }));
+  it("preserves inherit, disabled, unlimited and explicit prompt-cache limits", () => {
+    for (const value of [undefined, 0, -1, 2048]) {
+      const settings = loadSettings({ cacheRamMiB: value });
+      const enabled = buildServerArgs(MODEL, "localhost", 8742, settings, { features });
+      assert.equal(argValue(enabled, "--cache-ram"), value === undefined ? undefined : String(value));
+      assert.equal(argValue(buildServerArgs(MODEL, "localhost", 8742, settings), "--cache-ram"), undefined);
+    }
+  });
+  it("places projector and separate draft independently and rejects unavailable devices", () => {
+    const settings = loadSettings({ mmprojPath: "/models/mmproj.gguf", mmprojDevice: "Vulkan1",
+      draftDevice: "Vulkan0", speculativeMode: "dflash", draftModelPath: "/models/draft.gguf" });
+    const args = buildServerArgs(MODEL, "localhost", 8742, settings, { features, gpus });
+    assert.equal(argValue(args, "--mmproj-device"), "Vulkan1");
+    assert.equal(argValue(args, "--spec-draft-device"), "Vulkan0");
+    const legacy = buildServerArgs(MODEL, "localhost", 8742, settings);
+    assert.equal(argValue(legacy, "--mmproj-device"), undefined);
+    assert.equal(argValue(legacy, "--spec-draft-device"), undefined);
+    assert.throws(() => buildServerArgs(MODEL, "localhost", 8742, { ...settings, draftDevice: "Vulkan9" }, { features, gpus }), /unavailable/);
+    const cpu = buildServerArgs(MODEL, "localhost", 8742, normalizeLoadSettingsForCpuBackend(settings), { features, gpus: [] });
+    assert.equal(argValue(cpu, "--mmproj-device"), undefined);
+    assert.equal(argValue(cpu, "--spec-draft-device"), undefined);
+    const embedded = buildServerArgs(MODEL, "localhost", 8742, { ...settings, speculativeMode: "mtp", draftModelPath: "" }, { features, gpus });
+    assert.equal(argValue(embedded, "--spec-draft-device"), undefined);
+  });
+  it("marks effective overrides as requiring a restart", () => {
+    const fingerprint = (over = {}) => serverConfigFingerprint(MODEL, loadSettings(over));
+    assert.notEqual(fingerprint(), fingerprint({ cacheRamMiB: 0 }));
+    assert.equal(fingerprint(), fingerprint({ draftDevice: "Vulkan1" }));
+    assert.notEqual(fingerprint({ mmprojPath: "mmproj.gguf" }), fingerprint({ mmprojPath: "mmproj.gguf", mmprojDevice: "Vulkan1" }));
+  });
+});
+
 describe("formatCommandDisplay", () => {
   it("quotes arguments that contain spaces", () => {
     assert.equal(

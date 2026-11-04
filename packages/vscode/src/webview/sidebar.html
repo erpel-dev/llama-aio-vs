@@ -301,6 +301,8 @@
   </div>
 
   <div class="subgroup-title">Memory &amp; KV cache</div>
+  <div class="row"><div class="label"><label for="cacheRamMiB" class="name tip" data-flag="--cache-ram" data-help="Maximum RAM for retained prompt-cache states, in MiB. Blank inherits the server default; 0 disables caching; -1 allows unlimited cache growth. This is a limit, not preallocated memory.">Prompt cache RAM (MiB)</label><input id="cacheRamMiB" type="number" min="-1" max="1048576" step="1" placeholder="Server default" /></div><div class="hint" id="cacheRamHint">Blank = server default · 0 = off · -1 = unlimited.</div></div>
+  <div class="row"><div class="label"><label for="mmprojDevice" class="name tip" data-flag="--mmproj-device" data-help="Choose the GPU for the projector independently of the main model. Auto follows llama.cpp's target device selection. Use the Projector RAM control for CPU execution.">Projector device</label><select id="mmprojDevice"><option value="">Auto</option></select></div><div class="hint" id="mmprojDeviceHint"></div></div>
   <div class="toggle"><label for="offloadKvCacheToGpu" class="tip" data-flag="-nkvo, --no-kv-offload" data-help="Whether to enable KV cache offloading to GPU (default: enabled). Uncheck to keep KV in system RAM.">Offload KV Cache to GPU Memory</label><input type="checkbox" id="offloadKvCacheToGpu" /></div>
   <div class="row">
     <div class="label"><label for="cacheTypeK" class="name tip" data-flag="-ctk, --cache-type-k" data-help="KV cache data type for K. Allowed: f32, f16, bf16, q8_0, q5_1, q5_0, q4_1, q4_0, iq4_nl (default: q8_0). q8_0 halves KV size with little quality loss.">KV Cache Type (K)</label>
@@ -508,6 +510,7 @@
       </div>
       <div class="hint" id="draftSamplingHint">Auto enables probabilistic drafting for MTP when supported.</div>
     </div>
+    <div class="row"><div class="label"><label for="draftDevice" class="name tip" data-flag="--spec-draft-device" data-help="Choose a device for a separate MTP or DFlash draft model. Auto follows the target's device selection. Embedded MTP heads stay with the main model.">Draft device</label><select id="draftDevice"><option value="">Auto</option></select></div><div class="hint" id="draftDeviceHint"></div></div>
     <div class="row" id="specDraftBatchRow">
       <div class="label"><label for="draftBatchSize" class="name tip" data-flag="--spec-draft-n-ubatch" data-help="Physical batch size of the draft context. 0 inherits the main physical batch size. A smaller value can reduce draft VRAM use, with a possible speed tradeoff. Requires a supporting llama.cpp binary (upstream October 14, 2026).">Draft batch size</label><input type="number" id="draftBatchSize" min="0" max="1048576" step="32" /></div>
       <div class="hint" id="draftBatchHint">0 = inherit the main physical batch size.</div>

@@ -88,6 +88,8 @@ export function normalizeLoadSettingsForCpuBackend(
     gpuOffload: 0,
     offloadKvCacheToGpu: false,
     mmprojOffloadToGpu: false,
+    mmprojDevice: "",
+    draftDevice: "",
     nCpuMoe: 0,
     moeCacheMiB: 0,
     nCpuFfn: 0,
@@ -128,6 +130,12 @@ export function buildServerArgs(
     features?: LlamaServerFeatures }
 ): string[] {
   const settings = normalizeLoadSettings(rawSettings);
+  const checkDevice = (device: string): string => {
+    if (device && device !== "none" && options?.gpus && !options.gpus.some(gpu => gpu.llamaDeviceId === device)) {
+      throw new Error(`Selected llama.cpp device ${device} is unavailable. Choose an available device or Auto.`);
+    }
+    return device;
+  };
   const args: string[] = [
     "-m",
     modelPath,
@@ -151,6 +159,9 @@ export function buildServerArgs(
 
   // --cache-reuse: min chunk size reused via KV shifting (0 = off).
   const cacheReuse = Math.max(0, settings.cacheReuse ?? 0);
+  if (options?.features?.cacheRam && settings.cacheRamMiB !== undefined) {
+    args.push("--cache-ram", String(settings.cacheRamMiB));
+  }
   if (cacheReuse > 0) {
     args.push("--cache-reuse", String(cacheReuse));
   }
@@ -252,6 +263,8 @@ export function buildServerArgs(
     args.push("--mmproj", mmproj);
     if (!settings.mmprojOffloadToGpu) {
       args.push("--no-mmproj-offload");
+    } else if (options?.features?.mmprojDevice && settings.mmprojDevice) {
+      args.push("--mmproj-device", checkDevice(settings.mmprojDevice));
     }
   }
 
@@ -334,6 +347,9 @@ export function buildServerArgs(
   const neuralDraft = speculativeUsesMtp(settings.speculativeMode) ||
     (speculativeUsesDflash(settings.speculativeMode) && !!settings.draftModelPath);
   if (neuralDraft) {
+    if (options?.features?.draftDevice && settings.draftDevice && settings.draftModelPath && settings.draftGpuOffload > 0) {
+      args.push("--spec-draft-device", checkDevice(settings.draftDevice));
+    }
     if (options?.features?.draftSampling) {
       const sampling = effectiveDraftSampling(settings);
       if (sampling) args.push("--spec-draft-sampling", sampling);
@@ -387,11 +403,17 @@ export function supportedPerformanceSettings(settings: LlamaLoadSettings, featur
     moeCacheMiB: features?.moeCache ? settings.moeCacheMiB : 0,
     draftSampling: features?.draftSampling ? settings.draftSampling : "greedy",
     draftBatchSize: features?.draftUbatch ? settings.draftBatchSize : 0,
+    cacheRamMiB: features?.cacheRam ? settings.cacheRamMiB : undefined,
+    mmprojDevice: features?.mmprojDevice ? settings.mmprojDevice : "",
+    draftDevice: features?.draftDevice ? settings.draftDevice : "",
   };
 }
 
 export function performanceFeatureNotes(settings: LlamaLoadSettings, features: LlamaServerFeatures, caps?: ModelCapabilities): string[] {
   const notes: string[] = [];
+  if (settings.cacheRamMiB !== undefined && !features.cacheRam) notes.push("Prompt-cache RAM override is inactive: this binary does not advertise --cache-ram.");
+  if (settings.mmprojDevice && !features.mmprojDevice) notes.push("Projector device override is inactive: this binary does not advertise --mmproj-device.");
+  if (settings.draftDevice && !features.draftDevice) notes.push("Draft device override is inactive: this binary does not advertise --spec-draft-device.");
   if (settings.moeCacheMiB > 0) {
     if (!features.moeCache) notes.push("GPU expert cache is inactive: the binary must advertise --moe-cache-mib and expose a usable GPU backend.");
     else if (!moeCacheEligibleLayers(settings, caps)) notes.push("GPU expert cache is inactive: it requires CPU MoE experts in GPU-assigned layers and a split mode other than Tensor.");
@@ -472,6 +494,7 @@ export function serverConfigFingerprint(
     reasoningBudget: settings.reasoningBudget ?? -1,
     contextCheckpoints: settings.contextCheckpoints,
     cacheReuse: settings.cacheReuse ?? 0,
+    cacheRamMiB: settings.cacheRamMiB,
     ropeFreqBase: settings.ropeFreqBase,
     ropeFreqScale: settings.ropeFreqScale,
     seed: settings.seed,
@@ -486,6 +509,7 @@ export function serverConfigFingerprint(
       speculativeUsesDflash(spec) || usesSidecarMtp(settings) ? settings.draftModelPath || "" : "",
     draftGpuOffload:
       speculativeUsesDflash(spec) || usesSidecarMtp(settings) ? settings.draftGpuOffload : 0,
+    draftDevice: (speculativeUsesDflash(spec) || usesSidecarMtp(settings)) && settings.draftGpuOffload > 0 ? settings.draftDevice : "",
     // N-gram knobs are CLI flags → restart-relevant. Omitted entirely when
     // n-gram speculation is off so old fingerprints stay stable.
     ...(speculativeUsesNgram(spec)
@@ -498,6 +522,7 @@ export function serverConfigFingerprint(
       : {}),
     mmprojPath: settings.mmprojPath || "",
     mmprojOffloadToGpu: !!settings.mmprojOffloadToGpu,
+    mmprojDevice: settings.mmprojPath && settings.mmprojOffloadToGpu ? settings.mmprojDevice : "",
     tensorSplit: settings.tensorSplit || "",
     splitMode: settings.splitMode || "layer",
     mainGpu: settings.mainGpu || 0,

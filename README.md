@@ -30,6 +30,14 @@ The **Memory & load** card estimates VRAM and RAM at full context and gives one 
 
 Newer llama.cpp builds also support a **GPU expert cache**, **draft sampling**, and a separate **draft batch size**. Llama AIO checks the active binary before using these flags. Expert caching defaults to off because it needs extra VRAM; draft batch size defaults to inheriting the main batch. Draft sampling defaults to Auto, which enables probabilistic MTP when supported and keeps DFlash's existing behavior. See [performance settings](docs/performance-settings.md) for compatibility and tuning details.
 
+Advanced settings also offer a **prompt-cache RAM limit** (blank inherits the server default,
+0 disables it, -1 is unlimited) and independent **projector and draft devices**.
+Device options use llama.cpp's device IDs; Auto follows the main model, and a
+separate draft can run on CPU. Unsupported controls are inactive on older builds;
+remote servers manage their own load settings. New llama.cpp servers can also
+advertise reasoning levels through `/props`, so an unfamiliar model name can
+still expose its reasoning picker without requiring a curated sampling profile.
+
 ## See what's running
 
 The header always shows the loaded model, context, GPU layers, speed and memory. Change a setting while the server runs and it lists exactly what will change — apply with **Reload**, or **Discard** to go back.

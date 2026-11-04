@@ -38,6 +38,57 @@ export interface ModelModeSet {
   inlineReasoningHistory?: boolean;
 }
 
+export interface ChatTemplateCaps {
+  reasoning_effort_levels?: unknown;
+  supports_preserve_reasoning?: boolean;
+}
+
+const SERVER_EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max"];
+
+/** Untrusted /props metadata. Empty/invalid lists cannot establish an effort picker. */
+export function serverReasoningLevels(caps?: ChatTemplateCaps): string[] {
+  if (!Array.isArray(caps?.reasoning_effort_levels)) return [];
+  return SERVER_EFFORTS.filter(level => (caps.reasoning_effort_levels as unknown[]).includes(level));
+}
+
+/** Discover template controls without inventing samplers or replacing numeric/strength controls. */
+export function resolveServerModelModes(profile: ModelModeSet | undefined, caps?: ChatTemplateCaps): ModelModeSet | undefined {
+  const levels = serverReasoningLevels(caps);
+  if (!levels.length) return profile;
+  const effortEntries = Object.entries(profile?.modes ?? {}).filter(([, params]) =>
+    typeof params.chat_template_kwargs?.reasoning_effort === "string");
+  // Numeric budgets and reasoning_strength use different controls than this probe.
+  if (Object.values(profile?.modes ?? {}).some(params =>
+    typeof params.chat_template_kwargs?.reasoning_effort === "number" ||
+    params.chat_template_kwargs?.reasoning_strength !== undefined)) return profile;
+  const label = (level: string) => `Think (${level === "xhigh" ? "XHigh" : level[0].toUpperCase() + level.slice(1)})`;
+  const modes: Record<string, ModelModeParams> = {};
+  if (profile) {
+    for (const [name, params] of Object.entries(profile.modes)) {
+      // A binary architecture fallback may hide the actual template's effort
+      // ladder (e.g. a renamed Qwen3.8 GGUF whose architecture is qwen35).
+      if (!effortEntries.length && name !== "No Think") continue;
+      const effort = params.chat_template_kwargs?.reasoning_effort;
+      if (typeof effort !== "string" || levels.includes(effort)) modes[name] = params;
+      else if (name === profile.defaultMode && effort === "max") {
+        // The server probe omits levels identical to the template's unknown-value
+        // fallback (e.g. GLM Max). Retain its verified recipe, including an
+        // explicit effort so a server-wide default cannot silently replace it.
+        modes[name] = params;
+      }
+    }
+  }
+  const recipe = (profile ? profile.modes[profile.defaultMode] : undefined) ?? effortEntries[0]?.[1] ?? {};
+  for (const level of levels) {
+    if (!Object.values(modes).some(params => params.chat_template_kwargs?.reasoning_effort === level)) {
+      modes[label(level)] = { ...recipe, chat_template_kwargs: { ...recipe.chat_template_kwargs, reasoning_effort: level } };
+    }
+  }
+  return { ...profile, familyLabel: profile?.familyLabel ?? "Server reasoning",
+    preserveReasoning: profile?.preserveReasoning ?? caps?.supports_preserve_reasoning === true,
+    defaultMode: profile && modes[profile.defaultMode] ? profile.defaultMode : label(levels[levels.length - 1]), modes };
+}
+
 const QWEN_THINK_SAMPLING = {
   temperature: 1.0,
   top_p: 0.95,
@@ -638,6 +689,7 @@ const MODE_EFFORT_VALUES: Record<string, string> = {
   "Think (High)": "high",
   "Think (Medium)": "medium",
   "Think (Low)": "low",
+  "Think (Minimal)": "minimal",
   "Think (General)": "high",
   "Think (Math / STEM)": "medium",
   "Think (Coding)": "medium",
