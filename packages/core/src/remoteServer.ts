@@ -4,6 +4,7 @@
  * is filled in from this machine's GPUs or model files.
  */
 import { Emitter, Event } from "./events";
+import type { ChatTemplateCaps } from "./modelModes";
 import {
   ConnectionError,
   type ConnectionErrorKind,
@@ -44,6 +45,7 @@ export interface LlamaMetrics {
 }
 
 export interface RemoteServerInfo {
+  chatTemplateCaps?: ChatTemplateCaps;
   url: string;
   state: RemoteState;
   checkedAt: number;
@@ -125,6 +127,7 @@ export function remoteModelIdentity(model: {
 }
 
 interface PropsResponse {
+  chat_template_caps?: ChatTemplateCaps;
   default_generation_settings?: { n_ctx?: number };
   total_slots?: number;
   model_path?: string;
@@ -629,6 +632,9 @@ export async function probeRemoteServer(
     info.buildInfo = typeof props.build_info === "string" && props.build_info ? props.build_info : undefined;
     info.vision = props.modalities?.vision === true;
     info.audio = props.modalities?.audio === true;
+    if (props.chat_template_caps && typeof props.chat_template_caps === "object") {
+      info.chatTemplateCaps = props.chat_template_caps;
+    }
     const bits = [
       info.buildInfo ? `llama.cpp ${shortBuild(info.buildInfo)}` : "llama.cpp",
       info.totalSlots ? `${info.totalSlots} slot${info.totalSlots === 1 ? "" : "s"}` : "",
@@ -825,7 +831,7 @@ export class RemoteServerMonitor {
       && (!next.modelId || next.modelId === prev.modelId)) {
       const missingIdentity = !next.modelId;
       const fields = ["modelId", "modelAlias", "modelAliases", "modelName", "modelPath", "trainedContext",
-        "slotContext", "servedContext", "strataInstanceId", "strataLoadedAt", "vision"] as const;
+        "slotContext", "servedContext", "strataInstanceId", "strataLoadedAt", "vision", "chatTemplateCaps"] as const;
       for (const field of fields) {
         if ((next[field] === undefined || (field === "modelAliases" && missingIdentity)) && prev[field] !== undefined) {
           Object.assign(next, { [field]: prev[field] });
@@ -866,6 +872,7 @@ export class RemoteServerMonitor {
       prev.modelName !== next.modelName ||
       prev.modelAlias !== next.modelAlias ||
       prev.modelPath !== next.modelPath ||
+      JSON.stringify(prev.chatTemplateCaps) !== JSON.stringify(next.chatTemplateCaps) ||
       JSON.stringify(prev.modelAliases) !== JSON.stringify(next.modelAliases) ||
       prev.slotContext !== next.slotContext ||
       prev.servedContext !== next.servedContext ||

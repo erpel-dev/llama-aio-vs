@@ -41,3 +41,25 @@ This control applies to MTP only. DFlash keeps the upstream default even if a sa
 [Added October 14, 2026](https://github.com/ggml-org/llama.cpp/pull/30459). This sets the draft context's physical batch size separately from the main model. It applies to neural drafting (MTP or DFlash), including stacked N-gram modes, and is omitted when no neural drafter is active.
 
 `0` inherits the main physical batch size. A smaller explicit value can reduce draft scratch-memory use, with a possible speed tradeoff. The main batch size is unchanged. The memory estimate does not assume an exact reduction in draft compute buffers from this knob; benchmark the model/backend before relying on the saving.
+
+## Prompt-cache RAM and separate devices
+
+Advanced settings expose three capability-checked controls:
+
+- **Prompt cache RAM (MiB)** (`--cache-ram`): blank inherits llama.cpp's default;
+  `0` disables the RAM prompt cache; `-1` allows unlimited growth. The cache grows
+  on demand, separately from the live model/KV estimate; the limit is not a RAM
+  reservation. This setting does not change the model's context window.
+- **Projector device** (`--mmproj-device`): Auto follows the target device
+  selection. Choose a detected llama.cpp GPU ID to keep the projector on a
+  different GPU. The existing Projector RAM mode takes precedence.
+- **Draft device** (`--spec-draft-device`): Auto follows the main model's devices;
+  select one GPU or CPU for a separate MTP/DFlash draft. Embedded MTP heads
+  remain attached to the target model and cannot be moved by this selector.
+
+The active executable's help must advertise each flag. Older binaries keep
+saved choices but omit unsupported overrides. CPU builds ignore saved GPU
+placement, and remote servers manage their own load settings. Saved GPU IDs
+that are no longer present cause a useful launch error rather than silently
+placing the model on another GPU. Device selection changes the corresponding
+memory bars and requires a server reload.

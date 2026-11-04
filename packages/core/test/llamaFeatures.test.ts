@@ -12,9 +12,17 @@ const help = `--moe-cache-mib N                       GPU cache size in MiB
 --spec-draft-sampling {greedy,probabilistic}
                                        how the draft is sampled
 `;
-const all = { probed: true, moeCache: true, draftSampling: true, draftUbatch: true };
+const all = { cacheRam: false, mmprojDevice: false, draftDevice: false, probed: true, moeCache: true, draftSampling: true, draftUbatch: true };
 
 describe("optional llama.cpp feature detection", () => {
+  it("probes new runtime controls instead of relying on build numbers", () => {
+    const parsed = parseLlamaServerFeatures(`-cram, --cache-ram N
+-mmdev, --mmproj-device DEVICE
+--spec-draft-device, -devd, --device-draft DEVICES
+`);
+    assert.equal(parsed.cacheRam, true); assert.equal(parsed.mmprojDevice, true); assert.equal(parsed.draftDevice, true);
+    assert.equal(parseLlamaServerFeatures("description: --cache-ram is new").cacheRam, false);
+  });
   it("recognizes actual help definitions, aliases and ANSI colors", () => {
     assert.deepEqual(parseLlamaServerFeatures(help), all);
     assert.deepEqual(parseLlamaServerFeatures(help.replace("--moe-cache-mib", "-mc, --moe-cache-mib")), all);

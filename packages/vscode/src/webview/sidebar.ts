@@ -1887,7 +1887,7 @@ const loadFieldIds = [
   'contextLength', 'contextLengthRange', 'gpuOffload', 'gpuOffloadRange',
   'cpuThreads', 'cpuThreadsRange', 'evalBatchSize', 'physicalBatchSize',
   'maxConcurrentPredictions', 'nCpuMoe', 'nCpuMoeRange', 'nCpuFfn', 'nCpuFfnRange', 'offloadKvCacheToGpu',
-  'mmprojOffloadToGpu',
+  'mmprojOffloadToGpu', 'mmprojDevice', 'draftDevice', 'cacheRamMiB',
   'cacheTypeK', 'cacheTypeV',
   'keepModelInMemory', 'tryMmap', 'lazyMode', 'unifiedKvCache', 'flashAttention',
   'contextCheckpoints', 'cacheReuse',
@@ -1910,7 +1910,7 @@ for (const id of loadFieldIds) {
 const ADV_KEYS = new Set([
   'cpuThreads', 'evalBatchSize', 'physicalBatchSize', 'maxConcurrentPredictions', 'flashAttention',
   'offloadKvCacheToGpu', 'cacheTypeK', 'cacheTypeV', 'keepModelInMemory', 'tryMmap', 'lazyMode',
-  'unifiedKvCache', 'contextCheckpoints', 'cacheReuse', 'reasoningFormat', 'reasoningBudget',
+  'unifiedKvCache', 'contextCheckpoints', 'cacheReuse', 'cacheRamMiB', 'mmprojDevice', 'draftDevice', 'reasoningFormat', 'reasoningBudget',
   'chatTemplateSource', 'chatTemplateName', 'chatTemplateFile', 'chatTemplateJinja',
   'ropeFreqBase', 'ropeFreqScale', 'seed', 'speculativeMode', 'ngramVariant', 'ngramSizeN',
   'ngramSizeM', 'ngramMinHits', 'maxDraftTokens', 'minDraftTokens', 'draftProbability', 'draftGpuOffload', 'draftSampling', 'draftBatchSize',
@@ -2112,6 +2112,9 @@ function readLoad() {
     flashAttention: $('flashAttention').value || 'auto',
     contextCheckpoints: Number($('contextCheckpoints').value),
     cacheReuse: Number($('cacheReuse').value),
+    cacheRamMiB: $('cacheRamMiB').value.trim() === '' ? null : Number($('cacheRamMiB').value),
+    mmprojDevice: $('mmprojDevice').value || '',
+    draftDevice: $('draftDevice').value || '',
     reasoningFormat: $('reasoningFormat').value || 'deepseek-legacy',
     reasoningBudget: reasoningUnlimited ? -1 : Number($('reasoningBudget').value),
     chatTemplateSource: ($('chatTemplateSource') && $('chatTemplateSource').value) || 'model',
@@ -2401,6 +2404,20 @@ function applySpecUi(bakedMtp, sidecarMtp) {
 }
 
 /** Preserve saved values while clearly marking settings the active binary cannot apply. */
+function fillRuntimeDeviceSelect(id, selected, allowCpu) {
+  const el = $(id);
+  if (!el || fieldFocused(id)) return;
+  el.textContent = '';
+  const add = (value, label) => { const opt = document.createElement('option'); opt.value = value; opt.textContent = label; el.appendChild(opt); };
+  add('', 'Auto (follow main model)');
+  if (allowCpu) add('none', 'CPU');
+  for (const gpu of (lastPayload?.gpus || [])) {
+    if (gpu.llamaDeviceId) add(gpu.llamaDeviceId, (gpu.shortName || gpu.name) + ' · ' + gpu.llamaDeviceId);
+  }
+  if (selected && !Array.from(el.options as HTMLOptionsCollection).some(o => o.value === selected)) add(selected, selected + ' (unavailable)');
+  el.value = selected;
+}
+
 function syncPerformanceFeatureUi() {
   const p = lastPayload || {};
   const f = p.serverFeatures || {};
@@ -2408,6 +2425,17 @@ function syncPerformanceFeatureUi() {
   const suffix = remote ? 'The remote server controls this setting.'
     : f.probed ? 'Inactive on this llama.cpp build. Update llama.cpp to use it.'
       : 'Inactive until support is verified. Install or select a runnable llama.cpp build.';
+  const hasProjector = !!($('mmprojAttach')?.dataset.path || '').trim();
+  const separateDraft = !!(p.state?.loadSettings?.draftModelPath) && ['mtp', 'ngram-mtp', 'dflash', 'ngram-dflash'].includes($('speculativeMode').value);
+  for (const [id, feature, applicable, text] of [
+    ['cacheRamMiB', 'cacheRam', true, 'Blank = server default · 0 = off · -1 = unlimited. Cache grows on demand.'],
+    ['mmprojDevice', 'mmprojDevice', hasProjector && !cpuOnlyLive() && $('mmprojOffloadToGpu').checked, 'Applies to the projector only; RAM mode overrides this selection.'],
+    ['draftDevice', 'draftDevice', separateDraft && !cpuOnlyLive() && Number($('draftGpuOffload').value) > 0, 'Applies to a separate draft model; embedded MTP heads follow the target.'],
+  ]) {
+    const el = $(id); if (el) el.disabled = remote || !f[feature] || !applicable;
+    const hint = $(id === 'cacheRamMiB' ? 'cacheRamHint' : id + 'Hint');
+    if (hint) hint.textContent = remote || !f[feature] ? suffix : text;
+  }
   const cache = $('moeCacheMiB');
   const cacheHint = $('moeCacheHint');
   const layers = Number($('nCpuMoe').value) || 0;
@@ -2811,6 +2839,9 @@ function applyState(payload) {
   setField('draftProbability', L.draftProbability);
   setField('draftSampling', L.draftSampling || 'auto');
   setField('draftBatchSize', L.draftBatchSize ?? 0);
+  setField('cacheRamMiB', L.cacheRamMiB ?? '');
+  fillRuntimeDeviceSelect('mmprojDevice', L.mmprojDevice || '', false);
+  fillRuntimeDeviceSelect('draftDevice', L.draftDevice || '', true);
   setField('ngramVariant', L.ngramVariant || 'simple');
   if (!fieldFocused('ngramSizeN') && !fieldFocused('ngramSizeNRange')) {
     setField('ngramSizeN', L.ngramSizeN ?? 12);

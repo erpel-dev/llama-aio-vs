@@ -1,7 +1,35 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { denseCaps } from "./helpers";
-import { applyModeToRequestBody, buildModeConfigurationSchema, resolveModeParams, resolveModelModes, resolveLocalModelModes, resolveRemoteModelModes } from "../src/modelModes";
+import { resolveServerModelModes, applyModeToRequestBody, buildModeConfigurationSchema, resolveModeParams, resolveModelModes, resolveLocalModelModes, resolveRemoteModelModes } from "../src/modelModes";
+
+describe("reasoning discovery from server templates", () => {
+  it("discovers only valid effort values without changing free sampling", () => {
+    const set = resolveServerModelModes(undefined, { reasoning_effort_levels: ["low", "xhigh", "low", "invalid", 42] });
+    assert.ok(set);
+    assert.equal(set.defaultMode, "Think (XHigh)");
+    assert.deepEqual(Object.keys(set.modes), ["Think (Low)", "Think (XHigh)"]);
+    assert.deepEqual(resolveModeParams(set, { reasoningEffort: "low" }).params, { chat_template_kwargs: { reasoning_effort: "low" } });
+    assert.equal(resolveServerModelModes(undefined, { reasoning_effort_levels: [] }), undefined);
+    assert.equal(resolveServerModelModes(undefined, { reasoning_effort_levels: "high" }), undefined);
+  });
+  it("retains sampling, filters mismatched efforts, and preserves a template-default alias", () => {
+    const qwen = resolveServerModelModes(resolveModelModes(undefined, "Qwen3.8-27B"), { reasoning_effort_levels: ["low", "xhigh"] })!;
+    assert.equal(qwen.modes["Think (Medium)"], undefined);
+    assert.equal(qwen.modes["Think (Low)"].top_k, 20);
+    assert.equal(qwen.modes["No Think"].chat_template_kwargs?.enable_thinking, false);
+    const glm = resolveServerModelModes(resolveModelModes(undefined, "GLM-5.3-Flash"), { reasoning_effort_levels: ["low", "high"] })!;
+    assert.equal(glm.defaultMode, "Think (Max)");
+    assert.deepEqual(glm.modes[glm.defaultMode].chat_template_kwargs, { clear_thinking: true, reasoning_effort: "max" });
+    const gemma = resolveModelModes(undefined, "gemma-4-12B-it");
+    assert.equal(resolveServerModelModes(gemma, { reasoning_effort_levels: [] }), gemma);
+    const fallback = resolveModelModes(denseCaps({ architecture: "qwen35", name: "Renamed", path: "/models/opaque.gguf" }));
+    const discovered = resolveServerModelModes(fallback, { reasoning_effort_levels: ["low", "medium", "xhigh"] })!;
+    assert.ok(discovered.modes["Think (Low)"]);
+    assert.equal(discovered.modes["Think (Coding)"], undefined);
+    assert.equal(discovered.modes["Think (Low)"].temperature, fallback?.modes[fallback.defaultMode].temperature);
+  });
+});
 
 // Contract expectations taken from the author recipes linked in docs/model-profiles.md.
 const cases: Array<[string, string, string, string[]]> = [

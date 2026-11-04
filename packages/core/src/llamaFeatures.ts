@@ -10,10 +10,14 @@ export interface LlamaServerFeatures {
   moeCache: boolean;
   draftSampling: boolean;
   draftUbatch: boolean;
+  cacheRam?: boolean;
+  mmprojDevice?: boolean;
+  draftDevice?: boolean;
 }
 
 export const NO_SERVER_FEATURES: Readonly<LlamaServerFeatures> = Object.freeze({
   probed: false, moeCache: false, draftSampling: false, draftUbatch: false,
+  cacheRam: false, mmprojDevice: false, draftDevice: false,
 });
 
 export function parseLlamaServerFeatures(help: string): LlamaServerFeatures {
@@ -25,6 +29,9 @@ export function parseLlamaServerFeatures(help: string): LlamaServerFeatures {
     moeCache: !!definition("--moe-cache-mib"),
     draftSampling: /\bprobabilistic\b/.test(definition("--spec-draft-sampling")),
     draftUbatch: !!definition("--spec-draft-n-ubatch"),
+    cacheRam: !!definition("--cache-ram"),
+    mmprojDevice: !!definition("--mmproj-device"),
+    draftDevice: !!definition("--spec-draft-device"),
   };
 }
 

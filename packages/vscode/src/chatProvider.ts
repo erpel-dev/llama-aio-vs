@@ -31,6 +31,8 @@ import {
   resolveModelModes,
   resolveLocalModelModes,
   resolveRemoteModelModes,
+  resolveServerModelModes,
+  type ChatTemplateCaps,
   resolveModeParams,
   rewriteToolInput,
   serverJson,
@@ -65,6 +67,7 @@ interface OpenAiModelsResponse {
 }
 
 interface ServerProps {
+  chat_template_caps?: ChatTemplateCaps;
   default_generation_settings?: { n_ctx?: number };
   total_slots?: number;
   model_path?: string;
@@ -581,7 +584,27 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
    * UI) reports neither the label nor the path, and the picker would otherwise
    * drop the thinking modes until VS Code is reloaded.
    */
+  private serverModeSet: { endpoint: string; modelId: string; modeSet: ModelModeSet } | undefined;
+
   private modeSetFor(modelId: string, props: ServerProps | undefined): ModelModeSet | undefined {
+    const profile = this.curatedModeSetFor(modelId, props);
+    const remote = this.remoteInfo();
+    const caps = props ? props.chat_template_caps : (remote?.modelId === modelId ? remote.chatTemplateCaps : undefined);
+    const endpoint = this.store.getEndpoint();
+    if (caps !== undefined) {
+      const found = resolveServerModelModes(profile, caps);
+      this.serverModeSet = found ? { endpoint, modelId, modeSet: found } : undefined;
+      return found;
+    }
+    if (props) {
+      this.serverModeSet = undefined;
+      return profile;
+    }
+    const last = this.serverModeSet;
+    return last?.endpoint === endpoint && last.modelId === modelId ? last.modeSet : profile;
+  }
+
+  private curatedModeSetFor(modelId: string, props: ServerProps | undefined): ModelModeSet | undefined {
     const endpoint = this.store.getEndpoint();
     if (!this.store.isRemote()) {
       return resolveLocalModelModes(this.store.getState().modelCapabilities, modelId,

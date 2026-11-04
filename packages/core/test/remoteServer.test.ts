@@ -178,6 +178,7 @@ describe("probeRemoteServer", () => {
             model_alias: "qwythos-9b",
             build_info: "b10517-abc",
             modalities: { vision: true },
+            chat_template_caps: { reasoning_effort_levels: ["low", "xhigh"] },
           })
         );
         return;
@@ -192,6 +193,12 @@ describe("probeRemoteServer", () => {
     }
     base = `http://127.0.0.1:${addr.port}`;
   }
+
+  it("retains template reasoning levels from /props", async () => {
+    await listen();
+    const info = await probeRemoteServer(base);
+    assert.deepEqual(info.chatTemplateCaps?.reasoning_effort_levels, ["low", "xhigh"]);
+  });
 
   it("reads a llama.cpp server as ready", async () => {
     mode = "ready";

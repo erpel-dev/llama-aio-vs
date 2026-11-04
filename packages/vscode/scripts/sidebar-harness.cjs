@@ -251,7 +251,7 @@ const processManager = {
   getServerFeatures: async () => {
     // Explicit fixtures for exercising guards without a GPU or an installed build.
     const fixture = argOf("--features", "");
-    if (fixture === "modern") return { probed: true, moeCache: true, draftSampling: true, draftUbatch: true };
+    if (fixture === "modern") return { probed: true, moeCache: true, draftSampling: true, draftUbatch: true, cacheRam: true, mmprojDevice: true, draftDevice: true };
     if (fixture === "old") return { ...core.NO_SERVER_FEATURES, probed: true };
     return realBinary ? core.probeLlamaServerFeatures({ binary: realBinary, command: realBinary,
       prefixArgs: [], env: core.withBinaryDirEnv(realBinary) }) : { ...core.NO_SERVER_FEATURES };

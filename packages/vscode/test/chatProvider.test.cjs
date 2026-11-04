@@ -219,6 +219,46 @@ describe("LlamaAioChatProvider requests", () => {
     seenRequests = [];
   });
 
+  for (const remote of [false, true]) {
+    it(`discovers unknown template efforts through /props (${remote ? 'remote' : 'local'})`, async () => {
+      servedModelId = "opaque-new-model";
+      servedProps = { chat_template_caps: { reasoning_effort_levels: ["low", "xhigh"], supports_preserve_reasoning: true } };
+      const { provider, state } = setup({ remote });
+      state.requestSettings.temperature = 0.42;
+      const [model] = await provider.provideLanguageModelChatInformation({}, cancelToken().token);
+      assert.deepEqual(model.configurationSchema.properties.reasoningEffort.enum, ["low", "xhigh"]);
+      for (const effort of ["low", "xhigh"]) {
+        await provider.provideLanguageModelChatResponse(model, [msg(Role.User, new TextPart("Hello"))],
+          { modelOptions: { reasoningEffort: effort } }, { report() {} }, cancelToken().token);
+        assert.equal(lastBody.temperature, 0.42);
+        assert.deepEqual(lastBody.chat_template_kwargs, { reasoning_effort: effort });
+      }
+      propsStatus = 404;
+      provider.notifyChanged();
+      const [offline] = await provider.provideLanguageModelChatInformation({}, cancelToken().token);
+      assert.deepEqual(offline.configurationSchema.properties.reasoningEffort.enum, ["low", "xhigh"]);
+      propsStatus = 200;
+      // An explicit fresh template response removes stale discovered controls.
+      servedProps = { chat_template_caps: { reasoning_effort_levels: [] } };
+      provider.notifyChanged();
+      const [changed] = await provider.provideLanguageModelChatInformation({}, cancelToken().token);
+      assert.equal(changed.configurationSchema, undefined);
+      servedModelId = "another-unknown-model";
+      servedProps = {};
+      provider.notifyChanged();
+      const [other] = await provider.provideLanguageModelChatInformation({}, cancelToken().token);
+      assert.equal(other.configurationSchema, undefined);
+    });
+  }
+
+  it("uses remote template capabilities when /props is temporarily unavailable", async () => {
+    servedModelId = "opaque"; propsStatus = 404;
+    const { provider } = setup({ remote: true, remoteInfo: { modelId: "opaque",
+      chatTemplateCaps: { reasoning_effort_levels: ["low", "high"] } } });
+    const [model] = await provider.provideLanguageModelChatInformation({}, cancelToken().token);
+    assert.deepEqual(model.configurationSchema.properties.reasoningEffort.enum, ["low", "high"]);
+  });
+
   it("uses the server's actual image capability for an audio-only projector", async () => {
     servedProps = { modalities: { vision: false, audio: true } };
     const { provider, state } = setup();
