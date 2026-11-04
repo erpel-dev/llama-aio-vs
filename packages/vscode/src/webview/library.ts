@@ -4,7 +4,7 @@
  * can update it; rendering and clicks live here.
  */
 import { $, vscode } from "./api";
-import { escAttr, escText, fmtBytes, fmtCount, fmtEta } from "./format";
+import { escAttr, escText, fmtBytes, fmtCount, fmtEta, friendlyNetworkError } from "./format";
 import type { ToWebviewMessage } from "./protocol";
 
 const LIBRARY_PAGE_SIZE = 50;
@@ -286,7 +286,7 @@ export function renderLibraryList() {
   if (lib.hfBusy) {
     html += '<div class="hint">' + (lib.hfMode === 'files' ? 'Listing GGUF files…' : 'Searching Hugging Face…') + '</div>';
   }
-  if (lib.hfError) html += '<div class="hint">' + escText(lib.hfError) + '</div>';
+  if (lib.hfError) html += '<div class="hint error-hint" title="' + escAttr(lib.hfError) + '">' + escText(friendlyNetworkError(lib.hfError, 'huggingface')) + '</div>';
   if (lib.hfMode === 'license' && lib.hfFiles && lib.hfFiles.license) {
     const lic = lib.hfFiles.license;
     html += '<div class="lib-job"><div class="lib-job-top"><span>' + escText(lic.id) + '</span></div>';

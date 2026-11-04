@@ -43,6 +43,7 @@ import { formatDownloadStatusLine } from "./downloadStatus";
 import { openModelFileDialog, pickDraftModelFromLibrary, pickMmprojFromLibrary } from "./modelPicker";
 import { SettingsViewProvider } from "./settingsView";
 import * as path from "path";
+import * as fs from "fs";
 import * as vscode from "vscode";
 import { LlamaAioChatProvider } from "./chatProvider";
 import { promptUseInCopilotChat } from "./copilotChatPrompt";
@@ -354,13 +355,21 @@ export function activate(context: vscode.ExtensionContext): void {
     if (!selected || store.isRemote()) {
       return;
     }
+    const name = path.basename(selected);
+    if (!fs.existsSync(processManager.resolveBinary())) {
+      // Nothing can start yet; the sidebar's Get started list shows the next step.
+      vscode.window.setStatusBarMessage(`Llama AIO: selected ${name}`, 5000);
+      return;
+    }
+    const running = await processManager.isHttpReady();
+    const action = running ? "Reload now" : "Start server";
     const choice = await vscode.window.showInformationMessage(
-      `Model selected:\n${selected}`,
-      "Start / reload server",
+      running ? `Selected ${name}. Reload the server to load it.` : `Selected ${name}.`,
+      action,
       "Later"
     );
-    if (choice === "Start / reload server") {
-      await runLaunch((await processManager.isHttpReady()) ? "reload" : "start");
+    if (choice === action) {
+      await runLaunch(running ? "reload" : "start");
     }
   };
 
@@ -888,7 +897,16 @@ export function activate(context: vscode.ExtensionContext): void {
       .join("\n");
     return usable;
   };
+  let remoteContext: boolean | undefined;
+  const syncRemoteContext = () => {
+    const remote = store.isRemote();
+    if (remote !== remoteContext) {
+      remoteContext = remote;
+      void vscode.commands.executeCommand("setContext", "llamaAio.remote", remote);
+    }
+  };
   const refreshStatusBar = async (forceBuildInfo = false) => {
+    syncRemoteContext();
     if (store.isRemote()) {
       await processManager.remote.refresh();
       syncPerfTarget(perf, store, processManager);

@@ -533,7 +533,8 @@ function setupSteps() {
   const p = lastPayload || {};
   const hasModel = !!(p.state && p.state.selectedModelPath);
   const build = p.build || {};
-  const runtimeOk = !!p.binaryExists && build.binaryRunnable !== false;
+  // A server that is up proves a runtime, even one started outside Llama AIO.
+  const runtimeOk = (!!p.binaryExists && build.binaryRunnable !== false) || serverRunning;
   const installing = llamaInstallRunning();
   const installFailed = !!(llamaInstall && llamaInstall.status === 'error');
   const jobs = (lib.downloads || []).filter(function (j) { return j && j.state !== 'error' && j.state !== 'gated'; });
@@ -2779,7 +2780,7 @@ function applyState(payload) {
     // No desktop terminal here: start uses Background, the saved choice stays.
     const forced = String(payload.launchModeFallback || '');
     const ext = lm.querySelector('option[value="externalTerminal"]');
-    if (ext) ext.textContent = forced ? 'External terminal (unavailable: ' + forced + ')' : 'External terminal (logs visible)';
+    if (ext) ext.textContent = forced ? 'External terminal (not available here)' : 'External terminal (logs visible)';
     lm.title = forced ? 'Using Background: ' + forced + '. Logs: ⋯ → Open log.' : 'How llama-server is started';
   }
   if (lm && payload.launchMode && document.activeElement !== lm) {

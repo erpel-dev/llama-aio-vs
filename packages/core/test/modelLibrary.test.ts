@@ -18,7 +18,7 @@ import {
   removalPathsForQuant,
   withoutHiddenModels,
 } from "../src/modelLibrary";
-import { hfSourceForPartial } from "../src/modelLibrary";
+import { hfSourceForPartial, OPENED_MODEL_SOURCE, withRecentExternalModels } from "../src/modelLibrary";
 
 const LANGUAGE_MIN = 32 * 1024 * 1024;
 
@@ -346,5 +346,32 @@ describe("hfSourceForPartial", () => {
     assert.equal(hfSourceForPartial(root, path.join(root, "noowner", "m.gguf.partial")), undefined);
     assert.equal(hfSourceForPartial(root, path.join(os.tmpdir(), "x__y", "m.gguf.partial")), undefined);
     assert.equal(hfSourceForPartial(root, path.join(root, "a__b", "m.gguf")), undefined);
+  });
+});
+
+describe("withRecentExternalModels", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "llama-aio-opened-"));
+  after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const big = (name: string) => {
+    const file = path.join(dir, name);
+    fs.writeFileSync(file, "");
+    fs.truncateSync(file, 40 * 1024 * 1024); // sparse; above the stub threshold
+    return file;
+  };
+  it("adds opened GGUFs outside the scan once, unowned, and skips missing files and companions", () => {
+    const external = big("Spark-X2.6-1.7B-Q4_K_M.gguf");
+    const link = path.join(dir, "spark-link.gguf");
+    fs.symlinkSync(external, link);
+    const mmproj = big("mmproj-F16.gguf");
+    const scanned = [{ path: path.join(dir, "scanned.gguf"), source: "LM Studio", sizeBytes: 1 }];
+    const out = withRecentExternalModels(scanned, [external, link, mmproj, path.join(dir, "gone.gguf"), ""]);
+    const opened = out.filter((e) => e.source === OPENED_MODEL_SOURCE);
+    assert.deepEqual(opened.map((e) => e.path), [external]);
+    assert.equal(isOwnedModelPath(external, path.join(os.tmpdir(), "llama-aio-models-root")), false);
+  });
+  it("does not duplicate a model the scan already found", () => {
+    const external = big("LFM3-1.7B-Q4_K_M.gguf");
+    const out = withRecentExternalModels([{ path: external, source: "Llama AIO", sizeBytes: 1 }], [external]);
+    assert.equal(out.length, 1);
   });
 });

@@ -551,8 +551,9 @@ details.advanced > summary,
 .label {
   overflow: visible;
 }
+select { width: auto; min-width: 88px; max-width: 100%; text-overflow: ellipsis; }
+input[type="number"], input[type="text"] { width: 88px; }
 input[type="number"], input[type="text"],     select {
-  width: 88px;
   background: var(--input-bg);
   color: var(--input-fg);
   border: 1px solid var(--border);
@@ -774,7 +775,7 @@ body:not(.remote-mode) #remoteLoad { display: none !important; }
 .menu-item:disabled { opacity: 0.45; cursor: default; background: none; }
 .menu-sep { border-top: 1px solid var(--border); margin: 4px 0 6px; }
 .menu-label { display: block; font-size: 11px; color: var(--muted); padding: 0 12px 4px; }
-.menu-body select { margin: 0 12px; width: calc(100% - 24px); }
+.menu-body select { margin: 0 12px; width: calc(100% - 24px); min-width: 0; }
 .srv-model { font-weight: 650; margin-top: 6px; overflow-wrap: anywhere; }
 .srv-sub { color: var(--muted); font-size: 11px; margin-top: 1px; }
 /* ---- Cards & folds ---- */
@@ -1101,3 +1102,17 @@ body:not(.layout-running) #perfSpecLine { display: none; }
 .live-chat { display: flex; justify-content: space-between; gap: 8px; font-size: 11px; margin: 7px 0 3px; }
 .live-chat .sub { color: var(--muted); }
 .ctx-stack.thin { height: 6px; border-radius: 3px; }
+
+/* High contrast (forced colors): keep the data colors of bars, swatches and
+   sparklines instead of letting the system paint them all one color, and give
+   each segment an edge so neighbors stay distinguishable. */
+@media (forced-colors: active) {
+  .ctx-stack, .mem-stack, .lib-bar { border: 1px solid CanvasText; }
+  .ctx-stack > span, .mem-stack > span, .lib-bar > span,
+  .mem-legend i, .ctx-legend i, .chart-legend i, svg {
+    forced-color-adjust: none;
+  }
+  .ctx-stack > span + span, .mem-stack > span + span { border-left: 1px solid Canvas; }
+  .setup-step.now .step-mark { forced-color-adjust: none; background: Highlight; border-color: Highlight; }
+  .setup { border-color: CanvasText; }
+}

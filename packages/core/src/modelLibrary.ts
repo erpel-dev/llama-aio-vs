@@ -1006,6 +1006,41 @@ function scanLocalModelEntries(config: ConfigAccessor): LocalModelEntry[] {
   });
 }
 
+/** Source label for models opened from outside the scanned folders. */
+export const OPENED_MODEL_SOURCE = "Opened";
+
+/**
+ * Add recently opened GGUFs that the folder scan does not cover, so a model
+ * picked with "Open GGUF…" stays one click away. Missing files, companions and
+ * paths already scanned (also via symlinks) are skipped. These entries are
+ * never owned: ownership is decided by the models folder alone.
+ */
+export function withRecentExternalModels(
+  entries: LocalModelEntry[],
+  recentPaths: readonly string[]
+): LocalModelEntry[] {
+  const seen = new Set(entries.map((e) => canonicalModelPath(e.path)));
+  const extra: LocalModelEntry[] = [];
+  for (const raw of recentPaths) {
+    const file = (raw || "").trim();
+    if (!file) continue;
+    const key = canonicalModelPath(file);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    let size = 0;
+    try {
+      const st = fs.statSync(file);
+      if (!st.isFile()) continue;
+      size = st.size;
+    } catch {
+      continue;
+    }
+    if (shouldSkipLanguageFile(path.basename(file), size)) continue;
+    extra.push({ path: file, source: OPENED_MODEL_SOURCE, sizeBytes: size });
+  }
+  return extra.length ? [...entries, ...collapseLocalModelEntries(extra)] : entries;
+}
+
 /** Same roots as listLocalModelEntries, but only vision projector GGUFs. */
 export function listMmprojEntries(config: ConfigAccessor): LocalModelEntry[] {
   return cachedScan("mmproj", config, () => {

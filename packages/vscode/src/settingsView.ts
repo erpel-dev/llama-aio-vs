@@ -39,6 +39,7 @@ import {
   listLocalModelEntries,
   listPartialDownloads,
   hfSourceForPartial,
+  withRecentExternalModels,
   listShardPaths,
   findSiblingMtpDraft,
   invalidateModelLibraryCache,
@@ -1474,7 +1475,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       void config.update("hiddenModels", present);
     }
     const hiddenSet = new Set(present);
-    const all = listLocalModelEntries(config);
+    const all = withRecentExternalModels(listLocalModelEntries(config), [
+      selectedPath,
+      ...(config.get<string[]>("recentModels") || []),
+    ]);
     const visible = withoutHiddenModels(all, present);
     const hiddenEntries = all.filter((entry) => hiddenSet.has(canonicalModelPath(entry.path)));
     const decorate = (groups: LibraryGroup[]) =>

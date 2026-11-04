@@ -159,6 +159,26 @@
         "title": "Llama AIO: View Last Response"
       }
     ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "llamaAio.switchToLocal",
+          "when": "llamaAio.remote"
+        },
+        {
+          "command": "llamaAio.setApiKey",
+          "when": "llamaAio.remote"
+        },
+        {
+          "command": "llamaAio.forgetApiKey",
+          "when": "llamaAio.remote"
+        },
+        {
+          "command": "llamaAio.copyConnectionDiagnostics",
+          "when": "llamaAio.remote"
+        }
+      ]
+    },
     "viewsContainers": {
       "activitybar": [
         {
