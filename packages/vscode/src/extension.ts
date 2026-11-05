@@ -38,10 +38,12 @@ import {
   UiBackend,
 } from "@llama-aio/core";
 import * as os from "os";
+import { syncPerfTarget } from "./perfTarget";
 import { formatDownloadStatusLine } from "./downloadStatus";
 import { openModelFileDialog, pickDraftModelFromLibrary, pickMmprojFromLibrary } from "./modelPicker";
 import { SettingsViewProvider } from "./settingsView";
 import * as path from "path";
+import * as fs from "fs";
 import * as vscode from "vscode";
 import { LlamaAioChatProvider } from "./chatProvider";
 import { promptUseInCopilotChat } from "./copilotChatPrompt";
@@ -68,6 +70,14 @@ export function activate(context: vscode.ExtensionContext): void {
   ensureDirs(getInstallDir(config), getModelsDir(config), getLockDir());
 
   const processManager = new ProcessManager(store);
+  // A terminal window opened by a browser-hosted or remote extension host
+  // appears on that host, never in front of the user: start in Background.
+  processManager.externalTerminalBlocked = () =>
+    vscode.env.uiKind === vscode.UIKind.Web
+      ? "VS Code is running in a browser"
+      : vscode.env.remoteName
+        ? `the extension runs on a remote host (${vscode.env.remoteName})`
+        : undefined;
   context.subscriptions.push(initServerDiagnostics(processManager));
   const perf = new PerfStats();
   perf.setSpeculativeMode(
@@ -317,7 +327,10 @@ export function activate(context: vscode.ExtensionContext): void {
             );
       message = status.message;
     } catch (e) {
-      await reportLaunchFailure(opts.failurePrefix ?? (kind === "reload" ? "Reload failed" : "Start failed"), e);
+      await reportLaunchFailure(opts.failurePrefix ?? (kind === "reload" ? "Reload failed" : "Start failed"), e, async () => {
+        await store.getConfig().update("launchMode", "background");
+        await runLaunch(kind, opts);
+      });
       return false;
     } finally {
       processManager.releaseLaunch(token);
@@ -342,13 +355,21 @@ export function activate(context: vscode.ExtensionContext): void {
     if (!selected || store.isRemote()) {
       return;
     }
+    const name = path.basename(selected);
+    if (!fs.existsSync(processManager.resolveBinary())) {
+      // Nothing can start yet; the sidebar's Get started list shows the next step.
+      vscode.window.setStatusBarMessage(`Llama AIO: selected ${name}`, 5000);
+      return;
+    }
+    const running = await processManager.isHttpReady();
+    const action = running ? "Reload now" : "Start server";
     const choice = await vscode.window.showInformationMessage(
-      `Model selected:\n${selected}`,
-      "Start / reload server",
+      running ? `Selected ${name}. Reload the server to load it.` : `Selected ${name}.`,
+      action,
       "Later"
     );
-    if (choice === "Start / reload server") {
-      await runLaunch((await processManager.isHttpReady()) ? "reload" : "start");
+    if (choice === action) {
+      await runLaunch(running ? "reload" : "start");
     }
   };
 
@@ -876,9 +897,19 @@ export function activate(context: vscode.ExtensionContext): void {
       .join("\n");
     return usable;
   };
+  let remoteContext: boolean | undefined;
+  const syncRemoteContext = () => {
+    const remote = store.isRemote();
+    if (remote !== remoteContext) {
+      remoteContext = remote;
+      void vscode.commands.executeCommand("setContext", "llamaAio.remote", remote);
+    }
+  };
   const refreshStatusBar = async (forceBuildInfo = false) => {
+    syncRemoteContext();
     if (store.isRemote()) {
       await processManager.remote.refresh();
+      syncPerfTarget(perf, store, processManager);
       serverReadyCache = paintRemoteStatusBar();
       await settingsView.postStatusNow(serverReadyCache);
       statusBar.show();
@@ -886,6 +917,7 @@ export function activate(context: vscode.ExtensionContext): void {
     }
     const status = await processManager.refreshStatus();
     serverReadyCache = status.running || (await processManager.isHttpReady());
+    syncPerfTarget(perf, store, processManager);
     currentBuildInfo(forceBuildInfo);
     statusBar.text = perf.statusBarText(serverReadyCache);
     // Same probe feeds the sidebar so a crash or a TUI stop clears "Server ready".
@@ -1182,6 +1214,8 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("llamaAio.openSettings", async () => {
       await vscode.commands.executeCommand("llamaAio.settingsView.focus");
     }),
+    vscode.commands.registerCommand("llamaAio.openAdvancedSettings", () => settingsView.openAdvancedPanel()),
+    { dispose: () => settingsView.dispose() },
     vscode.commands.registerCommand("llamaAio.openConfigFile", async () => {
       await configFile.ensureExists();
       const uri = vscode.Uri.file(describeConfigLocation().file);

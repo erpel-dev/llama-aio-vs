@@ -257,6 +257,8 @@ const processManager = {
       prefixArgs: [], env: core.withBinaryDirEnv(realBinary) }) : { ...core.NO_SERVER_FEATURES };
   },
   isCpuBackend: () => cpuBackend,
+  effectiveLaunchMode: () => "background",
+  launchModeFallbackReason: () => undefined,
   getLaunchedConfig: () => (running ? launched : undefined),
   claimLaunch: () => ({ id: 1 }),
   releaseLaunch() {},
@@ -333,6 +335,8 @@ const perf = {
   hasLastRequestContext: () => true,
   hasLastResponseTrace: () => true,
   setSpeculativeMode() {},
+  setTarget() {},
+  getTarget() { return undefined; },
   formatLastRequestContext: () => "",
   formatLastResponseTrace: () => "",
 };

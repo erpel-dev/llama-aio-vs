@@ -4,7 +4,7 @@
  * can update it; rendering and clicks live here.
  */
 import { $, vscode } from "./api";
-import { escAttr, escText, fmtBytes, fmtCount, fmtEta } from "./format";
+import { escAttr, escText, fmtBytes, fmtCount, fmtEta, friendlyNetworkError } from "./format";
 import type { ToWebviewMessage } from "./protocol";
 
 const LIBRARY_PAGE_SIZE = 50;
@@ -286,7 +286,7 @@ export function renderLibraryList() {
   if (lib.hfBusy) {
     html += '<div class="hint">' + (lib.hfMode === 'files' ? 'Listing GGUF files…' : 'Searching Hugging Face…') + '</div>';
   }
-  if (lib.hfError) html += '<div class="hint">' + escText(lib.hfError) + '</div>';
+  if (lib.hfError) html += '<div class="hint error-hint" title="' + escAttr(lib.hfError) + '">' + escText(friendlyNetworkError(lib.hfError, 'huggingface')) + '</div>';
   if (lib.hfMode === 'license' && lib.hfFiles && lib.hfFiles.license) {
     const lic = lib.hfFiles.license;
     html += '<div class="lib-job"><div class="lib-job-top"><span>' + escText(lic.id) + '</span></div>';
@@ -338,8 +338,11 @@ export function renderLibraryList() {
         if (!visible.length) return;
         const g = x.g;
         const vision = groupHasVision(g);
-        const sub = [g.detail || '', g.source && g.source !== 'Llama AIO' ? g.source : '', g.hidden ? 'hidden' : ''].filter(Boolean).join(' · ');
-        html += '<div class="lib-grp" title="' + escAttr(g.title + (g.detail ? ' — ' + g.detail : '') + ' · ' + g.source) + '"><span class="lib-title">' + escText(g.title) + '</span>' + (vision ? '<span class="lib-tag vision" title="A vision projector (mmproj) sits next to these files">vision</span>' : '') + '<span class="lib-detail">' + escText(sub) + '</span></div>';
+        // An opened file's parent folder name says nothing; label it by origin.
+        const opened = g.source === 'Opened';
+        const sub = (opened ? ['opened file', g.hidden ? 'hidden' : '']
+          : [g.detail || '', g.source && g.source !== 'Llama AIO' ? g.source : '', g.hidden ? 'hidden' : '']).filter(Boolean).join(' · ');
+        html += '<div class="lib-grp" title="' + escAttr(g.title + (g.detail ? ' — ' + (opened ? 'folder ' : '') + g.detail : '') + ' · ' + (opened ? 'opened from outside the scanned folders' : g.source)) + '"><span class="lib-title">' + escText(g.title) + '</span>' + (vision ? '<span class="lib-tag vision" title="A vision projector (mmproj) sits next to these files">vision</span>' : '') + '<span class="lib-detail">' + escText(sub) + '</span></div>';
         visible.forEach(function (quant) {
           const sel = quant.path === lib.selected;
           const draft = !!lib.drafts[quant.path];
@@ -396,7 +399,10 @@ export function renderLibraryPartials() {
   }
   el.classList.remove('hidden');
   const label = lib.payload.partialSizeLabel || '';
-  el.innerHTML = '<span>' + n + ' partial download' + (n === 1 ? '' : 's') + (label ? ' · ' + escText(label) : '') + '</span><button type="button" class="secondary small" data-act="clean-partials">Clean</button>';
+  const resumable = (lib.payload.partials || []).some(function (p) { return p && p.resumable; });
+  el.innerHTML = '<span>' + n + ' interrupted download' + (n === 1 ? '' : 's') + (label ? ' · ' + escText(label) : '') + '</span><span class="lib-actions" style="padding:0">' +
+    (resumable ? '<button type="button" class="secondary small" data-act="resume-partials" title="Continue from where the download stopped">Resume</button>' : '') +
+    '<button type="button" class="secondary small" data-act="clean-partials" title="Move the incomplete files to the trash">Clean</button></span>';
 }
 
 export function renderLibraryDialog() {

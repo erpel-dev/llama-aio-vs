@@ -80,20 +80,32 @@ export function keepMmapForLazy(
  * same zeros for launch args and dirty-fingerprint so the sidebar matches what
  * start ships.
  */
+const CPU_IGNORED_FIELDS = {
+  gpuOffload: 0,
+  offloadKvCacheToGpu: false,
+  mmprojOffloadToGpu: false,
+  mmprojDevice: "",
+  draftDevice: "",
+  nCpuMoe: 0,
+  moeCacheMiB: 0,
+  nCpuFfn: 0,
+} satisfies Partial<LlamaLoadSettings>;
+
+type CpuIgnoredField = keyof typeof CPU_IGNORED_FIELDS;
+
 export function normalizeLoadSettingsForCpuBackend(
   settings: LlamaLoadSettings
 ): LlamaLoadSettings {
-  return {
-    ...settings,
-    gpuOffload: 0,
-    offloadKvCacheToGpu: false,
-    mmprojOffloadToGpu: false,
-    mmprojDevice: "",
-    draftDevice: "",
-    nCpuMoe: 0,
-    moeCacheMiB: 0,
-    nCpuFfn: 0,
-  };
+  return { ...settings, ...CPU_IGNORED_FIELDS };
+}
+
+/** The fields a CPU build ignores, copied from `settings` (to preserve GPU preferences). */
+export function pickCpuIgnoredFields(settings: LlamaLoadSettings): Pick<LlamaLoadSettings, CpuIgnoredField> {
+  const out: Partial<LlamaLoadSettings> = {};
+  for (const key of Object.keys(CPU_IGNORED_FIELDS) as CpuIgnoredField[]) {
+    (out as Record<string, unknown>)[key] = settings[key];
+  }
+  return out as Pick<LlamaLoadSettings, CpuIgnoredField>;
 }
 
 /** Shell-ish display form of an argv list (clipboard / log), not a spawn argv. */

@@ -996,12 +996,33 @@ export function detectCudaHardwareAsync(): Promise<boolean> {
 }
 
 /** True when Vulkan looks usable (or we can at least install the Vulkan build). */
+/**
+ * True when Linux exposes a GPU device node: a DRM render node (AMD, Intel,
+ * NVIDIA open driver) or the NVIDIA proprietary device. `list` is injectable for tests.
+ */
+export function linuxHasGpuDevice(list: (dir: string) => string[] = safeReaddir): boolean {
+  return list("/dev/dri").some((n) => /^renderD\d+$/.test(n)) || list("/dev").some((n) => /^nvidia\d+$/.test(n));
+}
+
+function safeReaddir(dir: string): string[] {
+  try {
+    return fs.readdirSync(dir);
+  } catch {
+    return [];
+  }
+}
+
 export function detectVulkanHardware(): boolean {
   return cachedDetect("vulkan", detectVulkanHardwareUncached);
 }
 
 function detectVulkanHardwareUncached(): boolean {
   if (process.platform === "darwin") {
+    return false;
+  }
+  if (process.platform === "linux" && !linuxHasGpuDevice()) {
+    // No DRM render node and no NVIDIA device: containers, VMs and headless
+    // servers. A Vulkan build would only find a software device, so prefer CPU.
     return false;
   }
   if (commandExists("vulkaninfo")) {

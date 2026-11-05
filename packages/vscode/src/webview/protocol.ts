@@ -14,7 +14,7 @@ export type ToHostMessage =
   // Lifecycle
   | { type: "ready" }
   | { type: "start"; payload?: SettingsPatch }
-  | { type: "reload"; payload: SettingsPatch }
+  | { type: "reload"; payload?: SettingsPatch }
   | { type: "stop" }
   | { type: "openLog" }
   | { type: "copyCommandLine" }
@@ -68,6 +68,13 @@ export type ToHostMessage =
   | { type: "unhideLibraryModel"; path: string }
   | { type: "removeLibraryQuant"; path: string; companionPaths: string[] }
   | { type: "cleanPartialDownloads" }
+  | { type: "resumePartialDownloads" }
+  | { type: "openWebUi" }
+  | { type: "copyLocalApiKey" }
+  | { type: "copyText"; text: string }
+  | { type: "openCopilotChat" }
+  | { type: "openAdvanced" }
+  | { type: "dismissSetup" }
   // Hugging Face search and downloads
   | { type: "searchLibraryHf"; query: string; requestId: number }
   | { type: "listLibraryHfFiles"; modelId: string; requestId: number }
@@ -121,6 +128,7 @@ export type ToWebviewMessage =
   | { type: "draftModelSelected"; path: string }
   | { type: "mmprojSelected"; path: string }
   | { type: "openConnect" }
+  | { type: "advancedPanel"; open: boolean }
   | { type: "remoteConnected" }
   | { type: "remoteProbe"; payload?: ViewModel; error?: string }
   | {

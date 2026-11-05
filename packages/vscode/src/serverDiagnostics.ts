@@ -1,6 +1,6 @@
 import * as fs from "fs";
 import * as vscode from "vscode";
-import { getLogPath, LaunchCancelledError, ProcessManager } from "@llama-aio/core";
+import { getLogPath, LaunchCancelledError, ProcessManager, TerminalLaunchError } from "@llama-aio/core";
 
 let channel: vscode.OutputChannel | undefined;
 let processManager: ProcessManager | undefined;
@@ -59,7 +59,16 @@ export async function copyServerCommandLine(): Promise<void> {
  * The channel is not forced into view (an auto-start failure at window open
  * should not steal focus). A start cancelled by Stop is not an error.
  */
-export async function reportLaunchFailure(prefix: string, error: unknown): Promise<void> {
+/**
+ * `retryInBackground` switches the launch mode to Background and starts again;
+ * it is offered when an external terminal never ran llama-server. The prompt is
+ * not awaited there, so the failed launch releases its claim before the retry.
+ */
+export async function reportLaunchFailure(
+  prefix: string,
+  error: unknown,
+  retryInBackground?: () => Promise<unknown>
+): Promise<void> {
   if (error instanceof LaunchCancelledError) {
     vscode.window.setStatusBarMessage("Llama AIO: server start cancelled", 4000);
     return;
@@ -74,6 +83,16 @@ export async function reportLaunchFailure(prefix: string, error: unknown): Promi
     out.appendLine("");
     out.appendLine("# last 20 log lines");
     out.appendLine(recent);
+  }
+  if (error instanceof TerminalLaunchError && retryInBackground) {
+    void vscode.window.showErrorMessage(`${prefix}: ${message}`, "Start in Background mode", "Show output").then(async (pick) => {
+      if (pick === "Start in Background mode") {
+        await retryInBackground();
+      } else if (pick === "Show output") {
+        out.show(true);
+      }
+    });
+    return;
   }
   const choice = await vscode.window.showErrorMessage(`${prefix}: ${message}`, "Show output");
   if (choice === "Show output") {

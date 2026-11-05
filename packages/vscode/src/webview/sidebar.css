@@ -442,14 +442,112 @@ input:disabled, select:disabled { opacity: 0.5; }
 .mem-legend .seg-kv { background: #a855f7; }
 .mem-legend .seg-overhead { background: #64748b; }
 .setup {
-  background: var(--warn-bg);
-  border: 1px solid var(--border);
+  background: var(--input-bg);
+  border: 1px solid color-mix(in srgb, var(--accent) 55%, var(--border));
   border-radius: 6px;
   padding: 10px;
   margin-bottom: 10px;
 }
-.setup ol { margin: 6px 0 0 18px; padding: 0; }
-.setup li { margin: 4px 0; }
+.setup-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.setup-steps { list-style: none; margin: 8px 0 10px; padding: 0; }
+.setup-step { display: flex; gap: 8px; align-items: flex-start; margin: 6px 0; color: var(--muted); }
+.step-mark {
+  flex: 0 0 16px; height: 16px; margin-top: 1px; border-radius: 50%;
+  border: 1.5px solid var(--border); box-sizing: border-box;
+  font-size: 10px; line-height: 13px; text-align: center;
+}
+.setup-step.done .step-mark { border-color: var(--ok); color: var(--ok); }
+.setup-step.done .step-mark::before { content: "✓"; }
+.setup-step.now { color: var(--fg); }
+.setup-step.now .step-mark { border-color: var(--accent); background: var(--accent); }
+.setup-step.busy .step-mark { border-color: var(--starting); border-top-color: transparent; animation: step-spin 1s linear infinite; }
+.setup-step.error .step-mark { border-color: var(--bad); color: var(--bad); }
+.setup-step.error .step-mark::before { content: "!"; }
+.setup-step.now .step-title { font-weight: 600; }
+.step-body { min-width: 0; flex: 1; }
+.step-detail { font-size: 11px; overflow-wrap: anywhere; }
+.step-detail:empty { display: none; }
+.setup-step.error .step-detail { color: var(--vscode-errorForeground, var(--bad)); }
+.setup-actions .primary { width: 100%; }
+.setup-secondary { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.setup-secondary:empty { display: none; }
+.setup-secondary button { flex: 1 1 auto; }
+.setup-foot { margin-top: 8px; }
+@keyframes step-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .setup-step.busy .step-mark { animation: none; border-top-color: var(--starting); }
+}
+/* Onboarding: until llama.cpp and a model exist, hide cards that have nothing to show yet. */
+body.onboarding #perfCard,
+body.onboarding #copilotCard { display: none; }
+body.no-model #memCard > :not(.card-head):not(#memVerdict) { display: none; }
+.stage-line { display: block; }
+.profile-line { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; margin-top: 4px; font-size: 11px; }
+.profile-chip {
+  background: color-mix(in srgb, var(--ok) 14%, transparent); color: var(--fg);
+  border: 1px solid color-mix(in srgb, var(--ok) 40%, var(--border)); border-radius: 10px;
+  padding: 1px 8px; font-size: 11px; cursor: pointer;
+}
+.profile-chip.generic { background: transparent; border-color: var(--border); color: var(--muted); }
+.profile-chip:focus-visible { outline: 1px solid var(--vscode-focusBorder, var(--accent)); outline-offset: 1px; }
+.profile-mode { color: var(--muted); }
+.profile-details { order: 0; font-size: 11px; padding: 8px 10px; }
+body.view-advanced #profileDetails { display: none !important; }
+.profile-row { display: flex; justify-content: space-between; gap: 8px; margin: 2px 0; }
+.profile-row span:last-child { text-align: right; overflow-wrap: anywhere; }
+.stage-bar { height: 4px; border-radius: 2px; margin: 5px 0 3px; background: color-mix(in srgb, var(--fg) 14%, transparent); overflow: hidden; }
+.stage-bar > span { display: block; height: 100%; background: var(--starting); transition: width 0.4s; }
+.stage-bar.indeterminate > span { width: 30%; animation: stage-slide 1.4s ease-in-out infinite; }
+@keyframes stage-slide { from { margin-left: -30%; } to { margin-left: 100%; } }
+@media (prefers-reduced-motion: reduce) { .stage-bar.indeterminate > span { animation: none; width: 100%; opacity: 0.4; } }
+.stage-size { font-size: 11px; }
+/* Advanced settings live in an editor tab (view-advanced); the sidebar shows
+   one row that opens it. The tab shows the server bar, the memory verdict and
+   the Advanced section, nothing else. */
+.adv-page-head { display: none; }
+.adv-open { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; border-top: 1px solid var(--border); padding-top: 10px; margin-top: 4px; }
+.adv-open-title { font-weight: 600; }
+.adv-open .sum { color: var(--muted); font-size: 11px; flex: 1 1 auto; min-width: 0; }
+body.view-sidebar #advancedFold { display: none; }
+body.view-advanced .adv-open { display: none; }
+body.view-advanced { max-width: 760px; margin: 0 auto; padding: 16px 24px 40px; font-size: 13px; }
+body.view-advanced .adv-page-head { display: block; order: -1; margin-bottom: 8px; }
+body.view-advanced .adv-page-head h1 { font-size: 18px; font-weight: 600; margin: 0 0 4px; }
+body.view-advanced #setupBox,
+body.view-advanced #remoteModelCard,
+body.view-advanced #modelCard,
+body.view-advanced #perfCard,
+body.view-advanced #copilotCard,
+body.view-advanced #backendCard,
+body.view-advanced #srvLive,
+body.view-advanced #profileLine,
+body.view-advanced #primaryRow { display: none !important; }
+body.view-advanced #memCard > :not(.card-head):not(#memVerdict):not(#memFixes):not(#advancedFold) { display: none !important; }
+body.view-advanced #advancedFold > summary { display: none; }
+body.view-advanced .label input[type="number"],
+body.view-advanced .label input[type="text"] { width: 120px; }
+
+/* Remote server: it manages its own model and load settings, so this
+   machine's model, memory and runtime cards would only be noise. */
+body.remote-mode #modelCard,
+body.remote-mode #memCard,
+body.remote-mode #backendCard { display: none; }
+/* CPU backend: hide controls that only matter with a GPU. */
+body.perf-empty #perfKpis,
+body.perf-empty #perfCard .ctx-chart-title,
+body.perf-empty #ctxStack,
+body.perf-empty #ctxLegend,
+body.perf-empty #perfMore,
+body.perf-empty #perfSpecLine,
+body.perf-empty #srvLive { display: none !important; }
+.cpu-only-note { display: none; }
+body.cpu-only .cpu-only-note { display: block; margin: 4px 0 10px; }
+body.cpu-only #gpuOffloadRow,
+body.cpu-only #offloadFold,
+body.cpu-only #mmprojSeg,
+body.cpu-only .toggle:has(#offloadKvCacheToGpu),
+body.cpu-only .row:has(#mmprojDevice),
+body.cpu-only .row:has(#draftDevice) { display: none; }
 .row { margin: 10px 0 14px; }
 .label {
   display: flex;
@@ -520,8 +618,9 @@ details.advanced > summary,
 .label {
   overflow: visible;
 }
+select { width: auto; min-width: 88px; max-width: 100%; text-overflow: ellipsis; }
+input[type="number"], input[type="text"] { width: 88px; }
 input[type="number"], input[type="text"],     select {
-  width: 88px;
   background: var(--input-bg);
   color: var(--input-fg);
   border: 1px solid var(--border);
@@ -740,9 +839,10 @@ body:not(.remote-mode) #remoteLoad { display: none !important; }
   border-radius: 0;
 }
 .menu-item:hover { background: color-mix(in srgb, var(--fg) 10%, transparent); }
+.menu-item:disabled { opacity: 0.45; cursor: default; background: none; }
 .menu-sep { border-top: 1px solid var(--border); margin: 4px 0 6px; }
 .menu-label { display: block; font-size: 11px; color: var(--muted); padding: 0 12px 4px; }
-.menu-body select { margin: 0 12px; width: calc(100% - 24px); }
+.menu-body select { margin: 0 12px; width: calc(100% - 24px); min-width: 0; }
 .srv-model { font-weight: 650; margin-top: 6px; overflow-wrap: anywhere; }
 .srv-sub { color: var(--muted); font-size: 11px; margin-top: 1px; }
 /* ---- Cards & folds ---- */
@@ -1043,6 +1143,8 @@ body { display: flex; flex-direction: column; }
 #backendCard { order: 7; }
 #perfCard { order: 8; }                       /* stopped: last session, at the bottom */
 body.layout-running #perfCard { order: 1; }   /* running: live numbers right under the header */
+body.layout-running #setupBox { order: 1; }   /* …except the last Get started step comes first */
+body.awaiting-first-reply #perfCard { display: none; }
 body.layout-remote #perfCard { order: 2; }
 /* Running: the header strip shows gen / prompt / reuse and the chat bar;
    the card keeps the composition legend, draft acceptance and history. */
@@ -1067,3 +1169,17 @@ body:not(.layout-running) #perfSpecLine { display: none; }
 .live-chat { display: flex; justify-content: space-between; gap: 8px; font-size: 11px; margin: 7px 0 3px; }
 .live-chat .sub { color: var(--muted); }
 .ctx-stack.thin { height: 6px; border-radius: 3px; }
+
+/* High contrast (forced colors): keep the data colors of bars, swatches and
+   sparklines instead of letting the system paint them all one color, and give
+   each segment an edge so neighbors stay distinguishable. */
+@media (forced-colors: active) {
+  .ctx-stack, .mem-stack, .lib-bar { border: 1px solid CanvasText; }
+  .ctx-stack > span, .mem-stack > span, .lib-bar > span,
+  .mem-legend i, .ctx-legend i, .chart-legend i, svg {
+    forced-color-adjust: none;
+  }
+  .ctx-stack > span + span, .mem-stack > span + span { border-left: 1px solid Canvas; }
+  .setup-step.now .step-mark { forced-color-adjust: none; background: Highlight; border-color: Highlight; }
+  .setup { border-color: CanvasText; }
+}

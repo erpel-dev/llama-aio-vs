@@ -1,5 +1,9 @@
 import { randomBytes } from "crypto";
 import * as fs from "fs";
+import { WebUiGateway } from "@llama-aio/core";
+import { explainLocalModelModes, explainRemoteModelModes, resolveServerModelModes, serverReasoningLevels, type ModelCapabilities } from "@llama-aio/core";
+import { readLocalApiKey } from "@llama-aio/core";
+import { syncPerfTarget } from "./perfTarget";
 import * as os from "os";
 import * as path from "path";
 import * as vscode from "vscode";
@@ -23,6 +27,7 @@ import {
 import { LlamaInstaller, UiBackend } from "@llama-aio/core";
 import { clampLoadSettingsToModel, computeMemoryView, diffLoadSettings, fittingContextLength, memoryEstimateInputs, mmprojFileSize, resolveDraftCapabilities, shortGpuName, type SettingChange } from "@llama-aio/core";
 import { NO_SERVER_FEATURES, supportedPerformanceSettings, type LlamaServerFeatures } from "@llama-aio/core";
+import { normalizeLoadSettingsForCpuBackend, pickCpuIgnoredFields } from "@llama-aio/core";
 import { resolveLocalModelModes, resolveModelModes, resolveRemoteModelModes } from "@llama-aio/core";
 import {
   buildLibraryGroupsAsync,
@@ -35,6 +40,8 @@ import {
   listActiveModelSourceDirs,
   listLocalModelEntries,
   listPartialDownloads,
+  hfSourceForPartial,
+  withRecentExternalModels,
   listShardPaths,
   findSiblingMtpDraft,
   invalidateModelLibraryCache,
@@ -67,6 +74,11 @@ import {
 import { downloadGgufSelection, HuggingFaceClient, STARTER_MODEL } from "./huggingFace";
 
 /** Secret Storage keyed by server origin, with a sync cache for request headers. */
+/** globalState: the Get started checklist finished (first reply or dismissed). */
+const SETUP_DONE_KEY = "llamaAio.setupDone";
+/** globalState: last port of the web UI gateway (keeps the page origin stable). */
+const WEB_UI_GATEWAY_PORT_KEY = "llamaAio.webUiGatewayPort";
+
 export interface ApiKeyStore {
   /** Cached key; may miss a key stored in another window or before activation. */
   get(origin: string): string | undefined;
@@ -163,9 +175,55 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
   private apiKeys?: ApiKeyStore;
   private hfTokens?: HfTokenStore;
 
-  /** Typed send to the sidebar; a no-op while the view is closed. */
-  private post(msg: ToWebviewMessage): void {
-    void this.view?.webview.postMessage(msg);
+  /** Advanced settings in an editor tab: the same page, `advanced` mode. */
+  private advancedPanel?: vscode.WebviewPanel;
+
+  /** Typed send to the sidebar and the Advanced tab; a no-op while both are closed. */
+  private post(msg: ToWebviewMessage, only?: vscode.Webview): void {
+    if (!only || only === this.view?.webview) void this.view?.webview.postMessage(msg);
+    if (!only || only === this.advancedPanel?.webview) void this.advancedPanel?.webview.postMessage(msg);
+  }
+
+  /**
+   * A silent save from one page (sidebar or Advanced tab) refreshes the other
+   * page's form without re-filling the one the user is typing in.
+   */
+  private async syncOtherPage(from: vscode.Webview | undefined): Promise<void> {
+    const pages = [this.view?.webview, this.advancedPanel?.webview].filter((w): w is vscode.Webview => !!w);
+    const other = pages.find((w) => w !== from);
+    if (pages.length < 2 || !other) return;
+    await this.pushStateNow(other);
+  }
+
+  private hasViews(): boolean {
+    return !!(this.view || this.advancedPanel);
+  }
+
+  /**
+   * Open (or reveal) Advanced settings in an editor tab. It shares this
+   * provider's state and message handling with the sidebar; each page saves
+   * only the settings it shows, so neither overwrites the other's edits.
+   */
+  openAdvancedPanel(): void {
+    if (this.advancedPanel) {
+      this.advancedPanel.reveal(undefined, false);
+      return;
+    }
+    const panel = vscode.window.createWebviewPanel(
+      "llamaAio.advancedSettings",
+      "Llama AIO: Advanced settings",
+      { viewColumn: vscode.ViewColumn.Active, preserveFocus: false },
+      { enableScripts: true, localResourceRoots: [this.extensionUri], retainContextWhenHidden: true }
+    );
+    panel.iconPath = vscode.Uri.joinPath(this.extensionUri, "media", "llama-aio-activity.svg");
+    this.advancedPanel = panel;
+    panel.onDidDispose(() => {
+      if (this.advancedPanel === panel) this.advancedPanel = undefined;
+      this.post({ type: "advancedPanel", open: false });
+    });
+    panel.webview.html = this.getHtml(panel.webview, "advanced");
+    panel.webview.onDidReceiveMessage((msg: ToHostMessage) => this.handleMessage(msg, panel.webview));
+    this.post({ type: "advancedPanel", open: true });
   }
 
   /** Secret Storage cache owned by the extension. Keys never go in config.json. */
@@ -208,7 +266,11 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     };
     webviewView.webview.html = this.getHtml(webviewView.webview);
     this.bindDownloads();
-    webviewView.webview.onDidReceiveMessage(async (msg: ToHostMessage) => {
+    webviewView.webview.onDidReceiveMessage((msg: ToHostMessage) => this.handleMessage(msg, webviewView.webview));
+  }
+
+  /** One handler for the sidebar and the Advanced tab. */
+  private async handleMessage(msg: ToHostMessage, from?: vscode.Webview): Promise<void> {
       try {
         switch (msg.type) {
           case "ready":
@@ -228,6 +290,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             this.syncSpeculativeMode();
             if (msg.silent) {
               await this.postStatusNow();
+              await this.syncOtherPage(from);
             } else {
               await this.pushState();
             }
@@ -346,7 +409,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             this.postBootProgress("Reloading llama-server…");
             let readyMessage: string | undefined;
             try {
-              await this.store.updateLoadSettings(msg.payload as Partial<LlamaLoadSettings>);
+              if (msg.payload) await this.store.updateLoadSettings(msg.payload as Partial<LlamaLoadSettings>);
               this.syncSpeculativeMode();
               if (!(await this.confirmIfMemorySpill())) {
                 break;
@@ -605,6 +668,35 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           case "cleanPartialDownloads":
             await this.cleanPartialDownloads();
             break;
+          case "resumePartialDownloads":
+            await this.resumePartialDownloads();
+            break;
+          case "openWebUi":
+            await this.openWebUi();
+            break;
+          case "copyLocalApiKey":
+            await this.copyLocalApiKey();
+            break;
+          case "copyText": {
+            const text = typeof msg.text === "string" ? msg.text : "";
+            if (text) {
+              await vscode.env.clipboard.writeText(text);
+              vscode.window.setStatusBarMessage("Llama AIO: copied", 2500);
+            }
+            break;
+          }
+          case "openAdvanced":
+            this.openAdvancedPanel();
+            break;
+          case "openCopilotChat":
+            await vscode.commands.executeCommand("workbench.action.chat.open").then(undefined, () =>
+              vscode.window.showInformationMessage("Open Copilot Chat and choose a Llama AIO model in its model picker.")
+            );
+            break;
+          case "dismissSetup":
+            await this.globalState?.update(SETUP_DONE_KEY, true);
+            await this.pushState();
+            break;
           case "searchLibraryHf":
             await this.searchLibraryHf(typeof msg.query === "string" ? msg.query : "", msg.requestId);
             break;
@@ -681,7 +773,11 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         }
       } catch (e) {
         if (msg.type === "start" || msg.type === "reload") {
-          await reportLaunchFailure(msg.type === "reload" ? "Reload failed" : "Start failed", e);
+          const kind = msg.type;
+          await reportLaunchFailure(kind === "reload" ? "Reload failed" : "Start failed", e, async () => {
+            await this.store.getConfig().update("launchMode", "background");
+            await vscode.commands.executeCommand(kind === "reload" ? "llamaAio.reloadServer" : "llamaAio.startServer");
+          });
         } else {
           vscode.window.showErrorMessage(
             `Llama AIO: ${e instanceof Error ? e.message : String(e)}`
@@ -689,7 +785,6 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         }
         await this.pushState();
       }
-    });
   }
 
   private async detectGpusForEstimate(cpuOnly: boolean): Promise<GpuMemoryInfo[]> {
@@ -722,6 +817,61 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     };
   }
 
+  /**
+   * What the profile resolver decided for the model being served: the same
+   * `explain*` calls the request path uses, plus the mode sent last on this
+   * target. Local: the running model (a pending selection is reported apart).
+   */
+  private profileInfo(caps: ModelCapabilities | undefined, launchedPath: string | undefined, selectedPath: string | undefined) {
+    const lastMode = this.perf.get().modelMode;
+    if (this.store.isRemote()) {
+      const info = this.processManager.remote.current();
+      if (!info) return null;
+      const match = explainRemoteModelModes(info);
+      const levels = serverReasoningLevels(info.chatTemplateCaps);
+      const set = resolveServerModelModes(match.profile, info.chatTemplateCaps);
+      return {
+        advertised: info.modelId || info.modelAlias || info.modelName || "",
+        family: set?.familyLabel || "",
+        via: match.via,
+        nameSource: match.nameSource || "",
+        identityField: match.identityField || "",
+        defaultMode: set?.defaultMode || "",
+        modes: set ? Object.keys(set.modes) : [],
+        serverLevels: levels,
+        lastMode: lastMode || "",
+        pendingModel: "",
+      };
+    }
+    const served = launchedPath || selectedPath;
+    if (!served) return null;
+    const match = explainLocalModelModes(caps, served, launchedPath);
+    return {
+      advertised: path.basename(served),
+      family: match.profile?.familyLabel || "",
+      via: match.via,
+      nameSource: match.nameSource || "",
+      identityField: match.identityField || "",
+      defaultMode: match.profile?.defaultMode || "",
+      modes: match.profile ? Object.keys(match.profile.modes) : [],
+      serverLevels: [] as string[],
+      lastMode: lastMode || "",
+      pendingModel: launchedPath && selectedPath && path.resolve(launchedPath) !== path.resolve(selectedPath) ? path.basename(selectedPath) : "",
+    };
+  }
+
+  /** Get started is finished once a reply completed (or the user dismissed it). Sticky. */
+  private async onboardingDone(): Promise<boolean> {
+    if (this.globalState?.get<boolean>(SETUP_DONE_KEY)) {
+      return true;
+    }
+    const replied = (this.perf.get().history || []).some((h) => !h.outcome || h.outcome === "completed");
+    if (replied) {
+      await this.globalState?.update(SETUP_DONE_KEY, true);
+    }
+    return replied;
+  }
+
   private cpuOnlyBackend(): boolean {
     return this.installer.resolveActiveUiBackend() === "cpu" || this.processManager.isCpuBackend();
   }
@@ -733,7 +883,11 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       return [];
     }
     const state = this.store.getState();
-    const changes = diffLoadSettings(launched.loadSettings, state.loadSettings);
+    // Compare what start would ship: CPU builds ignore the GPU fields, so saved GPU
+    // preferences must not show up as "changes" (same rule as the dirty fingerprint).
+    const cpu = this.processManager.isCpuBackend();
+    const effective = <T extends LlamaLoadSettings | undefined>(s: T): T => (cpu && s ? normalizeLoadSettingsForCpuBackend(s) as T : s);
+    const changes = diffLoadSettings(effective(launched.loadSettings), effective(state.loadSettings));
     if (launched.modelPath && state.selectedModelPath && path.resolve(launched.modelPath) !== path.resolve(state.selectedModelPath)) {
       changes.unshift({
         key: "model",
@@ -742,7 +896,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         to: path.basename(state.selectedModelPath),
       });
     }
-    const mode = resolveLaunchMode(this.store.getConfig().get<string>("launchMode"));
+    const mode = this.processManager.effectiveLaunchMode();
     if (launched.launchMode && launched.launchMode !== mode) {
       changes.push({ key: "launchMode", label: "launch mode", from: launched.launchMode, to: mode });
     }
@@ -760,9 +914,14 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       await this.store.applySelectedModel(launched.modelPath);
     }
     if (launched.loadSettings) {
-      await this.store.updateLoadSettings(launched.loadSettings);
+      // A CPU launch records zeroed GPU fields; keep the user's saved GPU
+      // preferences so a later backend switch still has them.
+      const restore = this.processManager.isCpuBackend()
+        ? { ...launched.loadSettings, ...pickCpuIgnoredFields(state.loadSettings) }
+        : launched.loadSettings;
+      await this.store.updateLoadSettings(restore);
     }
-    const mode = resolveLaunchMode(this.store.getConfig().get<string>("launchMode"));
+    const mode = this.processManager.effectiveLaunchMode();
     if (launched.launchMode && launched.launchMode !== mode) {
       await this.store.getConfig().update("launchMode", launched.launchMode);
     }
@@ -1061,8 +1220,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     return this.pushTrailing;
   }
 
-  private async pushStateNow(): Promise<void> {
-    if (!this.view) {
+  private async pushStateNow(only?: vscode.Webview): Promise<void> {
+    syncPerfTarget(this.perf, this.store, this.processManager);
+    if (!this.hasViews()) {
       return;
     }
     // Paint Server ready/stopped before GPU probes and library scans. Reuse
@@ -1140,6 +1300,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         wikipediaLookupEnabled: this.store.isWikipediaLookupEnabled(),
         duplicateToolCallGuardEnabled: this.store.isDuplicateToolCallGuardEnabled(),
         copilotChatAvailable: isCopilotChatAvailable(),
+        onboardingDone: await this.onboardingDone(),
         endpoint: this.store.getEndpoint(),
         localServers: await this.localServersForSidebar(status, httpReady),
         ...this.remoteFields(),
@@ -1163,8 +1324,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         selectedUiBackend,
         cpuOnly,
         launchMode: resolveLaunchMode(this.store.getConfig().get<string>("launchMode")),
+        launchModeFallback: this.processManager.launchModeFallbackReason() || "",
         updateCheck,
         memoryView: memoryView ?? null,
+        profile: this.profileInfo(caps, launched?.modelPath, state.selectedModelPath),
         modeSampling: remoteMode
           ? describeModeSampling(resolveRemoteModelModes(this.processManager.remote.current()))
           : describeModeSampling(resolveLocalModelModes(caps, launched?.modelPath || state.selectedModelPath, launched?.modelPath)),
@@ -1218,7 +1381,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             }
           : null,
       },
-    });
+    }, only);
     if (library) {
       void this.postLibraryFits(
         [...library.groups, ...library.hiddenGroups].flatMap((group) => group.quants.map((quant) => quant.path)),
@@ -1278,11 +1441,12 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
    * dialogs). Returns the /health result so callers can reuse it.
    */
   async postStatusNow(knownHttpReady?: boolean): Promise<boolean> {
-    if (!this.view) {
+    if (!this.hasViews()) {
       return knownHttpReady ?? false;
     }
     const status = await this.processManager.refreshStatus();
     const httpReady = knownHttpReady ?? (await this.processManager.isHttpReady());
+    syncPerfTarget(this.perf, this.store, this.processManager);
     const ui = effectiveServerUiState({
       starting: status.starting,
       running: status.running,
@@ -1412,7 +1576,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       void config.update("hiddenModels", present);
     }
     const hiddenSet = new Set(present);
-    const all = listLocalModelEntries(config);
+    const all = withRecentExternalModels(listLocalModelEntries(config), [
+      selectedPath,
+      ...(config.get<string[]>("recentModels") || []),
+    ]);
     const visible = withoutHiddenModels(all, present);
     const hiddenEntries = all.filter((entry) => hiddenSet.has(canonicalModelPath(entry.path)));
     const decorate = (groups: LibraryGroup[]) =>
@@ -1450,7 +1617,8 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       buildLibraryGroupsAsync(visible, modelsDir),
       buildLibraryGroupsAsync(hiddenEntries, modelsDir),
     ]);
-    const partials = listPartialDownloads(modelsDir);
+    // A partial that a live job is writing is shown as that job, not as leftover.
+    const partials = listPartialDownloads(modelsDir).filter((file) => !downloadManager.isPartialInUse(file.path));
     const partialBytes = partials.reduce((sum, file) => sum + file.sizeBytes, 0);
     return {
       groups: decorate(groups),
@@ -1460,6 +1628,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         sizeBytes: file.sizeBytes,
         name: path.basename(file.path),
         sizeLabel: formatModelSize(file.sizeBytes),
+        resumable: !!hfSourceForPartial(modelsDir, file.path),
       })),
       partialBytes,
       partialSizeLabel: formatModelSize(partialBytes),
@@ -1862,6 +2031,113 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     await this.removeOwnedQuant(selected, []);
   }
 
+  /**
+   * llama.cpp's web UI. The managed local server requires the key Llama AIO
+   * generated, so copy it first and say why. The key never goes in the URL,
+   * the log or diagnostics.
+   */
+  private async openWebUi(): Promise<void> {
+    const endpoint = this.store.getEndpoint();
+    if (!/^https?:\/\//i.test(endpoint)) {
+      return;
+    }
+    // The managed local server: open its UI through the loopback gateway, which
+    // adds the key itself, so the page works without pasting anything.
+    if (!this.store.isRemote() && readLocalApiKey()) {
+      try {
+        const url = await this.ensureWebUiGateway();
+        const external = await vscode.env.asExternalUri(vscode.Uri.parse(url));
+        await vscode.env.openExternal(external);
+        vscode.window.setStatusBarMessage("Llama AIO: opened the llama.cpp web UI (signed in through the local gateway)", 6000);
+        return;
+      } catch (e) {
+        void vscode.window.showWarningMessage(
+          `Llama AIO could not start its web UI gateway (${e instanceof Error ? e.message : String(e)}); opening the server directly instead.`
+        );
+      }
+    }
+    // Fallback: the llama.cpp web UI keeps its key in that browser's own
+    // settings and cannot receive one except by pasting (a URL would leak it).
+    if (!this.store.isRemote()) {
+      const key = readLocalApiKey();
+      if (key) {
+        const already = (await vscode.env.clipboard.readText().then(undefined, () => "")) === key;
+        if (!already) {
+          await vscode.env.clipboard.writeText(key);
+        }
+        void vscode.window.showInformationMessage(
+          (already ? "Your clipboard already holds the local API key. " : "Llama AIO replaced your clipboard with the local API key. ") +
+            "If the llama.cpp page shows “Enter API Key”, paste it there; that browser then remembers it until the key changes."
+        );
+      }
+    }
+    await vscode.env.openExternal(vscode.Uri.parse(endpoint));
+  }
+
+  private webUiGateway?: WebUiGateway;
+
+  /**
+   * Start (once) the loopback gateway in front of the managed server. Its port
+   * is remembered so the web UI's origin, and its saved chats, stay stable.
+   */
+  private async ensureWebUiGateway(): Promise<string> {
+    if (!this.webUiGateway) {
+      this.webUiGateway = new WebUiGateway({
+        upstream: () => this.store.getEndpoint(),
+        apiKey: () => readLocalApiKey(),
+        // A browser-hosted or remote editor forwards the port itself, so the
+        // Host is the editor's; same-site checks still apply there.
+        strictHost: () => vscode.env.uiKind !== vscode.UIKind.Web && !vscode.env.remoteName,
+      });
+    }
+    if (!this.webUiGateway.running) {
+      const preferred = this.globalState?.get<number>(WEB_UI_GATEWAY_PORT_KEY) || 0;
+      const port = await this.webUiGateway.start(preferred);
+      if (port !== preferred) await this.globalState?.update(WEB_UI_GATEWAY_PORT_KEY, port);
+    }
+    return this.webUiGateway.url();
+  }
+
+  dispose(): void {
+    this.webUiGateway?.close();
+    this.webUiGateway = undefined;
+  }
+
+  private async copyLocalApiKey(): Promise<void> {
+    const key = readLocalApiKey();
+    if (!key) {
+      vscode.window.showInformationMessage("No local API key yet. Llama AIO creates one the first time it starts llama-server.");
+      return;
+    }
+    await vscode.env.clipboard.writeText(key);
+    vscode.window.showInformationMessage(
+      "Llama AIO replaced your clipboard with the local llama.cpp server key (generated for the server on this machine). Paste it where a client asks for an API key."
+    );
+  }
+
+  /**
+   * Restart interrupted Hugging Face downloads; each resumes from its
+   * `.partial` bytes. Companion partials (mmproj / MTP) are skipped when their
+   * language model is resumed too, since that re-queues its companions.
+   */
+  async resumePartialDownloads(): Promise<void> {
+    const modelsDir = getModelsDir(this.store.getConfig());
+    const sources = listPartialDownloads(modelsDir)
+      .filter((file) => !downloadManager.isPartialInUse(file.path))
+      .map((file) => hfSourceForPartial(modelsDir, file.path))
+      .filter((src): src is { modelId: string; filePath: string } => !!src);
+    if (!sources.length) {
+      vscode.window.showInformationMessage("No interrupted Hugging Face downloads to resume.");
+      return;
+    }
+    const isCompanion = (file: string) => /mmproj|[-_.]mtp[-_.]|draft/i.test(path.basename(file));
+    const reposWithModel = new Set(sources.filter((s) => !isCompanion(s.filePath)).map((s) => s.modelId));
+    const todo = sources.filter((s) => !(isCompanion(s.filePath) && reposWithModel.has(s.modelId)));
+    const runs = todo.map((s) => this.runLibraryDownload(s.modelId, s.filePath));
+    await this.pushState();
+    await Promise.all(runs);
+  }
+
   async cleanPartialDownloads(): Promise<void> {
     const modelsDir = getModelsDir(this.store.getConfig());
     const partials = listPartialDownloads(modelsDir).filter((file) =>
@@ -1895,7 +2171,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
    * esbuild.mjs. The markup is a static template; the few values that come
    * from core (starter model, built-in chat templates) are filled in here.
    */
-  getHtml(webview: vscode.Webview): string {
+  getHtml(webview: vscode.Webview, mode: "sidebar" | "advanced" = "sidebar"): string {
     const dir = vscode.Uri.joinPath(this.extensionUri, "out", "webview");
     const nonce = getNonce();
     const values: Record<string, string> = {
@@ -1907,6 +2183,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       starterSize: escapeHtml(STARTER_MODEL.approxSizeLabel),
       starterDetail: escapeHtml(STARTER_MODEL.detail),
       chatTemplateOptions: chatTemplateNameOptions(),
+      viewMode: mode,
     };
     return sidebarTemplate(vscode.Uri.joinPath(dir, "sidebar.html").fsPath).replace(
       /\{\{(\w+)\}\}/g,

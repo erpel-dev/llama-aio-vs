@@ -1,5 +1,6 @@
 import type * as http from "http";
 import { createHash } from "crypto";
+import { perfTargetKey } from "./perfTarget";
 import * as path from "path";
 import * as vscode from "vscode";
 import {
@@ -836,6 +837,12 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
       stream: true,
       stream_options: { include_usage: true },
     };
+    // llama.cpp streams measured prompt progress on request. Only ask servers
+    // known to be llama.cpp: strict OpenAI-compatible servers reject unknown fields.
+    const wantsProgress = !remote || remoteInfo?.isLlamaCpp === true;
+    if (wantsProgress) {
+      body.return_progress = true;
+    }
     if (tools?.length) {
       body.tools = tools;
       body.tool_choice = options.toolMode === vscode.LanguageModelChatToolMode.Required ? "required" : "auto";
@@ -930,15 +937,19 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
       modelMode: appliedModeName,
       contextBreakdown,
     });
-    this.perf.begin({
+    const requestId = this.perf.begin({
+      ...(() => { const target = perfTargetKey(this.store, this.processManager); return target ? { target } : {}; })(),
       contextLimit: slotCtx,
       estimatedPromptTokens,
       promptReplacements: replacementStats,
       speculativeMode: remote ? undefined : state.loadSettings.speculativeMode || "off",
       contextBreakdown,
+      progressRequested: wantsProgress,
+      modelMode: appliedModeName,
+      replyReserve: typeof body.max_tokens === "number" ? body.max_tokens : undefined,
     });
     if (countedPromptTokens !== undefined) {
-      this.perf.updateContext({ promptTokens: countedPromptTokens, contextLimit: slotCtx, estimated: false });
+      this.perf.updateContext({ promptTokens: countedPromptTokens, contextLimit: slotCtx, estimated: false, requestId });
     }
     let lastServerStats: StatsEvent | undefined;
     let lastCompletionTokens = 0;
@@ -1003,6 +1014,13 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
           recordTrace("Response in progress; stream has not completed.");
         },
       })) {
+        if (event.kind === "prompt_progress") {
+          this.perf.promptProgress(
+            { total: event.total, cache: event.cache, processed: event.processed, timeMs: event.timeMs },
+            requestId
+          );
+          continue;
+        }
         if (event.kind === "text") {
           emittedTextChars += event.text.length;
           hasVisibleText ||= !!event.text.trim();
@@ -1044,6 +1062,7 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
               promptTokens: event.promptTokens,
               contextLimit: slotCtx,
               estimated: false,
+              requestId,
             });
           }
           const gen = positiveRate(event.genTokPerSec);
@@ -1066,6 +1085,7 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
               this.perf.tick(event.completionTokens ?? lastCompletionTokens, {
                 genTokPerSec: gen,
                 promptTokPerSec: prompt,
+                requestId,
               });
             }
           }
@@ -1074,7 +1094,7 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
       if (token.isCancellationRequested) {
         // User stopped the request: no stats, no "empty reply" error.
         recordTrace("Request cancelled before the stream completed; partial output retained.");
-        this.perf.abort();
+        this.perf.abort("cancelled", requestId);
         return;
       }
       if (lastServerStats) {
@@ -1090,14 +1110,16 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
           processedPromptTokens: lastServerStats.processedPromptTokens,
           contextLimit: slotCtx,
           source: "server",
-        });
+          thinking: emittedReasoningChars > 0,
+        }, requestId);
       } else {
         this.perf.complete({
           promptTokens: lastPromptTokens ?? estimatedPromptTokens,
           completionTokens: lastCompletionTokens || undefined,
           contextLimit: slotCtx,
           source: lastPromptTokens !== undefined ? "server" : "estimate",
-        });
+          thinking: emittedReasoningChars > 0,
+        }, requestId);
       }
 
       // Thinking alone is not an answer: the SDK bridge requires visible text
@@ -1121,7 +1143,7 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
     } catch (e) {
       recordTrace(token.isCancellationRequested ? "Request cancelled; partial output retained."
         : `Request failed: ${e instanceof Error ? e.message : String(e)}`);
-      this.perf.abort();
+      this.perf.abort(token.isCancellationRequested ? "cancelled" : "failed", requestId);
       if (token.isCancellationRequested) {
         return;
       }

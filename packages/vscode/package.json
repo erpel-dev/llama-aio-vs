@@ -47,6 +47,10 @@
         "icon": "$(settings-gear)"
       },
       {
+        "command": "llamaAio.openAdvancedSettings",
+        "title": "Llama AIO: Open Advanced Settings"
+      },
+      {
         "command": "llamaAio.openConfigFile",
         "title": "Llama AIO: Open Configuration File"
       },
@@ -159,6 +163,26 @@
         "title": "Llama AIO: View Last Response"
       }
     ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "llamaAio.switchToLocal",
+          "when": "llamaAio.remote"
+        },
+        {
+          "command": "llamaAio.setApiKey",
+          "when": "llamaAio.remote"
+        },
+        {
+          "command": "llamaAio.forgetApiKey",
+          "when": "llamaAio.remote"
+        },
+        {
+          "command": "llamaAio.copyConnectionDiagnostics",
+          "when": "llamaAio.remote"
+        }
+      ]
+    },
     "viewsContainers": {
       "activitybar": [
         {

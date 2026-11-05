@@ -7,9 +7,32 @@ import type { SpeculativeMode } from "./types";
 
 export type ContextLevel = "ok" | "warn" | "critical";
 
+/** How a request ended. */
+export type PerfOutcome = "completed" | "cancelled" | "failed";
+
+/**
+ * What an in-flight request is doing, as far as it can be observed:
+ * `waiting` = sent, nothing back yet; `prompt` = the server reported prompt
+ * progress; `generating` = output tokens are arriving.
+ */
+export type PerfStage = "waiting" | "prompt" | "generating";
+
+/** Server-measured prompt processing (llama.cpp `prompt_progress`). */
+export interface PromptProgress {
+  total: number;
+  /** Tokens reused from the prefix cache (part of `processed`). */
+  cache: number;
+  processed: number;
+  timeMs: number;
+}
+
 /** One finished Copilot → llama.cpp call, for the sidebar history list. */
 export interface PerfCallSummary {
   finishedAt: number;
+  /** Completed (default when absent), cancelled or failed. */
+  outcome?: PerfOutcome;
+  /** Server/model identity the call ran against (see `PerfStats.setTarget`). */
+  target?: string;
   durationMs?: number;
   completionTokens?: number;
   promptTokens?: number;
@@ -73,7 +96,23 @@ export interface GenerationPerf {
    * previous completed call (llama.cpp only sends those timings at the end).
    */
   showingPreviousCall?: boolean;
-  /** Newest-first summaries of recent completed calls. */
+  /** Model mode this extension sent with the last request on this target (e.g. "No Think"). */
+  modelMode?: string;
+  /** Stage of the in-flight request; undefined when idle. */
+  stage?: PerfStage;
+  /** Latest server prompt progress for the in-flight request (never estimated). */
+  promptProgress?: PromptProgress;
+  /** True when this request asked the server for prompt progress. */
+  progressRequested?: boolean;
+  /** Max output tokens reserved for the reply (counts against the window). */
+  replyReserve?: number;
+  /** True when the reply streamed reasoning; completion tokens then include thinking. */
+  thinking?: boolean;
+  /** How the last (non-generating) request ended; undefined before any request. */
+  outcome?: PerfOutcome;
+  /** Server/model identity these numbers belong to. */
+  target?: string;
+  /** Newest-first summaries of recent calls on the current target. */
   history?: PerfCallSummary[];
 }
 
@@ -182,9 +221,45 @@ export class PerfStats {
   private lastRequest: LastChatRequestContext | undefined;
   /** Last streamed assistant payload (for debug "View last response"). */
   private lastResponse: LastChatResponseTrace | undefined;
+  /** Id of the request whose events may still update `current`. */
+  private activeRequest = 0;
+  private nextRequest = 1;
+  private target: string | undefined;
 
   get(): GenerationPerf {
-    return { ...this.current, history: this.history.slice() };
+    const target = this.target;
+    const history = target === undefined
+      ? this.history.slice()
+      : this.history.filter((h) => h.target === undefined || h.target === target);
+    return { ...this.current, history };
+  }
+
+  /**
+   * Bind the live numbers to one server + model. A different target clears
+   * the live tiles (they described another model) and makes any in-flight
+   * request's late events stale; history rows stay but are filtered to the
+   * active target, so switching back shows that target's calls again.
+   */
+  setTarget(target: string | undefined): void {
+    if (target === this.target) {
+      return;
+    }
+    this.target = target;
+    this.activeRequest = 0;
+    this.genStartedAt = undefined;
+    this.smoothedGen = undefined;
+    this.alertBand = 0;
+    this.current = { generating: false, speculativeMode: this.current.speculativeMode, target };
+    this._onDidChange.fire(this.get());
+  }
+
+  getTarget(): string | undefined {
+    return this.target;
+  }
+
+  /** False when `requestId` belongs to a request that was superseded or reset. */
+  private live(requestId: number | undefined): boolean {
+    return requestId === undefined || requestId === this.activeRequest;
   }
 
   hasLastRequestContext(): boolean {
@@ -499,7 +574,19 @@ export class PerfStats {
     promptReplacements?: PromptReplacementStats;
     speculativeMode?: SpeculativeMode | undefined;
     contextBreakdown?: ContextBreakdown;
-  }): void {
+    /** Server/model identity; a change resets live numbers first. */
+    target?: string;
+    /** The request asked for llama.cpp `prompt_progress`. */
+    progressRequested?: boolean;
+    /** Mode applied to this request; undefined = profile-free sampling. */
+    modelMode?: string;
+    replyReserve?: number;
+  }): number {
+    if (opts && "target" in opts) {
+      this.setTarget(opts.target);
+    }
+    const requestId = this.nextRequest++;
+    this.activeRequest = requestId;
     const prev = this.current;
     const ctx = withContextFields(
       prev,
@@ -515,6 +602,12 @@ export class PerfStats {
       estimated: true,
       source: "estimate",
       completionTokens: undefined,
+      thinking: undefined,
+      stage: "waiting",
+      promptProgress: undefined,
+      progressRequested: !!opts?.progressRequested,
+      modelMode: opts?.modelMode,
+      replyReserve: opts?.replyReserve,
       // Keep last-call prompt / reuse / MTP / gen until this request's
       // timings arrive — llama.cpp does not send draft_n / cache_n mid-stream.
       promptTokPerSec: prev.promptTokPerSec,
@@ -534,10 +627,13 @@ export class PerfStats {
       speculativeMode: opts?.speculativeMode ?? prev.speculativeMode,
       promptReplacements: opts?.promptReplacements ?? prev.promptReplacements,
       contextBreakdown: opts?.contextBreakdown ?? prev.contextBreakdown,
+      outcome: undefined,
+      target: this.target,
       ...ctx,
     };
     this.maybeResetAlertBand(ctx.contextPct);
     this._onDidChange.fire(this.get());
+    return requestId;
   }
 
   /**
@@ -547,9 +643,9 @@ export class PerfStats {
    */
   tick(
     completionTokens: number,
-    opts?: { genTokPerSec?: number; promptTokPerSec?: number; now?: number }
+    opts?: { genTokPerSec?: number; promptTokPerSec?: number; now?: number; requestId?: number }
   ): void {
-    if (!this.current.generating || !this.current.startedAt) {
+    if (!this.current.generating || !this.current.startedAt || !this.live(opts?.requestId)) {
       return;
     }
     const now = opts?.now ?? Date.now();
@@ -564,7 +660,9 @@ export class PerfStats {
       showingPreviousCall = false;
     }
 
+    let stage = this.current.stage;
     if (typeof completionTokens === "number" && completionTokens > 0) {
+      stage = "generating";
       nextCompletion = completionTokens;
       if (!this.genStartedAt) {
         this.genStartedAt = now;
@@ -614,7 +712,17 @@ export class PerfStats {
       source,
       promptTokPerSec,
       showingPreviousCall,
+      stage,
     };
+    this._onDidChange.fire(this.get());
+  }
+
+  /** Server prompt progress for the in-flight request; ignored once output started. */
+  promptProgress(progress: PromptProgress, requestId?: number): void {
+    if (!this.current.generating || !this.live(requestId) || this.current.stage === "generating") {
+      return;
+    }
+    this.current = { ...this.current, stage: "prompt", promptProgress: { ...progress } };
     this._onDidChange.fire(this.get());
   }
 
@@ -623,7 +731,11 @@ export class PerfStats {
     promptTokens?: number;
     contextLimit?: number;
     estimated?: boolean;
+    requestId?: number;
   }): void {
+    if (!this.live(opts.requestId)) {
+      return;
+    }
     const ctx = withContextFields(
       this.current,
       opts.promptTokens,
@@ -648,7 +760,11 @@ export class PerfStats {
   }
 
   /** Final numbers from llama-server `timings` / `usage`. */
-  complete(partial: Partial<GenerationPerf>): void {
+  complete(partial: Partial<GenerationPerf>, requestId?: number): void {
+    if (!this.live(requestId)) {
+      return;
+    }
+    this.activeRequest = 0;
     const finishedAt = Date.now();
     const startedAt = this.current.startedAt;
     const serverGen = positiveRate(partial.genTokPerSec);
@@ -751,6 +867,9 @@ export class PerfStats {
       finishedAt,
       estimated: !serverGen,
       source,
+      outcome: "completed",
+      target: this.target,
+      stage: undefined,
       ...ctx,
     };
     this.smoothedGen = undefined;
@@ -759,11 +878,40 @@ export class PerfStats {
     this._onDidChange.fire(this.get());
   }
 
-  abort(): void {
-    if (!this.current.generating) {
+  /**
+   * End the current request without final timings. Only this request's own
+   * output counts: a request cancelled during prefill reports 0 tokens rather
+   * than borrowing the previous answer's count. Rates from the previous call
+   * stay visible (still flagged as previous) so the tiles are not blanked.
+   */
+  abort(outcome: Exclude<PerfOutcome, "completed"> = "cancelled", requestId?: number): void {
+    if (!this.current.generating || !this.live(requestId)) {
       return;
     }
-    this.current = { ...this.current, generating: false, showingPreviousCall: false, finishedAt: Date.now() };
+    this.activeRequest = 0;
+    const finishedAt = Date.now();
+    const startedAt = this.current.startedAt;
+    this.current = {
+      ...this.current,
+      generating: false,
+      finishedAt,
+      outcome,
+      stage: undefined,
+      completionTokens: this.current.completionTokens ?? 0,
+    };
+    this.smoothedGen = undefined;
+    const durationMs = typeof startedAt === "number" && finishedAt >= startedAt ? finishedAt - startedAt : undefined;
+    this.history = [
+      {
+        finishedAt,
+        durationMs,
+        outcome,
+        target: this.target,
+        completionTokens: this.current.completionTokens,
+        promptTokens: this.current.contextEstimated ? undefined : this.current.promptTokens,
+      },
+      ...this.history,
+    ].slice(0, PERF_HISTORY_MAX);
     this._onDidChange.fire(this.get());
   }
 
@@ -782,6 +930,8 @@ export class PerfStats {
       {
         finishedAt,
         durationMs,
+        outcome: "completed" as const,
+        target: this.target,
         completionTokens: p.completionTokens,
         promptTokens: p.promptTokens,
         genTokPerSec: positiveRate(p.genTokPerSec),
