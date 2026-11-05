@@ -629,6 +629,11 @@ export type ProfileMatchVia = "name" | "architecture" | "excluded" | "unverified
 export interface ProfileMatch {
   profile?: ModelModeSet;
   via: ProfileMatchVia;
+  /**
+   * For `via: "name"` on a local model: whether the file name / id matched
+   * (`file`) or only the GGUF `general.name` metadata did (`metadata`).
+   */
+  nameSource?: "file" | "metadata";
   /** Remote only: which advertised identity matched (alias, path, name, id, aliases). */
   identityField?: "alias" | "path" | "name" | "id" | "aliases";
   identity?: string;
@@ -640,7 +645,11 @@ export function explainModelModes(caps?: ModelCapabilities, modelId?: string): P
   const arch = (caps?.architecture || "").toLowerCase();
   if (/^(?:dflash|gemma4[-_]assistant)$/.test(arch) || profileVariantExcluded(h)) return { via: "excluded" };
   const named = namedProfile(h);
-  if (named) return { profile: named, via: "name" };
+  if (named) {
+    // Same matcher, narrower input: does the file name / id alone match?
+    const byFile = namedProfile(haystack(caps?.path ? { path: caps.path } as ModelCapabilities : undefined, modelId));
+    return { profile: named, via: "name", nameSource: byFile === named ? "file" : "metadata" };
+  }
   // An explicitly named, unverified variant must not inherit a misleading
   // profile just because its base architecture is supported.
   if (/\b(?:frognano|spark[-_ ]?x?\d|ornith[-_ ]\d|lfm(?:2[._]\d|[-_ ]?3)|nemotron[-_ ]\d|(?:ternary[-_ ])?bonsai[-_ ]?\d|qwen3[-_ ]coder)/.test(h)) return { via: "unverified" };

@@ -338,8 +338,11 @@ export function renderLibraryList() {
         if (!visible.length) return;
         const g = x.g;
         const vision = groupHasVision(g);
-        const sub = [g.detail || '', g.source && g.source !== 'Llama AIO' ? g.source : '', g.hidden ? 'hidden' : ''].filter(Boolean).join(' · ');
-        html += '<div class="lib-grp" title="' + escAttr(g.title + (g.detail ? ' — ' + g.detail : '') + ' · ' + g.source) + '"><span class="lib-title">' + escText(g.title) + '</span>' + (vision ? '<span class="lib-tag vision" title="A vision projector (mmproj) sits next to these files">vision</span>' : '') + '<span class="lib-detail">' + escText(sub) + '</span></div>';
+        // An opened file's parent folder name says nothing; label it by origin.
+        const opened = g.source === 'Opened';
+        const sub = (opened ? ['opened file', g.hidden ? 'hidden' : '']
+          : [g.detail || '', g.source && g.source !== 'Llama AIO' ? g.source : '', g.hidden ? 'hidden' : '']).filter(Boolean).join(' · ');
+        html += '<div class="lib-grp" title="' + escAttr(g.title + (g.detail ? ' — ' + (opened ? 'folder ' : '') + g.detail : '') + ' · ' + (opened ? 'opened from outside the scanned folders' : g.source)) + '"><span class="lib-title">' + escText(g.title) + '</span>' + (vision ? '<span class="lib-tag vision" title="A vision projector (mmproj) sits next to these files">vision</span>' : '') + '<span class="lib-detail">' + escText(sub) + '</span></div>';
         visible.forEach(function (quant) {
           const sel = quant.path === lib.selected;
           const draft = !!lib.drafts[quant.path];

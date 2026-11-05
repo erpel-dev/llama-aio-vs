@@ -145,7 +145,11 @@ function renderRemoteModel() {
   const info = remoteInfo || {};
   const name = info.modelId || (lastPayload && lastPayload.remoteUrl ? 'Waiting for the server…' : '—');
   const nameEl = $('remoteModelName');
-  if (nameEl) nameEl.textContent = name;
+  if (nameEl) {
+    nameEl.textContent = name;
+    // The header already names a reported model; the card adds its facts.
+    nameEl.classList.toggle('hidden', !!info.modelId);
+  }
   const sub = $('remoteModelSub');
   if (sub) {
     sub.textContent = info.state === 'auth' ? 'partial' : (lastPayload && lastPayload.remoteLabel) || '';
@@ -213,12 +217,17 @@ function renderRemoteStatus() {
   const endpoint = (info.url || (lastPayload && lastPayload.endpoint) || '');
   if (meta) {
     meta.innerHTML = '';
+    const label = lastPayload && lastPayload.remoteLabel && lastPayload.remoteLabel !== endpoint ? String(lastPayload.remoteLabel) : '';
     if (endpoint) {
       const a = document.createElement('a');
       a.className = 'endpoint';
       a.href = endpoint;
       a.setAttribute('data-url', endpoint);
-      a.textContent = endpoint;
+      // One short line: the user's name for the server (or host:port); the URL is the tooltip.
+      let host = endpoint;
+      try { host = new URL(endpoint).host; } catch (e) { /* keep the raw text */ }
+      a.textContent = label || host;
+      a.title = endpoint;
       a.addEventListener('click', function (e) {
         e.preventDefault();
         vscode.postMessage({ type: 'openExternal', url: endpoint });
@@ -226,7 +235,6 @@ function renderRemoteStatus() {
       meta.appendChild(a);
     }
     const bits = [];
-    if (lastPayload && lastPayload.remoteLabel && lastPayload.remoteLabel !== endpoint) bits.push(lastPayload.remoteLabel);
     if (typeof info.rttMs === 'number') bits.push(info.rttMs + ' ms');
     else if (state === 'unreachable' && nextRetryAt) {
       const sec = Math.max(0, Math.round((nextRetryAt - Date.now()) / 1000));
@@ -244,13 +252,20 @@ function renderRemoteStatus() {
   const sumEl = $('srvSummary');
   if (sumEl) {
     const bits = [];
-    if (info.slotContext) bits.push(fmtTokShort(info.slotContext) + ' context window per slot');
-    if (info.totalSlots) bits.push(info.totalSlots + (info.totalSlots === 1 ? ' slot' : ' slots'));
+    if (info.slotContext) bits.push(fmtTokShort(info.slotContext) + ' per slot');
+    const slotsKnown = typeof info.slotsTotal === 'number' && info.slotsTotal > 0 && typeof info.slotsBusy === 'number';
+    if (slotsKnown) bits.push(info.slotsBusy + '/' + info.slotsTotal + ' busy');
+    else if (info.totalSlots) bits.push(info.totalSlots + (info.totalSlots === 1 ? ' slot' : ' slots'));
+    if (info.requestsDeferred > 0) bits.push(info.requestsDeferred + ' queued');
     if (info.vision) bits.push('vision');
-    if (info.buildInfo) bits.push('llama.cpp ' + String(info.buildInfo).split('-')[0]);
     if (state === 'auth') bits.push('model name from public /v1/models');
     if (state === 'limited') bits.push('OpenAI-compatible · not llama.cpp');
     sumEl.textContent = bits.join(' · ');
+    sumEl.title = [
+      info.slotContext ? fmtTokShort(info.slotContext) + ' context window per slot' : '',
+      info.totalSlots ? info.totalSlots + ' slots' : '',
+      info.buildInfo ? 'llama.cpp ' + String(info.buildInfo).split('-')[0] : '',
+    ].filter(Boolean).join(' · ');
     sumEl.classList.toggle('hidden', !bits.length);
   }
   const perfEl = $('srvPerf');
@@ -264,13 +279,20 @@ function renderRemoteStatus() {
   else if (typeof info.requestsProcessing === 'number') perfBits.push(info.requestsProcessing + ' running');
   if (info.requestsDeferred > 0) perfBits.push(info.requestsDeferred + ' queued');
   if (perfEl) {
-    perfEl.textContent = perfBits.join(' · ');
-    perfEl.classList.toggle('hidden', !perfBits.length);
+    // Slots and queue are on the summary line; only show this without /slots.
+    const extra = hasSlots ? [] : perfBits;
+    perfEl.textContent = extra.join(' · ');
+    perfEl.classList.toggle('hidden', !extra.length);
   }
   const load = $('remoteLoad');
   if (load) load.classList.toggle('hidden', !(hasSlots || hasMetrics));
   const loadSum = $('remoteLoadSum');
-  if (loadSum) loadSum.textContent = hasMetrics ? 'all clients · /metrics' : 'all clients · /slots';
+  if (loadSum) {
+    // Collapsed by default: the summary says what is inside.
+    const gen = fmtServerRate(info.serverGenTokPerSec);
+    loadSum.textContent = [hasSlots ? info.slotsBusy + '/' + info.slotsTotal + ' busy' : '', gen ? gen + ' tok/s' : '', 'all clients']
+      .filter(Boolean).join(' · ');
+  }
   const loadLabel = $('remoteLoadLabel');
   const loadCount = $('remoteLoadCount');
   const loadBar = $('remoteLoadBar');
@@ -887,6 +909,14 @@ const PROFILE_VIA = {
 };
 const PROFILE_FIELD = { alias: 'server alias', path: 'model path', name: 'model name', id: 'model id', aliases: 'alias list' };
 
+/** Name the exact thing that matched: file name, GGUF metadata, or a server identity. */
+function profileRecognition(info) {
+  if (info.via === 'name' && info.identityField) return 'matched by ' + (PROFILE_FIELD[info.identityField] || info.identityField);
+  if (info.via === 'name' && info.nameSource === 'metadata') return 'matched by GGUF model name (general.name), not the file name';
+  if (info.via === 'name') return 'matched by file name';
+  return (PROFILE_VIA[info.via] || info.via) + (info.identityField ? ' (' + (PROFILE_FIELD[info.identityField] || info.identityField) + ')' : '');
+}
+
 /**
  * Profile line under the model name: which curated profile the request path
  * uses (or an explicit generic fallback), the profile default, and the mode
@@ -913,7 +943,7 @@ function renderProfile(p) {
   mode.textContent = bits.join(' · ');
   const rows = [
     ['Advertised', info.advertised || '—'],
-    ['Recognition', (PROFILE_VIA[info.via] || info.via) + (info.identityField ? ' (' + (PROFILE_FIELD[info.identityField] || info.identityField) + ')' : '')],
+    ['Recognition', profileRecognition(info)],
   ];
   if (!generic) {
     rows.push(['Profile default', info.defaultMode || '—']);
@@ -1695,6 +1725,8 @@ function renderPerfStats(perf, perfLines) {
     if (!el) return;
     el.textContent = text;
     el.classList.toggle('muted', !!muted);
+    // Dimmed = carried over from the previous reply; say so on hover, not in a line.
+    el.title = muted ? 'From the previous reply; updates when this request finishes' : '';
   };
   setKpi('kpiGen', fmtRate(genNow) || '—', stale);
   setKpi('kpiPrompt', fmtRate(promptNow) || '—', stale);
@@ -1738,7 +1770,6 @@ function renderPerfStats(perf, perfLines) {
     } else {
       bits.push(requestStageHtml(p));
     }
-    if (stale) bits.push('<span class="muted">Rates above are from the previous reply until this one finishes.</span>');
   }
   if (!p.generating && ended) {
     const dur = typeof durationMs === 'number' && durationMs > 0 ? ' after ' + (durationMs / 1000).toFixed(1) + ' s' : '';

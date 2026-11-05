@@ -45,3 +45,14 @@ describe("explain*ModelModes (#35 profile visibility)", () => {
     assert.notEqual(running.via, "architecture");
   });
 });
+
+describe("explainModelModes nameSource", () => {
+  it("says whether the file name or only GGUF metadata matched", () => {
+    const byFile = explainModelModes({ name: "Spark X2.6 1.7B", path: "/m/Spark-X2.6-1.7B-Q4_K_M.gguf" } as never, "/m/Spark-X2.6-1.7B-Q4_K_M.gguf");
+    assert.equal(byFile.nameSource, "file");
+    const byMeta = explainModelModes({ name: "Spark X2.6 1.7B", path: "/m/My-Renamed-Model.gguf" } as never, "/m/My-Renamed-Model.gguf");
+    assert.equal(byMeta.via, "name");
+    assert.equal(byMeta.nameSource, "metadata");
+    assert.equal(byMeta.profile, byFile.profile);
+  });
+});
