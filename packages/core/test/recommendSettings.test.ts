@@ -236,6 +236,14 @@ describe("recommendLoadSettings", () => {
       assert.equal(r.physicalBatchSize, 512);
     });
 
+    it("tunes -ub like a discrete card when the APU has a large carve-out", () => {
+      // Strix Halo with 96 GiB reserved for the GPU in the BIOS.
+      const halo = { totalBytes: 96 * GiB, usedBytes: 0, name: "AMD Radeon(TM) 8060S Graphics", source: "test" };
+      const r = recommendLoadSettings(loadSettings(), denseCaps(), { gpu: halo, gpus: [halo] });
+      assert.equal(r.gpuOffload, 99);
+      assert.equal(r.physicalBatchSize, 1024);
+    });
+
     it("still drops layers when the model is larger than GTT", () => {
       const r = recommendLoadSettings(loadSettings(), denseCaps({ fileSizeBytes: 30 * GiB }), {
         gpu: apu,

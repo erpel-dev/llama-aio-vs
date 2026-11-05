@@ -139,6 +139,8 @@ function fitsHeadroom(
   return capacity - est.totalGpuBytes >= headroom;
 }
 
+/** iGPU carve-outs at or below this rely on shared memory (GTT) for the model. */
+const SMALL_CARVE_OUT_BYTES = 2 * GiB;
 /** Physical batch to aim for when prefill is fully GPU-bound. */
 const FAST_PREFILL_UBATCH = 1024;
 /** Extra VRAM (beyond the normal headroom) required before raising -ub. */
@@ -161,8 +163,9 @@ function tuneBatchSizes(
   if (
     !gpu?.totalBytes ||
     // Measured on Vega (Renoir/Cezanne): -ub 1024/2048 gives the same prefill
-    // as 512 while growing the compute buffer in shared RAM.
-    isIntegratedGpu(gpu) ||
+    // as 512 while growing the compute buffer in shared RAM. An APU with a
+    // large BIOS carve-out (Strix Halo) is tuned like a discrete card.
+    (isIntegratedGpu(gpu) && gpu.totalBytes <= SMALL_CARVE_OUT_BYTES) ||
     !fullyOffloaded ||
     settings.nCpuMoe > 0 ||
     settings.nCpuFfn > 0 ||

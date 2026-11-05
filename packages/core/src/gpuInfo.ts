@@ -900,7 +900,11 @@ export function isIntegratedGpu(
   if (!gpu || !(gpu.totalBytes > 0)) {
     return false;
   }
-  const name = `${gpu.name || ""} ${gpu.llamaDeviceId || ""}`.toLowerCase();
+  // Windows names carry trademark marks: `AMD Radeon(TM) 780M Graphics`.
+  const name = `${gpu.name || ""} ${gpu.llamaDeviceId || ""}`
+    .toLowerCase()
+    .replace(/\((?:tm|r)\)|[™®]/g, " ")
+    .replace(/\s+/g, " ");
   if (
     /onboard|\bigd\b|integrated|iris|uhd graphics|hd graphics|radeon graphics|vega mobile|cezanne|renoir|lucienne|barcelo|mendocino|rembrandt|raphael|phoenix|hawk.?point|strix|gfx[0-9]+c\b/.test(
       name
@@ -908,9 +912,19 @@ export function isIntegratedGpu(
   ) {
     return true;
   }
-  // Meteor Lake / Lunar Lake "Arc Graphics" has no A###/B### model number.
+  // Radeon 680M / 780M / 890M and Strix Halo 8060S. Discrete laptop cards are
+  // `Radeon RX 7600M`, so the model number must follow "radeon" directly.
+  if (/\bradeon \d{3}m\b|\bradeon \d{4}s\b/.test(name)) {
+    return true;
+  }
+  // Lunar Lake / Arrow Lake: `Intel Arc 140V GPU`, `Arc 130T GPU`; low-end
+  // Lunar Lake: `Intel Graphics`.
+  if (/\barc \d{3}[vt]\b|\bintel graphics\b/.test(name)) {
+    return true;
+  }
+  // Meteor Lake "Arc Graphics" has no A###/B### model number.
   // Discrete Arc A770 / B580 stays a discrete card.
-  if (/arc(?:\(tm\))? graphics/.test(name) && !/arc(?:\(tm\))?\s*[ab]\d{2,4}/.test(name)) {
+  if (/\barc graphics/.test(name) && !/\barc [ab]\d{2,4}/.test(name)) {
     return true;
   }
   const gtt = gpu.gttTotalBytes || 0;
