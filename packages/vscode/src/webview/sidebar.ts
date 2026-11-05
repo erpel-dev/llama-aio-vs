@@ -71,6 +71,23 @@ let lastPayload = null;
  * and reading it would persist minimum values for every setting.
  */
 let formReady = false;
+/** "sidebar" or "advanced" (the editor tab); both run this script. */
+const VIEW = document.body.classList.contains('view-advanced') ? 'advanced' : 'sidebar';
+/**
+ * Load settings as last received from the host. Saves send only what this
+ * page changed since then, so the sidebar and the Advanced tab can never
+ * overwrite each other's edits with stale values.
+ */
+let appliedLoad = {};
+function loadChanges() {
+  const cur = readLoad();
+  const out = {};
+  for (const k of Object.keys(cur)) {
+    if (JSON.stringify(cur[k]) !== JSON.stringify(appliedLoad[k])) out[k] = cur[k];
+  }
+  appliedLoad = { ...appliedLoad, ...out };
+  return out;
+}
 /** True once any request on the current target completed (perf history). */
 let sawCompletedReply = false;
 /** Whether the Get started checklist is showing (it then owns the next action). */
@@ -171,7 +188,14 @@ function renderRemoteModel() {
     });
   }
   const pathEl = $('remoteModelPath');
-  if (pathEl) pathEl.textContent = info.modelPath || '';
+  if (pathEl) {
+    // A remote path is long and only meaningful on that machine: show the
+    // file name, keep the full path in the tooltip.
+    const full = String(info.modelPath || '');
+    const file = full.split(/[\\/]/).pop() || '';
+    pathEl.textContent = file && file !== info.modelId ? file : '';
+    pathEl.title = full ? 'On ' + ((lastPayload && lastPayload.remoteLabel) || 'the server') + ': ' + full : '';
+  }
   const hint = $('remoteModelHint');
   if (hint) {
     if (info.isLlamaCpp === false && (info.state === 'ready' || info.state === 'limited')) {
@@ -1110,7 +1134,8 @@ function scheduleSaveLoad() {
   markDirtyIfRunning();
   refreshAdvancedMarks();
   saveLoadTimer = setTimeout(() => {
-    vscode.postMessage({ type: 'saveLoad', payload: readLoad(), silent: true });
+    const changes = loadChanges();
+    if (Object.keys(changes).length) vscode.postMessage({ type: 'saveLoad', payload: changes, silent: true });
   }, 280);
 }
 
@@ -1785,8 +1810,13 @@ function renderPerfStats(perf, perfLines) {
     const think = own && p.thinking ? ' incl. thinking' : '';
     bits.push('<span class="muted" title="' + (think ? 'llama.cpp counts reasoning and answer tokens together' : '') + '">Last reply: ' + fmtNum(completionTokens) + ' tok' + think + dur + '</span>');
   }
+  // Nothing measured yet on this server: one sentence instead of four "—"
+  // tiles, an empty bar and an empty history.
+  const empty = !rows.length && !p.generating && !p.startedAt;
+  document.body.classList.toggle('perf-empty', empty);
   if (metricsEl) {
-    metricsEl.innerHTML = bits.length ? bits.join('') : (rows.length ? '' : 'No generation yet');
+    metricsEl.innerHTML = bits.length ? bits.join('') : (rows.length ? ''
+      : '<span class="muted">No requests yet. Speed, prompt reuse and context use appear after the first reply' + (remoteMode ? ' (measured from this window, network included).' : '.') + '</span>');
     metricsEl.title = Array.isArray(perfLines) ? perfLines.join('\n') : '';
   }
 }
@@ -2060,7 +2090,7 @@ function applyLoadPatch(patch, opts?) {
   markDirtyIfRunning();
   vscode.postMessage({
     type: 'applyLoadPatch',
-    payload: Object.assign({}, readLoad(), patch),
+    payload: Object.assign({}, loadChanges(), patch),
     fitContext: !!(opts && opts.fitContext),
     cpuOnly: cpuOnlyLive(),
   });
@@ -2372,9 +2402,10 @@ function refreshAdvancedMarks() {
   }
   for (const hint of body.querySelectorAll(':scope > .hint')) hint.classList.toggle('filtered-out', filtering);
   const sum = $('advSum');
-  if (sum) sum.textContent = changedCount
-    ? changedCount + ' differ from defaults'
-    : 'threads, batch, KV, RoPE, speculative';
+  const sumText = changedCount ? changedCount + ' differ from defaults' : 'threads, batch, KV, RoPE, speculative';
+  if (sum) sum.textContent = sumText;
+  const openSum = $('advOpenSum');
+  if (openSum) openSum.textContent = sumText;
 }
 if ($('advFilter')) $('advFilter').addEventListener('input', refreshAdvancedMarks);
 if ($('advChangedOnly')) $('advChangedOnly').addEventListener('change', refreshAdvancedMarks);
@@ -3277,6 +3308,7 @@ function applyState(payload) {
   highlightPreset();
 
   memInputs = payload.memInputs || null;
+  appliedLoad = { ...L };
   formReady = true;
   const splitDirty = applyDualGpuUi(L);
   applyCpuOnlyUi(!!payload.cpuOnly || payload.selectedUiBackend === 'cpu');
@@ -3615,7 +3647,7 @@ function launch(action: string) {
     vscode.postMessage({ type: action });
     return;
   }
-  vscode.postMessage({ type: action, payload: readLoad() });
+  vscode.postMessage({ type: action, payload: loadChanges() });
   vscode.postMessage({ type: 'saveRequest', payload: readRequest() });
 }
 $('primaryBtn').addEventListener('click', () => launch($('primaryBtn').dataset.action));
@@ -3643,6 +3675,13 @@ $('dirtyToggle').addEventListener('click', () => {
   toggle.classList.toggle('open', open);
 });
 $('stopBtn').addEventListener('click', () => vscode.postMessage({ type: 'stop' }));
+$('openAdvancedBtn').addEventListener('click', () => vscode.postMessage({ type: 'openAdvanced' }));
+if (VIEW === 'advanced') {
+  // The tab is the Advanced section: always open, focus the search.
+  const fold = $('advancedFold');
+  if (fold) fold.open = true;
+  setTimeout(() => { const f = $('advFilter'); if (f) f.focus(); }, 0);
+}
 $('profileChip').addEventListener('click', () => {
   const details = $('profileDetails');
   const open = details.classList.contains('hidden');
@@ -3885,6 +3924,10 @@ $('libraryDialog').addEventListener('click', function (e) {
 window.addEventListener('message', (event: MessageEvent<ToWebviewMessage>) => {
   const msg = event.data;
   if (msg.type === 'libraryRefreshComplete') $('libraryRefreshBtn').disabled = false;
+  if (msg.type === 'advancedPanel') {
+    const b = $('openAdvancedBtn');
+    if (b) b.textContent = msg.open ? 'Show editor tab' : 'Open in editor';
+  }
   if (msg.type === 'state') applyState(msg.payload);
   if (msg.type === 'openConnect') {
     openConnectForm(lastPayload && lastPayload.serverMode === 'remote' ? undefined : { url: '', label: '' });

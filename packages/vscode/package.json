@@ -47,6 +47,10 @@
         "icon": "$(settings-gear)"
       },
       {
+        "command": "llamaAio.openAdvancedSettings",
+        "title": "Llama AIO: Open Advanced Settings"
+      },
+      {
         "command": "llamaAio.openConfigFile",
         "title": "Llama AIO: Open Configuration File"
       },

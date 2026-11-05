@@ -73,6 +73,7 @@ export type ToHostMessage =
   | { type: "copyLocalApiKey" }
   | { type: "copyText"; text: string }
   | { type: "openCopilotChat" }
+  | { type: "openAdvanced" }
   | { type: "dismissSetup" }
   // Hugging Face search and downloads
   | { type: "searchLibraryHf"; query: string; requestId: number }
@@ -127,6 +128,7 @@ export type ToWebviewMessage =
   | { type: "draftModelSelected"; path: string }
   | { type: "mmprojSelected"; path: string }
   | { type: "openConnect" }
+  | { type: "advancedPanel"; open: boolean }
   | { type: "remoteConnected" }
   | { type: "remoteProbe"; payload?: ViewModel; error?: string }
   | {

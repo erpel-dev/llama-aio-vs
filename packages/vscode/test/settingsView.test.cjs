@@ -15,6 +15,7 @@ const origResolve = Module._resolveFilename;
 Module._resolveFilename = function (request, ...rest) {
   return request === "vscode" ? "vscode" : origResolve.call(this, request, ...rest);
 };
+let lastPanel;
 require.cache.vscode = {
   id: "vscode",
   filename: "vscode",
@@ -28,6 +29,22 @@ require.cache.vscode = {
       showInformationMessage: async () => undefined,
       showErrorMessage: async () => undefined,
       withProgress: async (_o, fn) => fn({ report() {} }),
+      // Advanced settings tab: a fake panel whose messages tests can drive.
+      createWebviewPanel: () => {
+        const panel = {
+          posted: [],
+          webview: {
+            options: {}, html: "", cspSource: "",
+            asWebviewUri: (u) => ({ toString: () => u.fsPath }),
+            postMessage: (m) => { panel.posted.push(m); return Promise.resolve(true); },
+            onDidReceiveMessage: (h) => { panel.handler = h; return { dispose() {} }; },
+          },
+          onDidDispose: (h) => { panel.dispose = h; return { dispose() {} }; },
+          reveal() { panel.revealed = (panel.revealed || 0) + 1; },
+        };
+        lastPanel = panel;
+        return panel;
+      },
     },
     workspace: {},
     commands: { executeCommand: async () => undefined },
@@ -418,6 +435,33 @@ describe("SettingsViewProvider memory path", () => {
     await t.send({ type: "saveLoad", payload: { gpuOffload: 10 }, silent: true });
     const patch = t.posted.filter((m) => m.type === "statusPatch").pop();
     assert.ok(patch.payload.changes.some((c) => c.key === "gpuOffload"));
+  });
+
+  it("Advanced tab: a silent save there refreshes the sidebar only; reopening reveals the same tab", async () => {
+    const t = setup();
+    await t.send({ type: "ready" });
+    t.provider.openAdvancedPanel();
+    const panel = lastPanel;
+    assert.ok(panel.webview.html.includes("view-advanced"));
+    assert.ok(t.posted.some((m) => m.type === "advancedPanel" && m.open === true));
+    t.posted.length = 0;
+    panel.posted.length = 0;
+    await panel.handler({ type: "saveLoad", payload: { cpuThreads: 3 }, silent: true });
+    assert.equal(t.getState().loadSettings.cpuThreads, 3);
+    assert.ok(t.posted.some((m) => m.type === "state"), "sidebar gets the new values");
+    assert.ok(!panel.posted.some((m) => m.type === "state"), "the tab being edited is not re-filled");
+    t.provider.openAdvancedPanel();
+    assert.equal(panel.revealed, 1);
+    panel.dispose();
+    assert.ok(t.posted.some((m) => m.type === "advancedPanel" && m.open === false));
+  });
+
+  it("partial saves merge instead of resetting other settings", async () => {
+    const t = setup({ cacheTypeK: "q8_0" });
+    await t.send({ type: "ready" });
+    await t.send({ type: "saveLoad", payload: { contextLength: 16384 }, silent: true });
+    assert.equal(t.getState().loadSettings.contextLength, 16384);
+    assert.equal(t.getState().loadSettings.cacheTypeK, "q8_0");
   });
 
   it("spill confirmation uses the same verdict as the sidebar", async () => {

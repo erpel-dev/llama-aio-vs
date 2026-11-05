@@ -7,7 +7,12 @@
   <title>Llama AIO</title>
   <link rel="stylesheet" href="{{styleUri}}" />
 </head>
-<body>
+<body class="view-{{viewMode}}">
+  <header class="adv-page-head" id="advPageHead">
+    <h1>Advanced settings</h1>
+    <p class="hint local-only">llama-server load options. Changes save as you type and apply on the next Reload, shown in the bar below. The sidebar keeps model, memory fit, context and GPU layers.</p>
+    <p class="hint remote-only">Connected to a remote server: it manages its own load settings, so there is nothing to set here.</p>
+  </header>
   <div class="card server stopped sticky-head" id="serverCard">
     <div class="srv-top">
       <div class="status-line stopped" id="statusLine">
@@ -547,6 +552,11 @@
 
   </div>
   </details>
+  <div class="adv-open" id="advOpenRow">
+    <span class="adv-open-title">Advanced settings</span>
+    <span class="sum" id="advOpenSum">threads, batch, KV, RoPE, speculative</span>
+    <button type="button" class="secondary small" id="openAdvancedBtn" title="Open all advanced llama-server options, with search, in an editor tab">Open in editor</button>
+  </div>
   </div>
 
   <div class="card" id="perfCard">

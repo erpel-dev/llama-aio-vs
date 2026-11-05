@@ -172,9 +172,55 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
   private apiKeys?: ApiKeyStore;
   private hfTokens?: HfTokenStore;
 
-  /** Typed send to the sidebar; a no-op while the view is closed. */
-  private post(msg: ToWebviewMessage): void {
-    void this.view?.webview.postMessage(msg);
+  /** Advanced settings in an editor tab: the same page, `advanced` mode. */
+  private advancedPanel?: vscode.WebviewPanel;
+
+  /** Typed send to the sidebar and the Advanced tab; a no-op while both are closed. */
+  private post(msg: ToWebviewMessage, only?: vscode.Webview): void {
+    if (!only || only === this.view?.webview) void this.view?.webview.postMessage(msg);
+    if (!only || only === this.advancedPanel?.webview) void this.advancedPanel?.webview.postMessage(msg);
+  }
+
+  /**
+   * A silent save from one page (sidebar or Advanced tab) refreshes the other
+   * page's form without re-filling the one the user is typing in.
+   */
+  private async syncOtherPage(from: vscode.Webview | undefined): Promise<void> {
+    const pages = [this.view?.webview, this.advancedPanel?.webview].filter((w): w is vscode.Webview => !!w);
+    const other = pages.find((w) => w !== from);
+    if (pages.length < 2 || !other) return;
+    await this.pushStateNow(other);
+  }
+
+  private hasViews(): boolean {
+    return !!(this.view || this.advancedPanel);
+  }
+
+  /**
+   * Open (or reveal) Advanced settings in an editor tab. It shares this
+   * provider's state and message handling with the sidebar; each page saves
+   * only the settings it shows, so neither overwrites the other's edits.
+   */
+  openAdvancedPanel(): void {
+    if (this.advancedPanel) {
+      this.advancedPanel.reveal(undefined, false);
+      return;
+    }
+    const panel = vscode.window.createWebviewPanel(
+      "llamaAio.advancedSettings",
+      "Llama AIO: Advanced settings",
+      { viewColumn: vscode.ViewColumn.Active, preserveFocus: false },
+      { enableScripts: true, localResourceRoots: [this.extensionUri], retainContextWhenHidden: true }
+    );
+    panel.iconPath = vscode.Uri.joinPath(this.extensionUri, "media", "llama-aio-activity.svg");
+    this.advancedPanel = panel;
+    panel.onDidDispose(() => {
+      if (this.advancedPanel === panel) this.advancedPanel = undefined;
+      this.post({ type: "advancedPanel", open: false });
+    });
+    panel.webview.html = this.getHtml(panel.webview, "advanced");
+    panel.webview.onDidReceiveMessage((msg: ToHostMessage) => this.handleMessage(msg, panel.webview));
+    this.post({ type: "advancedPanel", open: true });
   }
 
   /** Secret Storage cache owned by the extension. Keys never go in config.json. */
@@ -217,7 +263,11 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     };
     webviewView.webview.html = this.getHtml(webviewView.webview);
     this.bindDownloads();
-    webviewView.webview.onDidReceiveMessage(async (msg: ToHostMessage) => {
+    webviewView.webview.onDidReceiveMessage((msg: ToHostMessage) => this.handleMessage(msg, webviewView.webview));
+  }
+
+  /** One handler for the sidebar and the Advanced tab. */
+  private async handleMessage(msg: ToHostMessage, from?: vscode.Webview): Promise<void> {
       try {
         switch (msg.type) {
           case "ready":
@@ -237,6 +287,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             this.syncSpeculativeMode();
             if (msg.silent) {
               await this.postStatusNow();
+              await this.syncOtherPage(from);
             } else {
               await this.pushState();
             }
@@ -631,6 +682,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             }
             break;
           }
+          case "openAdvanced":
+            this.openAdvancedPanel();
+            break;
           case "openCopilotChat":
             await vscode.commands.executeCommand("workbench.action.chat.open").then(undefined, () =>
               vscode.window.showInformationMessage("Open Copilot Chat and choose a Llama AIO model in its model picker.")
@@ -728,7 +782,6 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         }
         await this.pushState();
       }
-    });
   }
 
   private async detectGpusForEstimate(cpuOnly: boolean): Promise<GpuMemoryInfo[]> {
@@ -1164,9 +1217,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     return this.pushTrailing;
   }
 
-  private async pushStateNow(): Promise<void> {
+  private async pushStateNow(only?: vscode.Webview): Promise<void> {
     syncPerfTarget(this.perf, this.store, this.processManager);
-    if (!this.view) {
+    if (!this.hasViews()) {
       return;
     }
     // Paint Server ready/stopped before GPU probes and library scans. Reuse
@@ -1325,7 +1378,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             }
           : null,
       },
-    });
+    }, only);
     if (library) {
       void this.postLibraryFits(
         [...library.groups, ...library.hiddenGroups].flatMap((group) => group.quants.map((quant) => quant.path)),
@@ -1385,7 +1438,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
    * dialogs). Returns the /health result so callers can reuse it.
    */
   async postStatusNow(knownHttpReady?: boolean): Promise<boolean> {
-    if (!this.view) {
+    if (!this.hasViews()) {
       return knownHttpReady ?? false;
     }
     const status = await this.processManager.refreshStatus();
@@ -2072,7 +2125,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
    * esbuild.mjs. The markup is a static template; the few values that come
    * from core (starter model, built-in chat templates) are filled in here.
    */
-  getHtml(webview: vscode.Webview): string {
+  getHtml(webview: vscode.Webview, mode: "sidebar" | "advanced" = "sidebar"): string {
     const dir = vscode.Uri.joinPath(this.extensionUri, "out", "webview");
     const nonce = getNonce();
     const values: Record<string, string> = {
@@ -2084,6 +2137,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       starterSize: escapeHtml(STARTER_MODEL.approxSizeLabel),
       starterDetail: escapeHtml(STARTER_MODEL.detail),
       chatTemplateOptions: chatTemplateNameOptions(),
+      viewMode: mode,
     };
     return sidebarTemplate(vscode.Uri.joinPath(dir, "sidebar.html").fsPath).replace(
       /\{\{(\w+)\}\}/g,

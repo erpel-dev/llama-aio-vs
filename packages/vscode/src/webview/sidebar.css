@@ -500,12 +500,46 @@ body.no-model #memCard > :not(.card-head):not(#memVerdict) { display: none; }
 @keyframes stage-slide { from { margin-left: -30%; } to { margin-left: 100%; } }
 @media (prefers-reduced-motion: reduce) { .stage-bar.indeterminate > span { animation: none; width: 100%; opacity: 0.4; } }
 .stage-size { font-size: 11px; }
+/* Advanced settings live in an editor tab (view-advanced); the sidebar shows
+   one row that opens it. The tab shows the server bar, the memory verdict and
+   the Advanced section, nothing else. */
+.adv-page-head { display: none; }
+.adv-open { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; border-top: 1px solid var(--border); padding-top: 10px; margin-top: 4px; }
+.adv-open-title { font-weight: 600; }
+.adv-open .sum { color: var(--muted); font-size: 11px; flex: 1 1 auto; min-width: 0; }
+body.view-sidebar #advancedFold { display: none; }
+body.view-advanced .adv-open { display: none; }
+body.view-advanced { max-width: 760px; margin: 0 auto; padding: 16px 24px 40px; font-size: 13px; }
+body.view-advanced .adv-page-head { display: block; order: -1; margin-bottom: 8px; }
+body.view-advanced .adv-page-head h1 { font-size: 18px; font-weight: 600; margin: 0 0 4px; }
+body.view-advanced #setupBox,
+body.view-advanced #remoteModelCard,
+body.view-advanced #modelCard,
+body.view-advanced #perfCard,
+body.view-advanced #copilotCard,
+body.view-advanced #backendCard,
+body.view-advanced #srvLive,
+body.view-advanced #profileLine,
+body.view-advanced #primaryRow,
+body.view-advanced #srvMenu { display: none !important; }
+body.view-advanced #memCard > :not(.card-head):not(#memVerdict):not(#memFixes):not(#advancedFold) { display: none !important; }
+body.view-advanced #advancedFold > summary { display: none; }
+body.view-advanced .label input[type="number"],
+body.view-advanced .label input[type="text"] { width: 120px; }
+
 /* Remote server: it manages its own model and load settings, so this
    machine's model, memory and runtime cards would only be noise. */
 body.remote-mode #modelCard,
 body.remote-mode #memCard,
 body.remote-mode #backendCard { display: none; }
 /* CPU backend: hide controls that only matter with a GPU. */
+body.perf-empty #perfKpis,
+body.perf-empty #perfCard .ctx-chart-title,
+body.perf-empty #ctxStack,
+body.perf-empty #ctxLegend,
+body.perf-empty #perfMore,
+body.perf-empty #perfSpecLine,
+body.perf-empty #srvLive { display: none !important; }
 .cpu-only-note { display: none; }
 body.cpu-only .cpu-only-note { display: block; margin: 4px 0 10px; }
 body.cpu-only #gpuOffloadRow,
