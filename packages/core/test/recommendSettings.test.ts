@@ -191,6 +191,46 @@ describe("recommendLoadSettings", () => {
     });
   });
 
+  describe("integrated GPU (APU)", () => {
+    // Ryzen 5 PRO 5650U: 512 MiB VRAM carve-out, 15.3 GiB GTT in shared RAM.
+    const apu = {
+      totalBytes: 512 * 1024 ** 2,
+      usedBytes: 0,
+      gttTotalBytes: 15696 * 1024 ** 2,
+      name: "AMD Radeon Graphics (RADV RENOIR)",
+      source: "test",
+    };
+    // Spark X2.6 1.7B Q4_K_M-sized dense model.
+    const small = denseCaps({
+      fileSizeBytes: 1.65 * GiB,
+      blockCount: 28,
+      embeddingLength: 2048,
+      attentionHeadCount: 8,
+      attentionHeadCountKv: 2,
+      keyLength: 256,
+      valueLength: 256,
+    });
+
+    it("offloads every layer when the model fits in GTT", () => {
+      const r = recommendLoadSettings(loadSettings(), small, { gpu: apu, gpus: [apu] });
+      assert.equal(r.gpuOffload, 99);
+      assert.equal(r.nCpuFfn, 0);
+    });
+
+    it("keeps -ub at 512 instead of raising it", () => {
+      const r = recommendLoadSettings(loadSettings(), small, { gpu: apu, gpus: [apu] });
+      assert.equal(r.physicalBatchSize, 512);
+    });
+
+    it("still drops layers when the model is larger than GTT", () => {
+      const r = recommendLoadSettings(loadSettings(), denseCaps({ fileSizeBytes: 30 * GiB }), {
+        gpu: apu,
+        gpus: [apu],
+      });
+      assert.ok(r.gpuOffload < 99 || r.nCpuFfn > 0, `got gpuOffload ${r.gpuOffload}, nCpuFfn ${r.nCpuFfn}`);
+    });
+  });
+
   it("leaves GPU knobs untouched on the CPU backend", () => {
     const before = loadSettings({ gpuOffload: 33, nCpuMoe: 7 });
     const r = recommendLoadSettings(before, moeCaps(), { cpuOnly: true });

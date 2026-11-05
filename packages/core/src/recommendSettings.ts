@@ -1,4 +1,4 @@
-import { detectGpus, GpuMemoryInfo } from "./gpuInfo";
+import { detectGpus, GpuMemoryInfo, isIntegratedGpu } from "./gpuInfo";
 import {
   capacityAwareTensorSplit,
   type LayerWeightMassOptions,
@@ -9,7 +9,7 @@ import {
   tensorSplitForTargetWeightShare,
 } from "./gpuSplit";
 import { isQwen4expArchitecture, ModelCapabilities } from "./ggufMetadata";
-import { estimateMemory, MemoryEstimate, VRAM_HEADROOM_BYTES } from "./memoryEstimate";
+import { estimateMemory, gpuBarCapacityBytes, MemoryEstimate, VRAM_HEADROOM_BYTES } from "./memoryEstimate";
 import { isMtpBakedInFile, isMtpSidecarFile } from "./modelLibrary";
 import { LlamaLoadSettings, recommendedMaxDraftTokens, speculativeUsesDflash, speculativeUsesNgram } from "./types";
 
@@ -131,10 +131,12 @@ function fitsHeadroom(
   if (gpus.length >= 2) {
     return !est.willSpill;
   }
-  if (!gpu?.totalBytes) {
+  // An APU's weights and KV live in GTT, not its small VRAM carve-out.
+  const capacity = gpuBarCapacityBytes(gpu);
+  if (!capacity) {
     return false;
   }
-  return gpu.totalBytes - est.totalGpuBytes >= headroom;
+  return capacity - est.totalGpuBytes >= headroom;
 }
 
 /** Physical batch to aim for when prefill is fully GPU-bound. */
@@ -158,6 +160,9 @@ function tuneBatchSizes(
     settings.gpuOffload >= 99 || settings.gpuOffload >= Math.max(1, caps.blockCount || 1);
   if (
     !gpu?.totalBytes ||
+    // Measured on Vega (Renoir/Cezanne): -ub 1024/2048 gives the same prefill
+    // as 512 while growing the compute buffer in shared RAM.
+    isIntegratedGpu(gpu) ||
     !fullyOffloaded ||
     settings.nCpuMoe > 0 ||
     settings.nCpuFfn > 0 ||
