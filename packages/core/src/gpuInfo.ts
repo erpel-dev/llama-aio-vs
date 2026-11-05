@@ -28,7 +28,10 @@ export interface GpuMemoryInfo {
    * too small (`mem_info_vis_vram_total`) or the allocation is host-visible.
    */
   gttUsedBytes?: number;
-  /** GTT aperture size (`mem_info_gtt_total`). */
+  /**
+   * GTT aperture size (`mem_info_gtt_total`). On Windows iGPUs, the shared
+   * memory llama.cpp's `--list-devices` reports (WMI sees only the carve-out).
+   */
   gttTotalBytes?: number;
   /**
    * Visible (BAR-mapped) VRAM total — `mem_info_vis_vram_total`. A value far
@@ -633,8 +636,15 @@ export function orderGpusLikeLlama(
     // Linux sysfs totals are left alone (source is not "wmi").
     const upgradeCapped =
       g.source === "wmi" && listedTotal > sysfsTotal && adapterRamLooksCapped(sysfsTotal);
+    // A Windows iGPU's WMI size is its small carve-out; the Vulkan/SYCL device
+    // reports the shared memory it can actually use. Keep it as the GTT
+    // figure so capacity checks treat it like a Linux APU.
+    const sharedIgpu =
+      g.source === "wmi" && !upgradeCapped && listedTotal > sysfsTotal &&
+      isIntegratedGpu({ ...g, llamaDeviceId: dev.id, name: g.name || dev.name });
     ordered.push({
       ...g,
+      ...(sharedIgpu ? { gttTotalBytes: listedTotal } : {}),
       name: g.name && !/^(amdgpu|nvidia|i915|xe)$/i.test(g.name.trim()) ? g.name : dev.name,
       // `||` would take a 0 MiB `--list-devices` reading over a good sysfs total.
       totalBytes: upgradeCapped ? listedTotal : sysfsTotal || listedTotal,

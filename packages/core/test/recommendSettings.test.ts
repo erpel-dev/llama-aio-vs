@@ -222,6 +222,20 @@ describe("recommendLoadSettings", () => {
       assert.equal(r.physicalBatchSize, 512);
     });
 
+    it("offloads every layer on a Windows iGPU with shared memory", () => {
+      // i7-1270P on Windows: WMI 1 GiB, Vulkan reports ~15.8 GiB shared.
+      const irisXe = {
+        totalBytes: 1 * GiB,
+        usedBytes: 0,
+        gttTotalBytes: 15.8 * GiB,
+        name: "Intel(R) Iris(R) Xe Graphics",
+        source: "wmi",
+      };
+      const r = recommendLoadSettings(loadSettings(), small, { gpu: irisXe, gpus: [irisXe] });
+      assert.equal(r.gpuOffload, 99);
+      assert.equal(r.physicalBatchSize, 512);
+    });
+
     it("still drops layers when the model is larger than GTT", () => {
       const r = recommendLoadSettings(loadSettings(), denseCaps({ fileSizeBytes: 30 * GiB }), {
         gpu: apu,
