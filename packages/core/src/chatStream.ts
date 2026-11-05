@@ -30,6 +30,20 @@ export interface ChatStreamStats {
   processedPromptTokens?: number;
 }
 
+/**
+ * llama.cpp prompt-processing progress (`prompt_progress`, sent per batch when
+ * the request sets `return_progress`). Server-measured, never estimated:
+ * `total` prompt tokens, `cache` reused from the prefix cache, `processed`
+ * evaluated so far (cache included), `timeMs` spent on the prompt.
+ */
+export interface ChatStreamPromptProgress {
+  kind: "prompt_progress";
+  total: number;
+  cache: number;
+  processed: number;
+  timeMs: number;
+}
+
 export interface ChatStreamTrace {
   kind: "trace";
   finishReason?: string;
@@ -46,6 +60,7 @@ export type ChatStreamPart =
   | { kind: "reasoning"; text: string }
   | { kind: "tool_call"; callId: string; name: string; input: object }
   | ChatStreamStats
+  | ChatStreamPromptProgress
   | ChatStreamTrace;
 
 interface LlamaUsage {
@@ -133,6 +148,7 @@ export function openChatStream(
 }
 
 type SseChunk = {
+  prompt_progress?: { total?: number; cache?: number; processed?: number; time_ms?: number };
   choices?: Array<{
     finish_reason?: string | null;
     delta?: {
@@ -229,6 +245,16 @@ export async function* parseChatStream(
     }
     if (json.usage) {
       lastUsage = json.usage;
+    }
+    const pp = json.prompt_progress;
+    if (pp && typeof pp.total === "number" && pp.total > 0 && typeof pp.processed === "number") {
+      yield {
+        kind: "prompt_progress",
+        total: pp.total,
+        cache: typeof pp.cache === "number" ? pp.cache : 0,
+        processed: Math.min(pp.processed, pp.total),
+        timeMs: typeof pp.time_ms === "number" ? pp.time_ms : 0,
+      };
     }
 
     const choice = json.choices?.[0];

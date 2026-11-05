@@ -14,7 +14,7 @@ export type ToHostMessage =
   // Lifecycle
   | { type: "ready" }
   | { type: "start"; payload?: SettingsPatch }
-  | { type: "reload"; payload: SettingsPatch }
+  | { type: "reload"; payload?: SettingsPatch }
   | { type: "stop" }
   | { type: "openLog" }
   | { type: "copyCommandLine" }

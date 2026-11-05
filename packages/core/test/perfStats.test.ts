@@ -216,3 +216,58 @@ describe("PerfStats request and target identity (#33)", () => {
     assert.equal(p.outcome, undefined);
   });
 });
+
+describe("PerfStats request stages and prompt progress (#35)", () => {
+  const pp = (processed: number, total = 8000, cache = 0) => ({ total, cache, processed, timeMs: processed });
+
+  it("waiting → prompt (server-measured) → generating → cleared on completion", () => {
+    const perf = new PerfStats();
+    const id = perf.begin({ progressRequested: true, replyReserve: 4096 });
+    assert.equal(perf.get().stage, "waiting");
+    assert.equal(perf.get().progressRequested, true);
+    assert.equal(perf.get().replyReserve, 4096);
+    perf.promptProgress(pp(2048), id);
+    assert.equal(perf.get().stage, "prompt");
+    assert.deepEqual(perf.get().promptProgress, pp(2048));
+    perf.tick(3, { requestId: id });
+    assert.equal(perf.get().stage, "generating");
+    perf.promptProgress(pp(8000), id); // late prompt event must not move the stage back
+    assert.equal(perf.get().stage, "generating");
+    perf.complete({ completionTokens: 3, source: "server" }, id);
+    assert.equal(perf.get().stage, undefined);
+  });
+
+  it("cancel during prompt processing clears the stage and keeps the cancelled outcome", () => {
+    const perf = new PerfStats();
+    const id = perf.begin({ progressRequested: true });
+    perf.promptProgress(pp(1024), id);
+    perf.abort("cancelled", id);
+    assert.equal(perf.get().stage, undefined);
+    assert.equal(perf.get().outcome, "cancelled");
+    assert.equal(perf.get().completionTokens, 0);
+  });
+
+  it("progress from an older request or another target is ignored", () => {
+    const perf = new PerfStats();
+    perf.setTarget("a");
+    const old = perf.begin({ progressRequested: true });
+    const now = perf.begin({ progressRequested: true });
+    perf.promptProgress(pp(4000), old);
+    assert.equal(perf.get().promptProgress, undefined);
+    perf.setTarget("b");
+    perf.promptProgress(pp(4000), now);
+    assert.equal(perf.get().promptProgress, undefined);
+    assert.equal(perf.get().stage, undefined);
+  });
+
+  it("a new request starts without the previous request's progress", () => {
+    const perf = new PerfStats();
+    const a = perf.begin({ progressRequested: true });
+    perf.promptProgress(pp(8000), a);
+    perf.complete({ completionTokens: 2, source: "server" }, a);
+    perf.begin({ progressRequested: false });
+    assert.equal(perf.get().promptProgress, undefined);
+    assert.equal(perf.get().stage, "waiting");
+    assert.equal(perf.get().progressRequested, false);
+  });
+});

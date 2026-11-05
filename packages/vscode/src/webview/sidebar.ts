@@ -66,6 +66,11 @@ let llamaInstall = null;
 /** Settings the running server has not picked up yet ({ label, from, to }). */
 let pendingChanges = [];
 let lastPayload = null;
+/**
+ * True once applyState has filled the form. Before that every input is empty,
+ * and reading it would persist minimum values for every setting.
+ */
+let formReady = false;
 /** True once any request on the current target completed (perf history). */
 let sawCompletedReply = false;
 /** Whether the Get started checklist is showing (it then owns the next action). */
@@ -797,8 +802,10 @@ function renderDirtyList() {
   const n = pendingChanges.length;
   if (count) count.textContent = n ? n + ' change' + (n === 1 ? '' : 's') + ' not applied' : 'Settings changed, not applied';
   list.innerHTML = n
-    ? pendingChanges.map((c) => '<div class="pending-row"><span>' + escText(c.label) + '</span><span class="mono">' +
-        escText(c.from) + ' → ' + escText(c.to) + '</span></div>').join('')
+    ? pendingChanges.map((c) => '<div class="pending-row"><span>' + escText(c.label) +
+        // Switching models drops a projector that does not belong to the new one.
+        (c.key === 'mmprojPath' && c.to === 'none' ? ' <span class="muted">(none found for this model)</span>' : '') +
+        '</span><span class="mono">' + escText(c.from) + ' → ' + escText(c.to) + '</span></div>').join('')
     : '<div class="hint" style="margin:0">Load settings or launch mode changed.</div>';
 }
 
@@ -871,12 +878,65 @@ function applyLayout() {
   if (live) live.classList.toggle('hidden', layout !== 'running' || connectOpen);
 }
 
+const PROFILE_VIA = {
+  name: 'matched by model name',
+  architecture: 'matched by GGUF architecture only',
+  excluded: 'draft / projector / base variant: no chat profile',
+  unverified: 'variant without a verified profile',
+  generic: 'no profile matched',
+};
+const PROFILE_FIELD = { alias: 'server alias', path: 'model path', name: 'model name', id: 'model id', aliases: 'alias list' };
+
+/**
+ * Profile line under the model name: which curated profile the request path
+ * uses (or an explicit generic fallback), the profile default, and the mode
+ * this extension sent last on this target. Details expand on demand.
+ */
+function renderProfile(p) {
+  const line = $('profileLine');
+  if (!line) return;
+  const info = p && p.profile;
+  const show = !!info && (serverRunning || remoteMode);
+  line.classList.toggle('hidden', !show);
+  if (!show) return;
+  // Perf patches arrive between state pushes; they carry the freshest sent mode.
+  if (lastPerf && 'modelMode' in lastPerf) info.lastMode = lastPerf.modelMode || '';
+  const chip = $('profileChip');
+  const generic = !info.family;
+  chip.textContent = generic ? 'Generic defaults' : info.family + ' profile';
+  chip.classList.toggle('generic', generic);
+  chip.title = generic ? 'No curated profile: Chat Requests sampling applies' : 'Curated sampling and reasoning modes';
+  const mode = $('profileMode');
+  const bits = [];
+  if (info.lastMode) bits.push('last sent: ' + info.lastMode);
+  else if (info.defaultMode) bits.push('default: ' + info.defaultMode);
+  mode.textContent = bits.join(' · ');
+  const rows = [
+    ['Advertised', info.advertised || '—'],
+    ['Recognition', (PROFILE_VIA[info.via] || info.via) + (info.identityField ? ' (' + (PROFILE_FIELD[info.identityField] || info.identityField) + ')' : '')],
+  ];
+  if (!generic) {
+    rows.push(['Profile default', info.defaultMode || '—']);
+    rows.push(['Last sent', info.lastMode ? info.lastMode : 'no request yet on this server']);
+    if (info.modes && info.modes.length) rows.push(['Modes', info.modes.join(', ')]);
+  } else {
+    rows.push(['Sampling', 'Chat Requests settings (temperature, top-p/k, max tokens)']);
+  }
+  if (info.serverLevels && info.serverLevels.length) rows.push(['Reasoning levels', info.serverLevels.join(', ') + ' (advertised by the server)']);
+  if (info.pendingModel) rows.push(['Pending', info.pendingModel + ' after Reload']);
+  const details = $('profileDetails');
+  details.innerHTML = rows.map(function (r) {
+    return '<div class="profile-row"><span class="muted">' + escText(r[0]) + '</span><span>' + escText(r[1]) + '</span></div>';
+  }).join('') + '<div class="hint" style="margin:4px 0 0">Copilot can pick another mode per request; “last sent” is what Llama AIO applied.</div>';
+}
+
 /**
  * Header: what is running and how it is doing. Settings details (window,
  * layers, backend, uptime, endpoint) are in the tooltip; the cards below own them.
  */
 function renderHeader() {
   applyLayout();
+  renderProfile(lastPayload);
   if (remoteMode) {
     if (!connectOpen) renderRemoteStatus();
     return;
@@ -1014,6 +1074,7 @@ function markDirtyIfRunning() {
 }
 
 function scheduleSaveLoad() {
+  if (!formReady) return;
   if (saveLoadTimer) clearTimeout(saveLoadTimer);
   highlightPreset();
   markDirtyIfRunning();
@@ -1179,7 +1240,11 @@ function updateBackendControls() {
   }
 
   if (selectedOpt && !selectedOpt.installed) {
-    hint.textContent = 'Not installed — selecting this backend will download it.';
+    // Start falls back to llama-server on PATH; say so instead of "not installed" alone.
+    const fallback = lastPayload && lastPayload.binaryExists ? String(lastPayload.binary || '') : '';
+    hint.textContent = fallback
+      ? 'Using llama-server from PATH (' + fallback.replace(/^.*[\\/]([^\\/]+[\\/][^\\/]+)$/, '…/$1') + '). Install the ' + (selectedOpt.label || selectedOpt.id) + ' build to let Llama AIO manage updates.'
+      : 'Not installed — selecting this backend will download it.';
     installBtn.textContent = 'Install ' + (selectedOpt.label || selectedOpt.id);
     installBtn.disabled = false;
     installBtn.classList.remove('hidden');
@@ -1243,9 +1308,12 @@ function renderBackendLine() {
   if (line) {
     const tag = (active && active.installedTag) || updateCheck.installedTag || '';
     const upToDate = !updateCheck.pending && !updateCheck.checkFailed && !updateCheck.updateAvailable && tag;
-    line.textContent = active
-      ? active.label + (tag ? ' · ' + tag : '') + (upToDate ? ' · ✓ latest' : '')
-      : 'not installed';
+    const pathFallback = !!(active && !active.installed && lastPayload && lastPayload.binaryExists);
+    line.textContent = pathFallback
+      ? 'llama-server on PATH'
+      : active
+        ? active.label + (tag ? ' · ' + tag : '') + (upToDate ? ' · ✓ latest' : '')
+        : 'not installed';
   }
   if (sum) {
     sum.textContent = backendOptionsCache
@@ -1494,7 +1562,66 @@ function renderContextStack(perf) {
   }
 }
 
+/** Last perf payload, re-rendered each second while a request waits. */
+let lastPerf = null;
+let lastPerfLines = [];
+let perfTicker = null;
+
+/**
+ * In-flight request line: the observed stage, elapsed time, and server-measured
+ * prompt progress when the server reports it (indeterminate otherwise).
+ */
+function requestStageHtml(p) {
+  const elapsed = p.startedAt ? Math.max(0, Math.floor((Date.now() - p.startedAt) / 1000)) : 0;
+  const secs = elapsed >= 60 ? Math.floor(elapsed / 60) + ' min ' + (elapsed % 60) + ' s' : elapsed + ' s';
+  const pp = p.promptProgress;
+  let head = '';
+  let bar = '';
+  if (p.stage === 'prompt' && pp && pp.total > 0) {
+    const pct = Math.min(100, Math.floor((pp.processed / pp.total) * 100));
+    const fresh = Math.max(0, pp.processed - pp.cache);
+    const rate = pp.timeMs > 0 && fresh > 0 ? fresh / (pp.timeMs / 1000) : 0;
+    const left = rate > 0 ? Math.ceil((pp.total - pp.processed) / rate) : 0;
+    // llama.cpp reports once per batch, so a long prompt sits at its cached
+    // share until the first batch finishes. Say when the next number comes.
+    const L = lastPayload && !remoteMode ? (lastPayload.launchedSettings || (lastPayload.state && lastPayload.state.loadSettings) || {}) : {};
+    const batch = Number(L.evalBatchSize) || 0;
+    const firstBatch = fresh === 0 && pp.total - pp.cache > 0;
+    head = 'Processing prompt · ' + fmtNum(pp.processed) + ' / ' + fmtNum(pp.total) + ' tok · ' + pct + '%' +
+      (pp.cache > 0 ? ' · ' + fmtTokK(pp.cache) + ' from cache' : '') +
+      (left > 0 && pct < 100 ? ' · ~' + left + ' s left' : '') + ' · ' + secs +
+      (firstBatch ? ' · the server reports after each ' + (batch ? fmtNum(Math.min(batch, pp.total - pp.cache)) + '-token ' : '') + 'batch' : '');
+    bar = '<div class="stage-bar" role="progressbar" aria-label="Prompt processing" aria-valuemin="0" aria-valuemax="100" aria-valuenow="' + pct + '"><span style="width:' + pct + '%"></span></div>';
+  } else {
+    head = (p.progressRequested ? 'Waiting for the server' : 'Waiting for the first token') + ' · ' + secs +
+      (!p.progressRequested && elapsed >= 3 ? ' · this server does not report prompt progress' : '');
+    bar = elapsed >= 1 ? '<div class="stage-bar indeterminate" role="progressbar" aria-label="Waiting for the server"><span></span></div>' : '';
+  }
+  let size = '';
+  if (typeof p.promptTokens === 'number' && typeof p.contextLimit === 'number' && p.contextLimit > 0) {
+    const reserve = typeof p.replyReserve === 'number' && p.replyReserve > 0 ? p.replyReserve : 0;
+    size = '<div class="muted stage-size" title="' + (p.contextEstimated ? 'Client estimate until the server counts the prompt' : 'Counted by the server') + '">Prompt ' +
+      (p.contextEstimated ? '≈' : '') + fmtTokK(p.promptTokens) + ' of ' + fmtTokK(p.contextLimit) + ' window' +
+      (reserve ? ' · ' + fmtTokK(reserve) + ' kept for the reply' : '') + '</div>';
+  }
+  return '<div class="stage-line"><span class="ok">● ' + escText(head) + '</span>' + bar + size + '</div>';
+}
+
+function syncPerfTicker(p) {
+  const waiting = !!(p && p.generating && p.stage !== 'generating');
+  if (waiting && !perfTicker) {
+    perfTicker = setInterval(function () { if (lastPerf) renderPerfStats(lastPerf, lastPerfLines); }, 1000);
+  } else if (!waiting && perfTicker) {
+    clearInterval(perfTicker);
+    perfTicker = null;
+  }
+}
+
 function renderPerfStats(perf, perfLines) {
+  lastPerf = perf;
+  lastPerfLines = perfLines;
+  syncPerfTicker(perf);
+  if (lastPayload && lastPayload.profile) renderProfile(lastPayload);
   const metricsEl = $('perfMetrics');
   const tableEl = $('perfHistoryTable');
   const p = perf || {};
@@ -1605,9 +1732,13 @@ function renderPerfStats(perf, perfLines) {
   const bits = [];
   if (p.generating) {
     const hasTokens = typeof p.completionTokens === 'number' && p.completionTokens > 0;
-    const live = hasTokens && !stale ? fmtRate(p.genTokPerSec) : '';
-    bits.push('<span class="ok">● ' + (hasTokens ? 'Generating…' : 'Waiting for first token…') +
-      (live ? ' ' + live + ' tok/s' : '') + '</span>');
+    if (hasTokens || p.stage === 'generating') {
+      const live = hasTokens && !stale ? fmtRate(p.genTokPerSec) : '';
+      bits.push('<span class="ok">● Generating…' + (live ? ' ' + live + ' tok/s' : '') + '</span>');
+    } else {
+      bits.push(requestStageHtml(p));
+    }
+    if (stale) bits.push('<span class="muted">Rates above are from the previous reply until this one finishes.</span>');
   }
   if (!p.generating && ended) {
     const dur = typeof durationMs === 'number' && durationMs > 0 ? ' after ' + (durationMs / 1000).toFixed(1) + ' s' : '';
@@ -1620,7 +1751,8 @@ function renderPerfStats(perf, perfLines) {
     const dur = typeof durationMs === 'number' && durationMs > 0
       ? ' in ' + (durationMs / 1000).toFixed(1) + ' s'
       : '';
-    bits.push('<span class="muted">Last reply: ' + fmtNum(completionTokens) + ' tok' + dur + '</span>');
+    const think = own && p.thinking ? ' incl. thinking' : '';
+    bits.push('<span class="muted" title="' + (think ? 'llama.cpp counts reasoning and answer tokens together' : '') + '">Last reply: ' + fmtNum(completionTokens) + ' tok' + think + dur + '</span>');
   }
   if (metricsEl) {
     metricsEl.innerHTML = bits.length ? bits.join('') : (rows.length ? '' : 'No generation yet');
@@ -1668,6 +1800,8 @@ function syncMmprojOffloadUi(cpuOnly) {
 }
 
 function applyCpuOnlyUi(cpuOnly) {
+  // GPU-only controls are hidden (not just dimmed) on CPU; values stay saved.
+  document.body.classList.toggle('cpu-only', !!cpuOnly);
   $('gpuOffload').disabled = cpuOnly;
   $('gpuOffloadRange').disabled = cpuOnly;
   $('offloadKvCacheToGpu').disabled = cpuOnly;
@@ -2245,6 +2379,7 @@ window.addEventListener('scroll', () => {
 // Request defaults apply to the next chat call (no server reload). Persist on edit.
 let saveRequestTimer = null;
 function scheduleSaveRequest() {
+  if (!formReady) return;
   if (saveRequestTimer) clearTimeout(saveRequestTimer);
   saveRequestTimer = setTimeout(() => {
     vscode.postMessage({ type: 'saveRequest', payload: readRequest() });
@@ -3111,6 +3246,7 @@ function applyState(payload) {
   highlightPreset();
 
   memInputs = payload.memInputs || null;
+  formReady = true;
   const splitDirty = applyDualGpuUi(L);
   applyCpuOnlyUi(!!payload.cpuOnly || payload.selectedUiBackend === 'cpu');
   syncPerformanceFeatureUi();
@@ -3443,6 +3579,11 @@ function launch(action: string) {
     endpoint: '',
     message: '',
   });
+  if (!formReady) {
+    // The host starts with the saved settings; never send an unfilled form.
+    vscode.postMessage({ type: action });
+    return;
+  }
   vscode.postMessage({ type: action, payload: readLoad() });
   vscode.postMessage({ type: 'saveRequest', payload: readRequest() });
 }
@@ -3471,6 +3612,12 @@ $('dirtyToggle').addEventListener('click', () => {
   toggle.classList.toggle('open', open);
 });
 $('stopBtn').addEventListener('click', () => vscode.postMessage({ type: 'stop' }));
+$('profileChip').addEventListener('click', () => {
+  const details = $('profileDetails');
+  const open = details.classList.contains('hidden');
+  details.classList.toggle('hidden', !open);
+  $('profileChip').setAttribute('aria-expanded', String(open));
+});
 const closeMenu = () => {
   const menu = $('srvMenu');
   if (menu) menu.open = false;

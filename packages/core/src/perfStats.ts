@@ -10,6 +10,22 @@ export type ContextLevel = "ok" | "warn" | "critical";
 /** How a request ended. */
 export type PerfOutcome = "completed" | "cancelled" | "failed";
 
+/**
+ * What an in-flight request is doing, as far as it can be observed:
+ * `waiting` = sent, nothing back yet; `prompt` = the server reported prompt
+ * progress; `generating` = output tokens are arriving.
+ */
+export type PerfStage = "waiting" | "prompt" | "generating";
+
+/** Server-measured prompt processing (llama.cpp `prompt_progress`). */
+export interface PromptProgress {
+  total: number;
+  /** Tokens reused from the prefix cache (part of `processed`). */
+  cache: number;
+  processed: number;
+  timeMs: number;
+}
+
 /** One finished Copilot → llama.cpp call, for the sidebar history list. */
 export interface PerfCallSummary {
   finishedAt: number;
@@ -80,6 +96,18 @@ export interface GenerationPerf {
    * previous completed call (llama.cpp only sends those timings at the end).
    */
   showingPreviousCall?: boolean;
+  /** Model mode this extension sent with the last request on this target (e.g. "No Think"). */
+  modelMode?: string;
+  /** Stage of the in-flight request; undefined when idle. */
+  stage?: PerfStage;
+  /** Latest server prompt progress for the in-flight request (never estimated). */
+  promptProgress?: PromptProgress;
+  /** True when this request asked the server for prompt progress. */
+  progressRequested?: boolean;
+  /** Max output tokens reserved for the reply (counts against the window). */
+  replyReserve?: number;
+  /** True when the reply streamed reasoning; completion tokens then include thinking. */
+  thinking?: boolean;
   /** How the last (non-generating) request ended; undefined before any request. */
   outcome?: PerfOutcome;
   /** Server/model identity these numbers belong to. */
@@ -548,6 +576,11 @@ export class PerfStats {
     contextBreakdown?: ContextBreakdown;
     /** Server/model identity; a change resets live numbers first. */
     target?: string;
+    /** The request asked for llama.cpp `prompt_progress`. */
+    progressRequested?: boolean;
+    /** Mode applied to this request; undefined = profile-free sampling. */
+    modelMode?: string;
+    replyReserve?: number;
   }): number {
     if (opts && "target" in opts) {
       this.setTarget(opts.target);
@@ -569,6 +602,12 @@ export class PerfStats {
       estimated: true,
       source: "estimate",
       completionTokens: undefined,
+      thinking: undefined,
+      stage: "waiting",
+      promptProgress: undefined,
+      progressRequested: !!opts?.progressRequested,
+      modelMode: opts?.modelMode,
+      replyReserve: opts?.replyReserve,
       // Keep last-call prompt / reuse / MTP / gen until this request's
       // timings arrive — llama.cpp does not send draft_n / cache_n mid-stream.
       promptTokPerSec: prev.promptTokPerSec,
@@ -621,7 +660,9 @@ export class PerfStats {
       showingPreviousCall = false;
     }
 
+    let stage = this.current.stage;
     if (typeof completionTokens === "number" && completionTokens > 0) {
+      stage = "generating";
       nextCompletion = completionTokens;
       if (!this.genStartedAt) {
         this.genStartedAt = now;
@@ -671,7 +712,17 @@ export class PerfStats {
       source,
       promptTokPerSec,
       showingPreviousCall,
+      stage,
     };
+    this._onDidChange.fire(this.get());
+  }
+
+  /** Server prompt progress for the in-flight request; ignored once output started. */
+  promptProgress(progress: PromptProgress, requestId?: number): void {
+    if (!this.current.generating || !this.live(requestId) || this.current.stage === "generating") {
+      return;
+    }
+    this.current = { ...this.current, stage: "prompt", promptProgress: { ...progress } };
     this._onDidChange.fire(this.get());
   }
 
@@ -818,6 +869,7 @@ export class PerfStats {
       source,
       outcome: "completed",
       target: this.target,
+      stage: undefined,
       ...ctx,
     };
     this.smoothedGen = undefined;
@@ -844,6 +896,7 @@ export class PerfStats {
       generating: false,
       finishedAt,
       outcome,
+      stage: undefined,
       completionTokens: this.current.completionTokens ?? 0,
     };
     this.smoothedGen = undefined;

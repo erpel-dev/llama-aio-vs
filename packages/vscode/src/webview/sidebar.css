@@ -481,6 +481,39 @@ input:disabled, select:disabled { opacity: 0.5; }
 body.onboarding #perfCard,
 body.onboarding #copilotCard { display: none; }
 body.no-model #memCard > :not(.card-head):not(#memVerdict) { display: none; }
+.stage-line { display: block; }
+.profile-line { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; margin-top: 4px; font-size: 11px; }
+.profile-chip {
+  background: color-mix(in srgb, var(--ok) 14%, transparent); color: var(--fg);
+  border: 1px solid color-mix(in srgb, var(--ok) 40%, var(--border)); border-radius: 10px;
+  padding: 1px 8px; font-size: 11px; cursor: pointer;
+}
+.profile-chip.generic { background: transparent; border-color: var(--border); color: var(--muted); }
+.profile-chip:focus-visible { outline: 1px solid var(--vscode-focusBorder, var(--accent)); outline-offset: 1px; }
+.profile-mode { color: var(--muted); }
+.profile-details { flex-basis: 100%; border: 1px solid var(--border); border-radius: 5px; padding: 6px 8px; margin-top: 2px; }
+.profile-row { display: flex; justify-content: space-between; gap: 8px; margin: 2px 0; }
+.profile-row span:last-child { text-align: right; overflow-wrap: anywhere; }
+.stage-bar { height: 4px; border-radius: 2px; margin: 5px 0 3px; background: color-mix(in srgb, var(--fg) 14%, transparent); overflow: hidden; }
+.stage-bar > span { display: block; height: 100%; background: var(--starting); transition: width 0.4s; }
+.stage-bar.indeterminate > span { width: 30%; animation: stage-slide 1.4s ease-in-out infinite; }
+@keyframes stage-slide { from { margin-left: -30%; } to { margin-left: 100%; } }
+@media (prefers-reduced-motion: reduce) { .stage-bar.indeterminate > span { animation: none; width: 100%; opacity: 0.4; } }
+.stage-size { font-size: 11px; }
+/* Remote server: it manages its own model and load settings, so this
+   machine's model, memory and runtime cards would only be noise. */
+body.remote-mode #modelCard,
+body.remote-mode #memCard,
+body.remote-mode #backendCard { display: none; }
+/* CPU backend: hide controls that only matter with a GPU. */
+.cpu-only-note { display: none; }
+body.cpu-only .cpu-only-note { display: block; margin: 4px 0 10px; }
+body.cpu-only #gpuOffloadRow,
+body.cpu-only #offloadFold,
+body.cpu-only #mmprojSeg,
+body.cpu-only .toggle:has(#offloadKvCacheToGpu),
+body.cpu-only .row:has(#mmprojDevice),
+body.cpu-only .row:has(#draftDevice) { display: none; }
 .row { margin: 10px 0 14px; }
 .label {
   display: flex;

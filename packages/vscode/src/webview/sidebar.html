@@ -46,6 +46,11 @@
       </div>
     </div>
     <div class="srv-model" id="srvModel">No model selected</div>
+    <div class="profile-line hidden" id="profileLine">
+      <button type="button" class="profile-chip" id="profileChip" aria-expanded="false" aria-controls="profileDetails"></button>
+      <span class="profile-mode" id="profileMode"></span>
+      <div class="profile-details hidden" id="profileDetails" role="region" aria-label="Model profile details"></div>
+    </div>
     <div class="srv-sub remote-only" id="srvSummary"></div>
     <div class="srv-sub remote-only" id="srvPerf"></div>
     <div class="srv-live hidden" id="srvLive" aria-label="Live performance">
@@ -248,6 +253,7 @@
       </div>
       <div class="hint" id="gpuOffloadHint">Max = all model layers.</div>
     </div>
+    <div class="hint cpu-only-note" id="cpuOnlyNote">CPU backend: the model runs in system RAM, so GPU options are hidden. Saved GPU preferences are kept.</div>
     <details class="fold" id="offloadFold">
       <summary><span>Multi-GPU &amp; CPU offload</span><span class="sum" id="offloadSum">—</span></summary>
       <div class="fold-body">

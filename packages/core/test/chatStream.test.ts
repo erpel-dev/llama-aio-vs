@@ -294,3 +294,26 @@ describe("streamChatCompletion (TUI client) on the shared parser", () => {
     assert.equal(stats.completionTokens, 5);
   });
 });
+
+describe("parseChatStream prompt_progress (#35)", () => {
+  it("emits llama.cpp prompt progress as measured events, before any text", async () => {
+    const parts = await collect(sse([
+      { choices: [{ delta: {} }], prompt_progress: { total: 313, cache: 0, processed: 0, time_ms: 0 } },
+      { choices: [{ delta: {} }], prompt_progress: { total: 313, cache: 100, processed: 309, time_ms: 3456 } },
+      delta({ content: "hi" }),
+      "[DONE]",
+    ]), false);
+    const progress = parts.filter((p) => p.kind === "prompt_progress");
+    assert.deepEqual(progress, [
+      { kind: "prompt_progress", total: 313, cache: 0, processed: 0, timeMs: 0 },
+      { kind: "prompt_progress", total: 313, cache: 100, processed: 309, timeMs: 3456 },
+    ]);
+    assert.ok(parts.findIndex((p) => p.kind === "prompt_progress") < parts.findIndex((p) => p.kind === "text"));
+    assert.equal(text(parts), "hi");
+  });
+
+  it("ignores malformed progress objects", async () => {
+    const parts = await collect(sse([{ choices: [{ delta: {} }], prompt_progress: { total: 0 } }, delta({ content: "x" }), "[DONE]"]), false);
+    assert.equal(parts.filter((p) => p.kind === "prompt_progress").length, 0);
+  });
+});

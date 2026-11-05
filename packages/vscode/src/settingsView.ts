@@ -1,5 +1,6 @@
 import { randomBytes } from "crypto";
 import * as fs from "fs";
+import { explainLocalModelModes, explainRemoteModelModes, resolveServerModelModes, serverReasoningLevels, type ModelCapabilities } from "@llama-aio/core";
 import { readLocalApiKey } from "@llama-aio/core";
 import { syncPerfTarget } from "./perfTarget";
 import * as os from "os";
@@ -354,7 +355,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             this.postBootProgress("Reloading llama-server…");
             let readyMessage: string | undefined;
             try {
-              await this.store.updateLoadSettings(msg.payload as Partial<LlamaLoadSettings>);
+              if (msg.payload) await this.store.updateLoadSettings(msg.payload as Partial<LlamaLoadSettings>);
               this.syncSpeculativeMode();
               if (!(await this.confirmIfMemorySpill())) {
                 break;
@@ -757,6 +758,47 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         draftCaps: resolveDraftCapabilities(state.loadSettings),
         withFixes: true,
       }),
+    };
+  }
+
+  /**
+   * What the profile resolver decided for the model being served: the same
+   * `explain*` calls the request path uses, plus the mode sent last on this
+   * target. Local: the running model (a pending selection is reported apart).
+   */
+  private profileInfo(caps: ModelCapabilities | undefined, launchedPath: string | undefined, selectedPath: string | undefined) {
+    const lastMode = this.perf.get().modelMode;
+    if (this.store.isRemote()) {
+      const info = this.processManager.remote.current();
+      if (!info) return null;
+      const match = explainRemoteModelModes(info);
+      const levels = serverReasoningLevels(info.chatTemplateCaps);
+      const set = resolveServerModelModes(match.profile, info.chatTemplateCaps);
+      return {
+        advertised: info.modelId || info.modelAlias || info.modelName || "",
+        family: set?.familyLabel || "",
+        via: match.via,
+        identityField: match.identityField || "",
+        defaultMode: set?.defaultMode || "",
+        modes: set ? Object.keys(set.modes) : [],
+        serverLevels: levels,
+        lastMode: lastMode || "",
+        pendingModel: "",
+      };
+    }
+    const served = launchedPath || selectedPath;
+    if (!served) return null;
+    const match = explainLocalModelModes(caps, served, launchedPath);
+    return {
+      advertised: path.basename(served),
+      family: match.profile?.familyLabel || "",
+      via: match.via,
+      identityField: match.identityField || "",
+      defaultMode: match.profile?.defaultMode || "",
+      modes: match.profile ? Object.keys(match.profile.modes) : [],
+      serverLevels: [] as string[],
+      lastMode: lastMode || "",
+      pendingModel: launchedPath && selectedPath && path.resolve(launchedPath) !== path.resolve(selectedPath) ? path.basename(selectedPath) : "",
     };
   }
 
@@ -1227,6 +1269,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         launchModeFallback: this.processManager.launchModeFallbackReason() || "",
         updateCheck,
         memoryView: memoryView ?? null,
+        profile: this.profileInfo(caps, launched?.modelPath, state.selectedModelPath),
         modeSampling: remoteMode
           ? describeModeSampling(resolveRemoteModelModes(this.processManager.remote.current()))
           : describeModeSampling(resolveLocalModelModes(caps, launched?.modelPath || state.selectedModelPath, launched?.modelPath)),
@@ -1940,13 +1983,19 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     if (!/^https?:\/\//i.test(endpoint)) {
       return;
     }
+    // The llama.cpp web UI keeps its key in that browser's own settings; it has
+    // no supported way to receive one except typing/pasting (a URL would leak it).
+    // So: put the key on the clipboard only when needed, and say so plainly.
     if (!this.store.isRemote()) {
       const key = readLocalApiKey();
       if (key) {
-        await vscode.env.clipboard.writeText(key);
+        const already = (await vscode.env.clipboard.readText().then(undefined, () => "")) === key;
+        if (!already) {
+          await vscode.env.clipboard.writeText(key);
+        }
         void vscode.window.showInformationMessage(
-          "Local API key copied. When the llama.cpp page asks for an API key, paste it (Ctrl/Cmd+V). " +
-            "Llama AIO generated this key for its own server; keep it private."
+          (already ? "Your clipboard already holds the local API key. " : "Llama AIO replaced your clipboard with the local API key. ") +
+            "If the llama.cpp page shows “Enter API Key”, paste it there; that browser then remembers it until the key changes."
         );
       }
     }
@@ -1961,7 +2010,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     }
     await vscode.env.clipboard.writeText(key);
     vscode.window.showInformationMessage(
-      "Copied the local llama.cpp server key. Llama AIO generated it for the server on this machine; paste it where a client asks for an API key."
+      "Llama AIO replaced your clipboard with the local llama.cpp server key (generated for the server on this machine). Paste it where a client asks for an API key."
     );
   }
 

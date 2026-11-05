@@ -614,23 +614,46 @@ export function resolveModelModes(
   caps?: ModelCapabilities,
   modelId?: string
 ): ModelModeSet | undefined {
+  return explainModelModes(caps, modelId).profile;
+}
+
+/**
+ * How a model was recognized: `name` = a curated profile matched the model's
+ * name / file / id; `architecture` = only the GGUF architecture matched;
+ * `excluded` = a draft / projector / base variant that must not get a chat
+ * profile; `unverified` = a named variant without a verified profile;
+ * `generic` = nothing matched, so Chat Requests sampling applies.
+ */
+export type ProfileMatchVia = "name" | "architecture" | "excluded" | "unverified" | "generic";
+
+export interface ProfileMatch {
+  profile?: ModelModeSet;
+  via: ProfileMatchVia;
+  /** Remote only: which advertised identity matched (alias, path, name, id, aliases). */
+  identityField?: "alias" | "path" | "name" | "id" | "aliases";
+  identity?: string;
+}
+
+/** `resolveModelModes` with the reason; the single implementation of profile matching. */
+export function explainModelModes(caps?: ModelCapabilities, modelId?: string): ProfileMatch {
   const h = haystack(caps, modelId);
   const arch = (caps?.architecture || "").toLowerCase();
-  if (/^(?:dflash|gemma4[-_]assistant)$/.test(arch) || profileVariantExcluded(h)) return undefined;
+  if (/^(?:dflash|gemma4[-_]assistant)$/.test(arch) || profileVariantExcluded(h)) return { via: "excluded" };
   const named = namedProfile(h);
-  if (named) return named;
+  if (named) return { profile: named, via: "name" };
   // An explicitly named, unverified variant must not inherit a misleading
   // profile just because its base architecture is supported.
-  if (/\b(?:frognano|spark[-_ ]?x?\d|ornith[-_ ]\d|lfm(?:2[._]\d|[-_ ]?3)|nemotron[-_ ]\d|(?:ternary[-_ ])?bonsai[-_ ]?\d|qwen3[-_ ]coder)/.test(h)) return undefined;
-  if (/^gpt[-_]oss$/.test(arch)) return GPT_OSS_MODES;
-  if (arch === "qwen4exp" || arch === "qwen4_exp") return QWEN4EXP_THINKING_MODES;
-  if (/^qwen(?:35|3_5)/.test(arch)) return QWEN35_THINKING_MODES;
-  if (/^qwen3(?:moe)?$/.test(arch)) return QWEN3_THINKING_MODES;
+  if (/\b(?:frognano|spark[-_ ]?x?\d|ornith[-_ ]\d|lfm(?:2[._]\d|[-_ ]?3)|nemotron[-_ ]\d|(?:ternary[-_ ])?bonsai[-_ ]?\d|qwen3[-_ ]coder)/.test(h)) return { via: "unverified" };
+  const byArch = (profile: ModelModeSet): ProfileMatch => ({ profile, via: "architecture" });
+  if (/^gpt[-_]oss$/.test(arch)) return byArch(GPT_OSS_MODES);
+  if (arch === "qwen4exp" || arch === "qwen4_exp") return byArch(QWEN4EXP_THINKING_MODES);
+  if (/^qwen(?:35|3_5)/.test(arch)) return byArch(QWEN35_THINKING_MODES);
+  if (/^qwen3(?:moe)?$/.test(arch)) return byArch(QWEN3_THINKING_MODES);
   // Spark X2.5 and X2.6 share spark2_5; architecture alone cannot select
   // their different controls (some published GGUF names are just "Dense F32").
-  if (isGlimmerFamily(arch)) return GLIMMER_THINKING_MODES;
-  if (isGemma4Family(arch)) return GEMMA4_THINKING_MODES;
-  return undefined;
+  if (isGlimmerFamily(arch)) return byArch(GLIMMER_THINKING_MODES);
+  if (isGemma4Family(arch)) return byArch(GEMMA4_THINKING_MODES);
+  return { via: "generic" };
 }
 
 function profileVariantExcluded(h: string): boolean {
@@ -652,30 +675,47 @@ export function resolveLocalModelModes(
   modelId: string | undefined,
   loadedModelPath?: string
 ): ModelModeSet | undefined {
+  return explainLocalModelModes(caps, modelId, loadedModelPath).profile;
+}
+
+export function explainLocalModelModes(
+  caps: ModelCapabilities | undefined,
+  modelId: string | undefined,
+  loadedModelPath?: string
+): ProfileMatch {
   if (loadedModelPath && loadedModelPath !== caps?.path) {
-    return resolveRemoteModelModes({ modelPath: loadedModelPath, modelId });
+    return explainRemoteModelModes({ modelPath: loadedModelPath, modelId });
   }
-  return resolveModelModes(caps, modelId);
+  return explainModelModes(caps, modelId);
 }
 
 /** Shared by remote chat and the sidebar; never consult local model settings. */
 export function resolveRemoteModelModes(
   info: Pick<RemoteServerInfo, "modelAlias" | "modelPath" | "modelName" | "modelId" | "modelAliases"> | undefined
 ): ModelModeSet | undefined {
-  if (!info) return undefined;
-  const identities = [info.modelAlias, info.modelPath, info.modelName, info.modelId];
+  return explainRemoteModelModes(info).profile;
+}
+
+export function explainRemoteModelModes(
+  info: Pick<RemoteServerInfo, "modelAlias" | "modelPath" | "modelName" | "modelId" | "modelAliases"> | undefined
+): ProfileMatch {
+  if (!info) return { via: "generic" };
+  const fields = [["alias", info.modelAlias], ["path", info.modelPath], ["name", info.modelName], ["id", info.modelId]] as const;
   // Canonical Base/draft identities take precedence over generic chat aliases.
-  if (identities.some(identity => identity && profileVariantExcluded(haystack(undefined, identity)))) return undefined;
-  for (const identity of identities) {
-    const profile = resolveModelModes(undefined, identity);
-    if (profile) return profile;
+  const excluded = fields.find(([, identity]) => identity && profileVariantExcluded(haystack(undefined, identity)));
+  if (excluded) return { via: "excluded", identityField: excluded[0], identity: excluded[1] };
+  for (const [field, identity] of fields) {
+    const match = explainModelModes(undefined, identity);
+    if (match.profile) return { ...match, identityField: field, identity };
   }
-  const aliases = (info.modelAliases ?? []).map(alias => resolveModelModes(undefined, alias))
-    .filter((profile): profile is ModelModeSet => !!profile);
+  const aliases = (info.modelAliases ?? []).map(alias => ({ alias, profile: resolveModelModes(undefined, alias) }))
+    .filter((hit): hit is { alias: string; profile: ModelModeSet } => !!hit.profile);
   // An arbitrary alias list may name different families. Leave sampling free
   // if it contradicts itself instead of choosing whichever alias appeared first.
-  return aliases.length && aliases.every(profile => profile.familyLabel === aliases[0].familyLabel)
-    ? aliases[0] : undefined;
+  if (aliases.length && aliases.every(hit => hit.profile.familyLabel === aliases[0].profile.familyLabel)) {
+    return { profile: aliases[0].profile, via: "name", identityField: "aliases", identity: aliases[0].alias };
+  }
+  return { via: aliases.length ? "unverified" : "generic", identity: info.modelId || info.modelAlias || info.modelName };
 }
 
 // Copilot CLI filters reasoningEffort against its standard effort values. Keep
