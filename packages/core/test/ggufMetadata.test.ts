@@ -101,6 +101,7 @@ describe("readModelCapabilities", () => {
       "general.architecture": { type: "string", value: "qwen3moe" },
       "qwen3moe.block_count": { type: "u32", value: 4 },
       "qwen3moe.expert_count": { type: "u32", value: 8 },
+      "qwen3moe.expert_feed_forward_length": { type: "u32", value: 768 },
       "qwen3moe.attention.head_count_kv": { type: "u32[]", value: [1, 2, 1, 2] },
     }, [{ name: "blk.0.ffn_down_exps.weight", bytes: 3000 }, { name: "output.weight", bytes: 7000 }]));
     const decode = t.mock.method(Buffer.prototype, "toString");
@@ -110,6 +111,7 @@ describe("readModelCapabilities", () => {
     assert.equal(caps.architecture, "qwen3moe");
     assert.equal(caps.blockCount, 4);
     assert.deepEqual(caps.attentionHeadCountKvPerLayer, [1, 2, 1, 2]);
+    assert.equal(caps.expertFfnLength, 768);
     assert.ok(Math.abs((caps.moeExpertShare || 0) - 0.3) < 0.02);
     assert.ok(decodes < 50, `decoded ${decodes} strings; vocabulary must be skipped`);
   });

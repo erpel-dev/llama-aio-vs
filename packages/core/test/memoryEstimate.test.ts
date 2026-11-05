@@ -12,6 +12,7 @@ import {
   integratedGpuNotes,
   kvSlotMultiplier,
   peerGpuOverheadBytes,
+  slidingWindowGraphFraction,
   vulkanDeviceReservedBytes,
   vulkanDriverBytes,
 } from "../src/memoryEstimate";
@@ -1478,5 +1479,37 @@ describe("estimateMemory", () => {
     assert.equal(kvSlotMultiplier({ unifiedKvCache: false, maxConcurrentPredictions: 4 }), 4);
     assert.equal(four.kvBytes, one.kvBytes * 4);
     assert.equal(unified.kvBytes, one.kvBytes);
+  });
+});
+
+describe("graph and batch sizing from model shape", () => {
+  // flint-like: 49 layers, 14 full-attention, the rest a 513-token window.
+  const swaPattern = Array.from({ length: 49 }, (_, i) => i >= 2 && i % 4 !== 1 && i !== 48);
+  const vulkan = { totalBytes: 12 * GiB, usedBytes: 0, name: "RX 9070 XT", source: "test", llamaDeviceId: "Vulkan0" };
+
+  it("bills only full-context layers for a sliding-window graph", () => {
+    const caps = { architecture: "flint", blockCount: 49, slidingWindow: 513, slidingWindowPattern: swaPattern };
+    const f = slidingWindowGraphFraction(caps, 65536)!;
+    assert.ok(f > 0.2 && f < 0.4, `fraction ${f}`);
+    assert.equal(slidingWindowGraphFraction(caps, 1024), undefined, "window covers the context");
+    assert.equal(slidingWindowGraphFraction({ ...caps, architecture: "qwen4exp" }, 65536), undefined);
+    assert.equal(slidingWindowGraphFraction({ ...caps, slidingWindow: 0 }, 65536), undefined);
+    const base = moeCaps({ architecture: "flint", blockCount: 49, embeddingLength: 2048 });
+    const s = loadSettings({ contextLength: 65536, nCpuMoe: 40, physicalBatchSize: 512 });
+    const dense = estimateMemory(base, s, vulkan)!;
+    const swa = estimateMemory({ ...base, slidingWindow: 513, slidingWindowPattern: swaPattern }, s, vulkan)!;
+    // Measured flint 24 GB: SWA layers made the old graph term ~1–2.7 GiB too high.
+    assert.ok(dense.gpuOverheadBytes - swa.gpuOverheadBytes > 0.5 * GiB);
+  });
+
+  it("scales MoE batch buffers with the active expert width", () => {
+    const opts = { contextLength: 65536, backend: "vulkan" as const };
+    const plain = computeOverheadBytes(2048, 4096, 4096, opts) - computeOverheadBytes(2048, 512, 4096, opts);
+    const moe =
+      computeOverheadBytes(2048, 4096, 4096, { ...opts, moeActiveFfnWidth: 8 * 512 }) -
+      computeOverheadBytes(2048, 512, 4096, { ...opts, moeActiveFfnWidth: 8 * 512 });
+    // Groot 19B (8 experts × 512) measured +1.26 GiB going -ub 512 → 4096.
+    assert.ok(plain < 0.8 * GiB);
+    assert.ok(moe > 1.2 * GiB && moe < 1.5 * GiB, `moe ubatch cost ${moe / GiB}`);
   });
 });

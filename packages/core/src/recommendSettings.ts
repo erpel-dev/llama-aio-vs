@@ -155,11 +155,18 @@ const UBATCH_EXTRA_HEADROOM = 1 * GiB;
  */
 const CPU_EXPERT_PREFILL_UBATCH = 4096;
 /**
- * Extra `--n-cpu-moe` layers worth trading for a bigger ubatch. Groot 19B on
- * 8 GB: -ub 4096 with 3 more CPU layers ran prompts 3.7x faster (143 → 531
- * tok/s) for −6% generation; 6 more layers cost −11%.
+ * Extra `--n-cpu-moe` layers worth trading for a bigger ubatch. Measured in
+ * a 64k coding-agent session (prompt cache on, ~6k new tokens per turn):
+ * when most expert layers already run from RAM (8 GB card), every ubatch
+ * copies a lot of weight, and -ub 4096 beat 2048 by 11–24% per session even
+ * at 3–7 more CPU layers (Groot 19B 205 → 156 s at CPU-MoE 34, Mellum 12B
+ * 216 → 192 s, flint 24 GB 568 → 445 s). With few CPU layers (12 GB card)
+ * sessions tied and the extra GPU layers generated faster, so keep 3 there.
  */
 const CPU_EXPERT_UBATCH_MAX_EXTRA_LAYERS = 3;
+const CPU_EXPERT_UBATCH_MAX_EXTRA_LAYERS_HEAVY = 7;
+/** Share of expert layers on the CPU from which a session is copy-bound. */
+const CPU_EXPERT_HEAVY_SHARE = 0.5;
 
 /**
  * Agent prompts are prefill-heavy, so a larger physical batch (-ub) is the main
@@ -181,7 +188,13 @@ function tuneCpuExpertBatch(
   headroom: number
 ): LlamaLoadSettings {
   const nLayers = Math.max(1, caps.blockCount || 1);
-  const maxExtra = caps.isMoe && settings.nCpuMoe > 0 && gpus.length < 2 ? CPU_EXPERT_UBATCH_MAX_EXTRA_LAYERS : 0;
+  const heavy = settings.nCpuMoe >= nLayers * CPU_EXPERT_HEAVY_SHARE;
+  const maxExtra =
+    caps.isMoe && settings.nCpuMoe > 0 && gpus.length < 2
+      ? heavy
+        ? CPU_EXPERT_UBATCH_MAX_EXTRA_LAYERS_HEAVY
+        : CPU_EXPERT_UBATCH_MAX_EXTRA_LAYERS
+      : 0;
   for (const ubatch of [CPU_EXPERT_PREFILL_UBATCH, CPU_EXPERT_PREFILL_UBATCH / 2]) {
     if (ubatch <= settings.physicalBatchSize) {
       break;

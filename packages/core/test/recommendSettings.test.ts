@@ -44,15 +44,19 @@ describe("recommendLoadSettings", () => {
   });
 
   it("uses a big ubatch when experts run from system RAM", () => {
-    // Each ubatch re-copies the CPU experts to the GPU: 8 GB RX 9060 XT
-    // measured Groot 19B 143 → 531 tok/s prompt going -ub 512 → 4096.
-    const plain = recommendLoadSettings(loadSettings(), moeCaps(), { gpu: gpu(16) });
-    assert.ok(plain.nCpuMoe > 0);
-    // This test model is wide (5120 hidden): 4096 costs too much, 2048 fits.
-    assert.equal(plain.physicalBatchSize, 2048);
-    assert.ok(plain.evalBatchSize >= plain.physicalBatchSize);
-    const est = estimateMemory(moeCaps(), plain, gpu(16));
+    // Each ubatch re-copies the CPU experts to the GPU. Most expert layers on
+    // the CPU (8 GB card): -ub 4096 is worth up to 7 more CPU layers (64k agent
+    // session: Groot 19B 205 → 156 s, flint 24 GB 568 → 445 s vs -ub 2048).
+    const heavy = recommendLoadSettings(loadSettings(), moeCaps(), { gpu: gpu(16) });
+    assert.ok(heavy.nCpuMoe >= 24, `most of 48 expert layers on the CPU (${heavy.nCpuMoe})`);
+    assert.equal(heavy.physicalBatchSize, 4096);
+    assert.ok(heavy.evalBatchSize >= heavy.physicalBatchSize);
+    const est = estimateMemory(moeCaps(), heavy, gpu(16));
     assert.ok(est!.totalGpuBytes < 16 * GiB - 1.5 * GiB, "still inside the normal headroom");
+    // Few CPU layers (12 GB card): sessions tied, so the extra GPU layers win.
+    const light = recommendLoadSettings(loadSettings(), moeCaps(), { gpu: gpu(24) });
+    assert.ok(light.nCpuMoe > 0 && light.nCpuMoe < 24);
+    assert.equal(light.physicalBatchSize, 2048);
     // A narrower MoE affords 4096.
     const narrow = recommendLoadSettings(loadSettings(), moeCaps({ embeddingLength: 2048 }), { gpu: gpu(14) });
     assert.ok(narrow.nCpuMoe > 0);

@@ -85,7 +85,9 @@ export class SettingsStore {
     if (!path || !caps) {
       return false;
     }
-    const moeNeedsShare = caps.isMoe && (caps.moeExpertShare === undefined || !Number.isFinite(caps.moeExpertShare));
+    const moeNeedsShare =
+      caps.isMoe &&
+      (caps.moeExpertShare === undefined || !Number.isFinite(caps.moeExpertShare) || caps.expertFfnLength === undefined);
     const qwen4NeedsPle =
       isQwen4expArchitecture(caps.architecture) &&
       (caps.pleShare === undefined || !Number.isFinite(caps.pleShare));

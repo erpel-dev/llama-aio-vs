@@ -330,6 +330,13 @@ export interface ComputeOverheadOptions {
    * fat heap; qwen4exp + SSM uses the compact one.
    */
   compactVulkanHeap?: boolean;
+  /**
+   * MoE routed FFN width per token (experts used × expert FFN length). The
+   * expert intermediate buffers scale with -ub: going -ub 512 → 4096 cost
+   * Groot 19B (8×512) +1.26 GiB and Mellum 12B (8×896) ~+1.6 GiB on Vulkan,
+   * where the hidden-size term alone predicted ~0.7 GiB.
+   */
+  moeActiveFfnWidth?: number;
 }
 
 const BACKEND_OVERHEAD: Record<
@@ -463,7 +470,8 @@ export function computeOverheadBytes(
   const faOff = (options?.flashAttention || "auto") === "off";
   const graphElem = faOff ? Math.max(tax.graphElemBytes, 36) : tax.graphElemBytes;
   // Several f32 residual / FFN streams (old *24 was ~4× too small).
-  const activations = ubatch * embed * 96;
+  const moeWidth = Math.max(0, options?.moeActiveFfnWidth || 0);
+  const activations = ubatch * (embed * 96 + moeWidth * 44);
   const batchBuf = batch * 8 * 1024;
   // Linear-recurrent hybrids (Qwen3.5 RCO, qwen4exp with ssm.*) keep a
   // fixed SSM state off the full-attn layers, so only the full-attention
@@ -743,6 +751,43 @@ export function countFullAttentionLayers(
   >
 ): number {
   return recurrentLayerMask(caps).filter((isRecurrent) => !isRecurrent).length;
+}
+
+/**
+ * Share of layers whose attention spans the whole context, for sizing the
+ * compute graph of true sliding-window models (flint, Mellum, Spark). SWA
+ * layers attend over a short window, so only the remaining layers scale the
+ * graph with context. Undefined when the model has no usable SWA layout, the
+ * window covers the context anyway, or for qwen4exp (Flash-Next keeps its
+ * calibrated dense graph).
+ */
+export function slidingWindowGraphFraction(
+  caps: Pick<
+    ModelCapabilities,
+    | "architecture"
+    | "blockCount"
+    | "slidingWindow"
+    | "slidingWindowPattern"
+    | "fullAttentionInterval"
+    | "recurrentLayers"
+    | "attentionHeadCountKvPerLayer"
+  >,
+  contextLength: number
+): number | undefined {
+  const window = caps.slidingWindow || 0;
+  const pattern = caps.slidingWindowPattern;
+  const n = Math.max(1, caps.blockCount || 1);
+  if (!(window > 0) || !pattern?.length || isQwen4expArchitecture(caps.architecture) || contextLength <= window * 2) {
+    return undefined;
+  }
+  const recurrent = recurrentLayerMask(caps);
+  let full = 0;
+  for (let i = 0; i < n; i++) {
+    if (!recurrent[i] && !pattern[i % pattern.length]) {
+      full++;
+    }
+  }
+  return full < n ? full / n : undefined;
 }
 
 export function resolveMoeExpertShare(caps: ModelCapabilities): number {
@@ -1102,6 +1147,10 @@ export function estimateMemory(
   const computeBackend = inferComputeBackend(cpuOnly, gpusForBackend);
   const fullAttentionFraction = fullAttnLayers / nLayers;
   const rcoHeap = isLinearRecurrentHybrid(caps);
+  // Measured on Vulkan (64k, RX 9070 XT / 9060 XT): billing every SWA layer a
+  // full-context graph left flint 24 GB, Mellum 12B and Spark 4B estimates
+  // 1.2–2.7 GiB high, which parked 2–3.6 GiB of a 12 GB card unused.
+  const swaGraphFraction = rcoHeap ? undefined : slidingWindowGraphFraction(caps, settings.contextLength);
   // The 2.5 GiB/card dual-GPU RADV reserve was measured on Flash-Next
   // (qwen4exp). On a current llama.cpp Vulkan build, split flint 24 GB,
   // Mellum 12B and Spark 4B (64k ctx, peak during a 29–39k prompt) showed none
@@ -1120,9 +1169,10 @@ export function estimateMemory(
       contextLength: settings.contextLength,
       backend: computeBackend,
       flashAttention: settings.flashAttention,
-      fullAttentionFraction,
-      discountRecurrentGraph: rcoHeap,
+      fullAttentionFraction: swaGraphFraction ?? fullAttentionFraction,
+      discountRecurrentGraph: rcoHeap || swaGraphFraction !== undefined,
       compactVulkanHeap: compactHeap,
+      moeActiveFfnWidth: caps.isMoe ? (caps.expertUsedCount || 0) * (caps.expertFfnLength || 0) : 0,
       vulkanDeviceCount,
     }
   );
