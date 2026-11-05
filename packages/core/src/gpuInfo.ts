@@ -917,9 +917,10 @@ export function isIntegratedGpu(
   if (/\bradeon \d{3}m\b|\bradeon \d{4}s\b/.test(name)) {
     return true;
   }
-  // Lunar Lake / Arrow Lake: `Intel Arc 140V GPU`, `Arc 130T GPU`; low-end
-  // Lunar Lake: `Intel Graphics`.
-  if (/\barc \d{3}[vt]\b|\bintel graphics\b/.test(name)) {
+  // Lunar Lake / Arrow Lake: `Intel Arc 140V GPU`, `Arc 130T GPU`. Panther
+  // Lake: `Arc B390` / `Arc B370` (discrete Battlemage is B5xx and Pro B50/B60).
+  // Smaller Lunar / Panther Lake parts: `Intel Graphics`.
+  if (/\barc \d{3}[vt]\b|\barc (?:pro )?b3\d{2}\b|\bintel graphics\b/.test(name)) {
     return true;
   }
   // Meteor Lake "Arc Graphics" has no A###/B### model number.
