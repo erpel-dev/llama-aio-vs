@@ -391,6 +391,38 @@ describe("iGPU / APU guidance", () => {
     );
   });
 
+  it("classifies newer and Windows-named iGPUs, but not discrete laptop cards", () => {
+    const igpu = (name: string, totalBytes = 512 * MiB) => isIntegratedGpu({ name, totalBytes });
+    for (const name of [
+      "AMD Radeon(TM) Graphics",
+      "AMD Radeon(TM) 780M Graphics",
+      "AMD Radeon 760M Graphics",
+      "AMD Radeon(TM) 890M Graphics",
+      "AMD Radeon 680M",
+      "Intel(R) Arc(TM) 140V GPU (16GB)",
+      "Intel(R) Arc(TM) 130T GPU (16GB)",
+      "Intel(R) Graphics",
+      "Intel(R) Iris(R) Xe Graphics",
+      "Intel(R) Arc(TM) B390 GPU",
+      "Intel(R) Arc(TM) B370 GPU",
+      "Intel(R) Arc(TM) Pro B390 GPU",
+    ]) {
+      assert.equal(igpu(name), true, name);
+    }
+    assert.equal(igpu("AMD Radeon(TM) 8060S Graphics", 96 * GiB), true);
+    for (const name of [
+      "AMD Radeon RX 7600M XT",
+      "AMD Radeon(TM) RX 7900 XTX",
+      "Intel(R) Arc(TM) B580 Graphics",
+      "Intel(R) Arc(TM) A770M Graphics",
+      "Intel(R) Arc(TM) B570 Graphics",
+      "Intel(R) Arc(TM) Pro B60 Graphics",
+      "NVIDIA GeForce RTX 4060 Laptop GPU",
+    ]) {
+      assert.equal(igpu(name, 8 * GiB), false, name);
+    }
+  });
+
   it("replaces Tight/ReBAR banners when offload is 0", () => {
     const notes = integratedGpuNotes({
       gpu: apu,

@@ -246,6 +246,23 @@ describe("resolveWindowsGpuList", () => {
     assert.equal(windowsVramNeedsRegistry([capped7900], listed), false);
   });
 
+  it("keeps a Windows iGPU's shared --list-devices memory as its GTT capacity", () => {
+    // i7-1270P: WMI sees the 1 GiB carve-out; Vulkan reports shared memory.
+    const irisXe: GpuMemoryInfo = { totalBytes: 1 * GiB, name: "Intel(R) Iris(R) Xe Graphics", source: "wmi" };
+    const listed = parseLlamaListDevices("  Vulkan0: Intel(R) Iris(R) Xe Graphics (16179 MiB, 15000 MiB free)\n");
+    const gpus = resolveWindowsGpuList([irisXe], listed, []);
+    assert.equal(gpus[0]?.totalBytes, 1 * GiB);
+    assert.equal(gpus[0]?.gttTotalBytes, 16179 * 1024 * 1024);
+    assert.equal(gpus[0]?.llamaDeviceId, "Vulkan0");
+  });
+
+  it("does not give a discrete Windows GPU a GTT capacity", () => {
+    const rtx: GpuMemoryInfo = { totalBytes: 2 * GiB, name: "NVIDIA GeForce RTX 3050 Laptop GPU", source: "wmi" };
+    const listed = parseLlamaListDevices("  Vulkan0: NVIDIA GeForce RTX 3050 Laptop GPU (4096 MiB, 3900 MiB free)\n");
+    const gpus = resolveWindowsGpuList([rtx], listed, []);
+    assert.equal(gpus[0]?.gttTotalBytes, undefined);
+  });
+
   it("uses the registry qword when --list-devices reports 0 MiB", () => {
     const listed = parseLlamaListDevices(
       "  Vulkan0: AMD Radeon RX 7900 XTX (RADV GFX1100) (0 MiB, 0 MiB free)\n"

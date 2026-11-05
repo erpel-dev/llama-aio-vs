@@ -1,4 +1,4 @@
-import { detectGpus, GpuMemoryInfo } from "./gpuInfo";
+import { detectGpus, GpuMemoryInfo, isIntegratedGpu } from "./gpuInfo";
 import {
   capacityAwareTensorSplit,
   type LayerWeightMassOptions,
@@ -9,7 +9,7 @@ import {
   tensorSplitForTargetWeightShare,
 } from "./gpuSplit";
 import { isQwen4expArchitecture, ModelCapabilities } from "./ggufMetadata";
-import { estimateMemory, MemoryEstimate, VRAM_HEADROOM_BYTES } from "./memoryEstimate";
+import { estimateMemory, gpuBarCapacityBytes, MemoryEstimate, VRAM_HEADROOM_BYTES } from "./memoryEstimate";
 import { isMtpBakedInFile, isMtpSidecarFile } from "./modelLibrary";
 import { LlamaLoadSettings, recommendedMaxDraftTokens, speculativeUsesDflash, speculativeUsesNgram } from "./types";
 
@@ -131,12 +131,16 @@ function fitsHeadroom(
   if (gpus.length >= 2) {
     return !est.willSpill;
   }
-  if (!gpu?.totalBytes) {
+  // An APU's weights and KV live in GTT, not its small VRAM carve-out.
+  const capacity = gpuBarCapacityBytes(gpu);
+  if (!capacity) {
     return false;
   }
-  return gpu.totalBytes - est.totalGpuBytes >= headroom;
+  return capacity - est.totalGpuBytes >= headroom;
 }
 
+/** iGPU carve-outs at or below this rely on shared memory (GTT) for the model. */
+const SMALL_CARVE_OUT_BYTES = 2 * GiB;
 /** Physical batch to aim for when prefill is fully GPU-bound. */
 const FAST_PREFILL_UBATCH = 1024;
 /** Extra VRAM (beyond the normal headroom) required before raising -ub. */
@@ -158,6 +162,10 @@ function tuneBatchSizes(
     settings.gpuOffload >= 99 || settings.gpuOffload >= Math.max(1, caps.blockCount || 1);
   if (
     !gpu?.totalBytes ||
+    // Measured on Vega (Renoir/Cezanne): -ub 1024/2048 gives the same prefill
+    // as 512 while growing the compute buffer in shared RAM. An APU with a
+    // large BIOS carve-out (Strix Halo) is tuned like a discrete card.
+    (isIntegratedGpu(gpu) && gpu.totalBytes <= SMALL_CARVE_OUT_BYTES) ||
     !fullyOffloaded ||
     settings.nCpuMoe > 0 ||
     settings.nCpuFfn > 0 ||
