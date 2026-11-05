@@ -577,14 +577,21 @@ export function gpusFromListedDevices(devices: LlamaListedDevice[]): GpuMemoryIn
 export function gpuModelTokens(name: string): string[] {
   const n = (name || "").toLowerCase();
   const tokens: string[] = [];
-  const rx = /rx\s*(\d{3,4})/gi;
+  // lspci names a PCI id shared by several SKUs with slashes, and the later
+  // models carry no prefix: "Radeon RX 9050 / 9060 XT" is also an RX 9060.
+  const slashTail = (tail: string): string[] => tail.match(/\d{3,4}/g) || [];
+  const rx = /rx\s*(\d{3,4})((?:\s*\/\s*(?:rx\s*)?\d{3,4})*)/gi;
   let m: RegExpExecArray | null;
   while ((m = rx.exec(n))) {
-    tokens.push(`rx${m[1]}`);
+    for (const num of [m[1], ...slashTail(m[2] || "")]) {
+      tokens.push(`rx${num}`);
+    }
   }
-  const nv = /(rtx|gtx)\s*(\d{3,4})/gi;
+  const nv = /(rtx|gtx)\s*(\d{3,4})((?:\s*\/\s*(?:(?:rtx|gtx)\s*)?\d{3,4})*)/gi;
   while ((m = nv.exec(n))) {
-    tokens.push(`${m[1]}${m[2]}`);
+    for (const num of [m[2], ...slashTail(m[3] || "")]) {
+      tokens.push(`${m[1]}${num}`);
+    }
   }
   const arc = /arc\s+([a-z]?\d{3,4})/gi;
   while ((m = arc.exec(n))) {

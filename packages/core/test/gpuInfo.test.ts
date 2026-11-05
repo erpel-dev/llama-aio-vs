@@ -53,6 +53,14 @@ describe("gpuModelTokens", () => {
     assert.ok(gpuModelTokens("Radeon RX 9070/9070 XT/9070 GRE").includes("rx9070"));
     assert.ok(gpuModelTokens("Radeon RX 9060 XT").includes("rx9060"));
   });
+
+  it("reads unprefixed model numbers after a slash in lspci names", () => {
+    assert.deepEqual(gpuModelTokens("Radeon RX 9050 / 9060 XT"), ["rx9050", "rx9060"]);
+    assert.deepEqual(gpuModelTokens("Radeon RX 7900 XT/7900 XTX/7900 GRE/7900M"), ["rx7900"]);
+    assert.deepEqual(gpuModelTokens("GeForce GTX 1050 / 1060"), ["gtx1050", "gtx1060"]);
+    // A slash-separated number with no RX/RTX/GTX before it is not a card.
+    assert.deepEqual(gpuModelTokens("Navi 44 / 48"), []);
+  });
 });
 
 describe("orderGpusLikeLlama", () => {
@@ -80,6 +88,26 @@ describe("orderGpusLikeLlama", () => {
     assert.equal(ordered[1]?.llamaDeviceId, "Vulkan1");
     assert.match(ordered[1]?.name || "", /9060/);
     assert.equal(ordered[1]?.index, 1);
+  });
+
+  it("matches lspci's 'RX 9050 / 9060 XT' to llama.cpp's RX 9060 XT (Vulkan0 = 9060)", () => {
+    // Real two-GPU PC: lspci names the 9060 by its shared PCI id, and
+    // llama.cpp lists it first. Unmatched, it lost its id and moved to the
+    // end, so "GPU 2" and a 75/25 tensor split landed on the wrong card.
+    const pci: GpuMemoryInfo[] = [
+      { totalBytes: 16e9, name: "Radeon RX 9070/9070 XT/9070 GRE", source: "sysfs:card1", pciSlot: "0000:2a:00.0", index: 0 },
+      { totalBytes: 16e9, name: "Radeon RX 9050 / 9060 XT", source: "sysfs:card0", pciSlot: "0000:27:00.0", index: 1 },
+    ];
+    const listed = parseLlamaListDevices(`
+Available devices:
+  Vulkan0: AMD Radeon RX 9060 XT (RADV GFX1200) (16304 MiB, 14795 MiB free)
+  Vulkan1: AMD Radeon RX 9070 XT (RADV GFX1201) (16304 MiB, 16246 MiB free)
+`);
+    const ordered = orderGpusLikeLlama(pci, listed);
+    assert.equal(ordered[0]?.llamaDeviceId, "Vulkan0");
+    assert.match(ordered[0]?.name || "", /9060/);
+    assert.equal(ordered[1]?.llamaDeviceId, "Vulkan1");
+    assert.match(ordered[1]?.name || "", /9070/);
   });
 
   it("keeps sysfs VRAM when --list-devices reports 0 MiB", () => {
