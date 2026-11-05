@@ -1215,6 +1215,7 @@ export function activate(context: vscode.ExtensionContext): void {
       await vscode.commands.executeCommand("llamaAio.settingsView.focus");
     }),
     vscode.commands.registerCommand("llamaAio.openAdvancedSettings", () => settingsView.openAdvancedPanel()),
+    { dispose: () => settingsView.dispose() },
     vscode.commands.registerCommand("llamaAio.openConfigFile", async () => {
       await configFile.ensureExists();
       const uri = vscode.Uri.file(describeConfigLocation().file);

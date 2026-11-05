@@ -5,7 +5,7 @@
  */
 import { $, vscode } from "./api";
 import type { ToWebviewMessage } from "./protocol";
-import { escAttr, escText, fmtBytes, fmtEta, fmtNum, fmtParams, fmtRate, fmtServerRate, fmtTokK, fmtTokShort, fmtUptime, friendlyNetworkError, pickNum } from "./format";
+import { escAttr, escText, fmtBytes, fmtEta, fmtNum, fmtParams, fmtRate, fmtServerRate, fmtTokK, fmtTokShort, fmtUptime, friendlyNetworkError, pickNum, promptEtaSeconds } from "./format";
 import {
   clampMainGpu,
   denseFfnShareOf,
@@ -668,7 +668,7 @@ function renderSetup() {
       state: 'now',
       detail: lastPayload.copilotChatAvailable
         ? 'In Copilot Chat, open the model picker and choose “Llama AIO: ' + (lastPayload.modelName || 'model') + '”.'
-        : 'Copilot Chat is not installed. Any OpenAI-compatible client can use ' + (lastEndpoint || lastPayload.endpoint || '') + ' with the local API key.',
+        : 'Copilot Chat is not installed. Chat in llama.cpp\'s web UI (opens signed in), or point any OpenAI-compatible client at ' + (lastEndpoint || lastPayload.endpoint || '') + '.',
     };
   }
 
@@ -721,8 +721,8 @@ function renderSetup() {
     if (lastPayload.copilotChatAvailable) {
       action = 'openChat'; label = 'Open Copilot Chat';
     } else {
-      action = 'copyKey'; label = 'Copy local API key';
-      secondary.push(setupButton('copyEndpoint', 'Copy endpoint'));
+      action = 'webui'; label = 'Open llama.cpp web UI';
+      secondary.push(setupButton('copyKey', 'Copy API key'), setupButton('copyEndpoint', 'Copy endpoint'));
     }
     secondary.push(setupButton('dismiss', 'Done'));
   } else {
@@ -769,6 +769,8 @@ function runSetupAction(action) {
     launch('start');
   } else if (action === 'openChat') {
     vscode.postMessage({ type: 'openCopilotChat' });
+  } else if (action === 'webui') {
+    vscode.postMessage({ type: 'openWebUi' });
   } else if (action === 'copyKey') {
     vscode.postMessage({ type: 'copyLocalApiKey' });
   } else if (action === 'copyEndpoint') {
@@ -952,7 +954,11 @@ function renderProfile(p) {
   const info = p && p.profile;
   const show = !!info && (serverRunning || remoteMode);
   line.classList.toggle('hidden', !show);
-  if (!show) return;
+  if (!show) {
+    $('profileDetails').classList.add('hidden');
+    $('profileChip').setAttribute('aria-expanded', 'false');
+    return;
+  }
   // Perf patches arrive between state pushes; they carry the freshest sent mode.
   if (lastPerf && 'modelMode' in lastPerf) info.lastMode = lastPerf.modelMode || '';
   const chip = $('profileChip');
@@ -1635,8 +1641,7 @@ function requestStageHtml(p) {
   if (p.stage === 'prompt' && pp && pp.total > 0) {
     const pct = Math.min(100, Math.floor((pp.processed / pp.total) * 100));
     const fresh = Math.max(0, pp.processed - pp.cache);
-    const rate = pp.timeMs > 0 && fresh > 0 ? fresh / (pp.timeMs / 1000) : 0;
-    const left = rate > 0 ? Math.ceil((pp.total - pp.processed) / rate) : 0;
+    const left = promptEtaSeconds(pp);
     // llama.cpp reports once per batch, so a long prompt sits at its cached
     // share until the first batch finishes. Say when the next number comes.
     const L = lastPayload && !remoteMode ? (lastPayload.launchedSettings || (lastPayload.state && lastPayload.state.loadSettings) || {}) : {};

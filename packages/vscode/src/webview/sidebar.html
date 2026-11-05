@@ -10,7 +10,7 @@
 <body class="view-{{viewMode}}">
   <header class="adv-page-head" id="advPageHead">
     <h1>Advanced settings</h1>
-    <p class="hint local-only">llama-server load options. Changes save as you type and apply on the next Reload, shown in the bar below. The sidebar keeps model, memory fit, context and GPU layers.</p>
+    <p class="hint local-only">Saved as you type; applied on the next Reload.</p>
     <p class="hint remote-only">Connected to a remote server: it manages its own load settings, so there is nothing to set here.</p>
   </header>
   <div class="card server stopped sticky-head" id="serverCard">
@@ -31,7 +31,7 @@
           <div class="menu-body">
             <button class="menu-item local-only" id="openLogBtn" type="button">Open log</button>
             <button class="menu-item local-only" id="copyCmdBtn" type="button" title="The llama-server command for the current settings (the API key is not included)">Copy command line</button>
-            <button class="menu-item" id="openWebUiBtn" type="button" title="Opens llama.cpp's own chat page. For this machine's server the local API key is copied first, so you can paste it when the page asks.">Open llama.cpp web UI</button>
+            <button class="menu-item" id="openWebUiBtn" type="button" title="Opens llama.cpp's own chat page. For this machine's server it opens signed in, through a local gateway that adds the key.">Open llama.cpp web UI</button>
             <button class="menu-item local-only" id="copyKeyBtn" type="button" title="The key Llama AIO generated for its own llama-server. Paste it where the web UI or another client asks for an API key.">Copy local API key</button>
             <button class="menu-item remote-only" id="copyDiagBtn" type="button">Copy connection diagnostics</button>
             <div class="menu-sep local-only"></div>
@@ -54,7 +54,6 @@
     <div class="profile-line hidden" id="profileLine">
       <button type="button" class="profile-chip" id="profileChip" aria-expanded="false" aria-controls="profileDetails"></button>
       <span class="profile-mode" id="profileMode"></span>
-      <div class="profile-details hidden" id="profileDetails" role="region" aria-label="Model profile details"></div>
     </div>
     <div class="srv-sub remote-only" id="srvSummary"></div>
     <div class="srv-sub remote-only" id="srvPerf"></div>
@@ -112,6 +111,9 @@
       <button class="secondary" id="remoteSecondaryBtn" type="button">Edit connection</button>
     </div>
   </div>
+
+  <!-- Outside the sticky header, so opening it never pushes live request feedback away. -->
+  <div class="card profile-details hidden" id="profileDetails" role="region" aria-label="Model profile details"></div>
 
   <div class="card hidden" id="remoteModelCard">
     <div class="card-head">

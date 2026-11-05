@@ -50,3 +50,4 @@ export * from "./types";
 export * from "./wikipediaLookup";
 export * from "./xmlToolCalls";
 export * from "./localApiKey";
+export * from "./webUiGateway";

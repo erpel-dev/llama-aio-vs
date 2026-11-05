@@ -1,5 +1,6 @@
 import { randomBytes } from "crypto";
 import * as fs from "fs";
+import { WebUiGateway } from "@llama-aio/core";
 import { explainLocalModelModes, explainRemoteModelModes, resolveServerModelModes, serverReasoningLevels, type ModelCapabilities } from "@llama-aio/core";
 import { readLocalApiKey } from "@llama-aio/core";
 import { syncPerfTarget } from "./perfTarget";
@@ -75,6 +76,8 @@ import { downloadGgufSelection, HuggingFaceClient, STARTER_MODEL } from "./huggi
 /** Secret Storage keyed by server origin, with a sync cache for request headers. */
 /** globalState: the Get started checklist finished (first reply or dismissed). */
 const SETUP_DONE_KEY = "llamaAio.setupDone";
+/** globalState: last port of the web UI gateway (keeps the page origin stable). */
+const WEB_UI_GATEWAY_PORT_KEY = "llamaAio.webUiGatewayPort";
 
 export interface ApiKeyStore {
   /** Cached key; may miss a key stored in another window or before activation. */
@@ -2038,9 +2041,23 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     if (!/^https?:\/\//i.test(endpoint)) {
       return;
     }
-    // The llama.cpp web UI keeps its key in that browser's own settings; it has
-    // no supported way to receive one except typing/pasting (a URL would leak it).
-    // So: put the key on the clipboard only when needed, and say so plainly.
+    // The managed local server: open its UI through the loopback gateway, which
+    // adds the key itself, so the page works without pasting anything.
+    if (!this.store.isRemote() && readLocalApiKey()) {
+      try {
+        const url = await this.ensureWebUiGateway();
+        const external = await vscode.env.asExternalUri(vscode.Uri.parse(url));
+        await vscode.env.openExternal(external);
+        vscode.window.setStatusBarMessage("Llama AIO: opened the llama.cpp web UI (signed in through the local gateway)", 6000);
+        return;
+      } catch (e) {
+        void vscode.window.showWarningMessage(
+          `Llama AIO could not start its web UI gateway (${e instanceof Error ? e.message : String(e)}); opening the server directly instead.`
+        );
+      }
+    }
+    // Fallback: the llama.cpp web UI keeps its key in that browser's own
+    // settings and cannot receive one except by pasting (a URL would leak it).
     if (!this.store.isRemote()) {
       const key = readLocalApiKey();
       if (key) {
@@ -2055,6 +2072,35 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       }
     }
     await vscode.env.openExternal(vscode.Uri.parse(endpoint));
+  }
+
+  private webUiGateway?: WebUiGateway;
+
+  /**
+   * Start (once) the loopback gateway in front of the managed server. Its port
+   * is remembered so the web UI's origin, and its saved chats, stay stable.
+   */
+  private async ensureWebUiGateway(): Promise<string> {
+    if (!this.webUiGateway) {
+      this.webUiGateway = new WebUiGateway({
+        upstream: () => this.store.getEndpoint(),
+        apiKey: () => readLocalApiKey(),
+        // A browser-hosted or remote editor forwards the port itself, so the
+        // Host is the editor's; same-site checks still apply there.
+        strictHost: () => vscode.env.uiKind !== vscode.UIKind.Web && !vscode.env.remoteName,
+      });
+    }
+    if (!this.webUiGateway.running) {
+      const preferred = this.globalState?.get<number>(WEB_UI_GATEWAY_PORT_KEY) || 0;
+      const port = await this.webUiGateway.start(preferred);
+      if (port !== preferred) await this.globalState?.update(WEB_UI_GATEWAY_PORT_KEY, port);
+    }
+    return this.webUiGateway.url();
+  }
+
+  dispose(): void {
+    this.webUiGateway?.close();
+    this.webUiGateway = undefined;
   }
 
   private async copyLocalApiKey(): Promise<void> {

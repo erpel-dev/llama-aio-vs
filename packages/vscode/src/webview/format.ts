@@ -134,3 +134,17 @@ export function friendlyNetworkError(raw: unknown, service: 'github' | 'huggingf
   const first = text.split('\n')[0].replace(/\{[\s\S]*\}/, '').trim();
   return first.length > 160 ? first.slice(0, 157) + '…' : (first || 'Request to ' + name + ' failed.');
 }
+
+/**
+ * Seconds left for prompt processing, or 0 while the evidence is too thin.
+ * Extrapolates only from tokens the server evaluated this request (cache
+ * hits excluded) after enough tokens and time: one early sample once
+ * claimed ~1,600 s left on a 45k-token prompt.
+ */
+export function promptEtaSeconds(pp: { total: number; cache: number; processed: number; timeMs: number } | null | undefined): number {
+  if (!pp || !(pp.total > 0) || pp.processed >= pp.total) return 0;
+  const fresh = Math.max(0, pp.processed - pp.cache);
+  if (fresh < 256 || pp.timeMs < 1500) return 0;
+  const rate = fresh / (pp.timeMs / 1000);
+  return rate > 0 ? Math.ceil((pp.total - pp.processed) / rate) : 0;
+}

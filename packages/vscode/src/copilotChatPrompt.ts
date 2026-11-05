@@ -82,18 +82,16 @@ export async function promptUseInCopilotChat(
  */
 async function promptNoCopilotChat(
   store: SettingsStore,
-  statusMessage?: string,
+  _statusMessage?: string, // launch details stay in the sidebar and log, not this toast
   globalState?: vscode.Memento
 ): Promise<void> {
   if (globalState?.get<boolean>(NO_COPILOT_NOTICE_DISMISSED_KEY)) {
     return;
   }
   const endpoint = store.getEndpoint();
-  const base = (statusMessage || "").trim() || "Llama AIO server is ready.";
 
   const choice = await vscode.window.showInformationMessage(
-    `${base}\nCopilot Chat isn't available in this editor, so the model can't be used in chat here. ` +
-      `The server is running at ${endpoint} (OpenAI-compatible) and can be used by extensions that support the VS Code Language Model API.`,
+    `Llama AIO is ready at ${endpoint}. Copilot Chat isn't installed; other Language Model API extensions and OpenAI-compatible clients can use the server.`,
     "Copy server URL",
     "Don't show again"
   );
