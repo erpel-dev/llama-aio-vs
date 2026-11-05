@@ -9,6 +9,7 @@ import {
   normalizeGpuSplitMode,
   normalizeTensorSplit,
   parseTensorSplit,
+  remapLegacyGpuOrder,
   capacityAwareTensorSplit,
   retargetTensorSplitMainShare,
   tensorSplitFromFractions,
@@ -276,5 +277,29 @@ describe("mainWeightShareFromSplit", () => {
       { isMoe: true, nCpuMoe: 23, moeExpertShare: 0.5116 }
     );
     assert.ok(share < 0.4, `50/50 layers should be well under 50% weights, got ${share}`);
+  });
+});
+
+describe("remapLegacyGpuOrder", () => {
+  // New order [9060, 9070]; before the fix it was [9070, 9060].
+  const swapped = [{ legacyIndex: 1 }, { legacyIndex: 0 }];
+
+  it("keeps the saved main GPU and split on the same physical cards", () => {
+    assert.deepEqual(remapLegacyGpuOrder({ mainGpu: 0, tensorSplit: "90,10" }, swapped), {
+      mainGpu: 1,
+      tensorSplit: "10,90",
+    });
+  });
+
+  it("leaves settings alone when the order did not change or is unknown", () => {
+    assert.equal(remapLegacyGpuOrder({ mainGpu: 0, tensorSplit: "3,1" }, [{}, {}]), undefined);
+    assert.equal(
+      remapLegacyGpuOrder({ mainGpu: 0, tensorSplit: "" }, [{ legacyIndex: 0 }, { legacyIndex: 1 }]),
+      undefined
+    );
+  });
+
+  it("remaps the main GPU even without a split", () => {
+    assert.deepEqual(remapLegacyGpuOrder({ mainGpu: 1, tensorSplit: "" }, swapped), { mainGpu: 0, tensorSplit: "" });
   });
 });

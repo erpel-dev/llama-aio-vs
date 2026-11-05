@@ -90,6 +90,11 @@ export interface ModelState {
   requestSettings: RequestSettings;
   modelMaxContext?: number;
   modelCapabilities?: ModelCapabilities;
+  /**
+   * 1 once `mainGpu` / `tensorSplit` were re-pointed from the pre-fix GPU
+   * order (lspci "RX 9050 / 9060 XT" names left a card unmatched and last).
+   */
+  gpuOrderRevision?: number;
 }
 
 export interface AppConfig {
@@ -225,6 +230,7 @@ export function normalizeConfig(raw: Partial<AppConfig> | undefined): AppConfig 
       requestSettings: normalizeRequestSettings(state.requestSettings),
       modelMaxContext: state.modelCapabilities?.maxContextLength ?? state.modelMaxContext,
       modelCapabilities: state.modelCapabilities,
+      ...(typeof state.gpuOrderRevision === "number" ? { gpuOrderRevision: state.gpuOrderRevision } : {}),
     },
   };
 }

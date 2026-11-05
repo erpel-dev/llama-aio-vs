@@ -25,6 +25,7 @@ export {
   effectiveTensorSplitShares,
   tensorSplitSharesEqual,
   isLegacyGpu0FirstSplit,
+  remapLegacyGpuOrder,
 } from "./gpuSplit";
 
 export type { ModelCapabilities };

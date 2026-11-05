@@ -93,6 +93,28 @@ describe("ConfigFile", () => {
     assert.deepEqual(saved.app.server.plainHttpConfirmed, ["http://example.invalid"]);
   });
 
+  it("re-points a saved main GPU and split from the pre-fix GPU order once", async (t) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "llama-config-gpuorder-"));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const file = path.join(dir, "config.json");
+    const store = new SettingsStore(new ConfigFile(file));
+    await store.updateLoadSettings({ mainGpu: 0, tensorSplit: "90,10", splitMode: "none" });
+    const gpus = [
+      { totalBytes: 16e9, source: "sysfs:card0", legacyIndex: 1 },
+      { totalBytes: 16e9, source: "sysfs:card1", legacyIndex: 0 },
+    ];
+    assert.equal(await store.migrateLegacyGpuOrder(gpus), true);
+    let load = new SettingsStore(new ConfigFile(file)).getState().loadSettings;
+    assert.equal(load.mainGpu, 1);
+    assert.equal(load.tensorSplit, "10,90");
+    // The user's later choice in the new order is never remapped again.
+    await store.updateLoadSettings({ mainGpu: 0 });
+    assert.equal(await new SettingsStore(new ConfigFile(file)).migrateLegacyGpuOrder(gpus), false);
+    load = new SettingsStore(new ConfigFile(file)).getState().loadSettings;
+    assert.equal(load.mainGpu, 0);
+    assert.equal(new ConfigFile(file).get().state.gpuOrderRevision, 1);
+  });
+
   it("recovers an abandoned lock and releases a lock after a failed write", async (t) => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "llama-config-lock-"));
     t.after(() => fs.rmSync(dir, { recursive: true, force: true }));

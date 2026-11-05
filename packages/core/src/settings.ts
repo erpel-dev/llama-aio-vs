@@ -11,7 +11,8 @@ import {
 import { isLoopbackHost, isWildcardHost, urlHostname } from "./serverHttp";
 import { Event } from "./events";
 import { clampLoadSettingsToModel, isQwen4expArchitecture, readModelCapabilities } from "./ggufMetadata";
-import { detectGpusAsync } from "./gpuInfo";
+import { detectGpusAsync, type GpuMemoryInfo } from "./gpuInfo";
+import { remapLegacyGpuOrder } from "./gpuSplit";
 import { LlamaInstaller } from "./llamaInstaller";
 import { resolveMmprojPath, resolveMtpDraftPath, findSiblingMtpDraft, isMtpSidecarFile } from "./modelLibrary";
 import { recommendLoadSettings } from "./recommendSettings";
@@ -343,6 +344,34 @@ export class SettingsStore {
     await this.getConfig().update("host", "127.0.0.1");
     await this.updateServer({ mode: "remote", remoteUrl, remoteLabel: "" });
     return remoteUrl;
+  }
+
+  /**
+   * Once per config: re-point a saved main GPU / tensor split from the
+   * pre-fix GPU order (an lspci "RX 9050 / 9060 XT" card used to sort last
+   * without a llama.cpp id) so it still names the same physical cards.
+   * Returns true when settings changed.
+   */
+  async migrateLegacyGpuOrder(gpus: GpuMemoryInfo[]): Promise<boolean> {
+    if (gpus.length < 2 || !gpus.every((g) => g.legacyIndex !== undefined)) {
+      return false;
+    }
+    if ((this.config.getState().gpuOrderRevision ?? 0) >= 1) {
+      return false;
+    }
+    let changed = false;
+    await this.config.updateState((raw) => {
+      if ((raw.gpuOrderRevision ?? 0) >= 1) {
+        return {};
+      }
+      const load = raw.loadSettings;
+      const remapped = remapLegacyGpuOrder(load, gpus);
+      changed = !!remapped;
+      return remapped
+        ? { gpuOrderRevision: 1, loadSettings: { ...load, ...remapped } }
+        : { gpuOrderRevision: 1 };
+    });
+    return changed;
   }
 
   /** Put `host` back after the user chose Undo on the migration toast. */

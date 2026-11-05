@@ -792,7 +792,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       return [];
     }
     // Async: nvidia-smi / rocm-smi / --list-devices must not block the extension host.
-    return detectGpusAsync(false, this.processManager.resolveBinary());
+    const gpus = await detectGpusAsync(false, this.processManager.resolveBinary());
+    // A saved main GPU / split from the pre-fix GPU order: keep it on the same cards.
+    await this.processManager.migrateLegacyGpuOrder(gpus);
+    return gpus;
   }
 
   /**

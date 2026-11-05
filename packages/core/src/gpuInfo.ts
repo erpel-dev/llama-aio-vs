@@ -41,6 +41,12 @@ export interface GpuMemoryInfo {
   visVramTotalBytes?: number;
   /** Used part of the visible VRAM window (`mem_info_vis_vram_used`). */
   visVramUsedBytes?: number;
+  /**
+   * Position this card had before lspci slash names ("RX 9050 / 9060 XT")
+   * were matched to llama.cpp devices. Set on every card only when that old
+   * order differs, so saved `mainGpu` / `tensorSplit` can be re-pointed once.
+   */
+  legacyIndex?: number;
 }
 
 export interface LlamaListedDevice {
@@ -603,6 +609,44 @@ export function gpuModelTokens(name: string): string[] {
   return [...new Set(tokens)];
 }
 
+/** The matcher before slash names were read: first model number only. */
+function legacyGpuModelTokens(name: string): string[] {
+  const n = (name || "").toLowerCase();
+  const tokens: string[] = [];
+  let m: RegExpExecArray | null;
+  const rx = /rx\s*(\d{3,4})/gi;
+  while ((m = rx.exec(n))) {
+    tokens.push(`rx${m[1]}`);
+  }
+  const nv = /(rtx|gtx)\s*(\d{3,4})/gi;
+  while ((m = nv.exec(n))) {
+    tokens.push(`${m[1]}${m[2]}`);
+  }
+  const arc = /arc\s+([a-z]?\d{3,4})/gi;
+  while ((m = arc.exec(n))) {
+    tokens.push(`arc${m[1]}`);
+  }
+  return [...new Set(tokens)];
+}
+
+/**
+ * lspci names a PCI id shared by several SKUs ("Radeon RX 9070/9070 XT/9070 GRE",
+ * "RX 9050 / 9060 XT"); the driver name llama.cpp lists is the exact card.
+ * Keep a specific sysfs name; take the listed one (minus "(RADV GFX1201)")
+ * over a driver placeholder or a multi-SKU list.
+ */
+function preferListedGpuName(sysfsName: string | undefined, listedName: string): string {
+  const own = (sysfsName || "").trim();
+  const listed = listedName.replace(/\s*\([^)]*\)\s*/g, " ").replace(/\s+/g, " ").trim();
+  if (!own || /^(amdgpu|nvidia|i915|xe)$/i.test(own)) {
+    return listed || own;
+  }
+  if (own.includes("/") && listed && !listed.includes("/") && gpuModelTokens(listed).length) {
+    return listed;
+  }
+  return own;
+}
+
 /**
  * Reorder sysfs/PCI GPUs to llama.cpp `--list-devices` order and attach
  * `Vulkan0` / `CUDA0` ids. Unmatched cards keep PCI order at the end.
@@ -614,12 +658,30 @@ export function orderGpusLikeLlama(
   if (!devices.length || !gpus.length) {
     return gpus;
   }
+  const from: number[] = [];
+  const legacyFrom: number[] = [];
+  const ordered = matchGpusToDevices(gpus, devices, gpuModelTokens, from);
+  matchGpusToDevices(gpus, devices, legacyGpuModelTokens, legacyFrom);
+  const legacyPos = from.map((input) => legacyFrom.indexOf(input));
+  if (legacyPos.some((p) => p < 0) || legacyPos.every((p, i) => p === i)) {
+    return ordered;
+  }
+  return ordered.map((g, i) => ({ ...g, legacyIndex: legacyPos[i] }));
+}
+
+function matchGpusToDevices(
+  gpus: GpuMemoryInfo[],
+  devices: LlamaListedDevice[],
+  tokenize: (name: string) => string[],
+  from: number[] = []
+): GpuMemoryInfo[] {
   const unused = [...gpus];
+  const unusedFrom = gpus.map((_, i) => i);
   const ordered: GpuMemoryInfo[] = [];
   for (const dev of devices) {
-    const tokens = gpuModelTokens(dev.name);
+    const tokens = tokenize(dev.name);
     let idx = tokens.length
-      ? unused.findIndex((g) => gpuModelTokens(g.name || "").some((t) => tokens.includes(t)))
+      ? unused.findIndex((g) => tokenize(g.name || "").some((t) => tokens.includes(t)))
       : -1;
     if (idx < 0) {
       // Positional fallback is only safe for a card we cannot identify at all
@@ -627,13 +689,14 @@ export function orderGpusLikeLlama(
       // *different* model number would attach this `VulkanN` id — and with it
       // `--main-gpu` / `--tensor-split` and the VRAM total — to the wrong
       // physical device, which reads as "the small card is idle".
-      const unidentifiable = unused.findIndex((g) => gpuModelTokens(g.name || "").length === 0);
+      const unidentifiable = unused.findIndex((g) => tokenize(g.name || "").length === 0);
       idx = unidentifiable;
     }
     if (idx < 0) {
       continue;
     }
     const g = unused.splice(idx, 1)[0];
+    const src = unusedFrom.splice(idx, 1)[0]!;
     if (!g) {
       continue;
     }
@@ -649,10 +712,11 @@ export function orderGpusLikeLlama(
     const sharedIgpu =
       g.source === "wmi" && !upgradeCapped && listedTotal > sysfsTotal &&
       isIntegratedGpu({ ...g, llamaDeviceId: dev.id, name: g.name || dev.name });
+    from.push(src);
     ordered.push({
       ...g,
       ...(sharedIgpu ? { gttTotalBytes: listedTotal } : {}),
-      name: g.name && !/^(amdgpu|nvidia|i915|xe)$/i.test(g.name.trim()) ? g.name : dev.name,
+      name: preferListedGpuName(g.name, dev.name),
       // `||` would take a 0 MiB `--list-devices` reading over a good sysfs total.
       totalBytes: upgradeCapped ? listedTotal : sysfsTotal || listedTotal,
       usedBytes: dev.usedBytes ?? g.usedBytes,
@@ -661,9 +725,10 @@ export function orderGpusLikeLlama(
       source: upgradeCapped ? "wmi+list-devices" : g.source,
     });
   }
-  for (const g of unused) {
+  unused.forEach((g, i) => {
+    from.push(unusedFrom[i]!);
     ordered.push({ ...g, index: ordered.length });
-  }
+  });
   return ordered;
 }
 

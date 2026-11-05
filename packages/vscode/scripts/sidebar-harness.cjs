@@ -179,6 +179,15 @@ const store = {
   updateRequestSettings: async (p) => {
     state = { ...state, requestSettings: { ...state.requestSettings, ...p } };
   },
+  // In-memory twin of SettingsStore.migrateLegacyGpuOrder (never writes the real config).
+  migrateLegacyGpuOrder: async (gpus) => {
+    if (state.gpuOrderRevision >= 1 || gpus.length < 2 || !gpus.every((g) => g.legacyIndex !== undefined)) {
+      return false;
+    }
+    const remapped = core.remapLegacyGpuOrder(state.loadSettings, gpus);
+    state = { ...state, gpuOrderRevision: 1, loadSettings: { ...state.loadSettings, ...(remapped || {}) } };
+    return !!remapped;
+  },
   applySelectedModel: async (p) => {
     const prev = state.selectedModelPath;
     state = { ...state, selectedModelPath: p, modelCapabilities: core.readModelCapabilities(p) };
@@ -219,6 +228,17 @@ const sameConfig = () =>
   launched.modelPath === state.selectedModelPath;
 
 const processManager = {
+  // Like ProcessManager: the running server's launch settings move with the saved ones.
+  migrateLegacyGpuOrder: async (gpus) => {
+    if (!(await store.migrateLegacyGpuOrder(gpus))) {
+      return false;
+    }
+    const remapped = core.remapLegacyGpuOrder(launched.loadSettings, gpus);
+    if (remapped) {
+      launched = { ...launched, loadSettings: { ...launched.loadSettings, ...remapped } };
+    }
+    return true;
+  },
   refreshStatus: async () => processManager.getStatus(),
   getStatus: () =>
     remoteMode

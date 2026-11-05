@@ -580,3 +580,30 @@ export function layerAwareWeightShares(
   }
   return mass.map((m) => m / tot);
 }
+
+/**
+ * Re-point a saved `mainGpu` / `tensorSplit` from the pre-fix GPU order to
+ * the current one, so they still name the same physical cards. Uses
+ * `legacyIndex` from detection; undefined when nothing needs to change.
+ */
+export function remapLegacyGpuOrder(
+  settings: { mainGpu: number; tensorSplit: string },
+  gpus: ReadonlyArray<{ legacyIndex?: number }>
+): { mainGpu: number; tensorSplit: string } | undefined {
+  const n = gpus.length;
+  const legacy = gpus.map((g) => g.legacyIndex);
+  if (n < 2 || legacy.some((p) => p === undefined || p < 0 || p >= n) || new Set(legacy).size !== n) {
+    return undefined;
+  }
+  const newIndexOfLegacy = new Map(legacy.map((p, i) => [p as number, i]));
+  const mainGpu = newIndexOfLegacy.get(settings.mainGpu) ?? settings.mainGpu;
+  const parts = parseTensorSplit(settings.tensorSplit);
+  let tensorSplit = settings.tensorSplit;
+  if (parts.length === n) {
+    tensorSplit = gpus.map((_, i) => parts[legacy[i] as number]).join(",");
+  }
+  if (mainGpu === settings.mainGpu && tensorSplit === settings.tensorSplit) {
+    return undefined;
+  }
+  return { mainGpu, tensorSplit };
+}

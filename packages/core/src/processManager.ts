@@ -20,7 +20,8 @@ import {
   type LaunchMode,
 } from "./externalTerminal";
 import { clampLoadSettingsToModel, readModelCapabilities } from "./ggufMetadata";
-import { detectGpus, detectGpusAsync } from "./gpuInfo";
+import { detectGpus, detectGpusAsync, type GpuMemoryInfo } from "./gpuInfo";
+import { remapLegacyGpuOrder } from "./gpuSplit";
 import { envForInstalledBinary, LlamaInstaller } from "./llamaInstaller";
 import {
   hasUsableFhsDynamicLinker,
@@ -530,6 +531,30 @@ export class ProcessManager {
     return serverConfigFingerprint(model, loadSettings, launchMode);
   }
 
+  /**
+   * Once per config: re-point the saved main GPU / tensor split from the
+   * pre-fix GPU order, and the running server's recorded launch settings with
+   * it, so a server already on those cards does not read as "changes not applied".
+   */
+  async migrateLegacyGpuOrder(gpus: GpuMemoryInfo[]): Promise<boolean> {
+    if (!(await this.store.migrateLegacyGpuOrder(gpus))) {
+      return false;
+    }
+    const lock = this.readLock();
+    const remapped = lock?.loadSettings ? remapLegacyGpuOrder(lock.loadSettings, gpus) : undefined;
+    if (lock?.loadSettings && remapped && this.lockPidIsOurs(lock)) {
+      const loadSettings = { ...lock.loadSettings, ...remapped };
+      this.writeLock({
+        ...lock,
+        loadSettings,
+        configFingerprint: lock.configFingerprint
+          ? serverConfigFingerprint(lock.modelPath, loadSettings, lock.launchMode)
+          : undefined,
+      });
+    }
+    return true;
+  }
+
   /** What the running server was launched with, or undefined when none of ours is up. */
   getLaunchedConfig(): LaunchedConfig | undefined {
     const lock = this.readLock();
@@ -821,6 +846,10 @@ export class ProcessManager {
       loadSettings = normalizeLoadSettingsForCpuBackend(loadSettings);
     }
     const gpus = this.isCpuBackend() ? [] : await detectGpusAsync(false, binary);
+    if (await this.migrateLegacyGpuOrder(gpus)) {
+      const migrated = this.store.getState().loadSettings;
+      loadSettings = { ...loadSettings, mainGpu: migrated.mainGpu, tensorSplit: migrated.tensorSplit };
+    }
     const features = await probeLlamaServerFeatures(launch);
     const args = buildServerArgs(model, host, port, loadSettings, {
       gpus,
