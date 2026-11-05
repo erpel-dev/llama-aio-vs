@@ -181,12 +181,17 @@ const store = {
   },
   // In-memory twin of SettingsStore.migrateLegacyGpuOrder (never writes the real config).
   migrateLegacyGpuOrder: async (gpus) => {
-    if (state.gpuOrderRevision >= 1 || gpus.length < 2 || !gpus.every((g) => g.legacyIndex !== undefined)) {
+    if (state.gpuOrderRevision >= 1 || gpus.length < 2 || !gpus.every((g) => g.llamaDeviceId)) {
       return false;
     }
-    const remapped = core.remapLegacyGpuOrder(state.loadSettings, gpus);
-    state = { ...state, gpuOrderRevision: 1, loadSettings: { ...state.loadSettings, ...(remapped || {}) } };
-    return !!remapped;
+    const L = state.loadSettings;
+    let patch = gpus.every((g) => g.legacyIndex !== undefined) ? core.remapLegacyGpuOrder(L, gpus) : undefined;
+    if (!patch && (L.mainGpu || 0) === 0 && core.parseTensorSplit(L.tensorSplit).length < 2) {
+      const best = core.preferredMainGpu(gpus);
+      patch = best > 0 ? { mainGpu: best } : undefined;
+    }
+    state = { ...state, gpuOrderRevision: 1, loadSettings: { ...L, ...(patch || {}) } };
+    return !!patch;
   },
   applySelectedModel: async (p) => {
     const prev = state.selectedModelPath;

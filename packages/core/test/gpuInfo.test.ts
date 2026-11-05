@@ -11,6 +11,7 @@ import {
   parseWindowsGpuRegistry,
   parseWindowsWmiVideoControllers,
   preferStableGpuList,
+  preferredMainGpu,
   resolveWindowsGpuList,
   windowsVramNeedsRegistry,
   type GpuMemoryInfo,
@@ -373,5 +374,28 @@ describe("preferStableGpuList capped fallback", () => {
     ];
     const kept = preferStableGpuList(next, previous);
     assert.equal(kept[0]?.totalBytes, 24 * GiB);
+  });
+});
+
+describe("preferredMainGpu", () => {
+  const G = 1024 ** 3;
+  const gpu = (name: string, totalBytes: number, usedBytes = 0): GpuMemoryInfo => ({ name, totalBytes, usedBytes, source: "test" });
+
+  it("picks the higher model of one generation (RX 9070 XT over 9060 XT, ~2x measured)", () => {
+    assert.equal(preferredMainGpu([gpu("AMD Radeon RX 9060 XT", 16 * G, 1.4 * G), gpu("AMD Radeon RX 9070 XT", 16 * G)]), 1);
+    assert.equal(preferredMainGpu([gpu("Radeon RX 9050 / 9060 XT", 16 * G), gpu("Radeon RX 9070/9070 XT/9070 GRE", 16 * G)]), 1);
+    assert.equal(preferredMainGpu([gpu("NVIDIA GeForce RTX 4060 Ti", 16 * G), gpu("NVIDIA GeForce RTX 4080", 16 * G)]), 1);
+    assert.equal(preferredMainGpu([gpu("AMD Radeon RX 7900 GRE", 16 * G), gpu("AMD Radeon RX 7600 XT", 16 * G)]), 0);
+  });
+
+  it("prefers more VRAM, and does not rank across generations", () => {
+    assert.equal(preferredMainGpu([gpu("NVIDIA GeForce RTX 4060", 8 * G), gpu("NVIDIA GeForce RTX 3090", 24 * G)]), 1);
+    // RTX 3080 vs 4070 at equal VRAM: unknown order → the idle card wins, else keep 0.
+    assert.equal(preferredMainGpu([gpu("NVIDIA GeForce RTX 4070", 12 * G), gpu("NVIDIA GeForce RTX 3080", 12 * G)]), 0);
+    assert.equal(preferredMainGpu([gpu("NVIDIA GeForce RTX 4070", 12 * G, 2 * G), gpu("NVIDIA GeForce RTX 3080", 12 * G)]), 1);
+  });
+
+  it("keeps 0 for one card", () => {
+    assert.equal(preferredMainGpu([gpu("AMD Radeon RX 9070 XT", 16 * G)]), 0);
   });
 });

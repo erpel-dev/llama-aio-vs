@@ -1023,3 +1023,54 @@ export function detectGpuMemory(force = false): GpuMemoryInfo | undefined {
   }
   return gpus.reduce((best, g) => (g.totalBytes > best.totalBytes ? g : best));
 }
+
+/**
+ * Best default main GPU for a multi-GPU machine (index into `gpus`), or 0.
+ * Discrete over integrated; then more VRAM (within 5%); then, for two cards
+ * of the same series and generation, the higher model number (RX 9070 >
+ * RX 9060: ~2x on an RX 9070 XT + 9060 XT pair); then the card with less VRAM
+ * already in use (usually not the one driving the display).
+ */
+export function preferredMainGpu(gpus: ReadonlyArray<GpuMemoryInfo>): number {
+  if (gpus.length < 2) {
+    return 0;
+  }
+  const series = (g: GpuMemoryInfo): { prefix: string; num: number } | undefined => {
+    const t = gpuModelTokens(g.name || "")
+      .map((tok) => /^([a-z]+)(\d+)$/.exec(tok))
+      .filter((m): m is RegExpExecArray => !!m);
+    // A multi-SKU name ("RX 9050 / 9060 XT") is rated by its highest number.
+    const best = t.sort((a, b) => Number(b[2]) - Number(a[2]))[0];
+    return best ? { prefix: best[1]!, num: Number(best[2]) } : undefined;
+  };
+  const better = (a: GpuMemoryInfo, b: GpuMemoryInfo): boolean => {
+    const ia = isIntegratedGpu(a);
+    const ib = isIntegratedGpu(b);
+    if (ia !== ib) {
+      return ib;
+    }
+    const va = a.totalBytes || 0;
+    const vb = b.totalBytes || 0;
+    if (Math.abs(va - vb) > 0.05 * Math.max(va, vb)) {
+      return va > vb;
+    }
+    const sa = series(a);
+    const sb = series(b);
+    if (sa && sb && sa.prefix === sb.prefix && String(sa.num).length === String(sb.num).length) {
+      // Generation: RX 9xxx / 7xxx → first digit; RTX 40xx / 50xx → first two.
+      const gen = (n: number): string =>
+        String(n).slice(0, sa.prefix !== "rx" && String(n).length >= 4 ? 2 : 1);
+      if (gen(sa.num) === gen(sb.num) && sa.num !== sb.num) {
+        return sa.num > sb.num;
+      }
+    }
+    return (a.usedBytes ?? 0) < (b.usedBytes ?? 0) - 256 * 1024 ** 2;
+  };
+  let best = 0;
+  for (let i = 1; i < gpus.length; i++) {
+    if (better(gpus[i]!, gpus[best]!)) {
+      best = i;
+    }
+  }
+  return best;
+}
