@@ -17,10 +17,20 @@ export function perfTargetKey(store: SettingsStore, processManager: ProcessManag
   return launched?.modelPath ? `local|${endpoint}|${path.resolve(launched.modelPath)}` : undefined;
 }
 
-/** Point `perf` at the current target when one is serving. */
+/**
+ * Point `perf` at the current target when one is serving. Switching between
+ * this machine and a remote server always starts fresh, even while nothing
+ * serves yet, so one side's numbers never show on the other.
+ */
 export function syncPerfTarget(perf: PerfStats, store: SettingsStore, processManager: ProcessManager): void {
   const key = perfTargetKey(store, processManager);
   if (key !== undefined) {
     perf.setTarget(key);
+    return;
+  }
+  const mode = store.isRemote() ? "remote" : "local";
+  const current = perf.getTarget();
+  if (current !== undefined && !current.startsWith(mode + "|")) {
+    perf.setTarget(`${mode}|${store.getEndpoint()}|`);
   }
 }

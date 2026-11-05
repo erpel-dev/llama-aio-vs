@@ -336,6 +336,7 @@ const perf = {
   hasLastResponseTrace: () => true,
   setSpeculativeMode() {},
   setTarget() {},
+  getTarget() { return undefined; },
   formatLastRequestContext: () => "",
   formatLastResponseTrace: () => "",
 };

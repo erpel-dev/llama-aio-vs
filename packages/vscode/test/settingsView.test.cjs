@@ -216,7 +216,7 @@ function setup(loadOverrides = {}, remoteInfo, serverFeatures = core.NO_SERVER_F
     peekUpdateCheck: () => ({ pending: false }),
     getUpdateCheck: async () => ({ pending: false }),
   };
-  const perf = { get: () => ({}), detailLines: () => [], hasLastRequestContext: () => false, hasLastResponseTrace: () => false, setSpeculativeMode() {}, setTarget() {} };
+  const perf = { get: () => ({}), detailLines: () => [], hasLastRequestContext: () => false, hasLastResponseTrace: () => false, setSpeculativeMode() {}, setTarget() {}, getTarget() { return undefined; } };
   const posted = [];
   let handler;
   const provider = new SettingsViewProvider(
