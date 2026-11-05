@@ -236,6 +236,23 @@ describe("recommendLoadSettings", () => {
       assert.equal(r.physicalBatchSize, 512);
     });
 
+    it("raises -ub for an MoE model that fits in GTT", () => {
+      // Groot 19B-A3B / Mellum 12B-A2.5B on Vega: -ub 1024 read prompts 8-11% faster.
+      const moe = moeCaps({
+        fileSizeBytes: 7.5 * GiB,
+        blockCount: 28,
+        embeddingLength: 2048,
+        attentionHeadCount: 16,
+        attentionHeadCountKv: 4,
+        expertCount: 64,
+        expertUsedCount: 8,
+      });
+      const r = recommendLoadSettings(loadSettings(), moe, { gpu: apu, gpus: [apu] });
+      assert.equal(r.gpuOffload, 99);
+      assert.equal(r.nCpuMoe, 0);
+      assert.equal(r.physicalBatchSize, 1024);
+    });
+
     it("tunes -ub like a discrete card when the APU has a large carve-out", () => {
       // Strix Halo with 96 GiB reserved for the GPU in the BIOS.
       const halo = { totalBytes: 96 * GiB, usedBytes: 0, name: "AMD Radeon(TM) 8060S Graphics", source: "test" };

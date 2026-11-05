@@ -162,10 +162,12 @@ function tuneBatchSizes(
     settings.gpuOffload >= 99 || settings.gpuOffload >= Math.max(1, caps.blockCount || 1);
   if (
     !gpu?.totalBytes ||
-    // Measured on Vega (Renoir/Cezanne): -ub 1024/2048 gives the same prefill
-    // as 512 while growing the compute buffer in shared RAM. An APU with a
-    // large BIOS carve-out (Strix Halo) is tuned like a discrete card.
-    (isIntegratedGpu(gpu) && gpu.totalBytes <= SMALL_CARVE_OUT_BYTES) ||
+    // Measured on Vega (Renoir/Cezanne): a dense model gets the same prefill
+    // at -ub 1024/2048 as at 512, while the compute buffer grows in shared
+    // RAM. MoE models gained 8-11% at 1024 (more tokens per expert), so they
+    // keep the raise. An APU with a large BIOS carve-out (Strix Halo) is tuned
+    // like a discrete card.
+    (isIntegratedGpu(gpu) && gpu.totalBytes <= SMALL_CARVE_OUT_BYTES && !caps.isMoe) ||
     !fullyOffloaded ||
     settings.nCpuMoe > 0 ||
     settings.nCpuFfn > 0 ||
