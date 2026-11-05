@@ -80,6 +80,11 @@ export interface ModelCapabilities {
   expertCount?: number;
   /** Experts used per token if present */
   expertUsedCount?: number;
+  /**
+   * Routed expert FFN width (`expert_feed_forward_length`). 0 on a MoE GGUF
+   * without the key, so stale-capability checks can tell "absent" from "not read".
+   */
+  expertFfnLength?: number;
   /** True when expert_count > 0 */
   isMoe: boolean;
   /** Default RoPE base from GGUF if present */
@@ -926,6 +931,7 @@ function readModelCapabilitiesUncached(filePath: string): ModelCapabilities {
   }
   const expertCount = pickArchNumber("expert_count");
   const expertUsedCount = pickArchNumber("expert_used_count");
+  const expertFfnLength = expertCount && expertCount > 0 ? pickArchNumber("expert_feed_forward_length") ?? 0 : undefined;
   const ropeFreqBase = pickArchNumber("rope.freq_base");
   const nextnPredictLayers = pickArchNumber("nextn_predict_layers");
   // Recurrent-state geometry (Mamba-style SSM / gated delta net). Absent on
@@ -990,6 +996,7 @@ function readModelCapabilitiesUncached(filePath: string): ModelCapabilities {
     pleShare,
     expertCount,
     expertUsedCount,
+    expertFfnLength,
     isMoe,
     ropeFreqBase,
     nextnPredictLayers,
