@@ -56,17 +56,19 @@ ${deviceCheck}
 process.stderr.write(${JSON.stringify(help)});
 `);
     const result = await Promise.all(Array.from({ length: 5 }, () => probeLlamaServerFeatures(launch)));
-    result.forEach((f) => assert.deepEqual(f, all));
-    assert.deepEqual(probeLlamaServerFeaturesSync(launch), all);
+    // The fake binary lists CUDA0, so probes also report the backend.
+    const probed = { ...all, gpuBackend: "cuda" };
+    result.forEach((f) => assert.deepEqual(f, probed));
+    assert.deepEqual(probeLlamaServerFeaturesSync(launch), probed);
     assert.equal(fs.readFileSync(script + ".calls", "utf8"), "xx", "one help and one GPU check, shared by all callers");
     result[0].moeCache = false;
-    assert.deepEqual(await probeLlamaServerFeatures(launch), all, "callers cannot mutate the cached result");
+    assert.deepEqual(await probeLlamaServerFeatures(launch), probed, "callers cannot mutate the cached result");
   });
   it("detects both upgrades/backports and downgrades at the same binary path", async (t) => {
     const { script, launch } = fake(t, `process.stdout.write('--ctx-size N');`);
     assert.deepEqual(await probeLlamaServerFeatures(launch), { ...NO_SERVER_FEATURES, probed: true });
     fs.writeFileSync(script, deviceCheck + `process.stdout.write(${JSON.stringify(help)});`);
-    assert.deepEqual(probeLlamaServerFeaturesSync(launch), all);
+    assert.deepEqual(probeLlamaServerFeaturesSync(launch), { ...all, gpuBackend: "cuda" });
     fs.writeFileSync(script, `process.stdout.write('--threads N');`);
     assert.deepEqual(await probeLlamaServerFeatures(launch), { ...NO_SERVER_FEATURES, probed: true });
   });

@@ -43,6 +43,29 @@ describe("recommendLoadSettings", () => {
     assert.ok(r.nCpuMoe > 0);
   });
 
+  it("uses a big ubatch when experts run from system RAM", () => {
+    // Each ubatch re-copies the CPU experts to the GPU: 8 GB RX 9060 XT
+    // measured Groot 19B 143 → 531 tok/s prompt going -ub 512 → 4096.
+    const plain = recommendLoadSettings(loadSettings(), moeCaps(), { gpu: gpu(16) });
+    assert.ok(plain.nCpuMoe > 0);
+    // This test model is wide (5120 hidden): 4096 costs too much, 2048 fits.
+    assert.equal(plain.physicalBatchSize, 2048);
+    assert.ok(plain.evalBatchSize >= plain.physicalBatchSize);
+    const est = estimateMemory(moeCaps(), plain, gpu(16));
+    assert.ok(est!.totalGpuBytes < 16 * GiB - 1.5 * GiB, "still inside the normal headroom");
+    // A narrower MoE affords 4096.
+    const narrow = recommendLoadSettings(loadSettings(), moeCaps({ embeddingLength: 2048 }), { gpu: gpu(14) });
+    assert.ok(narrow.nCpuMoe > 0);
+    assert.equal(narrow.physicalBatchSize, 4096);
+    // Every expert layer already on the CPU and still no room: keep the default.
+    const full = recommendLoadSettings(loadSettings(), moeCaps(), { gpu: gpu(12) });
+    assert.equal(full.physicalBatchSize, 512);
+    // When the model fits on the card, the fully-GPU path keeps its own -ub.
+    const fits = recommendLoadSettings(loadSettings(), moeCaps(), { gpu: gpu(80) });
+    assert.equal(fits.nCpuMoe, 0);
+    assert.ok(fits.physicalBatchSize <= 1024);
+  });
+
   it("raises --n-cpu-ffn before dropping layers for dense models when it fits", () => {
     // 24 GiB card: full model + KV (~25 GiB) does not fit; FFN-on-CPU does.
     const caps = denseCaps({ ffnLength: 13824 });

@@ -145,12 +145,62 @@ const SMALL_CARVE_OUT_BYTES = 2 * GiB;
 const FAST_PREFILL_UBATCH = 1024;
 /** Extra VRAM (beyond the normal headroom) required before raising -ub. */
 const UBATCH_EXTRA_HEADROOM = 1 * GiB;
+/**
+ * Physical batch when MoE experts / FFN run from system RAM. llama.cpp copies
+ * those weights to the GPU once per ubatch for prompt processing, so a big
+ * ubatch amortizes the copy. Measured on an 8 GB RX 9060 XT (Ryzen 5700X3D,
+ * 5.7–7.7k prompt): flint 24 GB 54 → 230 tok/s and Groot 19B 143 → 560 tok/s
+ * going 512 → 4096, generation unchanged (±1%). 8192 gained more prompt speed
+ * but its compute buffer pushed Groot over the card.
+ */
+const CPU_EXPERT_PREFILL_UBATCH = 4096;
+/**
+ * Extra `--n-cpu-moe` layers worth trading for a bigger ubatch. Groot 19B on
+ * 8 GB: -ub 4096 with 3 more CPU layers ran prompts 3.7x faster (143 → 531
+ * tok/s) for −6% generation; 6 more layers cost −11%.
+ */
+const CPU_EXPERT_UBATCH_MAX_EXTRA_LAYERS = 3;
 
 /**
  * Agent prompts are prefill-heavy, so a larger physical batch (-ub) is the main
  * lever on time-to-first-token — but only when the whole model is on the GPU and
  * there is room to spare. Partial offload is CPU-bound anyway.
  */
+/**
+ * Experts in system RAM: raise -ub (and -b) to {@link CPU_EXPERT_PREFILL_UBATCH}
+ * (else half of it) for ~3–4x prompt speed, moving at most
+ * {@link CPU_EXPERT_UBATCH_MAX_EXTRA_LAYERS} more expert layers to the CPU
+ * to pay for the larger compute buffer. Multi-GPU keeps its fitted split and
+ * only takes the bigger batch when it fits as is.
+ */
+function tuneCpuExpertBatch(
+  settings: LlamaLoadSettings,
+  caps: ModelCapabilities,
+  gpu: GpuMemoryInfo,
+  gpus: GpuMemoryInfo[],
+  headroom: number
+): LlamaLoadSettings {
+  const nLayers = Math.max(1, caps.blockCount || 1);
+  const maxExtra = caps.isMoe && settings.nCpuMoe > 0 && gpus.length < 2 ? CPU_EXPERT_UBATCH_MAX_EXTRA_LAYERS : 0;
+  for (const ubatch of [CPU_EXPERT_PREFILL_UBATCH, CPU_EXPERT_PREFILL_UBATCH / 2]) {
+    if (ubatch <= settings.physicalBatchSize) {
+      break;
+    }
+    for (let extra = 0; extra <= maxExtra; extra++) {
+      const candidate: LlamaLoadSettings = {
+        ...settings,
+        physicalBatchSize: ubatch,
+        evalBatchSize: Math.max(settings.evalBatchSize, ubatch),
+        nCpuMoe: Math.min(nLayers, settings.nCpuMoe + extra),
+      };
+      if (fitsHeadroom(caps, candidate, gpu, false, headroom, gpus)) {
+        return candidate;
+      }
+    }
+  }
+  return settings;
+}
+
 function tuneBatchSizes(
   settings: LlamaLoadSettings,
   caps: ModelCapabilities,
@@ -160,6 +210,14 @@ function tuneBatchSizes(
 ): LlamaLoadSettings {
   const fullyOffloaded =
     settings.gpuOffload >= 99 || settings.gpuOffload >= Math.max(1, caps.blockCount || 1);
+  if (
+    gpu?.totalBytes &&
+    fullyOffloaded &&
+    (settings.nCpuMoe > 0 || settings.nCpuFfn > 0) &&
+    settings.physicalBatchSize < CPU_EXPERT_PREFILL_UBATCH
+  ) {
+    return tuneCpuExpertBatch(settings, caps, gpu, gpus, headroom);
+  }
   if (
     !gpu?.totalBytes ||
     // Measured on Vega (Renoir/Cezanne): -ub 1024/2048 gives the same prefill

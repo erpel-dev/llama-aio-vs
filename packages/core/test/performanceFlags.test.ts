@@ -94,6 +94,11 @@ describe("guarded performance flags", () => {
     const requested = loadSettings({ speculativeMode: "mtp", nCpuMoe: 48, moeCacheMiB: 4096, draftBatchSize: 64 });
     assert.equal(performanceFeatureNotes(requested, NO_SERVER_FEATURES, caps).length, 3);
     assert.deepEqual(performanceFeatureNotes(requested, features, caps), []);
+    // An active cache on Vulkan gets the measured warning; other backends do not.
+    const vulkanNotes = performanceFeatureNotes(requested, { ...features, gpuBackend: "vulkan" }, caps);
+    assert.equal(vulkanNotes.length, 1);
+    assert.match(vulkanNotes[0]!, /slower on Vulkan/);
+    assert.deepEqual(performanceFeatureNotes(requested, { ...features, gpuBackend: "cuda" }, caps), []);
   });
 });
 
