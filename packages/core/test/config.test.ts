@@ -93,6 +93,62 @@ describe("ConfigFile", () => {
     assert.deepEqual(saved.app.server.plainHttpConfirmed, ["http://example.invalid"]);
   });
 
+  it("re-points a saved main GPU and split from the pre-fix GPU order once", async (t) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "llama-config-gpuorder-"));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const file = path.join(dir, "config.json");
+    const store = new SettingsStore(new ConfigFile(file));
+    await store.updateLoadSettings({ mainGpu: 0, tensorSplit: "90,10", splitMode: "none" });
+    const gpus = [
+      { totalBytes: 16e9, source: "sysfs:card0", llamaDeviceId: "Vulkan0", legacyIndex: 1 },
+      { totalBytes: 16e9, source: "sysfs:card1", llamaDeviceId: "Vulkan1", legacyIndex: 0 },
+    ];
+    assert.equal(await store.migrateLegacyGpuOrder(gpus), true);
+    let load = new SettingsStore(new ConfigFile(file)).getState().loadSettings;
+    assert.equal(load.mainGpu, 1);
+    assert.equal(load.tensorSplit, "10,90");
+    // The user's later choice in the new order is never remapped again.
+    await store.updateLoadSettings({ mainGpu: 0 });
+    assert.equal(await new SettingsStore(new ConfigFile(file)).migrateLegacyGpuOrder(gpus), false);
+    load = new SettingsStore(new ConfigFile(file)).getState().loadSettings;
+    assert.equal(load.mainGpu, 0);
+    assert.equal(new ConfigFile(file).get().state.gpuOrderRevision, 1);
+  });
+
+  it("starts a fresh two-GPU config on the stronger card, once", async (t) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "llama-config-maingpu-"));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const file = path.join(dir, "config.json");
+    const store = new SettingsStore(new ConfigFile(file));
+    const gpus = [
+      { totalBytes: 16e9, name: "AMD Radeon RX 9060 XT", source: "sysfs:card0", llamaDeviceId: "Vulkan0" },
+      { totalBytes: 16e9, name: "AMD Radeon RX 9070 XT", source: "sysfs:card1", llamaDeviceId: "Vulkan1" },
+    ];
+    // No llama.cpp ids yet (runtime not installed): the order is not final, wait.
+    assert.equal(await store.migrateLegacyGpuOrder(gpus.map((g) => ({ ...g, llamaDeviceId: undefined }))), false);
+    assert.equal(new ConfigFile(file).get().state.gpuOrderRevision, undefined);
+    assert.equal(await store.migrateLegacyGpuOrder(gpus), true);
+    assert.equal(store.getState().loadSettings.mainGpu, 1);
+    await store.updateLoadSettings({ mainGpu: 0 });
+    assert.equal(await store.migrateLegacyGpuOrder(gpus), false, "a later choice is the user's");
+    assert.equal(store.getState().loadSettings.mainGpu, 0);
+  });
+
+  it("keeps a saved split and main GPU when the order did not change", async (t) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "llama-config-keepsplit-"));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const file = path.join(dir, "config.json");
+    const store = new SettingsStore(new ConfigFile(file));
+    await store.updateLoadSettings({ mainGpu: 0, tensorSplit: "60,40" });
+    const gpus = [
+      { totalBytes: 16e9, name: "AMD Radeon RX 9060 XT", source: "sysfs:card0", llamaDeviceId: "Vulkan0" },
+      { totalBytes: 16e9, name: "AMD Radeon RX 9070 XT", source: "sysfs:card1", llamaDeviceId: "Vulkan1" },
+    ];
+    assert.equal(await store.migrateLegacyGpuOrder(gpus), false);
+    assert.equal(store.getState().loadSettings.mainGpu, 0);
+    assert.equal(store.getState().loadSettings.tensorSplit, "60,40");
+  });
+
   it("recovers an abandoned lock and releases a lock after a failed write", async (t) => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "llama-config-lock-"));
     t.after(() => fs.rmSync(dir, { recursive: true, force: true }));

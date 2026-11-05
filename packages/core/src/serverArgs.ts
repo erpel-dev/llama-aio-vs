@@ -429,6 +429,10 @@ export function performanceFeatureNotes(settings: LlamaLoadSettings, features: L
   if (settings.moeCacheMiB > 0) {
     if (!features.moeCache) notes.push("GPU expert cache is inactive: the binary must advertise --moe-cache-mib and expose a usable GPU backend.");
     else if (!moeCacheEligibleLayers(settings, caps)) notes.push("GPU expert cache is inactive: it requires CPU MoE experts in GPU-assigned layers and a split mode other than Tensor.");
+    // Measured on Vulkan (RX 9070 XT / 9060 XT, b12130): flint 24 GB with
+    // --n-cpu-moe 28 went 34.6 → 18.6 tok/s with a 2 GiB cache, while the
+    // same VRAM as 4 fewer CPU MoE layers gave 37.2 tok/s.
+    else if (features.gpuBackend === "vulkan") notes.push("GPU expert cache measured slower on Vulkan than spending the same VRAM on fewer CPU MoE layers (flint 24 GB: 34.6 → 18.6 tok/s with 2 GiB). Consider --moe-cache-mib 0 and a lower --n-cpu-moe.");
   }
   const neuralDraft = speculativeUsesMtp(settings.speculativeMode) ||
     (speculativeUsesDflash(settings.speculativeMode) && !!settings.draftModelPath);

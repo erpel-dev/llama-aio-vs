@@ -2889,7 +2889,7 @@ function syncPerformanceFeatureUi() {
   if (cacheHint) cacheHint.textContent = remote ? suffix : !f.moeCache
     ? 'Inactive: requires a compatible llama.cpp GPU build with a usable GPU device.' : !eligible
     ? 'Inactive: requires CPU MoE experts in GPU-assigned layers; Tensor split is unsupported.'
-    : '0 = off. Adds VRAM; host experts remain in RAM. Included in the memory estimate.';
+    : '0 = off. On Vulkan this measured slower than giving the same VRAM to fewer CPU MoE layers; prefer lowering CPU MoE first.';
   for (const [id, feature, hintId, help] of [
     ['draftSampling', 'draftSampling', 'draftSamplingHint', 'Auto: probabilistic for MTP when supported; DFlash keeps its default.'],
     ['draftBatchSize', 'draftUbatch', 'draftBatchHint', '0 = inherit the main physical batch size. Smaller can save draft VRAM.'],

@@ -11,6 +11,7 @@ import {
   heuristicDenseFfnShare,
   heuristicMoeExpertShare,
   isLinearRecurrentHybrid,
+  isQwen4expArchitecture,
   ModelCapabilities,
   readModelCapabilities,
 } from "./ggufMetadata";
@@ -1101,6 +1102,13 @@ export function estimateMemory(
   const computeBackend = inferComputeBackend(cpuOnly, gpusForBackend);
   const fullAttentionFraction = fullAttnLayers / nLayers;
   const rcoHeap = isLinearRecurrentHybrid(caps);
+  // The 2.5 GiB/card dual-GPU RADV reserve was measured on Flash-Next
+  // (qwen4exp). On a current llama.cpp Vulkan build, split flint 24 GB,
+  // Mellum 12B and Spark 4B (64k ctx, peak during a 29–39k prompt) showed none
+  // of it: estimates ran 6.4–7.2 GiB over and pushed flint onto
+  // `--n-cpu-moe 11` (20x slower prompts). Other architectures bill the
+  // compact 256 MiB, which still left those estimates 1.5–2.7 GiB high.
+  const compactHeap = rcoHeap || !isQwen4expArchitecture(caps.architecture);
   const splitAcrossGpus =
     onGpu > 0 && gpusForBackend.length >= 2 && settings.splitMode !== "none";
   const vulkanDeviceCount = onGpu <= 0 ? 0 : splitAcrossGpus ? gpusForBackend.length : 1;
@@ -1114,7 +1122,7 @@ export function estimateMemory(
       flashAttention: settings.flashAttention,
       fullAttentionFraction,
       discountRecurrentGraph: rcoHeap,
-      compactVulkanHeap: rcoHeap,
+      compactVulkanHeap: compactHeap,
       vulkanDeviceCount,
     }
   );
@@ -1125,7 +1133,7 @@ export function estimateMemory(
           caps.embeddingLength || 0,
           settings.physicalBatchSize,
           computeBackend,
-          rcoHeap
+          compactHeap
         )
       : 0;
   const cpuOverheadBytes = onGpu > 0 ? Math.round(overheadBytes * 0.15) : Math.round(overheadBytes * 0.5);

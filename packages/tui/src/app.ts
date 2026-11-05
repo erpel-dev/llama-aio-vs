@@ -1034,6 +1034,8 @@ export async function runApp(services: AppServices): Promise<void> {
     if (gpus.length < 2) {
       return;
     }
+    // A saved main GPU / split from the pre-fix GPU order: keep it on the same cards.
+    void services.processManager.migrateLegacyGpuOrder(gpus);
     const load = services.store.getState().loadSettings;
     if (!isLegacyGpu0FirstSplit(load.tensorSplit) || load.mainGpu <= 0) {
       return;

@@ -11,7 +11,8 @@ import {
 import { isLoopbackHost, isWildcardHost, urlHostname } from "./serverHttp";
 import { Event } from "./events";
 import { clampLoadSettingsToModel, isQwen4expArchitecture, readModelCapabilities } from "./ggufMetadata";
-import { detectGpusAsync } from "./gpuInfo";
+import { detectGpusAsync, preferredMainGpu, type GpuMemoryInfo } from "./gpuInfo";
+import { parseTensorSplit, remapLegacyGpuOrder } from "./gpuSplit";
 import { LlamaInstaller } from "./llamaInstaller";
 import { resolveMmprojPath, resolveMtpDraftPath, findSiblingMtpDraft, isMtpSidecarFile } from "./modelLibrary";
 import { recommendLoadSettings } from "./recommendSettings";
@@ -343,6 +344,42 @@ export class SettingsStore {
     await this.getConfig().update("host", "127.0.0.1");
     await this.updateServer({ mode: "remote", remoteUrl, remoteLabel: "" });
     return remoteUrl;
+  }
+
+  /**
+   * Once per config, on the first multi-GPU detection with llama.cpp ids:
+   * - re-point a saved main GPU / tensor split from the pre-fix GPU order (an
+   *   lspci "RX 9050 / 9060 XT" card used to sort last without an id), or
+   * - when the main GPU was never moved off the default (0, no split), start
+   *   on the strongest card ({@link preferredMainGpu}) instead of Vulkan0.
+   * Returns true when settings changed.
+   */
+  async migrateLegacyGpuOrder(gpus: GpuMemoryInfo[]): Promise<boolean> {
+    if (gpus.length < 2 || !gpus.every((g) => !!g.llamaDeviceId)) {
+      return false;
+    }
+    if ((this.config.getState().gpuOrderRevision ?? 0) >= 1) {
+      return false;
+    }
+    let changed = false;
+    await this.config.updateState((raw) => {
+      if ((raw.gpuOrderRevision ?? 0) >= 1) {
+        return {};
+      }
+      const load = raw.loadSettings;
+      let patch: Partial<LlamaLoadSettings> | undefined = gpus.every((g) => g.legacyIndex !== undefined)
+        ? remapLegacyGpuOrder(load, gpus)
+        : undefined;
+      if (!patch && (load.mainGpu || 0) === 0 && parseTensorSplit(load.tensorSplit).length < 2) {
+        const best = preferredMainGpu(gpus);
+        patch = best > 0 ? { mainGpu: best } : undefined;
+      }
+      changed = !!patch;
+      return patch
+        ? { gpuOrderRevision: 1, loadSettings: { ...load, ...patch } }
+        : { gpuOrderRevision: 1 };
+    });
+    return changed;
   }
 
   /** Put `host` back after the user chose Undo on the migration toast. */

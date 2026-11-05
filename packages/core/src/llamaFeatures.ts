@@ -8,6 +8,8 @@ import type { LaunchPlan } from "./nixCompat";
 export interface LlamaServerFeatures {
   probed: boolean;
   moeCache: boolean;
+  /** GPU backend of the binary's devices (`vulkan`, `cuda`, …) from --list-devices. */
+  gpuBackend?: string;
   draftSampling: boolean;
   draftUbatch: boolean;
   cacheRam?: boolean;
@@ -64,8 +66,10 @@ function* probeSteps(launch: ProbeLaunch): ExecSteps<LlamaServerFeatures> {
     // CPU builds advertise the shared flag too, but using it throws without
     // a GPU backend. Probe the binary itself, not just physical GPU hardware.
     const devices = yield { ...request(launch, "--list-devices"), captureStderr: true };
-    features.moeCache = devices.status !== null &&
-      parseLlamaListDevices(devices.stdout + "\n" + devices.stderr).length > 0;
+    const listed = devices.status !== null ? parseLlamaListDevices(devices.stdout + "\n" + devices.stderr) : [];
+    features.moeCache = listed.length > 0;
+    const backend = /^([a-z]+)\d*$/i.exec(listed[0]?.id || "")?.[1]?.toLowerCase();
+    if (backend) features.gpuBackend = backend;
   }
   return features;
 }

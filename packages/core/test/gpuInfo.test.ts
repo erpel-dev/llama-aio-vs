@@ -11,6 +11,7 @@ import {
   parseWindowsGpuRegistry,
   parseWindowsWmiVideoControllers,
   preferStableGpuList,
+  preferredMainGpu,
   resolveWindowsGpuList,
   windowsVramNeedsRegistry,
   type GpuMemoryInfo,
@@ -108,6 +109,27 @@ Available devices:
     assert.match(ordered[0]?.name || "", /9060/);
     assert.equal(ordered[1]?.llamaDeviceId, "Vulkan1");
     assert.match(ordered[1]?.name || "", /9070/);
+    // The multi-SKU lspci names give way to the exact card llama.cpp lists.
+    assert.equal(ordered[0]?.name, "AMD Radeon RX 9060 XT");
+    assert.equal(ordered[1]?.name, "AMD Radeon RX 9070 XT");    // Before the fix the 9060 was unmatched and sorted last.
+    assert.equal(ordered[0]?.legacyIndex, 1);
+    assert.equal(ordered[1]?.legacyIndex, 0);
+  });
+
+  it("keeps a specific sysfs name over the listed one", () => {
+    const pci: GpuMemoryInfo[] = [
+      { totalBytes: 16e9, name: "Radeon RX 7900 XTX", source: "sysfs" },
+      { totalBytes: 8e9, name: "Radeon RX 6600", source: "sysfs" },
+    ];
+    const listed = parseLlamaListDevices(`
+Available devices:
+  Vulkan0: AMD Radeon RX 7900 XTX (RADV NAVI31) (24560 MiB, 24000 MiB free)
+  Vulkan1: AMD Radeon RX 6600 (RADV NAVI23) (8176 MiB, 8000 MiB free)
+`);
+    const ordered = orderGpusLikeLlama(pci, listed);
+    assert.equal(ordered[0]?.name, "Radeon RX 7900 XTX");
+    assert.equal(ordered[0]?.legacyIndex, undefined, "order unchanged by the fix");
+    assert.equal(ordered[1]?.name, "Radeon RX 6600");
   });
 
   it("keeps sysfs VRAM when --list-devices reports 0 MiB", () => {
@@ -352,5 +374,28 @@ describe("preferStableGpuList capped fallback", () => {
     ];
     const kept = preferStableGpuList(next, previous);
     assert.equal(kept[0]?.totalBytes, 24 * GiB);
+  });
+});
+
+describe("preferredMainGpu", () => {
+  const G = 1024 ** 3;
+  const gpu = (name: string, totalBytes: number, usedBytes = 0): GpuMemoryInfo => ({ name, totalBytes, usedBytes, source: "test" });
+
+  it("picks the higher model of one generation (RX 9070 XT over 9060 XT, ~2x measured)", () => {
+    assert.equal(preferredMainGpu([gpu("AMD Radeon RX 9060 XT", 16 * G, 1.4 * G), gpu("AMD Radeon RX 9070 XT", 16 * G)]), 1);
+    assert.equal(preferredMainGpu([gpu("Radeon RX 9050 / 9060 XT", 16 * G), gpu("Radeon RX 9070/9070 XT/9070 GRE", 16 * G)]), 1);
+    assert.equal(preferredMainGpu([gpu("NVIDIA GeForce RTX 4060 Ti", 16 * G), gpu("NVIDIA GeForce RTX 4080", 16 * G)]), 1);
+    assert.equal(preferredMainGpu([gpu("AMD Radeon RX 7900 GRE", 16 * G), gpu("AMD Radeon RX 7600 XT", 16 * G)]), 0);
+  });
+
+  it("prefers more VRAM, and does not rank across generations", () => {
+    assert.equal(preferredMainGpu([gpu("NVIDIA GeForce RTX 4060", 8 * G), gpu("NVIDIA GeForce RTX 3090", 24 * G)]), 1);
+    // RTX 3080 vs 4070 at equal VRAM: unknown order → the idle card wins, else keep 0.
+    assert.equal(preferredMainGpu([gpu("NVIDIA GeForce RTX 4070", 12 * G), gpu("NVIDIA GeForce RTX 3080", 12 * G)]), 0);
+    assert.equal(preferredMainGpu([gpu("NVIDIA GeForce RTX 4070", 12 * G, 2 * G), gpu("NVIDIA GeForce RTX 3080", 12 * G)]), 1);
+  });
+
+  it("keeps 0 for one card", () => {
+    assert.equal(preferredMainGpu([gpu("AMD Radeon RX 9070 XT", 16 * G)]), 0);
   });
 });
