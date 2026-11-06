@@ -1541,11 +1541,15 @@ describe("per-layer expert share", () => {
 });
 
 describe("display card reserve", () => {
-  it("keeps the desktop's VRAM out of a split, capped at 2 GiB", () => {
+  it("counts the desktop's VRAM from the lowest use seen, not from a card a model fills", () => {
     assert.equal(displayReserveBytes({ drivesDisplay: false, usedBytes: 1.3 * GiB }), 0);
+    // Idle desktop reading: that is the reserve.
     assert.equal(displayReserveBytes({ drivesDisplay: true, usedBytes: 1.3 * GiB }), 1.3 * GiB);
-    // Our own running server on that card is not the desktop: cap it.
-    assert.equal(displayReserveBytes({ drivesDisplay: true, usedBytes: 12 * GiB }), 2 * GiB);
+    // Our own server is running: live use is the model, the lowest use seen is the desktop.
+    assert.equal(displayReserveBytes({ drivesDisplay: true, usedBytes: 15.6 * GiB, idleUsedBytes: 1.3 * GiB }), 1.3 * GiB);
+    // No idle reading yet (a model was already there): count a modest fallback only.
+    assert.equal(displayReserveBytes({ drivesDisplay: true, usedBytes: 15.6 * GiB, idleUsedBytes: 15.6 * GiB }), 1.5 * GiB);
+    assert.equal(displayReserveBytes({ drivesDisplay: true, usedBytes: 12 * GiB }), 1.5 * GiB);
   });
 
   it("flags a split as spilling when only the desktop's share would overflow the display card", () => {

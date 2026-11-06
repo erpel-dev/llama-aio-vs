@@ -50,6 +50,12 @@ export interface GpuMemoryInfo {
   /** A monitor is attached to this card (Linux DRM connector status). */
   drivesDisplay?: boolean;
   /**
+   * Lowest VRAM use seen on this card since the process started (before a
+   * llama-server of ours filled it): what the desktop itself holds. Only
+   * meaningful for a card that drives a display.
+   */
+  idleUsedBytes?: number;
+  /**
    * Narrowest PCIe hop between this card and the CPU, in GB/s per direction
    * (Linux sysfs). A card behind a chipset (B450: PCIe 2.0 x4, ~2 GB/s) is far
    * slower to feed than one on CPU lanes (PCIe 3.0 x16, ~15.8 GB/s).
@@ -1172,8 +1178,24 @@ function* detectGpusSteps(force: boolean, binKey: string): ExecSteps<GpuMemoryIn
   ) {
     lastGoodGpus = gpus;
   }
+  gpus = withIdleBaseline(gpus);
   cached = { at: now, binKey, gpus };
   return gpus;
+}
+
+/** Lowest live VRAM use seen per card, keyed by PCI slot (else device id / name). */
+const idleBaseline = new Map<string, number>();
+
+function withIdleBaseline(gpus: GpuMemoryInfo[]): GpuMemoryInfo[] {
+  return gpus.map((g) => {
+    if (typeof g.usedBytes !== "number" || !(g.usedBytes >= 0)) {
+      return g;
+    }
+    const key = g.pciSlot || g.llamaDeviceId || g.name || g.source;
+    const low = Math.min(idleBaseline.get(key) ?? g.usedBytes, g.usedBytes);
+    idleBaseline.set(key, low);
+    return { ...g, idleUsedBytes: low };
+  });
 }
 
 /** Dedicated VRAM this small is usually a UMA carve-out, not a discrete card. */

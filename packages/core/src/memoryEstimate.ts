@@ -145,18 +145,30 @@ export function deviceWouldSpill(
 }
 
 /**
- * VRAM the desktop already holds on a card that drives a display, capped so a
- * running llama-server of our own on that card is not counted twice. A two-GPU
- * split of Groot 65B that left the display card (RX 9060 XT, ~1.3 GiB desktop)
- * with 0.7 GiB free hung it mid-session (amdgpu compute ring timeout); 1.5 GiB
+ * VRAM the desktop already holds on a card that drives a display. A split of
+ * Groot 65B that left the display card (RX 9060 XT, ~1.3 GiB desktop) with
+ * 0.7 GiB free hung it mid-session (amdgpu compute ring timeout); 1.5 GiB
  * free on top of the desktop ran stably.
+ *
+ * While a llama-server of ours runs, the card's live use is mostly the model,
+ * so the lowest use seen since startup (`idleUsedBytes`) is the desktop; with
+ * no such reading the live figure counts only up to
+ * {@link DISPLAY_RESERVE_FALLBACK_BYTES}.
  */
 export const DISPLAY_RESERVE_MAX_BYTES = 2 * GiB;
-export function displayReserveBytes(gpu: Pick<GpuMemoryInfo, "drivesDisplay" | "usedBytes"> | undefined): number {
+export const DISPLAY_RESERVE_FALLBACK_BYTES = 1.5 * GiB;
+export function displayReserveBytes(
+  gpu: Pick<GpuMemoryInfo, "drivesDisplay" | "usedBytes" | "idleUsedBytes"> | undefined
+): number {
   if (!gpu?.drivesDisplay) {
     return 0;
   }
-  return Math.min(DISPLAY_RESERVE_MAX_BYTES, Math.max(0, gpu.usedBytes || 0));
+  // A lowest-seen reading above the cap was taken with a model already on the
+  // card (no idle reading yet): it is not the desktop.
+  if (typeof gpu.idleUsedBytes === "number" && gpu.idleUsedBytes <= DISPLAY_RESERVE_MAX_BYTES) {
+    return Math.max(0, gpu.idleUsedBytes);
+  }
+  return Math.min(DISPLAY_RESERVE_FALLBACK_BYTES, Math.max(0, gpu.usedBytes || 0));
 }
 
 /** VRAM, or GTT on an APU — the number the bars and spill check should use. */
