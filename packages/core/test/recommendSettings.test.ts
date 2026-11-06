@@ -13,6 +13,17 @@ const gpu = (totalGiB: number) => ({
 });
 
 describe("recommendLoadSettings", () => {
+  it("keeps desktop reserve in single-GPU recommendations and honors custom headroom", () => {
+    const card = { ...gpu(16), drivesDisplay: true, idleUsedBytes: 1.3 * GiB, usedBytes: 1.3 * GiB };
+    for (const caps of [denseCaps(), moeCaps()]) {
+      for (const headroom of [1.5 * GiB, 2 * GiB]) {
+        const result = recommendLoadSettings(loadSettings(), caps, { gpus: [card], gpu: card, headroomBytes: headroom });
+        const est = estimateMemory(caps, result, card, { gpus: [card] })!;
+        assert.ok(card.totalBytes - est.totalGpuBytes - card.idleUsedBytes >= headroom);
+        assert.equal(est.willSpill, false);
+      }
+    }
+  });
   it("caps context at the model maximum", () => {
     const r = recommendLoadSettings(loadSettings(), denseCaps({ maxContextLength: 8192 }), {
       gpu: gpu(48),

@@ -49,6 +49,7 @@ require.cache.vscode = {
     workspace: {},
     commands: { executeCommand: async () => undefined },
     env: {},
+    UIKind: { Desktop: 1, Web: 2 },
     extensions: { getExtension: (id) => (copilotChatInstalled && id === "GitHub.copilot-chat" ? {} : undefined) },
     Uri: { joinPath: (base, ...parts) => ({ fsPath: path.join(base.fsPath, ...parts) }) },
     ProgressLocation: {},
@@ -59,6 +60,29 @@ require.cache.vscode = {
 
 const core = require("@llama-aio/core");
 const { SettingsViewProvider } = require(path.join(__dirname, "..", "out-harness", "settingsView.js"));
+
+it("an open managed gateway stops forwarding in remote mode and resumes in local mode", async (t) => {
+  const seen = [];
+  const server = http.createServer((req, res) => { seen.push(req.headers.authorization); res.end("ok"); });
+  await new Promise(r => server.listen(0, "127.0.0.1", r));
+  let remote = false;
+  const provider = Object.create(SettingsViewProvider.prototype);
+  provider.store = { isRemote: () => remote, getEndpoint: () => `http://127.0.0.1:${server.address().port}` };
+  t.after(() => { provider.dispose(); server.close(); });
+  const url = await provider.ensureWebUiGateway();
+  // The test uses its own key, never the user's managed credential.
+  provider.webUiGateway.options.apiKey = () => "synthetic-test-key";
+  const request = () => new Promise((resolve, reject) => {
+    http.get(url + "props", res => { res.resume(); res.on("end", () => resolve(res.statusCode)); }).on("error", reject);
+  });
+  assert.equal(await request(), 200);
+  remote = true;
+  assert.equal(await request(), 502);
+  assert.deepEqual(seen, ["Bearer synthetic-test-key"]);
+  remote = false;
+  assert.equal(await request(), 200);
+  assert.equal(seen.length, 2);
+});
 
 describe("removal through a symlinked models directory", () => {
   for (const role of ["main", "mmproj", "draft"]) {

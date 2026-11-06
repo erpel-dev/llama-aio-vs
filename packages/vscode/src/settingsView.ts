@@ -2086,7 +2086,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
   private async ensureWebUiGateway(): Promise<string> {
     if (!this.webUiGateway) {
       this.webUiGateway = new WebUiGateway({
-        upstream: () => this.store.getEndpoint(),
+        // Keep the gateway port for saved chats, but never send the managed
+        // local key to a remote connection selected after the UI was opened.
+        upstream: () => this.store.isRemote() ? "" : this.store.getEndpoint(),
         apiKey: () => readLocalApiKey(),
         // A browser-hosted or remote editor forwards the port itself, so the
         // Host is the editor's; same-site checks still apply there.

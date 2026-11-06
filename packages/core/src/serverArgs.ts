@@ -1,6 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
-import { offloadDeviceOrder, parseTensorSplit } from "./gpuSplit";
+import { effectiveGpuSplitMode, effectiveOffloadDeviceOrder, parseTensorSplit } from "./gpuSplit";
 import type { GpuMemoryInfo } from "./gpuInfo";
 import {
   heuristicPleShare,
@@ -289,7 +289,7 @@ export function buildServerArgs(
     const listed = options?.gpus || [];
     // llama.cpp SYCL does not implement --split-mode row.
     const sycl = listed.some((g) => /^sycl/i.test((g.llamaDeviceId || "").trim()));
-    const splitMode = sycl && settings.splitMode === "row" ? "layer" : settings.splitMode;
+    const splitMode = effectiveGpuSplitMode(listed, settings.splitMode);
     if (splitMode === "none") {
       const gpus = listed.filter((g) => g.totalBytes > 0);
       const main = gpus.length
@@ -306,7 +306,7 @@ export function buildServerArgs(
       // CPU-held weights are copied to llama.cpp's first device for every
       // prompt batch: put the card with the fastest PCIe link first and
       // reorder the split and main GPU to match (offloadDeviceOrder).
-      const order = offloadDeviceOrder(listed, { ...settings, splitMode });
+      const order = effectiveOffloadDeviceOrder(listed, { ...settings, splitMode });
       const ids = order?.map((i) => (listed[i]?.llamaDeviceId || "").trim());
       if (order && ids && ids.every(Boolean) && split.length === order.length) {
         ids.forEach(checkDevice);
