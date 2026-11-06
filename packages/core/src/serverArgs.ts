@@ -1,6 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
-import { parseTensorSplit } from "./gpuSplit";
+import { offloadDeviceOrder, parseTensorSplit } from "./gpuSplit";
 import type { GpuMemoryInfo } from "./gpuInfo";
 import {
   heuristicPleShare,
@@ -303,9 +303,22 @@ export function buildServerArgs(
         args.push("--main-gpu", String(main));
       }
     } else if (split.length >= 2) {
-      args.push("--tensor-split", settings.tensorSplit);
-      args.push("--split-mode", splitMode || "layer");
-      args.push("--main-gpu", String(settings.mainGpu || 0));
+      // CPU-held weights are copied to llama.cpp's first device for every
+      // prompt batch: put the card with the fastest PCIe link first and
+      // reorder the split and main GPU to match (offloadDeviceOrder).
+      const order = offloadDeviceOrder(listed, { ...settings, splitMode });
+      const ids = order?.map((i) => (listed[i]?.llamaDeviceId || "").trim());
+      if (order && ids && ids.every(Boolean) && split.length === order.length) {
+        ids.forEach(checkDevice);
+        args.push("--device", ids.join(","));
+        args.push("--tensor-split", order.map((i) => String(split[i])).join(","));
+        args.push("--split-mode", "layer");
+        args.push("--main-gpu", String(Math.max(0, order.indexOf(settings.mainGpu || 0))));
+      } else {
+        args.push("--tensor-split", settings.tensorSplit);
+        args.push("--split-mode", splitMode || "layer");
+        args.push("--main-gpu", String(settings.mainGpu || 0));
+      }
     } else if (sycl && settings.splitMode === "row") {
       args.push("--split-mode", "layer");
       if (settings.mainGpu !== 0) {

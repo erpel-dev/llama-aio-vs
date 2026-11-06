@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import {
   adapterRamLooksCapped,
   decodeRegistryQueryOutput,
@@ -12,6 +15,12 @@ import {
   parseWindowsWmiVideoControllers,
   preferStableGpuList,
   preferredMainGpu,
+  pcieLinkGBps,
+  normalizePciSlot,
+  parseNvidiaSmiGpus,
+  parseWindowsPcieLinks,
+  pcieGenLinkGBps,
+  sysfsPcieBottleneckGBps,
   resolveWindowsGpuList,
   windowsVramNeedsRegistry,
   type GpuMemoryInfo,
@@ -397,5 +406,85 @@ describe("preferredMainGpu", () => {
 
   it("keeps 0 for one card", () => {
     assert.equal(preferredMainGpu([gpu("AMD Radeon RX 9070 XT", 16 * G)]), 0);
+  });
+});
+
+describe("pcieLinkGBps", () => {
+  it("applies the line encoding of each PCIe generation", () => {
+    assert.equal(pcieLinkGBps("5.0 GT/s PCIe", 4), 2); // PCIe 2.0 x4 (B450 chipset slot)
+    assert.ok(Math.abs(pcieLinkGBps("8.0 GT/s PCIe", 16)! - 15.75) < 0.01); // PCIe 3.0 x16
+    assert.ok(Math.abs(pcieLinkGBps("32.0 GT/s PCIe", 16)! - 63.02) < 0.01); // PCIe 5.0 x16
+    assert.equal(pcieLinkGBps("Unknown", 4), undefined);
+    assert.equal(pcieLinkGBps("8.0 GT/s PCIe", 0), undefined);
+  });
+});
+
+describe("PCIe link detection", () => {
+  it("finds the chipset port as the bottleneck in a sysfs path, at max link", (t) => {
+    // RX 9060 XT on a B450 board: root 8x8 → chipset 8x4 → chipset port 5x4 → card bridge.
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "llama-pcie-"));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const hops: Array<[string, string, number]> = [
+      ["0000:00:01.3", "8.0 GT/s PCIe", 8], ["0000:03:00.2", "8.0 GT/s PCIe", 4],
+      ["0000:20:04.0", "5.0 GT/s PCIe", 4], ["0000:25:00.0", "32.0 GT/s PCIe", 16],
+      ["0000:26:00.0", "32.0 GT/s PCIe", 16], ["0000:27:00.0", "32.0 GT/s PCIe", 16],
+    ];
+    let dir = path.join(root, "pci0000:00");
+    for (const [addr, speed, width] of hops) {
+      dir = path.join(dir, addr);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, "max_link_speed"), speed + "\n");
+      fs.writeFileSync(path.join(dir, "max_link_width"), width + "\n");
+      // The card idles its own link down; max is what counts.
+      fs.writeFileSync(path.join(dir, "current_link_speed"), "2.5 GT/s PCIe\n");
+      fs.writeFileSync(path.join(dir, "current_link_width"), width + "\n");
+    }
+    assert.equal(sysfsPcieBottleneckGBps(dir), 2);
+  });
+
+  it("normalizes nvidia-smi bus ids to sysfs slots", () => {
+    assert.equal(normalizePciSlot("00000000:01:00.0"), "0000:01:00.0");
+    assert.equal(normalizePciSlot("0000:2A:00.0"), "0000:2a:00.0");
+    assert.equal(normalizePciSlot("n/a"), undefined);
+  });
+
+  it("reads link and display from extended nvidia-smi output, and accepts the old format", () => {
+    const ext = parseNvidiaSmiGpus("NVIDIA GeForce RTX 4090, 24564, 1200, 00000000:01:00.0, 4, 16, Enabled\nNVIDIA GeForce RTX 3060, 12288, 10, 00000000:05:00.0, 3, 4, Disabled");
+    assert.equal(ext.length, 2);
+    assert.ok(Math.abs(ext[0]!.pcieGBps! - 31.5) < 0.01);
+    assert.equal(ext[0]!.drivesDisplay, true);
+    assert.ok(Math.abs(ext[1]!.pcieGBps! - 3.94) < 0.01);
+    assert.equal(ext[1]!.drivesDisplay, false);
+    const old = parseNvidiaSmiGpus("NVIDIA GeForce RTX 4090, 24564, 1200, 00000000:01:00.0");
+    assert.equal(old[0]!.pcieGBps, undefined);
+    assert.equal(old[0]!.drivesDisplay, undefined);
+    assert.equal(pcieGenLinkGBps(2, 4), 2);
+  });
+
+  it("parses Windows PnP link hops (generation codes) per adapter", () => {
+    // Shape of ConvertTo-Json for two adapters; single-hop rows come as an object.
+    const json = JSON.stringify([
+      { Id: "PCI\\VEN_1002&DEV_7590&SUBSYS_1&REV_C0\\6&1", Hops: [
+        { ms: 5, mw: 16, cs: 1, cw: 16 }, { ms: 5, mw: 16 }, { ms: 5, mw: 16 },
+        { ms: 2, mw: 4 }, { ms: 3, mw: 4 }, { ms: null, mw: null } ] },
+      { Id: "PCI\\VEN_1002&DEV_7550&SUBSYS_2&REV_C0\\6&2", Hops: [ { ms: 5, mw: 16 }, { ms: 3, mw: 16 } ] },
+      { Id: "PCI\\VEN_10DE&DEV_2684\\4&3", Hops: { ms: 4, mw: 16 } },
+      { Id: "ROOT\\BASICDISPLAY\\0000", Hops: [] },
+    ]);
+    const links = parseWindowsPcieLinks(json);
+    assert.equal(links.get("PCI\\VEN_1002&DEV_7590&SUBSYS_1&REV_C0\\6&1"), 2);
+    assert.ok(Math.abs(links.get("PCI\\VEN_1002&DEV_7550&SUBSYS_2&REV_C0\\6&2")! - 15.75) < 0.01);
+    assert.ok(Math.abs(links.get("PCI\\VEN_10DE&DEV_2684\\4&3")! - 31.5) < 0.01);
+    assert.equal(links.has("ROOT\\BASICDISPLAY\\0000"), false);
+  });
+
+  it("marks the Windows adapter with a desktop resolution as the display card", () => {
+    const gpus = parseWindowsWmiVideoControllers(JSON.stringify([
+      { Name: "AMD Radeon RX 9060 XT", AdapterRAM: 4293918720, PNPDeviceID: "PCI\\VEN_1002&DEV_7590", CurrentHorizontalResolution: 3840 },
+      { Name: "AMD Radeon RX 9070 XT", AdapterRAM: 4293918720, PNPDeviceID: "PCI\\VEN_1002&DEV_7550", CurrentHorizontalResolution: null },
+    ]));
+    assert.equal(gpus[0]!.drivesDisplay, true);
+    assert.equal(gpus[1]!.drivesDisplay, false);
+    assert.equal(gpus[1]!.pnpDeviceId, "PCI\\VEN_1002&DEV_7550");
   });
 });

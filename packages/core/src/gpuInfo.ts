@@ -49,6 +49,14 @@ export interface GpuMemoryInfo {
   legacyIndex?: number;
   /** A monitor is attached to this card (Linux DRM connector status). */
   drivesDisplay?: boolean;
+  /**
+   * Narrowest PCIe hop between this card and the CPU, in GB/s per direction
+   * (Linux sysfs). A card behind a chipset (B450: PCIe 2.0 x4, ~2 GB/s) is far
+   * slower to feed than one on CPU lanes (PCIe 3.0 x16, ~15.8 GB/s).
+   */
+  pcieGBps?: number;
+  /** Windows PnP instance id (`PCI\\VEN_1002&DEV_7550&…`), to match link data. */
+  pnpDeviceId?: string;
 }
 
 export interface LlamaListedDevice {
@@ -151,6 +159,101 @@ function* sysfsGpuName(deviceDir: string, uevent: string, pciSlot?: string): Exe
   return driver || undefined;
 }
 
+/** GB/s per direction of one PCIe link: `"5.0 GT/s PCIe"` × lanes, after line encoding. */
+export function pcieLinkGBps(speed: string, width: number): number | undefined {
+  const gts = Number.parseFloat(speed);
+  if (!(gts > 0) || !(width > 0)) {
+    return undefined;
+  }
+  // PCIe 1/2 use 8b/10b; PCIe 3+ use 128b/130b (PCIe 6 FLIT is close enough).
+  const efficiency = gts <= 5 ? 0.8 : 128 / 130;
+  return (gts * width * efficiency) / 8;
+}
+
+/**
+ * Narrowest PCIe link from a GPU up to the CPU root port, walking the sysfs
+ * device path (`…/0000:00:01.3/0000:03:00.2/…/0000:27:00.0`). Each hop counts
+ * at its maximum trained capability (`max_link_*`, else `current_link_*`), so
+ * a card idling at a lower link speed still reads its real ceiling; the slot
+ * or chipset port caps the minimum (B450 chipset port: 5 GT/s x4 = 2 GB/s).
+ * GPU-internal switch links report full speed and never win the minimum.
+ */
+export function sysfsPcieBottleneckGBps(deviceDir: string): number | undefined {
+  let dir: string;
+  try {
+    dir = fs.realpathSync(deviceDir);
+  } catch {
+    return undefined;
+  }
+  const read = (name: string): string | undefined => {
+    try {
+      return fs.readFileSync(path.join(dir, name), "utf8").trim();
+    } catch {
+      return undefined;
+    }
+  };
+  let best: number | undefined;
+  while (/^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$/i.test(path.basename(dir))) {
+    const speed = read("max_link_speed") ?? read("current_link_speed");
+    const width = Number(read("max_link_width") ?? read("current_link_width"));
+    const gbps = speed ? pcieLinkGBps(speed, width) : undefined;
+    if (gbps !== undefined) {
+      best = best === undefined ? gbps : Math.min(best, gbps);
+    }
+    dir = path.dirname(dir);
+  }
+  return best;
+}
+
+/** sysfs form of a PCI address: nvidia-smi's `00000000:01:00.0` → `0000:01:00.0`. */
+export function normalizePciSlot(slot: string | undefined): string | undefined {
+  const m = /([0-9a-f]{4,8}):([0-9a-f]{2}):([0-9a-f]{2})\.([0-7])/i.exec(slot || "");
+  if (!m) {
+    return undefined;
+  }
+  return `${m[1]!.slice(-4)}:${m[2]}:${m[3]}.${m[4]}`.toLowerCase();
+}
+
+/**
+ * Link and display facts for a card found by another tool (nvidia-smi) on
+ * Linux, read from sysfs by its PCI slot.
+ */
+function linuxPciExtras(pciSlot: string | undefined): Pick<GpuMemoryInfo, "pcieGBps" | "drivesDisplay"> {
+  const slot = normalizePciSlot(pciSlot);
+  if (process.platform !== "linux" || !slot) {
+    return {};
+  }
+  const dev = path.join("/sys/bus/pci/devices", slot);
+  const out: Pick<GpuMemoryInfo, "pcieGBps" | "drivesDisplay"> = {};
+  const gbps = sysfsPcieBottleneckGBps(dev);
+  if (gbps !== undefined) {
+    out.pcieGBps = gbps;
+  }
+  try {
+    const root = "/sys/class/drm";
+    const entries = fs.readdirSync(root);
+    const real = fs.realpathSync(dev);
+    for (const ent of entries) {
+      if (/^card\d+$/.test(ent) && fs.realpathSync(path.join(root, ent, "device")) === real) {
+        out.drivesDisplay = sysfsCardDrivesDisplay(root, ent, entries);
+        break;
+      }
+    }
+  } catch {
+    // no DRM node for this card
+  }
+  return out;
+}
+
+/** PCIe generation (Windows link-speed code, nvidia-smi gen) → GT/s. */
+const PCIE_GEN_GTS: Record<number, number> = { 1: 2.5, 2: 5, 3: 8, 4: 16, 5: 32, 6: 64 };
+
+/** GB/s of a link given as PCIe generation (1…6) and lane count. */
+export function pcieGenLinkGBps(gen: number, width: number): number | undefined {
+  const gts = PCIE_GEN_GTS[Math.round(gen)];
+  return gts ? pcieLinkGBps(`${gts} GT/s`, width) : undefined;
+}
+
 /** True when a connector of DRM card `ent` (`card1-DP-1/status`) has a monitor attached. */
 export function sysfsCardDrivesDisplay(root: string, ent: string, entries: string[]): boolean {
   for (const conn of entries) {
@@ -236,6 +339,7 @@ function* readSysfsGpus(): ExecSteps<GpuMemoryInfo[] | undefined> {
         source: `sysfs:${ent}`,
         pciSlot,
         drivesDisplay: sysfsCardDrivesDisplay(root, ent, entries),
+        pcieGBps: sysfsPcieBottleneckGBps(deviceDir),
         gttUsedBytes,
         gttTotalBytes,
         visVramTotalBytes,
@@ -251,45 +355,66 @@ function* readSysfsGpus(): ExecSteps<GpuMemoryInfo[] | undefined> {
   return sortAndIndex(dedupeByPci(found));
 }
 
+/** nvidia-smi fields. Link max = what this GPU and slot can train to (idle-proof). */
+const NVIDIA_SMI_FIELDS = "name,memory.total,memory.used,pci.bus_id";
+const NVIDIA_SMI_FIELDS_EXT = `${NVIDIA_SMI_FIELDS},pcie.link.gen.max,pcie.link.width.max,display_active`;
+
 function* readNvidiaSmiAll(): ExecSteps<GpuMemoryInfo[] | undefined> {
-  const res = yield {
+  const query = (fields: string) => ({
     command: "nvidia-smi",
-    args: ["--query-gpu=name,memory.total,memory.used,pci.bus_id", "--format=csv,noheader,nounits"],
+    args: [`--query-gpu=${fields}`, "--format=csv,noheader,nounits"],
     timeoutMs: 3000,
-  };
+  });
+  let res = yield query(NVIDIA_SMI_FIELDS_EXT);
+  if (!res.ok || !res.stdout.trim()) {
+    // Older nvidia-smi rejects unknown fields for the whole query.
+    res = yield query(NVIDIA_SMI_FIELDS);
+  }
   try {
     const out = res.ok ? res.stdout.trim() : "";
-    if (!out) {
-      return undefined;
-    }
-    const found: GpuMemoryInfo[] = [];
-    for (const line of out.split("\n")) {
-      const parts = line.split(",").map((s) => s.trim());
-      if (parts.length < 2) {
-        continue;
-      }
-      const name = parts[0];
-      const totalMiB = Number(parts[1]);
-      const usedMiB = parts[2] !== undefined ? Number(parts[2]) : undefined;
-      const pciSlot = parts[3] || undefined;
-      if (!Number.isFinite(totalMiB)) {
-        continue;
-      }
-      const totalBytes = totalMiB * 1024 * 1024;
-      if (totalBytes < MIN_VRAM) {
-        continue;
-      }
-      const usedBytes =
-        usedMiB !== undefined && Number.isFinite(usedMiB) ? usedMiB * 1024 * 1024 : undefined;
-      found.push({ totalBytes, usedBytes, name, source: "nvidia-smi", pciSlot });
-    }
+    const found = out ? parseNvidiaSmiGpus(out) : [];
     if (!found.length) {
       return undefined;
     }
-    return sortAndIndex(found);
+    // Linux: sysfs sees the whole path (a chipset uplink too) and the monitors.
+    return sortAndIndex(found.map((g) => ({ ...g, ...linuxPciExtras(g.pciSlot) })));
   } catch {
     return undefined;
   }
+}
+
+/** `nvidia-smi --query-gpu=name,memory.total,memory.used,pci.bus_id[,gen.max,width.max,display_active]` CSV. */
+export function parseNvidiaSmiGpus(out: string): GpuMemoryInfo[] {
+  const found: GpuMemoryInfo[] = [];
+  for (const line of out.split("\n")) {
+    const parts = line.split(",").map((s) => s.trim());
+    if (parts.length < 2) {
+      continue;
+    }
+    const name = parts[0];
+    const totalMiB = Number(parts[1]);
+    const usedMiB = parts[2] !== undefined ? Number(parts[2]) : undefined;
+    const pciSlot = parts[3] || undefined;
+    if (!Number.isFinite(totalMiB)) {
+      continue;
+    }
+    const totalBytes = totalMiB * 1024 * 1024;
+    if (totalBytes < MIN_VRAM) {
+      continue;
+    }
+    const usedBytes =
+      usedMiB !== undefined && Number.isFinite(usedMiB) ? usedMiB * 1024 * 1024 : undefined;
+    const gpu: GpuMemoryInfo = { totalBytes, usedBytes, name, source: "nvidia-smi", pciSlot };
+    const gbps = pcieGenLinkGBps(Number(parts[4]), Number(parts[5]));
+    if (gbps !== undefined) {
+      gpu.pcieGBps = gbps;
+    }
+    if (parts[6] !== undefined && /^(enabled|disabled)$/i.test(parts[6])) {
+      gpu.drivesDisplay = /^enabled$/i.test(parts[6]);
+    }
+    found.push(gpu);
+  }
+  return found;
 }
 
 function* readRocmSmi(): ExecSteps<GpuMemoryInfo | undefined> {
@@ -331,7 +456,7 @@ function* readWindowsWmiGpus(): ExecSteps<GpuMemoryInfo[] | undefined> {
     args: [
       "-NoProfile",
       "-Command",
-      "Get-CimInstance Win32_VideoController | Select-Object Name, AdapterRAM | ConvertTo-Json -Compress",
+      "Get-CimInstance Win32_VideoController | Select-Object Name, AdapterRAM, PNPDeviceID, CurrentHorizontalResolution | ConvertTo-Json -Compress",
     ],
     timeoutMs: 6000,
   };
@@ -340,7 +465,15 @@ function* readWindowsWmiGpus(): ExecSteps<GpuMemoryInfo[] | undefined> {
     if (!out) {
       return undefined;
     }
-    const found = parseWindowsWmiVideoControllers(out);
+    let found = parseWindowsWmiVideoControllers(out);
+    if (found.length >= 2) {
+      // Only a split can reorder devices; the PnP walk costs a PowerShell run.
+      const links = yield* readWindowsPcieLinks();
+      found = found.map((g) => {
+        const gbps = g.pnpDeviceId ? links?.get(g.pnpDeviceId.toUpperCase()) : undefined;
+        return gbps !== undefined ? { ...g, pcieGBps: gbps } : g;
+      });
+    }
     return found.length ? sortAndIndex(found) : undefined;
   } catch {
     return undefined;
@@ -486,9 +619,8 @@ function* readWindowsRegistryGpus(): ExecSteps<WindowsRegistryGpu[] | undefined>
 
 /** CIM JSON from `Win32_VideoController`. `AdapterRAM` may arrive as a string. */
 export function parseWindowsWmiVideoControllers(json: string): GpuMemoryInfo[] {
-  const parsed = JSON.parse(json) as
-    | { Name?: string; AdapterRAM?: number | string }
-    | Array<{ Name?: string; AdapterRAM?: number | string }>;
+  type Row = { Name?: string; AdapterRAM?: number | string; PNPDeviceID?: string; CurrentHorizontalResolution?: number | null };
+  const parsed = JSON.parse(json) as Row | Row[];
   const items = Array.isArray(parsed) ? parsed : [parsed];
   const found: GpuMemoryInfo[] = [];
   for (const item of items) {
@@ -500,9 +632,75 @@ export function parseWindowsWmiVideoControllers(json: string): GpuMemoryInfo[] {
     if (!Number.isFinite(totalBytes) || totalBytes < MIN_VRAM) {
       continue;
     }
-    found.push({ totalBytes, name, source: "wmi" });
+    const gpu: GpuMemoryInfo = { totalBytes, name, source: "wmi" };
+    if (item.PNPDeviceID) {
+      gpu.pnpDeviceId = String(item.PNPDeviceID);
+    }
+    if ("CurrentHorizontalResolution" in item) {
+      // Windows only reports a resolution for an adapter that drives a desktop.
+      gpu.drivesDisplay = Number(item.CurrentHorizontalResolution) > 0;
+    }
+    found.push(gpu);
   }
   return found;
+}
+
+/**
+ * PowerShell: for each display adapter, walk up its PnP parents and print the
+ * PCIe link properties of every hop (max, else current) as JSON.
+ */
+const WINDOWS_PCIE_LINKS_PS = [
+  "$keys='DEVPKEY_PciDevice_MaxLinkSpeed','DEVPKEY_PciDevice_MaxLinkWidth','DEVPKEY_PciDevice_CurrentLinkSpeed','DEVPKEY_PciDevice_CurrentLinkWidth','DEVPKEY_Device_Parent';",
+  "$r=@(); foreach($v in Get-CimInstance Win32_VideoController){ if(-not $v.PNPDeviceID){continue}; $hops=@(); $cur=$v.PNPDeviceID;",
+  "for($i=0; $i -lt 12 -and $cur; $i++){ $h=@{}; foreach($x in (Get-PnpDeviceProperty -InstanceId $cur -KeyName $keys -ErrorAction SilentlyContinue)){ $h[$x.KeyName]=$x.Data };",
+  "$hops+=[pscustomobject]@{ms=$h['DEVPKEY_PciDevice_MaxLinkSpeed'];mw=$h['DEVPKEY_PciDevice_MaxLinkWidth'];cs=$h['DEVPKEY_PciDevice_CurrentLinkSpeed'];cw=$h['DEVPKEY_PciDevice_CurrentLinkWidth']};",
+  "$cur=$h['DEVPKEY_Device_Parent'] };",
+  "$r+=[pscustomobject]@{Id=$v.PNPDeviceID;Hops=$hops} }; ConvertTo-Json -Compress -Depth 4 @($r)",
+].join(" ");
+
+function* readWindowsPcieLinks(): ExecSteps<Map<string, number> | undefined> {
+  const res = yield {
+    command: "powershell.exe",
+    args: ["-NoProfile", "-Command", WINDOWS_PCIE_LINKS_PS],
+    timeoutMs: 10000,
+  };
+  try {
+    return res.ok && res.stdout.trim() ? parseWindowsPcieLinks(res.stdout.trim()) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Narrowest PCIe hop per adapter (upper-cased PNP id → GB/s) from the
+ * {@link WINDOWS_PCIE_LINKS_PS} JSON. Windows reports link speed as the PCIe
+ * generation code (1 = 2.5 GT/s … 5 = 32 GT/s) and width in lanes.
+ */
+export function parseWindowsPcieLinks(json: string): Map<string, number> {
+  type Hop = { ms?: number | null; mw?: number | null; cs?: number | null; cw?: number | null };
+  type Row = { Id?: string; Hops?: Hop | Hop[] | null };
+  const parsed = JSON.parse(json) as Row | Row[];
+  const rows = Array.isArray(parsed) ? parsed : [parsed];
+  const out = new Map<string, number>();
+  for (const row of rows) {
+    if (!row?.Id) {
+      continue;
+    }
+    const hops = Array.isArray(row.Hops) ? row.Hops : row.Hops ? [row.Hops] : [];
+    let best: number | undefined;
+    for (const hop of hops) {
+      const gen = Number(hop.ms ?? hop.cs);
+      const width = Number(hop.mw ?? hop.cw);
+      const gbps = pcieGenLinkGBps(gen, width);
+      if (gbps !== undefined) {
+        best = best === undefined ? gbps : Math.min(best, gbps);
+      }
+    }
+    if (best !== undefined) {
+      out.set(row.Id.toUpperCase(), best);
+    }
+  }
+  return out;
 }
 
 /** Detected GPUs, cached briefly because sysfs/nvidia-smi are stable. */
