@@ -10,6 +10,7 @@ import {
   normalizeTensorSplit,
   parseTensorSplit,
   remapLegacyGpuOrder,
+  offloadDeviceOrder,
   capacityAwareTensorSplit,
   retargetTensorSplitMainShare,
   tensorSplitFromFractions,
@@ -310,5 +311,32 @@ describe("remapLegacyGpuOrder", () => {
 
   it("remaps the main GPU even without a split", () => {
     assert.deepEqual(remapLegacyGpuOrder({ mainGpu: 1, tensorSplit: "" }, swapped), { mainGpu: 0, tensorSplit: "" });
+  });
+});
+
+describe("offloadDeviceOrder", () => {
+  // RX 9060 XT behind a B450 chipset (PCIe 2.0 x4) is llama.cpp's Vulkan0; the
+  // RX 9070 XT sits on CPU lanes (PCIe 3.0 x16).
+  const pair = [{ pcieGBps: 2.0 }, { pcieGBps: 15.75 }];
+
+  it("puts the fastest link first when weights stay in RAM on a layer split", () => {
+    assert.deepEqual(offloadDeviceOrder(pair, { splitMode: "layer", nCpuMoe: 23 }), [1, 0]);
+    assert.deepEqual(offloadDeviceOrder(pair, { splitMode: "layer", nCpuFfn: 10 }), [1, 0]);
+  });
+
+  it("keeps llama.cpp's order otherwise", () => {
+    assert.equal(offloadDeviceOrder(pair, { splitMode: "layer", nCpuMoe: 0 }), undefined, "nothing copied");
+    assert.equal(offloadDeviceOrder(pair, { splitMode: "none", nCpuMoe: 23 }), undefined);
+    assert.equal(offloadDeviceOrder([{ pcieGBps: 15.75 }, { pcieGBps: 2.0 }], { nCpuMoe: 23 }), undefined, "already first");
+    assert.equal(offloadDeviceOrder([{ pcieGBps: 7.9 }, { pcieGBps: 9.0 }], { nCpuMoe: 23 }), undefined, "too close");
+    assert.equal(offloadDeviceOrder([{}, { pcieGBps: 15.75 }], { nCpuMoe: 23 }), undefined, "unknown link");
+  });
+
+  it("assigns the first layers to the reordered lead card", () => {
+    // App order [9060, 9070], split 32/68, llama.cpp order [9070, 9060] → 68/32.
+    const assign = assignLayerDevices(48, 48, [32, 68], "layer", 1, [1, 0]);
+    assert.equal(assign[0], 1);
+    assert.equal(assign.filter((d) => d === 1).length, 34, "il / 49 < 0.68 on the 9070 XT");
+    assert.equal(assign[47], 0);
   });
 });

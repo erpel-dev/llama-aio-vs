@@ -12,6 +12,7 @@ import {
   parseWindowsWmiVideoControllers,
   preferStableGpuList,
   preferredMainGpu,
+  pcieLinkGBps,
   resolveWindowsGpuList,
   windowsVramNeedsRegistry,
   type GpuMemoryInfo,
@@ -397,5 +398,15 @@ describe("preferredMainGpu", () => {
 
   it("keeps 0 for one card", () => {
     assert.equal(preferredMainGpu([gpu("AMD Radeon RX 9070 XT", 16 * G)]), 0);
+  });
+});
+
+describe("pcieLinkGBps", () => {
+  it("applies the line encoding of each PCIe generation", () => {
+    assert.equal(pcieLinkGBps("5.0 GT/s PCIe", 4), 2); // PCIe 2.0 x4 (B450 chipset slot)
+    assert.ok(Math.abs(pcieLinkGBps("8.0 GT/s PCIe", 16)! - 15.75) < 0.01); // PCIe 3.0 x16
+    assert.ok(Math.abs(pcieLinkGBps("32.0 GT/s PCIe", 16)! - 63.02) < 0.01); // PCIe 5.0 x16
+    assert.equal(pcieLinkGBps("Unknown", 4), undefined);
+    assert.equal(pcieLinkGBps("8.0 GT/s PCIe", 0), undefined);
   });
 });

@@ -477,8 +477,14 @@ export function assignLayerDevices(
   layersOnGpu: number,
   shares: number[],
   splitMode: GpuSplitMode | undefined,
-  mainGpu: number
+  mainGpu: number,
+  order?: readonly number[]
 ): number[] {
+  if (order && order.length === shares.length && order.some((d, i) => d !== i)) {
+    // llama.cpp sees the devices in `order` (--device): split and layers follow it.
+    const inner = assignLayerDevices(nLayers, layersOnGpu, order.map((d) => shares[d] || 0), splitMode, Math.max(0, order.indexOf(mainGpu)));
+    return inner.map((d) => (d < 0 ? d : order[d]!));
+  }
   const n = Math.max(0, Math.round(nLayers) || 0);
   const onGpu = Math.min(n, Math.max(0, Math.round(layersOnGpu) || 0));
   const start = n - onGpu;
@@ -526,6 +532,8 @@ export interface LayerWeightMassOptions {
   moeExpertShare?: number;
   nCpuFfn?: number;
   denseFfnShare?: number;
+  /** llama.cpp device order when it differs from the GPU list (offloadDeviceOrder). */
+  deviceOrder?: readonly number[];
 }
 
 /** Relative GPU-resident mass of one layer (0 if the layer is on CPU). */
@@ -564,14 +572,15 @@ export function layerAwareWeightShares(
   shares: number[],
   splitMode: GpuSplitMode | undefined,
   mainGpu: number,
-  options: LayerWeightMassOptions = {}
+  options: LayerWeightMassOptions = {},
+  order?: readonly number[]
 ): number[] {
   const nDev = Math.max(1, shares.length);
   const fallback = shares.length === nDev ? shares : Array.from({ length: nDev }, () => 1 / nDev);
   if (splitMode === "row" || splitMode === "tensor") {
     return fallback;
   }
-  const assign = assignLayerDevices(nLayers, layersOnGpu, shares, splitMode, mainGpu);
+  const assign = assignLayerDevices(nLayers, layersOnGpu, shares, splitMode, mainGpu, order ?? options.deviceOrder);
   const mass = Array.from({ length: nDev }, () => 0);
   let tot = 0;
   for (let i = 0; i < assign.length; i++) {
@@ -613,4 +622,46 @@ export function remapLegacyGpuOrder(
     return undefined;
   }
   return { mainGpu, tensorSplit };
+}
+
+/** A link at least this much faster than llama.cpp's first device takes its place. */
+export const OFFLOAD_LINK_MIN_RATIO = 1.5;
+
+/**
+ * Device order (indices into `gpus`) for a layer split whose CPU-held weights
+ * are copied to the first GPU for every prompt batch (llama.cpp op offload):
+ * the card with the fastest PCIe link first, the rest in their usual order.
+ * Undefined when nothing stays in RAM, a link is unknown, or the first device
+ * already has the fastest link.
+ *
+ * RX 9070 XT (PCIe 3.0 x16, 15.8 GB/s) + RX 9060 XT (chipset PCIe 2.0 x4,
+ * 2 GB/s) with Groot 65B and 23 CPU-MoE layers: prompts 80 → 353 tok/s at
+ * -ub 1024, and a 64k agent session 741 → 171 s at -ub 2048 with the 9070 XT
+ * first. With the slow card first its long copy jobs also tripped the amdgpu
+ * 2 s compute timeout (ErrorDeviceLost).
+ */
+export function offloadDeviceOrder(
+  gpus: ReadonlyArray<{ pcieGBps?: number }>,
+  settings: { splitMode?: GpuSplitMode; nCpuMoe?: number; nCpuFfn?: number }
+): number[] | undefined {
+  if (gpus.length < 2 || (settings.splitMode && settings.splitMode !== "layer")) {
+    return undefined;
+  }
+  if (!((settings.nCpuMoe || 0) > 0 || (settings.nCpuFfn || 0) > 0)) {
+    return undefined;
+  }
+  const bw = gpus.map((g) => g.pcieGBps || 0);
+  if (bw.some((b) => !(b > 0))) {
+    return undefined;
+  }
+  let fastest = 0;
+  for (let i = 1; i < bw.length; i++) {
+    if (bw[i]! > bw[fastest]!) {
+      fastest = i;
+    }
+  }
+  if (fastest === 0 || bw[fastest]! < bw[0]! * OFFLOAD_LINK_MIN_RATIO) {
+    return undefined;
+  }
+  return [fastest, ...gpus.map((_, i) => i).filter((i) => i !== fastest)];
 }
