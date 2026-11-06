@@ -52,7 +52,7 @@ describe("WebUiGateway", () => {
 
   const get = (path: string, headers: Record<string, string> = {}) =>
     new Promise<{ status: number; body: string; headers: http.IncomingHttpHeaders }>((resolve, reject) => {
-      const req = http.request(base + path, { headers }, (res) => {
+      const req = http.request(base, { headers, path }, (res) => {
         let body = "";
         res.on("data", (c) => (body += c));
         res.on("end", () => resolve({ status: res.statusCode || 0, body, headers: res.headers }));
@@ -73,6 +73,32 @@ describe("WebUiGateway", () => {
   it("streams SSE through unchanged", async () => {
     const r = await get("/stream");
     assert.equal(r.body, "data: one\n\ndata: two\n\n");
+  });
+
+  it("rejects absolute, network-path and backslash targets without forwarding credentials", async () => {
+    const before = seen.length;
+    for (const target of [upstreamUrl + "/props", "//" + new URL(upstreamUrl).host + "/props",
+      "/" + String.fromCharCode(92) + new URL(upstreamUrl).host + "/props"]) {
+      const r = await get(target);
+      assert.equal(r.status, 400, target);
+      assert.ok(!r.body.includes("k1"));
+    }
+    assert.equal(seen.length, before);
+  });
+
+  it("refuses nonlocal or unsupported upstreams before constructing a credentialed request", async () => {
+    for (const target of ["", "http://example.invalid", "https://127.0.0.1:1"]) {
+      let keyReads = 0;
+      const g = new WebUiGateway({ upstream: () => target, apiKey: () => { keyReads++; return "k1"; }, strictHost: () => true });
+      try {
+        const port = await g.start();
+        const status = await new Promise<number>((resolve, reject) => {
+          http.get(`http://127.0.0.1:${port}/props`, res => { res.resume(); res.on("end", () => resolve(res.statusCode!)); }).on("error", reject);
+        });
+        assert.equal(status, 502);
+        assert.equal(keyReads, 0);
+      } finally { g.close(); }
+    }
   });
 
   it("refuses a cross-site request before it reaches the server", async () => {

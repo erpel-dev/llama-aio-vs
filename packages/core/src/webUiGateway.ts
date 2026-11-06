@@ -150,9 +150,25 @@ export class WebUiGateway {
       res.end(`Llama AIO web UI gateway: refused (${refusal}).`);
       return;
     }
+    const requestPath = req.url || "/";
+    // Never redirect the managed Authorization header using a request target.
+    if (!requestPath.startsWith("/") || requestPath.startsWith("//") || requestPath.includes("\\")) {
+      res.writeHead(400, { "content-type": "text/plain; charset=utf-8" });
+      res.end("Llama AIO web UI gateway: invalid request path.");
+      return;
+    }
     let target: URL;
     try {
-      target = new URL(req.url || "/", this.options.upstream());
+      const base = new URL(this.options.upstream());
+      if (base.protocol !== "http:" || !LOOPBACK_HOSTS.has(base.hostname.toLowerCase())) {
+        throw new Error("Not a managed local endpoint");
+      }
+      target = new URL(requestPath, base);
+      if (target.origin !== base.origin) {
+        res.writeHead(400, { "content-type": "text/plain; charset=utf-8" });
+        res.end("Llama AIO web UI gateway: invalid request path.");
+        return;
+      }
     } catch {
       res.writeHead(502, { "content-type": "text/plain; charset=utf-8" });
       res.end("Llama AIO web UI gateway: no local server address.");

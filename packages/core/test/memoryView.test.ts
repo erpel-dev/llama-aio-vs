@@ -29,6 +29,14 @@ describe("shortGpuName", () => {
 });
 
 describe("buildMemoryView", () => {
+  it("includes the desktop in the displayed overflow when the model alone fits", () => {
+    const card = { ...gpu(16), llamaDeviceId: "CUDA0", drivesDisplay: true, usedBytes: 1.3 * GiB, idleUsedBytes: 1.3 * GiB };
+    const caps = denseCaps({ fileSizeBytes: 13.25 * GiB });
+    const { view, estimate } = computeMemoryView(caps, loadSettings({ contextLength: 8192, gpuOffload: 99 }), [card]);
+    assert.ok(estimate!.totalGpuBytes < card.totalBytes);
+    assert.equal(view!.level, "spill");
+    assert.match(view!.headline, /^243 MiB over VRAM/);
+  });
   it("reports a comfortable fit on one GPU as good with free space in the headline", () => {
     const caps = denseCaps({ fileSizeBytes: 8 * GiB });
     const s = loadSettings({ contextLength: 16384 });

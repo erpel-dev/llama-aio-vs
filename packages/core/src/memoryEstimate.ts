@@ -2,7 +2,8 @@ import * as os from "os";
 import { formatGpuDeviceLabel, GpuMemoryInfo, isIntegratedGpu } from "./gpuInfo";
 import {
   assignLayerDevices,
-  offloadDeviceOrder,
+  effectiveOffloadDeviceOrder,
+  effectiveGpuSplitMode,
   gpuDisplayOrder,
   parseTensorSplit,
   effectiveTensorSplitShares,
@@ -1190,6 +1191,7 @@ export function estimateMemory(
       : !cpuOnly && gpu?.totalBytes
         ? [gpu]
         : [];
+  settings = { ...settings, splitMode: effectiveGpuSplitMode(gpusForBackend, settings.splitMode) };
   const computeBackend = inferComputeBackend(cpuOnly, gpusForBackend);
   const fullAttentionFraction = fullAttnLayers / nLayers;
   const rcoHeap = isLinearRecurrentHybrid(caps);
@@ -1257,7 +1259,7 @@ export function estimateMemory(
     denseFfnShare,
   };
   // CPU-held weights on a layer split: the fastest PCIe link goes first (--device).
-  const deviceOrder = gpus.length >= 2 ? offloadDeviceOrder(gpus, settings) : undefined;
+  const deviceOrder = gpus.length >= 2 ? effectiveOffloadDeviceOrder(gpus, settings) : undefined;
   const weightShares =
     gpus.length >= 2
       ? layerAwareWeightShares(
