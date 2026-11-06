@@ -108,7 +108,27 @@ interface ModelsResponse {
     meta?: { size?: number; n_params?: number; n_ctx_train?: number; label?: string; aliases?: unknown; n_ctx?: number; context?: number; instanceId?: string };
     /** vLLM's served context length. */
     max_model_len?: number;
+    /** llama-server router: `{ value: "loaded" | "unloaded" | "loading" }`. */
+    status?: unknown;
   }>;
+}
+
+/**
+ * The model a server is actually serving from its `/v1/models` list. A
+ * llama-server router (`--models-dir`) lists every model in its folder with a
+ * `status` and loads whichever one a request names, so the first entry is
+ * often an unloaded one; naming it would swap the running model out. Prefer
+ * `loaded`, then `loading`, then the first entry (single-model servers).
+ */
+export function pickServedModel<T extends { status?: unknown }>(data: readonly T[] | undefined): T | undefined {
+  if (!data?.length) {
+    return undefined;
+  }
+  const state = (m: T): string => {
+    const st = m.status as { value?: unknown } | string | undefined;
+    return String((typeof st === "object" && st ? st.value : st) || "").toLowerCase();
+  };
+  return data.find((m) => state(m) === "loaded") ?? data.find((m) => state(m) === "loading") ?? data[0];
 }
 
 /** Shared parsing for the remote monitor and the chat provider's model probe. */
@@ -594,7 +614,7 @@ export async function probeRemoteServer(
       apiKey: opts.apiKey,
       timeoutMs: REMOTE_PROPS_TIMEOUT_MS,
     });
-    const first = models.data?.[0];
+    const first = pickServedModel(models.data);
     modelsEmpty = Array.isArray(models.data) && models.data.length === 0;
     strataModel = first?.owned_by === "strata";
     strataInstanceId = typeof first?.meta?.instanceId === "string" ? first.meta.instanceId : undefined;
