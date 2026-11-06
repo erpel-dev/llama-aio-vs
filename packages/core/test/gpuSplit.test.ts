@@ -188,14 +188,22 @@ describe("capacityAwareTensorSplit", () => {
 });
 
 describe("assignLayerDevices", () => {
-  it("gives GPU0 the first layers of a 45/55 split", () => {
+  it("gives GPU0 the first layers of a 45/55 split, as llama.cpp does", () => {
+    // llama.cpp: layer il → first device with cumulative split > il / (n_layer + 1).
     const assign = assignLayerDevices(48, 48, [0.45, 0.55], "layer", 0);
     assert.equal(assign[0], 0);
-    assert.equal(assign[20], 0);
-    assert.equal(assign[21], 1);
+    assert.equal(assign[22], 0);
+    assert.equal(assign[23], 1);
     assert.equal(assign[47], 1);
-    assert.equal(assign.filter((d) => d === 0).length, 21);
-    assert.equal(assign.filter((d) => d === 1).length, 27);
+    assert.equal(assign.filter((d) => d === 0).length, 23);
+    assert.equal(assign.filter((d) => d === 1).length, 25);
+  });
+
+  it("puts 34 of 48 layers on GPU0 at 68/32 (Groot 65B, measured per card)", () => {
+    const assign = assignLayerDevices(48, 48, [68, 32], "layer", 1);
+    assert.equal(assign.filter((d) => d === 0).length, 34);
+    assert.equal(assign[33], 0);
+    assert.equal(assign[34], 1);
   });
 
   it("offloads the last ngl layers when the model is only partly on GPU", () => {
@@ -213,8 +221,9 @@ describe("assignLayerDevices", () => {
 describe("layerAwareWeightShares", () => {
   it("matches tensor-split when every layer has the same mass", () => {
     const shares = layerAwareWeightShares(48, 48, [0.75, 0.25], "layer", 0, {});
-    assert.ok(Math.abs(shares[0]! - 0.75) < 0.001);
-    assert.ok(Math.abs(shares[1]! - 0.25) < 0.001);
+    // 37 of 48 layers (il / 49 < 0.75); the output layer, slot 49, is on GPU1.
+    assert.ok(Math.abs(shares[0]! - 37 / 48) < 0.001);
+    assert.ok(Math.abs(shares[1]! - 11 / 48) < 0.001);
   });
 
   it("loads the later GPU with full experts after --n-cpu-moe on the first layers", () => {
@@ -249,7 +258,7 @@ describe("tensorSplitForTargetWeightShare", () => {
 
   it("puts extra cheap layers on Main so 50% is GPU-resident weights after --n-cpu-moe", () => {
     const split = tensorSplitForTargetWeightShare(0.5, 0, 2, 48, 48, "layer", flashNextMass);
-    assert.equal(split, "63,37");
+    assert.equal(split, "60,40"); // was 63,37 under the old (k+1)/n layer rule
     const shares = tensorSplitShares(split, 2, [16, 16]);
     const weight = layerAwareWeightShares(48, 48, shares, "layer", 0, flashNextMass);
     assert.ok(Math.abs(weight[0]! - 0.5) < 0.03, `expected ~50% weights on GPU0, got ${weight[0]} (${split})`);
@@ -257,7 +266,7 @@ describe("tensorSplitForTargetWeightShare", () => {
 
   it("inverts the same way when Main is GPU 1", () => {
     const split = tensorSplitForTargetWeightShare(0.5, 1, 2, 48, 48, "layer", flashNextMass);
-    assert.equal(split, "63,37");
+    assert.equal(split, "60,40"); // was 63,37 under the old (k+1)/n layer rule
     const shares = tensorSplitShares(split, 2, [16, 16]);
     const weight = layerAwareWeightShares(48, 48, shares, "layer", 1, flashNextMass);
     assert.ok(Math.abs(weight[1]! - 0.5) < 0.03, `expected ~50% weights on GPU1, got ${weight[1]} (${split})`);

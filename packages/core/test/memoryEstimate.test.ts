@@ -3,6 +3,7 @@ import { describe, it } from "node:test";
 import {
   computeOverheadBytes,
   deviceWouldSpill,
+  displayReserveBytes,
   VRAM_HEADROOM_BYTES,
   estimateKvBytes,
   estimateMemory,
@@ -12,6 +13,7 @@ import {
   integratedGpuNotes,
   kvSlotMultiplier,
   peerGpuOverheadBytes,
+  perLayerMoeExpertShare,
   slidingWindowGraphFraction,
   vulkanDeviceReservedBytes,
   vulkanDriverBytes,
@@ -1222,8 +1224,9 @@ describe("estimateMemory", () => {
     assert.ok(est.charts.vram2);
     const w0 = est.charts.vram.segments.find((s) => s.key === "weights")!.bytes;
     const w1 = est.charts.vram2!.segments.find((s) => s.key === "weights")!.bytes;
-    assert.ok(Math.abs(w0 / (w0 + w1) - 0.75) < 0.001);
-    assert.ok(Math.abs(w1 / (w0 + w1) - 0.25) < 0.001);
+    // llama.cpp counts the output layer as slot 49: 37 of 48 layers on GPU0.
+    assert.ok(Math.abs(w0 / (w0 + w1) - 37 / 48) < 0.001);
+    assert.ok(Math.abs(w1 / (w0 + w1) - 11 / 48) < 0.001);
     const oh0 = est.charts.vram.segments.find((s) => s.key === "overhead")!.bytes;
     const oh1 = est.charts.vram2!.segments.find((s) => s.key === "overhead")!.bytes;
     assert.ok(oh0 > 0);
@@ -1247,7 +1250,8 @@ describe("estimateMemory", () => {
     assert.match(est.charts.vram2!.title, /9060/);
     const wMain = est.charts.vram.segments.find((s) => s.key === "weights")!.bytes;
     const wOther = est.charts.vram2!.segments.find((s) => s.key === "weights")!.bytes;
-    assert.ok(Math.abs(wMain / (wMain + wOther) - 0.75) < 0.001);
+    // 25,75 → layers 0–12 on GPU0 (il / 49 < 0.25), 35 of 48 on Main.
+    assert.ok(Math.abs(wMain / (wMain + wOther) - 35 / 48) < 0.001);
     assert.ok(est.charts.vram.segments.find((s) => s.key === "overhead")!.bytes > 0);
     assert.ok(est.charts.vram2!.segments.find((s) => s.key === "overhead")!.bytes > 0);
   });
@@ -1511,5 +1515,51 @@ describe("graph and batch sizing from model shape", () => {
     // Groot 19B (8 experts × 512) measured +1.26 GiB going -ub 512 → 4096.
     assert.ok(plain < 0.8 * GiB);
     assert.ok(moe > 1.2 * GiB && moe < 1.5 * GiB, `moe ubatch cost ${moe / GiB}`);
+  });
+});
+
+describe("per-layer expert share", () => {
+  it("excludes a RAM-resident PLE table from a layer's weight", () => {
+    // Groot 65B: experts 51% of the file, PLE table 45% → 93% of each layer.
+    const groot = moeCaps({ architecture: "qwen4exp", moeExpertShare: 0.51, pleShare: 0.45 });
+    assert.ok(Math.abs(perLayerMoeExpertShare(groot) - 0.51 / 0.55) < 1e-9);
+    // Without a PLE table the file share is the layer share.
+    assert.equal(perLayerMoeExpertShare(moeCaps({ moeExpertShare: 0.9 })), 0.9);
+  });
+
+  it("bills --n-cpu-moe layers on the first GPU as nearly empty", () => {
+    const g = (id: string) => ({ totalBytes: 16 * GiB, usedBytes: 0, name: "RX 9070 XT", source: "test", llamaDeviceId: id });
+    const gpus = [g("Vulkan0"), g("Vulkan1")];
+    const caps = moeCaps({ architecture: "qwen4exp", blockCount: 48, fileSizeBytes: 73.3 * GiB, moeExpertShare: 0.51, pleShare: 0.45 });
+    const s = loadSettings({ contextLength: 65536, gpuOffload: 99, nCpuMoe: 22, splitMode: "layer", tensorSplit: "68,32", mainGpu: 1 });
+    const e = estimateMemory(caps, s, gpus[0], { gpus })!;
+    const w = (i: number) => e.charts.gpus!.find((c) => c.gpuIndex === i)!.segments.find((x) => x.key === "weights")!.bytes;
+    // 34 layers on GPU0, 22 of them without experts; 14 full layers on GPU1. Measured ~11.3 / ~11.0 GiB.
+    assert.ok(w(0) > 10 * GiB && w(0) < 13 * GiB, `GPU0 weights ${w(0) / GiB}`);
+    assert.ok(w(1) > 10 * GiB && w(1) < 13 * GiB, `GPU1 weights ${w(1) / GiB}`);
+  });
+});
+
+describe("display card reserve", () => {
+  it("keeps the desktop's VRAM out of a split, capped at 2 GiB", () => {
+    assert.equal(displayReserveBytes({ drivesDisplay: false, usedBytes: 1.3 * GiB }), 0);
+    assert.equal(displayReserveBytes({ drivesDisplay: true, usedBytes: 1.3 * GiB }), 1.3 * GiB);
+    // Our own running server on that card is not the desktop: cap it.
+    assert.equal(displayReserveBytes({ drivesDisplay: true, usedBytes: 12 * GiB }), 2 * GiB);
+  });
+
+  it("flags a split as spilling when only the desktop's share would overflow the display card", () => {
+    // Groot 65B at 70/30 with 22 CPU-MoE layers: ~13.9 GiB on the RX 9060 XT,
+    // which also holds ~1.3 GiB of desktop; it hung mid-session at 15.2 GiB.
+    const card = (id: string, display: boolean, used: number) => ({ totalBytes: 15.92 * GiB, usedBytes: used * GiB, name: "RX 9070 XT", source: "test", llamaDeviceId: id, drivesDisplay: display });
+    const caps = moeCaps({ architecture: "qwen4exp", blockCount: 48, fileSizeBytes: 73.3 * GiB, moeExpertShare: 0.51, pleShare: 0.45 });
+    const s = loadSettings({ contextLength: 65536, gpuOffload: 99, nCpuMoe: 22, splitMode: "layer", tensorSplit: "70,30", mainGpu: 1, physicalBatchSize: 2048 });
+    const headless = [card("Vulkan0", false, 1.3), card("Vulkan1", false, 0.06)];
+    const desktop = [card("Vulkan0", true, 1.3), card("Vulkan1", false, 0.06)];
+    const a = estimateMemory(caps, s, headless[0], { gpus: headless })!;
+    const b = estimateMemory(caps, s, desktop[0], { gpus: desktop })!;
+    assert.equal(a.totalGpuBytes, b.totalGpuBytes, "the reserve changes the fit, not the estimate");
+    assert.ok(!a.willSpill || b.willSpill);
+    assert.ok(b.willSpill, "display card left with < 1.5 GiB must count as spilling");
   });
 });

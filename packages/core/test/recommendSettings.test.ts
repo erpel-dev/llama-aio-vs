@@ -70,6 +70,17 @@ describe("recommendLoadSettings", () => {
     assert.ok(fits.physicalBatchSize <= 1024);
   });
 
+  it("keeps -ub at 1024 when CPU experts run with layers split over two GPUs", () => {
+    // -ub 4096 and 2048 hung an RX 9070 XT + 9060 XT pair late in 64k sessions (ErrorDeviceLost).
+    const card = (id: string) => ({ totalBytes: 16 * GiB, usedBytes: 0, name: "RX 9070 XT", source: "test", llamaDeviceId: id });
+    const gpus = [card("Vulkan0"), card("Vulkan1")];
+    const caps = moeCaps({ embeddingLength: 2048, fileSizeBytes: 40 * GiB });
+    const r = recommendLoadSettings(loadSettings({ mainGpu: 1 }), caps, { gpus, gpu: gpus[0] });
+    assert.ok(r.nCpuMoe > 0, "experts must spill to RAM for this test");
+    assert.notEqual(r.splitMode, "none");
+    assert.ok(r.physicalBatchSize <= 1024, `split -ub ${r.physicalBatchSize}`);
+  });
+
   it("raises --n-cpu-ffn before dropping layers for dense models when it fits", () => {
     // 24 GiB card: full model + KV (~25 GiB) does not fit; FFN-on-CPU does.
     const caps = denseCaps({ ffnLength: 13824 });

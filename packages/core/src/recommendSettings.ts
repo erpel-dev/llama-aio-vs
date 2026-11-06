@@ -9,7 +9,7 @@ import {
   tensorSplitForTargetWeightShare,
 } from "./gpuSplit";
 import { isQwen4expArchitecture, ModelCapabilities } from "./ggufMetadata";
-import { estimateMemory, gpuBarCapacityBytes, MemoryEstimate, VRAM_HEADROOM_BYTES } from "./memoryEstimate";
+import { estimateMemory, gpuBarCapacityBytes, MemoryEstimate, perLayerMoeExpertShare, VRAM_HEADROOM_BYTES } from "./memoryEstimate";
 import { isMtpBakedInFile, isMtpSidecarFile } from "./modelLibrary";
 import { LlamaLoadSettings, recommendedMaxDraftTokens, speculativeUsesDflash, speculativeUsesNgram } from "./types";
 
@@ -165,6 +165,8 @@ const CPU_EXPERT_PREFILL_UBATCH = 4096;
  */
 const CPU_EXPERT_UBATCH_MAX_EXTRA_LAYERS = 3;
 const CPU_EXPERT_UBATCH_MAX_EXTRA_LAYERS_HEAVY = 7;
+/** Largest -ub for CPU experts when layers are split over several GPUs. */
+const CPU_EXPERT_SPLIT_MAX_UBATCH = 1024;
 /** Share of expert layers on the CPU from which a session is copy-bound. */
 const CPU_EXPERT_HEAVY_SHARE = 0.5;
 
@@ -195,7 +197,17 @@ function tuneCpuExpertBatch(
         ? CPU_EXPERT_UBATCH_MAX_EXTRA_LAYERS_HEAVY
         : CPU_EXPERT_UBATCH_MAX_EXTRA_LAYERS
       : 0;
-  for (const ubatch of [CPU_EXPERT_PREFILL_UBATCH, CPU_EXPERT_PREFILL_UBATCH / 2]) {
+  // Layers split over several GPUs: big ubatches hung the slower card of an
+  // RX 9070 XT + 9060 XT pair with Groot 65B (amdgpu compute ring timeout →
+  // Vulkan ErrorDeviceLost), late in 64k sessions when one ubatch attends over
+  // ~55k tokens: -ub 4096 every time, -ub 2048 in 2 of 3 sessions, and
+  // llama.cpp's own --fit on as well. -ub 1024 ran both agent scenarios with no
+  // reset and 1.5–1.6x faster than -ub 512. One GPU kept 4096 (8/12 GB runs).
+  const split = gpus.length >= 2 && settings.splitMode !== "none";
+  const ubatches = split
+    ? [CPU_EXPERT_SPLIT_MAX_UBATCH]
+    : [CPU_EXPERT_PREFILL_UBATCH, CPU_EXPERT_PREFILL_UBATCH / 2];
+  for (const ubatch of ubatches) {
     if (ubatch <= settings.physicalBatchSize) {
       break;
     }
@@ -352,7 +364,7 @@ function weightMassOptions(caps: ModelCapabilities, settings: LlamaLoadSettings)
   return {
     isMoe: caps.isMoe,
     nCpuMoe: settings.nCpuMoe,
-    moeExpertShare: caps.moeExpertShare,
+    moeExpertShare: caps.isMoe ? perLayerMoeExpertShare(caps) : caps.moeExpertShare,
     nCpuFfn: settings.nCpuFfn,
     denseFfnShare: caps.denseFfnShare,
   };
