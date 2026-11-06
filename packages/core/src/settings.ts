@@ -1,3 +1,4 @@
+import * as fs from "fs";
 import * as path from "path";
 import {
   AppConfig,
@@ -363,6 +364,15 @@ export class SettingsStore {
     if ((this.config.getState().gpuOrderRevision ?? 0) >= 1) {
       return false;
     }
+    // Older Llama AIO windows and TUIs rewrite config.json with the fields they
+    // know, dropping gpuOrderRevision. Migrating again would swap two cards
+    // back (seen live: 0.3.9 running beside a newer build). A marker file next
+    // to the config survives those rewrites.
+    const marker = this.gpuOrderMarkerPath();
+    if (fs.existsSync(marker)) {
+      await this.config.updateState(() => ({ gpuOrderRevision: 1 }));
+      return false;
+    }
     let changed = false;
     await this.config.updateState((raw) => {
       if ((raw.gpuOrderRevision ?? 0) >= 1) {
@@ -381,7 +391,17 @@ export class SettingsStore {
         ? { gpuOrderRevision: 1, loadSettings: { ...load, ...patch } }
         : { gpuOrderRevision: 1 };
     });
+    try {
+      fs.writeFileSync(marker, JSON.stringify({ revision: 1, at: new Date().toISOString() }) + "\n");
+    } catch {
+      // The config flag still guards this config; the marker only adds robustness.
+    }
     return changed;
+  }
+
+  /** `gpu-order-v1` beside config.json: set once the GPU-order migration ran. */
+  private gpuOrderMarkerPath(): string {
+    return path.join(path.dirname(this.config.path), "gpu-order-v1");
   }
 
   /** Put `host` back after the user chose Undo on the migration toast. */

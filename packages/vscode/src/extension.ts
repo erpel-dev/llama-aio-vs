@@ -338,7 +338,10 @@ export function activate(context: vscode.ExtensionContext): void {
       await settingsView.pushState();
       void refreshStatusBar();
     }
-    await promptUseInCopilotChat(store, message, context.globalState);
+    // Not awaited: the toast stays until someone clicks it, and the start /
+    // reload commands must resolve once the server is ready (other
+    // extensions and tasks run them programmatically). The sidebar does the same.
+    void promptUseInCopilotChat(store, message, context.globalState);
     return true;
   };
 
