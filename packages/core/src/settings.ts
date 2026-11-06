@@ -1,3 +1,4 @@
+import * as fs from "fs";
 import * as path from "path";
 import {
   AppConfig,
@@ -12,7 +13,7 @@ import { isLoopbackHost, isWildcardHost, urlHostname } from "./serverHttp";
 import { Event } from "./events";
 import { clampLoadSettingsToModel, isQwen4expArchitecture, readModelCapabilities } from "./ggufMetadata";
 import { detectGpusAsync, preferredMainGpu, type GpuMemoryInfo } from "./gpuInfo";
-import { parseTensorSplit, remapLegacyGpuOrder } from "./gpuSplit";
+import { normalizeTensorSplit, parseTensorSplit, remapLegacyGpuOrder } from "./gpuSplit";
 import { LlamaInstaller } from "./llamaInstaller";
 import { resolveMmprojPath, resolveMtpDraftPath, findSiblingMtpDraft, isMtpSidecarFile } from "./modelLibrary";
 import { recommendLoadSettings } from "./recommendSettings";
@@ -363,6 +364,23 @@ export class SettingsStore {
     if ((this.config.getState().gpuOrderRevision ?? 0) >= 1) {
       return false;
     }
+    // Older Llama AIO windows and TUIs rewrite config.json with the fields they
+    // know, dropping gpuOrderRevision. Migrating again would swap two cards back
+    // (seen live: 0.3.9 running beside a newer build). A marker file next to the
+    // config records the migrated GPU values and survives those rewrites:
+    // - values still equal to the marker: an older version only dropped the
+    //   flag, so restore it;
+    // - values differ: a new choice saved by an older version (in its old GPU
+    //   order), a restored backup, or a fresh config, so migrate again.
+    const marker = this.gpuOrderMarkerPath();
+    const recorded = this.readGpuOrderMarker(marker);
+    if (recorded) {
+      const now = this.config.getState().loadSettings;
+      if (now.mainGpu === recorded.mainGpu && normalizeTensorSplit(now.tensorSplit) === normalizeTensorSplit(recorded.tensorSplit)) {
+        await this.config.updateState(() => ({ gpuOrderRevision: 1 }));
+        return false;
+      }
+    }
     let changed = false;
     await this.config.updateState((raw) => {
       if ((raw.gpuOrderRevision ?? 0) >= 1) {
@@ -381,7 +399,29 @@ export class SettingsStore {
         ? { gpuOrderRevision: 1, loadSettings: { ...load, ...patch } }
         : { gpuOrderRevision: 1 };
     });
+    try {
+      const done = this.config.getState().loadSettings;
+      fs.writeFileSync(marker, JSON.stringify({ revision: 1, mainGpu: done.mainGpu, tensorSplit: done.tensorSplit || "", at: new Date().toISOString() }) + "\n");
+    } catch {
+      // The config flag still guards this config; the marker only adds robustness.
+    }
     return changed;
+  }
+
+  private readGpuOrderMarker(file: string): { mainGpu: number; tensorSplit: string } | undefined {
+    try {
+      const m = JSON.parse(fs.readFileSync(file, "utf8")) as { revision?: number; mainGpu?: number; tensorSplit?: string };
+      return m.revision === 1 && typeof m.mainGpu === "number"
+        ? { mainGpu: m.mainGpu, tensorSplit: String(m.tensorSplit || "") }
+        : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** `gpu-order-v1` beside config.json: set once the GPU-order migration ran. */
+  private gpuOrderMarkerPath(): string {
+    return path.join(path.dirname(this.config.path), "gpu-order-v1");
   }
 
   /** Put `host` back after the user chose Undo on the migration toast. */

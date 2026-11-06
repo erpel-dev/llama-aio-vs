@@ -115,6 +115,79 @@ describe("ConfigFile", () => {
     assert.equal(new ConfigFile(file).get().state.gpuOrderRevision, 1);
   });
 
+  it("does not swap the cards back when an older version drops the migration flag", async (t) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "llama-config-gpuorder-old-"));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const file = path.join(dir, "config.json");
+    const store = new SettingsStore(new ConfigFile(file));
+    await store.updateLoadSettings({ mainGpu: 0, tensorSplit: "90,10", splitMode: "none" });
+    const gpus = [
+      { totalBytes: 16e9, source: "sysfs:card1", llamaDeviceId: "Vulkan0", legacyIndex: 1 },
+      { totalBytes: 16e9, source: "sysfs:card0", llamaDeviceId: "Vulkan1", legacyIndex: 0 },
+    ];
+    assert.equal(await store.migrateLegacyGpuOrder(gpus), true);
+    assert.ok(fs.existsSync(path.join(dir, "gpu-order-v1")));
+    // Llama AIO 0.3.9 rewrites config.json with the fields it knows (seen live).
+    const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+    delete raw.state.gpuOrderRevision;
+    fs.writeFileSync(file, JSON.stringify(raw));
+    const fresh = new SettingsStore(new ConfigFile(file));
+    assert.equal(fresh.getState().loadSettings.mainGpu, 1);
+    assert.equal(await fresh.migrateLegacyGpuOrder(gpus), false, "a second swap would undo the first");
+    const load = new SettingsStore(new ConfigFile(file)).getState().loadSettings;
+    assert.equal(load.mainGpu, 1);
+    assert.equal(load.tensorSplit, "10,90");
+    assert.equal(new ConfigFile(file).get().state.gpuOrderRevision, 1, "flag restored from the marker");
+  });
+
+  describe("after an older version rewrites the config", () => {
+    // Same two cards as the dev PC: new order [9060 XT, 9070 XT]; before the fix [9070 XT, 9060 XT].
+    const gpus = [
+      { totalBytes: 16e9, name: "AMD Radeon RX 9060 XT", source: "sysfs:card1", llamaDeviceId: "Vulkan0", legacyIndex: 1 },
+      { totalBytes: 16e9, name: "AMD Radeon RX 9070 XT", source: "sysfs:card0", llamaDeviceId: "Vulkan1", legacyIndex: 0 },
+    ];
+    const setup = async (t: { after: (fn: () => void) => void }) => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "llama-config-gpuorder-edge-"));
+      t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+      const file = path.join(dir, "config.json");
+      const store = new SettingsStore(new ConfigFile(file));
+      await store.updateLoadSettings({ mainGpu: 0, tensorSplit: "90,10", splitMode: "layer" });
+      await store.migrateLegacyGpuOrder(gpus);
+      return { file, dir };
+    };
+    const dropFlag = (file: string, mutate?: (r: any) => void) => {
+      const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+      delete raw.state.gpuOrderRevision;
+      mutate?.(raw);
+      fs.writeFileSync(file, JSON.stringify(raw));
+    };
+    const load = (file: string) => new SettingsStore(new ConfigFile(file)).getState().loadSettings;
+
+    it("remaps a GPU choice an older version saved in its own order", async (t) => {
+      const { file } = await setup(t);
+      // 0.3.9 lists the 9070 XT first: its "main GPU 1, 30/70" means 9060 XT main, 30% on the 9070 XT.
+      dropFlag(file, (r) => { r.state.loadSettings.mainGpu = 1; r.state.loadSettings.tensorSplit = "30,70"; });
+      assert.equal(await new SettingsStore(new ConfigFile(file)).migrateLegacyGpuOrder(gpus), true);
+      assert.equal(load(file).mainGpu, 0, "the 9060 XT is position 0 now");
+      assert.equal(load(file).tensorSplit, "70,30");
+    });
+
+    it("migrates a restored pre-migration backup although the marker exists", async (t) => {
+      const { file } = await setup(t);
+      dropFlag(file, (r) => { r.state.loadSettings.mainGpu = 0; r.state.loadSettings.tensorSplit = "90,10"; });
+      assert.equal(await new SettingsStore(new ConfigFile(file)).migrateLegacyGpuOrder(gpus), true);
+      assert.equal(load(file).mainGpu, 1);
+      assert.equal(load(file).tensorSplit, "10,90");
+    });
+
+    it("still picks the stronger card for a fresh config when a marker is left over", async (t) => {
+      const { file } = await setup(t);
+      fs.unlinkSync(file);
+      assert.equal(await new SettingsStore(new ConfigFile(file)).migrateLegacyGpuOrder(gpus), true);
+      assert.equal(load(file).mainGpu, 1);
+    });
+  });
+
   it("starts a fresh two-GPU config on the stronger card, once", async (t) => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "llama-config-maingpu-"));
     t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
