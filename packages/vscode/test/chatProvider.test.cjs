@@ -219,6 +219,31 @@ describe("LlamaAioChatProvider requests", () => {
     seenRequests = [];
   });
 
+  it("keeps the local model id the same whether the server is up, loading or stopped", async () => {
+    // llama-server without --alias serves the model path as its id.
+    servedModelId = "/m/test.gguf";
+    const { provider, pm } = setup();
+    const [running] = await provider.provideLanguageModelChatInformation({}, cancelToken().token);
+    pm.isHttpReady = async () => false;
+    provider.notifyChanged();
+    const [stopped] = await provider.provideLanguageModelChatInformation({}, cancelToken().token);
+    assert.equal(running.id, "/m/test.gguf");
+    assert.equal(stopped.id, running.id, "Copilot keeps its model selection by id");
+    assert.equal(stopped.name, running.name);
+  });
+
+  for (const remote of [false, true]) {
+    it(`lists the loaded model of a llama-server router, not the first one (${remote ? "remote" : "local"})`, async () => {
+      servedModels = { data: [
+        { id: "LFM3-1.7B-QAD-Q4_0", status: { value: "unloaded" } },
+        { id: "Qwen3.5-2B-Q4_K_M", status: { value: "loaded" } },
+      ] };
+      const { provider } = setup({ remote });
+      const [model] = await provider.provideLanguageModelChatInformation({}, cancelToken().token);
+      assert.equal(model.id, "Qwen3.5-2B-Q4_K_M");
+    });
+  }
+
   for (const remote of [false, true]) {
     it(`discovers unknown template efforts through /props (${remote ? 'remote' : 'local'})`, async () => {
       servedModelId = "opaque-new-model";

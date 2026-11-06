@@ -24,6 +24,7 @@ import {
   overthinkingLogitBias,
   parseChatStream,
   PerfStats,
+  pickServedModel,
   positiveRate,
   ProcessManager,
   remoteSlotContext,
@@ -61,6 +62,8 @@ interface OpenAiModel {
   alias_of?: string;
   aliases?: unknown;
   meta?: { label?: string; aliases?: unknown };
+  /** llama-server router: `{ value: "loaded" | "unloaded" | "loading" }`. */
+  status?: unknown;
 }
 
 interface OpenAiModelsResponse {
@@ -659,7 +662,7 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
       const models = await serverJson<OpenAiModelsResponse>(joinServerUrl(endpoint, "/v1/models"), {
         timeoutMs: this.store.isRemote() ? 5000 : 3000,
       });
-      const first = models.data?.[0];
+      const first = pickServedModel(models.data);
       const modelId = first?.id;
       if (modelId) {
         const identity = remoteModelIdentity(first);
@@ -686,11 +689,13 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
     const state = this.store.getState();
     const remoteInfo = this.remoteInfo();
     const selected = state.selectedModelPath;
+    // The fallback must be the id the server will report: Copilot keeps the
+    // chosen model by id, so a different id while llama-server is stopped or
+    // loading (the file name vs. the served path) dropped the selection.
+    // llama-server without --alias serves the model path as its id.
     const fallback = remote
       ? remoteInfo?.modelId || this.store.getServerPreferences().lastRemoteModelId || "remote-model"
-      : selected
-        ? selected.split(/[/\\]/).pop() || "local-model"
-        : "local-model";
+      : selected || "local-model";
     const modelId = ready ? await this.cachedModelId(fallback) : fallback;
     if (remote && ready && modelId !== "remote-model") {
       void this.store.setLastRemoteModelId(modelId).catch(() => undefined);

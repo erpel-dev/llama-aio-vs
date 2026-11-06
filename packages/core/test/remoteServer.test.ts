@@ -15,6 +15,7 @@ import {
   remoteStateLabel,
   remoteStateUsable,
   RemoteServerMonitor,
+  pickServedModel,
 } from "../src/remoteServer";
 import { legacyRemoteHostUrl } from "../src/settings";
 
@@ -723,5 +724,22 @@ describe("slot and metrics parsers", () => {
     assert.equal(remoteLoadBusy({ slotsBusy: 1, slotsTotal: 4, requestsDeferred: 2 }), true);
     assert.equal(remoteLoadBusy({ slotsBusy: 0, slotsTotal: 4, requestsDeferred: 0 }), false);
     assert.equal(remoteLoadBusy({}), false);
+  });
+});
+
+describe("pickServedModel", () => {
+  it("prefers the loaded model of a llama-server router over the first entry", () => {
+    // Shape of llama-server --models-dir /v1/models after a chat with the second model.
+    const data = [
+      { id: "LFM3-1.7B-QAD-Q4_0", status: { value: "unloaded" } },
+      { id: "Qwen3.5-2B-Q4_K_M", status: { value: "loaded" } },
+    ];
+    assert.equal(pickServedModel(data)?.id, "Qwen3.5-2B-Q4_K_M");
+    const mixed: Array<{ id: string; status?: unknown }> = [{ id: "a", status: { value: "unloaded" } }, { id: "b", status: "loading" }];
+    assert.equal(pickServedModel(mixed)?.id, "b");
+    // Single-model servers (no status) and an all-unloaded router keep the first entry.
+    assert.equal(pickServedModel<{ id: string; status?: unknown }>([{ id: "only" }])?.id, "only");
+    assert.equal(pickServedModel([{ id: "x", status: { value: "unloaded" } }, { id: "y", status: { value: "unloaded" } }])?.id, "x");
+    assert.equal(pickServedModel([]), undefined);
   });
 });
