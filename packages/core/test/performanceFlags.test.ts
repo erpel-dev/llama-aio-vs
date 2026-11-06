@@ -143,3 +143,21 @@ describe("GPU expert cache memory budget", () => {
     assert.equal(estimateMemory(caps, { ...cached, splitMode: "tensor" }, limited)!.moeCacheBytes, undefined);
   });
 });
+
+describe("split device order", () => {
+  it("passes --device fastest-link first and reorders the split and main GPU", () => {
+    const gpus = [
+      { totalBytes: 16 * 2 ** 30, source: "test", llamaDeviceId: "Vulkan0", pcieGBps: 2.0 },
+      { totalBytes: 16 * 2 ** 30, source: "test", llamaDeviceId: "Vulkan1", pcieGBps: 15.75 },
+    ];
+    const args = buildServerArgs("m.gguf", "127.0.0.1", 8742, loadSettings({ nCpuMoe: 23, tensorSplit: "32,68", splitMode: "layer", mainGpu: 1 }), { gpus });
+    const value = (flag: string) => args[args.indexOf(flag) + 1];
+    assert.equal(value("--device"), "Vulkan1,Vulkan0");
+    assert.equal(value("--tensor-split"), "68,32");
+    assert.equal(value("--main-gpu"), "0");
+    // Everything on the GPUs: llama.cpp's own order stays.
+    const plain = buildServerArgs("m.gguf", "127.0.0.1", 8742, loadSettings({ nCpuMoe: 0, tensorSplit: "32,68", splitMode: "layer", mainGpu: 1 }), { gpus });
+    assert.equal(plain.includes("--device"), false);
+    assert.equal(plain[plain.indexOf("--tensor-split") + 1], "32,68");
+  });
+});

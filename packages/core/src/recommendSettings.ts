@@ -10,6 +10,7 @@ import {
 } from "./gpuSplit";
 import { isQwen4expArchitecture, ModelCapabilities } from "./ggufMetadata";
 import { estimateMemory, gpuBarCapacityBytes, MemoryEstimate, perLayerMoeExpertShare, VRAM_HEADROOM_BYTES } from "./memoryEstimate";
+import { offloadDeviceOrder } from "./gpuSplit";
 import { isMtpBakedInFile, isMtpSidecarFile } from "./modelLibrary";
 import { LlamaLoadSettings, recommendedMaxDraftTokens, speculativeUsesDflash, speculativeUsesNgram } from "./types";
 
@@ -167,6 +168,7 @@ const CPU_EXPERT_UBATCH_MAX_EXTRA_LAYERS = 3;
 const CPU_EXPERT_UBATCH_MAX_EXTRA_LAYERS_HEAVY = 7;
 /** Largest -ub for CPU experts when layers are split over several GPUs. */
 const CPU_EXPERT_SPLIT_MAX_UBATCH = 1024;
+
 /** Share of expert layers on the CPU from which a session is copy-bound. */
 const CPU_EXPERT_HEAVY_SHARE = 0.5;
 
@@ -198,11 +200,11 @@ function tuneCpuExpertBatch(
         : CPU_EXPERT_UBATCH_MAX_EXTRA_LAYERS
       : 0;
   // Layers split over several GPUs: big ubatches hung the slower card of an
-  // RX 9070 XT + 9060 XT pair with Groot 65B (amdgpu compute ring timeout →
-  // Vulkan ErrorDeviceLost), late in 64k sessions when one ubatch attends over
-  // ~55k tokens: -ub 4096 every time, -ub 2048 in 2 of 3 sessions, and
-  // llama.cpp's own --fit on as well. -ub 1024 ran both agent scenarios with no
-  // reset and 1.5–1.6x faster than -ub 512. One GPU kept 4096 (8/12 GB runs).
+  // RX 9070 XT + 9060 XT pair with Groot 65B late in 64k sessions (amdgpu 2 s
+  // compute timeout → Vulkan ErrorDeviceLost). -ub 4096 every time, -ub 2048
+  // in 2 of 3 sessions with the slow card first and again with it holding the
+  // full expert layers after offloadDeviceOrder. -ub 1024 ran every agent
+  // scenario without a reset. One GPU keeps 4096 (8/12 GB runs).
   const split = gpus.length >= 2 && settings.splitMode !== "none";
   const ubatches = split
     ? [CPU_EXPERT_SPLIT_MAX_UBATCH]
@@ -360,8 +362,9 @@ function uniqueSplits(splits: string[]): string[] {
   return out;
 }
 
-function weightMassOptions(caps: ModelCapabilities, settings: LlamaLoadSettings): LayerWeightMassOptions {
+function weightMassOptions(caps: ModelCapabilities, settings: LlamaLoadSettings, gpus?: GpuMemoryInfo[]): LayerWeightMassOptions {
   return {
+    deviceOrder: gpus ? offloadDeviceOrder(gpus, settings) : undefined,
     isMoe: caps.isMoe,
     nCpuMoe: settings.nCpuMoe,
     moeExpertShare: caps.isMoe ? perLayerMoeExpertShare(caps) : caps.moeExpertShare,
@@ -392,7 +395,7 @@ function retargetTensorSplitToWeightShare(
     Math.max(1, caps.blockCount || 1),
     layersOnGpuForSplit(caps, settings),
     settings.splitMode,
-    weightMassOptions(caps, settings)
+    weightMassOptions(caps, settings, gpus)
   );
   return next ? { ...settings, tensorSplit: next } : settings;
 }

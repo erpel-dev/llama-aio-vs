@@ -81,6 +81,19 @@ describe("recommendLoadSettings", () => {
     assert.ok(r.physicalBatchSize <= 1024, `split -ub ${r.physicalBatchSize}`);
   });
 
+  it("splits around the fast-link card when it leads llama.cpp's device order", () => {
+    // 9060 XT (Vulkan0) on PCIe 2.0 x4, 9070 XT (Vulkan1) on PCIe 3.0 x16: the
+    // 9070 XT goes first, takes the cheap CPU-MoE layers and most of the split.
+    const card = (id: string, gbps: number) => ({ totalBytes: 16 * GiB, usedBytes: 0, name: "RX 9070 XT", source: "test", llamaDeviceId: id, pcieGBps: gbps });
+    const caps = moeCaps({ embeddingLength: 2048, fileSizeBytes: 40 * GiB });
+    const gpus = [card("Vulkan0", 2.0), card("Vulkan1", 15.75)];
+    const r = recommendLoadSettings(loadSettings({ mainGpu: 1 }), caps, { gpus, gpu: gpus[0] });
+    assert.ok(r.nCpuMoe > 0);
+    assert.ok(r.physicalBatchSize <= 1024);
+    const [slow, fast] = r.tensorSplit.split(",").map(Number);
+    assert.ok(fast! > slow!, `9070 XT share ${fast} vs 9060 XT ${slow}`);
+  });
+
   it("raises --n-cpu-ffn before dropping layers for dense models when it fits", () => {
     // 24 GiB card: full model + KV (~25 GiB) does not fit; FFN-on-CPU does.
     const caps = denseCaps({ ffnLength: 13824 });

@@ -2,6 +2,7 @@ import * as os from "os";
 import { formatGpuDeviceLabel, GpuMemoryInfo, isIntegratedGpu } from "./gpuInfo";
 import {
   assignLayerDevices,
+  offloadDeviceOrder,
   gpuDisplayOrder,
   parseTensorSplit,
   effectiveTensorSplitShares,
@@ -1243,6 +1244,8 @@ export function estimateMemory(
     nCpuFfn: settings.nCpuFfn,
     denseFfnShare,
   };
+  // CPU-held weights on a layer split: the fastest PCIe link goes first (--device).
+  const deviceOrder = gpus.length >= 2 ? offloadDeviceOrder(gpus, settings) : undefined;
   const weightShares =
     gpus.length >= 2
       ? layerAwareWeightShares(
@@ -1251,12 +1254,13 @@ export function estimateMemory(
           shares,
           settings.splitMode,
           mainGpuIndex,
-          layerMassOpts
+          layerMassOpts,
+          deviceOrder
         )
       : shares;
   const layerAssign =
     gpus.length >= 2 && settings.splitMode !== "row" && settings.splitMode !== "tensor"
-      ? assignLayerDevices(nLayers, onGpu, shares, settings.splitMode, mainGpuIndex)
+      ? assignLayerDevices(nLayers, onGpu, shares, settings.splitMode, mainGpuIndex, deviceOrder)
       : undefined;
   const kvPerLayerFull = layerAssign
     ? estimateKvBytesPerLayer(

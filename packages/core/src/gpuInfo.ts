@@ -49,6 +49,12 @@ export interface GpuMemoryInfo {
   legacyIndex?: number;
   /** A monitor is attached to this card (Linux DRM connector status). */
   drivesDisplay?: boolean;
+  /**
+   * Narrowest PCIe hop between this card and the CPU, in GB/s per direction
+   * (Linux sysfs). A card behind a chipset (B450: PCIe 2.0 x4, ~2 GB/s) is far
+   * slower to feed than one on CPU lanes (PCIe 3.0 x16, ~15.8 GB/s).
+   */
+  pcieGBps?: number;
 }
 
 export interface LlamaListedDevice {
@@ -151,6 +157,46 @@ function* sysfsGpuName(deviceDir: string, uevent: string, pciSlot?: string): Exe
   return driver || undefined;
 }
 
+/** GB/s per direction of one PCIe link: `"5.0 GT/s PCIe"` × lanes, after line encoding. */
+export function pcieLinkGBps(speed: string, width: number): number | undefined {
+  const gts = Number.parseFloat(speed);
+  if (!(gts > 0) || !(width > 0)) {
+    return undefined;
+  }
+  // PCIe 1/2 use 8b/10b; PCIe 3+ use 128b/130b (PCIe 6 FLIT is close enough).
+  const efficiency = gts <= 5 ? 0.8 : 128 / 130;
+  return (gts * width * efficiency) / 8;
+}
+
+/**
+ * Narrowest PCIe link from a GPU up to the CPU root port, walking the sysfs
+ * device path (`…/0000:00:01.3/0000:03:00.2/…/0000:27:00.0`). GPU-internal
+ * switch links report full speed, so the minimum is the slot or chipset link.
+ */
+export function sysfsPcieBottleneckGBps(deviceDir: string): number | undefined {
+  let dir: string;
+  try {
+    dir = fs.realpathSync(deviceDir);
+  } catch {
+    return undefined;
+  }
+  let best: number | undefined;
+  while (/^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$/i.test(path.basename(dir))) {
+    try {
+      const speed = fs.readFileSync(path.join(dir, "current_link_speed"), "utf8");
+      const width = Number(fs.readFileSync(path.join(dir, "current_link_width"), "utf8").trim());
+      const gbps = pcieLinkGBps(speed, width);
+      if (gbps !== undefined) {
+        best = best === undefined ? gbps : Math.min(best, gbps);
+      }
+    } catch {
+      // root complex or a device without link attributes
+    }
+    dir = path.dirname(dir);
+  }
+  return best;
+}
+
 /** True when a connector of DRM card `ent` (`card1-DP-1/status`) has a monitor attached. */
 export function sysfsCardDrivesDisplay(root: string, ent: string, entries: string[]): boolean {
   for (const conn of entries) {
@@ -236,6 +282,7 @@ function* readSysfsGpus(): ExecSteps<GpuMemoryInfo[] | undefined> {
         source: `sysfs:${ent}`,
         pciSlot,
         drivesDisplay: sysfsCardDrivesDisplay(root, ent, entries),
+        pcieGBps: sysfsPcieBottleneckGBps(deviceDir),
         gttUsedBytes,
         gttTotalBytes,
         visVramTotalBytes,
