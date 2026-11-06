@@ -2,6 +2,7 @@ import { formatGpuDeviceLabel, GpuMemoryInfo, isIntegratedGpu } from "./gpuInfo"
 import { ModelCapabilities } from "./ggufMetadata";
 import {
   deviceWouldSpill,
+  displayReserveBytes,
   estimateMemory,
   gpuBarCapacityBytes,
   MemoryBarSegment,
@@ -44,6 +45,8 @@ export interface DeviceUsageView {
   freeBytes?: number;
   /** Current occupancy reported by the driver (not part of the estimate). */
   liveUsedBytes?: number;
+  /** VRAM the desktop holds on a card that drives a display; counted against free, not part of the bar. */
+  desktopBytes?: number;
   segments: MemoryBarSegment[];
   level: FitLevel;
 }
@@ -169,6 +172,9 @@ function devicesOf(est: MemoryEstimate, gpus: GpuMemoryInfo[], cpuOnly: boolean)
     }
     const integrated = isIntegratedGpu(g);
     const cap = chart.capacityBytes ?? gpuBarCapacityBytes(g);
+    // The desktop's share of a display card is not ours to fill: free memory
+    // and the fit level count it, exactly like the estimator's spill check.
+    const desktop = integrated ? 0 : displayReserveBytes(g);
     devices.push({
       key: `gpu${chart.gpuIndex}`,
       kind: integrated ? "igpu" : "gpu",
@@ -177,10 +183,11 @@ function devicesOf(est: MemoryEstimate, gpus: GpuMemoryInfo[], cpuOnly: boolean)
       gpuIndex: chart.gpuIndex,
       usedBytes: chart.totalBytes,
       capacityBytes: cap,
-      freeBytes: cap ? cap - chart.totalBytes : undefined,
+      freeBytes: cap ? cap - chart.totalBytes - desktop : undefined,
       liveUsedBytes: g?.usedBytes,
+      ...(desktop > 0 ? { desktopBytes: desktop } : {}),
       segments: chart.segments,
-      level: levelFor(chart.totalBytes, cap, integrated),
+      level: levelFor(chart.totalBytes + desktop, cap, integrated),
     });
   }
   // Partial offload / CPU MoE: RAM holds real weight, so it earns a bar.
@@ -222,7 +229,13 @@ function headlineFor(level: FitLevel, devices: DeviceUsageView[], cpuOnly: boole
     return "System RAM is over capacity. Lower context or GPU offload.";
   }
   if (level === "tight") {
-    return `Fits, but only ${formatBytes(Math.max(0, worstDev.freeBytes ?? 0))} free on ${worstDev.label} (target ${formatBytes(VRAM_HEADROOM_BYTES)}).`;
+    const desktop = worstDev.desktopBytes ? ` after the desktop's ~${formatBytes(worstDev.desktopBytes)}` : "";
+    const free = Math.max(0, worstDev.freeBytes ?? 0);
+    // Just under the target both would read "1.5 GiB": show the shortfall in MiB.
+    const freeText = free < VRAM_HEADROOM_BYTES && formatBytes(free) === formatBytes(VRAM_HEADROOM_BYTES)
+      ? `${Math.floor(free / (1024 * 1024))} MiB`
+      : formatBytes(free);
+    return `Fits, but only ${freeText} free on ${worstDev.label}${desktop} (target ${formatBytes(VRAM_HEADROOM_BYTES)}).`;
   }
   if (gpuDevs.length === 1) {
     return `Fits on ${worstDev.label} with ${formatBytes(worstDev.freeBytes ?? 0)} to spare.`;

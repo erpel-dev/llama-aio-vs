@@ -193,3 +193,47 @@ describe("friendlyModelTitle", () => {
     assert.equal(friendlyModelTitle("my-model", "/m/my-model-q8.gguf"), "my-model");
   });
 });
+
+describe("display card headroom in the fit verdict", () => {
+  // Two cards on a split. The RX 9060 XT drives the monitors and holds ~1.3 GiB of desktop.
+  const settings = loadSettings({ contextLength: 8192, gpuOffload: 99, splitMode: "layer", tensorSplit: "50,50", mainGpu: 0 });
+  const caps = denseCaps();
+  const sizes = () => {
+    const big = (id: string) => ({ totalBytes: 200 * GiB, usedBytes: 0, name: "RX 9070 XT", source: "t", llamaDeviceId: id });
+    const est = estimateMemory(caps, settings, big("Vulkan0"), { gpus: [big("Vulkan0"), big("Vulkan1")] })!;
+    return est.charts.gpus!.map((c) => c.totalBytes);
+  };
+  const cards = (display: boolean, freeA: number, freeB: number) => {
+    const [a, b] = sizes();
+    return [
+      { totalBytes: a! + freeA * GiB, usedBytes: 1.3 * GiB, idleUsedBytes: 1.3 * GiB, name: "AMD Radeon RX 9060 XT", source: "t", llamaDeviceId: "Vulkan0", drivesDisplay: display },
+      { totalBytes: b! + freeB * GiB, usedBytes: 0.1 * GiB, idleUsedBytes: 0.1 * GiB, name: "AMD Radeon RX 9070 XT", source: "t", llamaDeviceId: "Vulkan1" },
+    ];
+  };
+
+  it("names the display card, and its free memory includes the desktop", () => {
+    // By the estimate alone the 9070 XT has less free (1.9 vs 2.0 GiB); the desktop leaves the 9060 XT 0.7 GiB.
+    const { view } = computeMemoryView(caps, settings, cards(true, 2.0, 1.9));
+    assert.equal(view!.level, "tight");
+    assert.match(view!.headline, /RX 9060 XT/);
+    assert.match(view!.headline, /after the desktop's ~1\.3 GiB/);
+    const a = view!.devices.find((d) => d.label.includes("9060"))!;
+    assert.ok(Math.abs(a.freeBytes! - 0.7 * GiB) < 4096, `free ${a.freeBytes! / GiB}`);
+    assert.equal(a.level, "tight");
+    assert.equal(a.desktopBytes, 1.3 * GiB);
+    // The warning never quotes a free figure at or above its own target.
+    assert.ok(a.freeBytes! < VRAM_HEADROOM_BYTES);
+  });
+
+  it("stays green when no card drives a display", () => {
+    const { view } = computeMemoryView(caps, settings, cards(false, 2.0, 1.9));
+    assert.equal(view!.level, "good");
+    assert.match(view!.headline, /at least 1\.9 GiB free on each/);
+  });
+
+  it("shows a shortfall in MiB when it would round to the target", () => {
+    const { view } = computeMemoryView(caps, settings, cards(true, 2.78, 5));
+    assert.equal(view!.level, "tight");
+    assert.match(view!.headline, /only \d+ MiB free on RX 9060 XT/);
+  });
+});
