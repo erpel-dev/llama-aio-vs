@@ -47,6 +47,8 @@ export interface GpuMemoryInfo {
    * order differs, so saved `mainGpu` / `tensorSplit` can be re-pointed once.
    */
   legacyIndex?: number;
+  /** A monitor is attached to this card (Linux DRM connector status). */
+  drivesDisplay?: boolean;
 }
 
 export interface LlamaListedDevice {
@@ -149,6 +151,23 @@ function* sysfsGpuName(deviceDir: string, uevent: string, pciSlot?: string): Exe
   return driver || undefined;
 }
 
+/** True when a connector of DRM card `ent` (`card1-DP-1/status`) has a monitor attached. */
+export function sysfsCardDrivesDisplay(root: string, ent: string, entries: string[]): boolean {
+  for (const conn of entries) {
+    if (!conn.startsWith(`${ent}-`)) {
+      continue;
+    }
+    try {
+      if (fs.readFileSync(path.join(root, conn, "status"), "utf8").trim() === "connected") {
+        return true;
+      }
+    } catch {
+      // no status file (writeback connectors)
+    }
+  }
+  return false;
+}
+
 function* readSysfsGpus(): ExecSteps<GpuMemoryInfo[] | undefined> {
   if (process.platform !== "linux") {
     return undefined;
@@ -216,6 +235,7 @@ function* readSysfsGpus(): ExecSteps<GpuMemoryInfo[] | undefined> {
         name,
         source: `sysfs:${ent}`,
         pciSlot,
+        drivesDisplay: sysfsCardDrivesDisplay(root, ent, entries),
         gttUsedBytes,
         gttTotalBytes,
         visVramTotalBytes,

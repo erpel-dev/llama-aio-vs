@@ -127,7 +127,9 @@ describe("GPU expert cache memory budget", () => {
     const settings = loadSettings({ nCpuMoe: 48, tensorSplit: "1,1", splitMode: "layer" });
     const original = estimateMemory(caps, settings, gpus[0], { gpus })!;
     const cached = estimateMemory(caps, { ...settings, moeCacheMiB: 4096 }, gpus[0], { gpus })!;
-    assert.deepEqual(cached.charts.gpus!.map((c, i) => c.totalBytes - original.charts.gpus![i]!.totalBytes), [2 * GiB, 2 * GiB]);
+    const added = cached.charts.gpus!.map((c, i) => c.totalBytes - original.charts.gpus![i]!.totalBytes);
+    assert.equal(added.length, 2);
+    for (const bytes of added) assert.ok(Math.abs(bytes - 2 * GiB) < 1024, `cache share ${bytes}`);
   });
   it("includes the budget in spill detection and ignores it for CPU/dense/tensor modes", () => {
     const settings = loadSettings({ nCpuMoe: 48 });

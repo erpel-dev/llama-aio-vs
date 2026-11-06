@@ -497,13 +497,20 @@ export function assignLayerDevices(
   if (splitMode === "row" || splitMode === "tensor") {
     return out;
   }
+  // llama.cpp (llama_model::load_tensors): layer il goes to the first device
+  // whose cumulative split exceeds (il − i_gpu_start) / act_gpu_layers, where
+  // a full offload counts the output layer too (act = n_layer + 1). The old
+  // (k + 1) / n test put two layers fewer on the first card at 68/32 on 48
+  // layers — ~1.6 GB of Groot 65B experts billed to the wrong GPU.
+  const act = onGpu >= n ? n + 1 : onGpu;
+  const total = shares.reduce((a, v) => a + (v || 0), 0) || 1;
   for (let k = 0; k < onGpu; k++) {
-    const pos = (k + 1) / onGpu;
+    const pos = k / act;
     let cum = 0;
     let dev = nDev - 1;
     for (let d = 0; d < nDev; d++) {
-      cum += shares[d] || 0;
-      if (pos <= cum + 1e-9) {
+      cum += (shares[d] || 0) / total;
+      if (cum > pos + 1e-9) {
         dev = d;
         break;
       }

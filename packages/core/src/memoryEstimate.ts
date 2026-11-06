@@ -143,6 +143,21 @@ export function deviceWouldSpill(
   return used > cap - reserve;
 }
 
+/**
+ * VRAM the desktop already holds on a card that drives a display, capped so a
+ * running llama-server of our own on that card is not counted twice. A two-GPU
+ * split of Groot 65B that left the display card (RX 9060 XT, ~1.3 GiB desktop)
+ * with 0.7 GiB free hung it mid-session (amdgpu compute ring timeout); 1.5 GiB
+ * free on top of the desktop ran stably.
+ */
+export const DISPLAY_RESERVE_MAX_BYTES = 2 * GiB;
+export function displayReserveBytes(gpu: Pick<GpuMemoryInfo, "drivesDisplay" | "usedBytes"> | undefined): number {
+  if (!gpu?.drivesDisplay) {
+    return 0;
+  }
+  return Math.min(DISPLAY_RESERVE_MAX_BYTES, Math.max(0, gpu.usedBytes || 0));
+}
+
 /** VRAM, or GTT on an APU — the number the bars and spill check should use. */
 export function gpuBarCapacityBytes(gpu: GpuMemoryInfo | undefined): number | undefined {
   if (!gpu || !(gpu.totalBytes > 0)) {
@@ -816,6 +831,24 @@ export function resolveDenseFfnShare(caps: ModelCapabilities): number {
 }
 
 /**
+ * Routed experts' share of one layer's own weights, for spreading layers over
+ * GPUs. `moeExpertShare` is relative to the whole file; a PLE table (qwen4exp:
+ * ~45% of the file) is one global tensor kept in RAM, so per layer the experts
+ * weigh `moeExpertShare / (1 − pleShare)`. Groot 65B: 0.51 of the file is 0.93
+ * of a layer. Using the file share billed each --n-cpu-moe layer at 49% of a
+ * full layer instead of ~7%, overestimating the first GPU by 1.9–4.4 GiB and
+ * underestimating the next by 0.8–2.5 GiB on an RX 9060 XT + 9070 XT split.
+ */
+export function perLayerMoeExpertShare(caps: ModelCapabilities): number {
+  const share = resolveMoeExpertShare(caps);
+  const ple = resolvePleShare(caps);
+  if (!(share > 0) || !(ple > 0) || ple >= 0.95) {
+    return share;
+  }
+  return Math.min(0.98, share / (1 - ple));
+}
+
+/**
  * PLE / engram lookup table share. llama.cpp treats `per_layer_token_embd` as
  * a host-side gather, so these bytes stay in system RAM even at `-ngl 99`.
  */
@@ -1206,7 +1239,7 @@ export function estimateMemory(
   const layerMassOpts = {
     isMoe: !!caps.isMoe,
     nCpuMoe: settings.nCpuMoe,
-    moeExpertShare,
+    moeExpertShare: caps.isMoe ? perLayerMoeExpertShare(caps) : moeExpertShare,
     nCpuFfn: settings.nCpuFfn,
     denseFfnShare,
   };
@@ -1471,7 +1504,9 @@ export function estimateMemory(
         if (!(cap > 0)) {
           continue;
         }
-        if (deviceWouldSpill(used, cap)) {
+        // The desktop's share of a display card is not ours to fill.
+        const desktop = displayReserveBytes(gpus[i]);
+        if (deviceWouldSpill(used + desktop, cap)) {
           willSpill = true;
           const pct = Math.round((used / cap) * 100);
           const label = gpuLabel(gpus[i]!, i);
