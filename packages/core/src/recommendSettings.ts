@@ -9,8 +9,8 @@ import {
   tensorSplitForTargetWeightShare,
 } from "./gpuSplit";
 import { isQwen4expArchitecture, ModelCapabilities } from "./ggufMetadata";
-import { estimateMemory, gpuBarCapacityBytes, MemoryEstimate, perLayerMoeExpertShare, VRAM_HEADROOM_BYTES } from "./memoryEstimate";
-import { offloadDeviceOrder } from "./gpuSplit";
+import { displayReserveBytes, estimateMemory, gpuBarCapacityBytes, MemoryEstimate, perLayerMoeExpertShare, VRAM_HEADROOM_BYTES } from "./memoryEstimate";
+import { effectiveOffloadDeviceOrder } from "./gpuSplit";
 import { isMtpBakedInFile, isMtpSidecarFile } from "./modelLibrary";
 import { LlamaLoadSettings, recommendedMaxDraftTokens, speculativeUsesDflash, speculativeUsesNgram } from "./types";
 
@@ -137,7 +137,8 @@ function fitsHeadroom(
   if (!capacity) {
     return false;
   }
-  return capacity - est.totalGpuBytes >= headroom;
+  const desktop = isIntegratedGpu(gpu) ? 0 : displayReserveBytes(gpu);
+  return capacity - est.totalGpuBytes - desktop >= headroom;
 }
 
 /** iGPU carve-outs at or below this rely on shared memory (GTT) for the model. */
@@ -364,7 +365,7 @@ function uniqueSplits(splits: string[]): string[] {
 
 function weightMassOptions(caps: ModelCapabilities, settings: LlamaLoadSettings, gpus?: GpuMemoryInfo[]): LayerWeightMassOptions {
   return {
-    deviceOrder: gpus ? offloadDeviceOrder(gpus, settings) : undefined,
+    deviceOrder: gpus ? effectiveOffloadDeviceOrder(gpus, settings) : undefined,
     isMoe: caps.isMoe,
     nCpuMoe: settings.nCpuMoe,
     moeExpertShare: caps.isMoe ? perLayerMoeExpertShare(caps) : caps.moeExpertShare,

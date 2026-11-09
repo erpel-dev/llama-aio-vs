@@ -224,7 +224,7 @@ function headlineFor(level: FitLevel, devices: DeviceUsageView[], cpuOnly: boole
   if (level === "spill") {
     const overGpu = gpuDevs.find((d) => d.level === "spill");
     if (overGpu) {
-      return `${formatBytes(overGpu.usedBytes - (overGpu.capacityBytes || 0))} over VRAM on ${overGpu.label}. It will spill to system RAM and generation will slow down a lot.`;
+      return `${formatBytes(overGpu.usedBytes + (overGpu.desktopBytes || 0) - (overGpu.capacityBytes || 0))} over VRAM on ${overGpu.label}. It will spill to system RAM and generation will slow down a lot.`;
     }
     return "System RAM is over capacity. Lower context or GPU offload.";
   }

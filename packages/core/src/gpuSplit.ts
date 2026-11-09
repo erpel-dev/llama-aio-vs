@@ -627,6 +627,27 @@ export function remapLegacyGpuOrder(
 /** A link at least this much faster than llama.cpp's first device takes its place. */
 export const OFFLOAD_LINK_MIN_RATIO = 1.5;
 
+/** SYCL launches row requests as layer splits; estimates must use that mode too. */
+export function effectiveGpuSplitMode(
+  gpus: ReadonlyArray<{ llamaDeviceId?: string }>, mode: GpuSplitMode | undefined
+): GpuSplitMode {
+  return mode === "row" && gpus.some((g) => /^sycl/i.test(g.llamaDeviceId?.trim() || "")) ? "layer" : mode || "layer";
+}
+
+/** Device reorder that buildServerArgs can actually emit for this split. */
+export function effectiveOffloadDeviceOrder(
+  gpus: ReadonlyArray<{ pcieGBps?: number; llamaDeviceId?: string }>,
+  settings: { tensorSplit?: string; splitMode?: GpuSplitMode; nCpuMoe?: number; nCpuFfn?: number }
+): number[] | undefined {
+  if (parseTensorSplit(settings.tensorSplit).length !== gpus.length ||
+      !gpus.every((g) => !!g.llamaDeviceId?.trim())) {
+    return undefined;
+  }
+  // SYCL's row split is launched as layer mode.
+  const splitMode = effectiveGpuSplitMode(gpus, settings.splitMode);
+  return offloadDeviceOrder(gpus, { ...settings, splitMode });
+}
+
 /**
  * Device order (indices into `gpus`) for a layer split whose CPU-held weights
  * are copied to the first GPU for every prompt batch (llama.cpp op offload):
