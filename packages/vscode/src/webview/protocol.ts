@@ -74,6 +74,8 @@ export type ToHostMessage =
   | { type: "copyText"; text: string }
   | { type: "openCopilotChat" }
   | { type: "openAdvanced" }
+  | { type: "sendTest"; text: string }
+  | { type: "cancelTest" }
   | { type: "dismissSetup" }
   // Hugging Face search and downloads
   | { type: "searchLibraryHf"; query: string; requestId: number }
@@ -129,6 +131,7 @@ export type ToWebviewMessage =
   | { type: "mmprojSelected"; path: string }
   | { type: "openConnect" }
   | { type: "advancedPanel"; open: boolean }
+  | { type: "testResult"; status: "running" | "done" | "error" | "cancelled"; text?: string; error?: string; ms?: number }
   | { type: "remoteConnected" }
   | { type: "remoteProbe"; payload?: ViewModel; error?: string }
   | {
@@ -179,7 +182,7 @@ export type ToWebviewMessage =
       modelId: string;
       companionOnly: boolean;
       companionHint: string;
-      files: Array<{ path: string; label: string; detail: string }>;
+      files: Array<{ path: string; label: string; detail: string; fit?: "fits" | "tight" | "wont-fit"; needLabel?: string; capacityLabel?: string }>;
     };
 
 export type ToWebviewType = ToWebviewMessage["type"];

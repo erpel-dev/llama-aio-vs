@@ -92,6 +92,8 @@ function loadChanges() {
 let sawCompletedReply = false;
 /** Whether the Get started checklist is showing (it then owns the next action). */
 let setupVisible = false;
+/** Result of the Get started test message, kept until the user clicks Done. */
+let testState = null;
 let lastMemoryView = null;
 let loadDefaults = {};
 /** "Custom" GPU layers stays open while the user works with the slider. */
@@ -603,7 +605,7 @@ function renderSetup() {
   const box = $('setupBox');
   if (!box || !lastPayload) return;
   const st = setupSteps();
-  const visible = !remoteMode && !connectOpen && (!st.runtimeOk || !st.hasModel || !st.tried);
+  const visible = !remoteMode && !connectOpen && (!st.runtimeOk || !st.hasModel || !st.tried || !!testState);
   setupVisible = visible;
   box.classList.toggle('hidden', !visible);
   document.body.classList.toggle('onboarding', visible && !(st.runtimeOk && st.hasModel));
@@ -661,16 +663,15 @@ function renderSetup() {
     steps.start = { state: 'now', detail: 'Starts llama-server with the settings below. You can change them any time.' };
   }
   // First reply
-  if (st.tried) {
-    steps.try = { state: 'done', detail: '' };
+  const testing = !!(testState && testState.status === 'running');
+  if (testing) {
+    steps.try = { state: 'busy', detail: 'Waiting for the reply…' };
+  } else if (st.tried) {
+    steps.try = { state: 'done', detail: testState && testState.status === 'done' ? 'The model answered. Use it where you like:' : '' };
   } else if (serverRunning) {
-    steps.try = {
-      state: 'now',
-      detail: lastPayload.copilotChatAvailable
-        ? 'In Copilot Chat, open the model picker and choose “Llama AIO: ' + (lastPayload.modelName || 'model') + '”.'
-        : 'Copilot Chat is not installed. Chat in llama.cpp\'s web UI (opens signed in), or point any OpenAI-compatible client at ' + (lastEndpoint || lastPayload.endpoint || '') + '.',
-    };
+    steps.try = { state: 'now', detail: 'Send a test message to check that the model answers.' };
   }
+  renderSetupTest(serverRunning && (!st.tried || !!testState));
 
   const order = ['runtime', 'model', 'start', 'try'];
   const ids = { runtime: 'stepRuntime', model: 'stepModel', start: 'stepStart', try: 'stepTry' };
@@ -718,13 +719,16 @@ function renderSetup() {
   } else if (now === 'start') {
     action = 'start'; label = 'Start server';
   } else if (now === 'try') {
-    if (lastPayload.copilotChatAvailable) {
-      action = 'openChat'; label = 'Open Copilot Chat';
-    } else {
-      action = 'webui'; label = 'Open llama.cpp web UI';
-      secondary.push(setupButton('copyKey', 'Copy API key'), setupButton('copyEndpoint', 'Copy endpoint'));
-    }
-    secondary.push(setupButton('dismiss', 'Done'));
+    action = 'test'; label = testState && testState.status === 'error' ? 'Try again' : 'Send test message';
+    secondary.push(lastPayload.copilotChatAvailable ? setupButton('openChat', 'Open Copilot Chat') : setupButton('webui', 'Open web UI'),
+      setupButton('dismiss', 'Skip'));
+  } else if (testing) {
+    action = 'cancelTest'; label = 'Cancel';
+  } else if (st.tried && testState) {
+    // Answered: say where to use the model, then let the user close the list.
+    if (lastPayload.copilotChatAvailable) { action = 'openChat'; label = 'Open Copilot Chat'; }
+    else { action = 'webui'; label = 'Open llama.cpp web UI'; }
+    secondary.push(setupButton('copyKey', 'Copy API key'), setupButton('copyEndpoint', 'Copy endpoint'), setupButton('dismiss', 'Done'));
   } else {
     // Everything that needs the user is busy (installing / downloading / loading).
     const busy = order.find(function (k) { return steps[k].state === 'busy'; });
@@ -737,6 +741,33 @@ function renderSetup() {
   $('setupSecondary').innerHTML = secondary.join('');
   const foot = $('setupFoot');
   if (foot) foot.classList.toggle('hidden', st.runtimeOk && st.hasModel);
+}
+
+/** Test box under the last Get started step: input, then the reply or the error. */
+function renderSetupTest(show) {
+  const box = $('setupTest');
+  if (!box) return;
+  box.classList.toggle('hidden', !show);
+  const input = $('setupTestInput');
+  if (input) input.disabled = !!(testState && testState.status === 'running');
+  const reply = $('setupTestReply');
+  if (!reply) return;
+  const t = testState;
+  reply.classList.toggle('hidden', !t || t.status === 'running');
+  if (!t || t.status === 'running') return;
+  if (t.status === 'done') {
+    const p = lastPerf || {};
+    const bits = ['Worked'];
+    if (typeof p.completionTokens === 'number' && p.completionTokens > 0) bits.push(fmtNum(p.completionTokens) + ' tok' + (p.thinking ? ' incl. thinking' : ''));
+    if (typeof t.ms === 'number') bits.push((t.ms / 1000).toFixed(1) + ' s');
+    const rate = fmtRate(p.genTokPerSec);
+    if (rate) bits.push(rate + ' tok/s');
+    reply.innerHTML = escText(t.text || '(empty reply)') + '<span class="ok">' + escText(bits.join(' · ')) + '</span>';
+  } else if (t.status === 'cancelled') {
+    reply.innerHTML = '<span class="muted">Cancelled.</span>';
+  } else {
+    reply.innerHTML = '<span class="err">' + escText(t.error || 'The test message failed.') + '</span>';
+  }
 }
 
 function runSetupAction(action) {
@@ -769,6 +800,14 @@ function runSetupAction(action) {
     launch('start');
   } else if (action === 'openChat') {
     vscode.postMessage({ type: 'openCopilotChat' });
+  } else if (action === 'test') {
+    const text = (($('setupTestInput') && $('setupTestInput').value) || '').trim();
+    if (!text) return;
+    testState = { status: 'running' };
+    renderSetup();
+    vscode.postMessage({ type: 'sendTest', text: text });
+  } else if (action === 'cancelTest') {
+    vscode.postMessage({ type: 'cancelTest' });
   } else if (action === 'webui') {
     vscode.postMessage({ type: 'openWebUi' });
   } else if (action === 'copyKey') {
@@ -776,6 +815,7 @@ function runSetupAction(action) {
   } else if (action === 'copyEndpoint') {
     vscode.postMessage({ type: 'copyText', text: lastEndpoint || (lastPayload && lastPayload.endpoint) || '' });
   } else if (action === 'dismiss') {
+    testState = null;
     vscode.postMessage({ type: 'dismissSetup' });
   }
 }
@@ -3929,6 +3969,10 @@ $('libraryDialog').addEventListener('click', function (e) {
 window.addEventListener('message', (event: MessageEvent<ToWebviewMessage>) => {
   const msg = event.data;
   if (msg.type === 'libraryRefreshComplete') $('libraryRefreshBtn').disabled = false;
+  if (msg.type === 'testResult') {
+    testState = msg.status === 'cancelled' && !testState ? null : { status: msg.status, text: msg.text, error: msg.error, ms: msg.ms };
+    renderSetup();
+  }
   if (msg.type === 'advancedPanel') {
     const b = $('openAdvancedBtn');
     if (b) b.textContent = msg.open ? 'Show editor tab' : 'Open in editor';

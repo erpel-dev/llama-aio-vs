@@ -473,6 +473,11 @@ input:disabled, select:disabled { opacity: 0.5; }
 .setup-secondary:empty { display: none; }
 .setup-secondary button { flex: 1 1 auto; }
 .setup-foot { margin-top: 8px; }
+.setup-test { display: flex; flex-direction: column; gap: 4px; margin: 0 0 8px; }
+.setup-test textarea { width: 100%; box-sizing: border-box; resize: vertical; background: var(--bg); color: var(--input-fg); border: 1px solid var(--border); border-radius: 4px; padding: 6px 8px; font: inherit; }
+.setup-test-reply { border: 1px solid var(--border); border-radius: 4px; padding: 6px 8px; background: var(--bg); overflow-wrap: anywhere; white-space: pre-wrap; max-height: 160px; overflow-y: auto; }
+.setup-test-reply .ok, .setup-test-reply .muted, .setup-test-reply .err { display: block; font-size: 11px; margin-top: 4px; }
+.setup-test-reply .err { color: var(--vscode-errorForeground, var(--bad)); }
 @keyframes step-spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) {
   .setup-step.busy .step-mark { animation: none; border-top-color: var(--starting); }
@@ -540,6 +545,10 @@ body.perf-empty #ctxLegend,
 body.perf-empty #perfMore,
 body.perf-empty #perfSpecLine,
 body.perf-empty #srvLive { display: none !important; }
+.lib-fit { display: block; font-size: 11px; margin-top: 1px; }
+.lib-fit.fits { color: var(--ok); }
+.lib-fit.tight { color: var(--warn); }
+.lib-fit.wont-fit { color: var(--vscode-errorForeground, var(--bad)); }
 .cpu-only-note { display: none; }
 body.cpu-only .cpu-only-note { display: block; margin: 4px 0 10px; }
 body.cpu-only #gpuOffloadRow,
