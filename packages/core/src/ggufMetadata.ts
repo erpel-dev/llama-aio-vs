@@ -436,7 +436,7 @@ interface GgufHeaderScan {
   meta: Record<string, GgufValue>;
   /** Byte offset of tensor data section (aligned). */
   dataStart: number;
-  tensors: Array<{ name: string; offset: number; dimensions: number[] }>;
+  tensors: Array<{ name: string; offset: number; dimensions: number[]; type: number }>;
 }
 
 function readGgufHeader(r: GgufReader): GgufHeaderScan {
@@ -492,7 +492,7 @@ function readGgufHeader(r: GgufReader): GgufHeaderScan {
     pos = type.next;
     const offset = r.readU64(pos);
     pos = offset.next;
-    tensors.push({ name: name.value, offset: Number(offset.value), dimensions });
+    tensors.push({ name: name.value, offset: Number(offset.value), dimensions, type: type.value });
   }
 
   const alignmentRaw = meta["general.alignment"];
@@ -783,6 +783,7 @@ export function capsCacheStamp(filePath: string): string | undefined {
 /** Forget parsed GGUF headers (tests, or after files were replaced in place). */
 export function invalidateModelCapabilitiesCache(filePath?: string): void {
   pleCapsCache.clear();
+  pleRoleCache.clear();
   if (!filePath) {
     capsCache.clear();
     headerCache.clear();
@@ -1068,11 +1069,36 @@ export function totalModelBytes(filePath: string): {
 const PLE_TENSOR = "per_layer_token_embd.weight";
 const pleCapsCache = new Map<string, ModelCapabilities>();
 
-/** Content-based classification; filenames alone cannot distinguish a PLE table. */
+/** External PLE is one file, even when its name resembles a numbered shard. */
+export function pleFileStamp(filePath: string): string | undefined {
+  try {
+    const st = fs.statSync(filePath);
+    return `${st.size}:${st.mtimeMs}:${st.ctimeMs}:${st.ino}`;
+  } catch { return undefined; }
+}
+
+// Role checks are frequent during library scans. Most GGUFs have more than one
+// tensor: inspect only the fixed header instead of decoding their entire metadata.
+const pleRoleCache = new Map<string, { stamp: string; result: boolean }>();
 export function isPleOnlyGguf(filePath: string): boolean {
   try {
-    const { tensors } = readGgufHeaderFromFile(filePath);
-    return tensors.length === 1 && tensors[0].name === PLE_TENSOR;
+    const st = fs.statSync(filePath);
+    const stamp = `${st.size}:${st.mtimeMs}:${st.ctimeMs}:${st.ino}`;
+    const key = path.resolve(filePath);
+    const hit = pleRoleCache.get(key);
+    if (hit?.stamp === stamp) return hit.result;
+    const fd = fs.openSync(filePath, "r");
+    const fixed = Buffer.alloc(24);
+    let single = false;
+    try {
+      single = fs.readSync(fd, fixed, 0, fixed.length, 0) === fixed.length &&
+        fixed.readUInt32LE(0) === GGUF_MAGIC && fixed.readBigUInt64LE(8) === 1n;
+    } finally { fs.closeSync(fd); }
+    const tensors = single ? readGgufHeaderFromFile(filePath).tensors : [];
+    const result = tensors.length === 1 && tensors[0].name === PLE_TENSOR;
+    if (pleRoleCache.size >= 512) pleRoleCache.delete(pleRoleCache.keys().next().value!);
+    pleRoleCache.set(key, { stamp, result });
+    return result;
   } catch {
     return false;
   }
@@ -1087,7 +1113,7 @@ export function readEffectiveModelCapabilities(filePath: string, plePath = ""): 
   if (!plePath.trim()) return readModelCapabilities(filePath);
   if (plePath.includes(",")) throw new Error("PLE paths cannot contain commas (llama.cpp shard separator).");
   plePath = path.resolve(plePath.trim());
-  const key = JSON.stringify([path.resolve(filePath), capsCacheStamp(filePath), plePath, capsCacheStamp(plePath)]);
+  const key = JSON.stringify([path.resolve(filePath), capsCacheStamp(filePath), plePath, pleFileStamp(plePath)]);
   const hit = pleCapsCache.get(key);
   if (hit) return structuredClone(hit);
   const base = readModelCapabilities(filePath);
@@ -1102,7 +1128,25 @@ export function readEffectiveModelCapabilities(filePath: string, plePath = ""): 
   }
   const extSize = fs.statSync(plePath).size;
   const pleBytes = extSize - external.dataStart - replacement.offset;
-  if (replacement.offset !== 0 || pleBytes <= 0) throw new Error("The PLE GGUF has missing or invalid tensor data.");
+  const elements = dims[0] * dims[1];
+  // Common GGML row layouts (block elements, block bytes). Newer types retain
+  // a conservative one-bit lower bound; llama.cpp validates their exact layout.
+  const layout: Record<number, [number, number]> = {
+    0: [1, 4], 1: [1, 2], 2: [32, 18], 3: [32, 20],
+    6: [32, 22], 7: [32, 24], 8: [32, 34], 9: [32, 36],
+    10: [256, 84], 11: [256, 110], 12: [256, 144],
+    13: [256, 176], 14: [256, 210], 15: [256, 292], 30: [1, 2],
+  };
+  const row = layout[replacement.type];
+  const minimumBytes = row ? (dims[0] / row[0]) * row[1] * dims[1] : Math.ceil(elements / 8);
+  if (!Number.isSafeInteger(elements) || (row && dims[0] % row[0] !== 0) ||
+      !Number.isSafeInteger(pleBytes) || pleBytes < minimumBytes) {
+    throw new Error("The PLE GGUF tensor data is truncated or has an invalid quantization row size.");
+  }
+  const alignment = asNumber(external.meta["general.alignment"]) || 32;
+  if (!Number.isSafeInteger(replacement.offset) || replacement.offset < 0 || replacement.offset % alignment !== 0 || pleBytes <= 0) {
+    throw new Error("The PLE GGUF has missing or invalid tensor data.");
+  }
   const main = readGgufHeaderFromFile(filePath);
   const arch = base.architecture || "";
   const externalArch = external.meta["general.architecture"];
@@ -1127,10 +1171,18 @@ export function readEffectiveModelCapabilities(filePath: string, plePath = ""): 
     if (file !== filePath && header.tensors.length === 1 && ple) { skipped++; continue; }
     tensorCount += header.tensors.length;
     const size = fs.statSync(file).size;
-    const removed = tensorByteTotals(header.tensors, header.dataStart, size, n => n === PLE_TENSOR)?.matched || 0;
+    // Sort offsets once for all classes, rather than three times per shard.
+    const sorted = [...header.tensors].sort((a, b) => a.offset - b.offset);
+    let removed = 0;
+    for (let i = 0; i < sorted.length; i++) {
+      const t = sorted[i];
+      const end = i + 1 < sorted.length ? sorted[i + 1].offset : size - header.dataStart;
+      const bytes = Math.max(0, end - t.offset);
+      if (t.name === PLE_TENSOR) removed += bytes;
+      if (isMoeExpertTensor(t.name)) expertBytes += bytes;
+      if (isDenseFfnTensor(t.name)) ffnBytes += bytes;
+    }
     fileBytes += size - removed;
-    expertBytes += tensorByteTotals(header.tensors, header.dataStart, size, isMoeExpertTensor)?.matched || 0;
-    ffnBytes += tensorByteTotals(header.tensors, header.dataStart, size, isDenseFfnTensor)?.matched || 0;
   }
   if (missing + skipped > 0 && (missing + skipped !== 1 || (missing > 0 && original) || tensorCount + 1 !== main.meta["split.tensors.count"])) {
     throw new Error("Incomplete backbone: only a single dedicated PLE shard can be replaced by an external table.");
@@ -1138,7 +1190,12 @@ export function readEffectiveModelCapabilities(filePath: string, plePath = ""): 
   const width = asNumber(main.meta[`${arch}.embedding_length_per_layer_input`]);
   const offsets = main.meta[`${arch}.ple.head_offsets`];
   const sizes = main.meta[`${arch}.ple.head_vocab_sizes`];
-  if (Array.isArray(offsets) && Array.isArray(sizes) && offsets.length > 0 && offsets.length === sizes.length) {
+  if (offsets !== undefined || sizes !== undefined) {
+    if (!Array.isArray(offsets) || !Array.isArray(sizes) || offsets.length === 0 || offsets.length !== sizes.length ||
+        offsets.some((n, i) => typeof n !== "number" || !Number.isSafeInteger(n) || n < 0 ||
+          typeof sizes[i] !== "number" || !Number.isSafeInteger(sizes[i]) || Number(sizes[i]) <= 0)) {
+      throw new Error("Invalid PLE head ranges in the backbone metadata.");
+    }
     const ranges = offsets.map((o, i) => Number(o) + Number(sizes[i]));
     const rows = ranges.reduce((max, n) => Math.max(max, n), 0);
     if (!(width && Number.isSafeInteger(rows) && rows > 0) || dims[0] !== width || dims[1] < rows) {
@@ -1146,7 +1203,7 @@ export function readEffectiveModelCapabilities(filePath: string, plePath = ""): 
     }
   } else {
     // Gemma's vocabulary table is [per-layer width * layers, vocabulary].
-    const token = headers.flatMap(h => h.tensors).find(t => t.name === "token_embd.weight");
+    const token = headers.map(h => h.tensors.find(t => t.name === "token_embd.weight")).find(Boolean);
     const expected = original || (width && token ? [width * base.blockCount, token.dimensions[1]] : undefined);
     if (!expected || expected.length !== 2 || dims.some((n, i) => n !== expected[i])) {
       throw new Error("The PLE table dimensions do not match the selected model. Use a table from the same checkpoint.");

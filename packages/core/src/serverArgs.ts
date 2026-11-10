@@ -4,7 +4,7 @@ import { effectiveGpuSplitMode, effectiveOffloadDeviceOrder, parseTensorSplit } 
 import type { GpuMemoryInfo } from "./gpuInfo";
 import {
   heuristicPleShare,
-  capsCacheStamp,
+  pleFileStamp,
   isQwen4expArchitecture,
   shouldPinPleToCpu,
   type ModelCapabilities,
@@ -516,7 +516,7 @@ export function serverConfigFingerprint(
   return JSON.stringify({
     modelPath: (modelPath || "").trim(),
     plePath: settings.plePath,
-    pleStamp: settings.plePath ? capsCacheStamp(settings.plePath) : undefined,
+    pleStamp: settings.plePath ? pleFileStamp(settings.plePath) : undefined,
     launchMode: launchMode || "",
     contextLength: settings.contextLength,
     gpuOffload: settings.gpuOffload,

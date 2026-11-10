@@ -1060,6 +1060,9 @@ button.link-btn:hover { text-decoration: underline; }
 .mm-attach .mm-label { color: var(--muted); flex: none; }
 .mm-attach .mm-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .mm-attach .mm-name .sub { color: var(--muted); }
+#pleAttach .label { flex-wrap: nowrap; }
+#pleName { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#pleHint { overflow-wrap: anywhere; }
 .mm-attach .seg-btn { padding: 0 6px; font-size: 10.5px; }
 .mm-attach .icon-btn { width: 20px; height: 20px; background: transparent; color: var(--muted); font-size: 11px; }
 .mm-attach .icon-btn:hover { background: color-mix(in srgb, var(--fg) 10%, transparent); color: var(--fg); }

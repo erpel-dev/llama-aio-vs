@@ -298,6 +298,39 @@ function setup(loadOverrides = {}, remoteInfo, serverFeatures = core.NO_SERVER_F
 }
 
 describe("PLE attachment controls", () => {
+  it("renders the real sidebar bundle through pick, clear, missing-file and old-build states", async t => {
+    const { JSDOM } = require("jsdom");
+    const html = fs.readFileSync(path.join(__dirname, "../src/webview/sidebar.html"), "utf8").replace(/\{\{\w+\}\}/g, "");
+    const dom = new JSDOM(html, { runScripts: "outside-only", pretendToBeVisual: true, url: "https://preview.invalid" });
+    t.after(() => dom.window.close());
+    const sent = [];
+    dom.window.acquireVsCodeApi = () => ({ postMessage: m => sent.push(m), getState: () => null, setState() {} });
+    dom.window.eval(fs.readFileSync(path.join(__dirname, "../out/webview/sidebar.js"), "utf8"));
+    const ui = setup({}, undefined, { ...core.NO_SERVER_FEATURES, externalPle: "--shard" }, { ...caps, pleSupported: true });
+    await ui.provider.pushState();
+    const payload = ui.posted.filter(m => m.type === "state").at(-1).payload;
+    const paint = patch => dom.window.dispatchEvent(new dom.window.MessageEvent("message", { data: { type: "state", payload: { ...payload, ...patch } } }));
+    const el = id => dom.window.document.getElementById(id);
+    paint({});
+    assert.equal(el("pleName").textContent, "Built-in");
+    assert.equal(el("pickPleBtn").disabled, false);
+    el("pickPleBtn").click();
+    assert.equal(sent.at(-1).type, "pickPle");
+    paint({ pleTable: { supported: true, path: "/models/very-long-name-ple.gguf", bytes: 1024 } });
+    assert.equal(el("pleName").textContent, "very-long-name-ple.gguf");
+    assert.equal(el("clearPleBtn").classList.contains("hidden"), false);
+    el("clearPleBtn").click();
+    assert.equal(sent.at(-1).type, "clearPle");
+    paint({ pleTable: { supported: true, path: "/missing.gguf", problem: "File not found" }, serverFeatures: core.NO_SERVER_FEATURES });
+    assert.equal(el("pleHint").textContent, "File not found");
+    assert.equal(el("pickPleBtn").disabled, true);
+    assert.equal(el("clearPleBtn").disabled, false, "can detach after a binary downgrade");
+    paint({ pleTable: { supported: true, missing: true }, memoryView: null });
+    assert.equal(el("pleName").textContent, "Not attached");
+    assert.equal(el("memVerdict").textContent, "Attach a PLE table to estimate memory.");
+    paint({ pleTable: { supported: false, path: "" } });
+    assert.equal(el("pleAttach").classList.contains("hidden"), true);
+  });
   it("picks a table without replacing the model, lists Reload changes, and clears it", async t => {
     t.mock.method(require("vscode").window, "showOpenDialog", async () => [{ fsPath: "/m/ple-q8.gguf" }]);
     const ui = setup({}, undefined, { ...core.NO_SERVER_FEATURES, probed: true, externalPle: "--shard" }, { ...caps, pleSupported: true });
@@ -317,6 +350,15 @@ describe("PLE attachment controls", () => {
     await assert.rejects(setup().provider.pickPle(), /Update llama.cpp/);
     await assert.rejects(setup({}, { state: "ready" }).provider.pickPle(), /remote server/);
     assert.equal(dialog.mock.callCount(), 0);
+  });
+  it("rejects a pick when the connection changes while the file dialog is open", async t => {
+    const ui = setup({}, undefined, { ...core.NO_SERVER_FEATURES, externalPle: "--shard" });
+    t.mock.method(require("vscode").window, "showOpenDialog", async () => {
+      ui.provider.store.isRemote = () => true;
+      return [{ fsPath: "/m/ple.gguf" }];
+    });
+    await assert.rejects(ui.provider.pickPle(), /connection changed/);
+    assert.equal(ui.getState().loadSettings.plePath, "");
   });
   it("leaves a selection unchanged when the dialog is cancelled", async () => {
     const ui = setup({ plePath: "/m/existing.gguf" }, undefined, { ...core.NO_SERVER_FEATURES, externalPle: "--ple" });

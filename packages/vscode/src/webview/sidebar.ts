@@ -2047,8 +2047,12 @@ function renderMemoryView(view) {
   $('memNotes').textContent = '';
   $('memLines').textContent = '';
   if (!view) {
+    lastMemoryView = null;
     verdict.className = 'verdict unknown';
-    verdict.textContent = 'Select a model to estimate VRAM / RAM use.';
+    verdict.textContent = lastPayload?.pleTable?.problem ? 'Fix or clear the PLE attachment to estimate memory.'
+      : lastPayload?.pleTable?.missing ? 'Attach a PLE table to estimate memory.'
+      : lastPayload?.state?.selectedModelPath ? 'Memory estimate unavailable for this model.'
+      : 'Select a model to estimate VRAM / RAM use.';
     legend.classList.add('hidden');
     fixes.classList.add('hidden');
     $('memFootnote').textContent = '';

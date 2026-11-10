@@ -22,8 +22,8 @@ const meta: Record<string, MiniGgufValue> = {
   "gemma4.context_length": { type: "u32", value: 8192 },
   "gemma4.embedding_length_per_layer_input": { type: "u32", value: 2 },
 };
-const embedding = { name: "token_embd.weight", bytes: 1024, dimensions: [16, 64] };
-const original = { name: tensor, bytes: 4096, dimensions: [8, 64] };
+const embedding = { name: "token_embd.weight", bytes: 1024, dimensions: [16, 16] };
+const original = { name: tensor, bytes: 4096, dimensions: [8, 16] };
 
 function fixture(t: { after: (fn: () => void) => void }) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "llama-external-ple-"));
@@ -40,6 +40,82 @@ function fixture(t: { after: (fn: () => void) => void }) {
 }
 
 describe("external PLE tables", () => {
+  it("rejects partially truncated tables and unsafe tensor element counts", t => {
+    const { model, ple } = fixture(t);
+    fs.writeFileSync(ple, miniGgufWithTensors({}, [{ ...original, bytes: 511 }]));
+    assert.throws(() => readEffectiveModelCapabilities(model, ple), /truncated/);
+    fs.writeFileSync(ple, miniGgufWithTensors({}, [{ ...original, dimensions: [2 ** 40, 2 ** 30], bytes: 1024 }]));
+    assert.throws(() => readEffectiveModelCapabilities(model, ple), /truncated/);
+  });
+
+  it("accepts aligned data padding but rejects invalid tensor offsets", t => {
+    const { model, ple } = fixture(t);
+    fs.writeFileSync(ple, miniGgufWithTensors({}, [{ ...original, bytes: 512, offset: 64 }]));
+    assert.equal(readEffectiveModelCapabilities(model, ple).pleOverrideBytes, 512);
+    fs.writeFileSync(ple, miniGgufWithTensors({}, [{ ...original, bytes: 512, offset: 1 }]));
+    assert.throws(() => readEffectiveModelCapabilities(model, ple), /invalid tensor data/);
+  });
+
+  it("does not enumerate sibling files for an external numbered filename", t => {
+    const { model, write } = fixture(t);
+    const ple = write("external-00001-of-00100.gguf", {}, [{ ...original, bytes: 512 }]);
+    const stat = t.mock.method(require("node:fs") as typeof fs, "statSync");
+    readEffectiveModelCapabilities(model, ple);
+    assert.equal(stat.mock.calls.some(c => String(c.arguments[0]).includes("external-00002")), false);
+  });
+
+  it("checks quantized row blocks and payload sizes", t => {
+    const { write } = fixture(t);
+    const kv = { ...meta, "gemma4.embedding_length_per_layer_input": { type: "u32" as const, value: 8 } };
+    const model = write("wide.gguf", kv, [embedding, { ...original, dimensions: [32, 16] }]);
+    const ple = write("quant.gguf", {}, [{ ...original, dimensions: [32, 16], bytes: 544 }]);
+    fs.writeFileSync(ple, miniGgufWithTensors({}, [{ ...original, dimensions: [32, 16], bytes: 544, type: 8 }]));
+    assert.equal(readEffectiveModelCapabilities(model, ple).pleOverrideBytes, 544);
+    fs.truncateSync(ple, fs.statSync(ple).size - 1);
+    assert.throws(() => readEffectiveModelCapabilities(model, ple), /truncated/);
+  });
+
+  it("accepts exact common GGML payload sizes and rejects a one-byte truncation", t => {
+    const { write } = fixture(t);
+    const model = write("formats.gguf", { ...meta,
+      "gemma4.embedding_length_per_layer_input": { type: "u32", value: 64 } },
+      [embedding, { ...original, dimensions: [256, 16], bytes: 16384 }]);
+    // GGML b12233 row layouts: ggml.c / ggml-common.h static assertions.
+    const formats = [[0,1,4], [1,1,2], [2,32,18], [3,32,20], [6,32,22],
+      [7,32,24], [8,32,34], [9,32,36], [10,256,84], [11,256,110],
+      [12,256,144], [13,256,176], [14,256,210], [15,256,292], [30,1,2]];
+    for (const [type, block, size] of formats) {
+      const bytes = 256 / block * size * 16;
+      const file = write(`format-${type}.gguf`, {}, []);
+      fs.writeFileSync(file, miniGgufWithTensors({}, [{ name: tensor, dimensions: [256, 16], bytes, type }]));
+      assert.equal(readEffectiveModelCapabilities(model, file).pleOverrideBytes, bytes, `GGML type ${type}`);
+      fs.truncateSync(file, fs.statSync(file).size - 1);
+      assert.throws(() => readEffectiveModelCapabilities(model, file), /truncated/, `GGML type ${type}`);
+    }
+  });
+
+  it("keeps repeated ordinary model classification to a fixed header read", t => {
+    const { model } = fixture(t);
+    invalidateModelCapabilitiesCache();
+    const read = t.mock.method(require("node:fs") as typeof fs, "readSync");
+    for (let i = 0; i < 100; i++) assert.equal(isPleOnlyGguf(model), false);
+    assert.equal(read.mock.callCount(), 1);
+    assert.equal((read.mock.calls[0].arguments as unknown[])[3], 24);
+  });
+
+  it("does not rescan tensor headers on repeated effective-capability reads", t => {
+    const { model, ple } = fixture(t);
+    readEffectiveModelCapabilities(model, ple);
+    const read = t.mock.method(require("node:fs") as typeof fs, "readSync");
+    for (let i = 0; i < 100; i++) readEffectiveModelCapabilities(model, ple);
+    assert.equal(read.mock.callCount(), 0);
+  });
+
+  it("omits fit estimates when a required PLE attachment is missing", t => {
+    const { write } = fixture(t);
+    const model = write("missing-ple.gguf", meta, [embedding]);
+    assert.equal(estimateMemory(readModelCapabilities(model), loadSettings()), undefined);
+  });
   it("replaces embedded bytes once, keeps base caps unchanged and invalidates on replacement", t => {
     const { model, ple } = fixture(t);
     const base = readModelCapabilities(model);
@@ -84,6 +160,18 @@ describe("external PLE tables", () => {
     await assert.rejects(start.call(manager, undefined, () => undefined), /ENOENT/);
   });
 
+  it("preserves the running server when Reload has an invalid PLE attachment", async t => {
+    const { model, ple } = fixture(t);
+    fs.unlinkSync(ple);
+    t.mock.method(require("../src/launchLock"), "acquireLaunchLock", () => ({ release() {} }));
+    const manager = {
+      store: { getState: () => ({ selectedModelPath: model, loadSettings: loadSettings({ plePath: ple }) }) },
+      assertLocal() {}, takeLaunch() { return {}; }, releaseLaunch() {}, updateBootMessage() {},
+      stopServer: async () => assert.fail("invalid Reload must preserve the running server"),
+    };
+    await assert.rejects(ProcessManager.prototype.reload.call(manager as unknown as ProcessManager), /ENOENT/);
+  });
+
   it("validates hashed PLE row ranges and permits differently padded tables", t => {
     const { write } = fixture(t);
     const kv: Record<string, MiniGgufValue> = {
@@ -98,6 +186,9 @@ describe("external PLE tables", () => {
     assert.equal(readEffectiveModelCapabilities(model, ple).pleOverrideBytes, 4096);
     const small = write("too-small.gguf", {}, [{ ...original, dimensions: [8, 63] }]);
     assert.throws(() => readEffectiveModelCapabilities(model, small), /PLE head width and row ranges/);
+    const corrupt = write("bad-ranges.gguf", { ...kv,
+      "qwen4exp.ple.head_vocab_sizes": { type: "u32[]", value: [0] } }, [embedding]);
+    assert.throws(() => readEffectiveModelCapabilities(corrupt, ple), /Invalid PLE head ranges/);
   });
 
   it("allows one dedicated PLE shard to be present or absent, but rejects missing backbone weights", t => {
@@ -134,7 +225,7 @@ describe("external PLE tables", () => {
   it("recalculates expert shares without changing the absolute expert weight", t => {
     const { write, ple } = fixture(t);
     const model = write("moe.gguf", { ...meta, "gemma4.expert_count": { type: "u32", value: 8 } },
-      [embedding, { name: "blk.0.ffn_down_exps.weight", bytes: 8192, dimensions: [16, 64] }, original]);
+      [embedding, { name: "blk.0.ffn_down_exps.weight", bytes: 8192, dimensions: [16, 16] }, original]);
     const caps = readEffectiveModelCapabilities(model, ple);
     assert.equal(caps.moeExpertShare! * caps.fileSizeBytes!, 8192);
     const all = estimateMemory(caps, loadSettings({ gpuOffload: 99, lazyMode: "off" }));

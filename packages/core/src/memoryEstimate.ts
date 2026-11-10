@@ -1095,7 +1095,7 @@ export function estimateMemory(
   gpu?: GpuMemoryInfo,
   options?: { cpuOnly?: boolean; draftCaps?: ModelCapabilities; gpus?: GpuMemoryInfo[] }
 ): MemoryEstimate | undefined {
-  if (!caps?.fileSizeBytes || !caps.blockCount) {
+  if (!caps?.fileSizeBytes || !caps.blockCount || caps.pleMissing || caps.pleOverrideError) {
     return undefined;
   }
 

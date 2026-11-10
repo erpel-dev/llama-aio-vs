@@ -188,8 +188,8 @@
       <button class="link-btn hidden" id="attachMmprojBtn" type="button" title="Attach a multimodal projector (--mmproj)">+ Attach projector…</button>
       <div class="row hidden" id="pleAttach">
         <div class="label"><span class="name tip" data-flag="--ple, --shard" data-help="Replace the per-layer embedding table with a PLE-only GGUF from the same checkpoint. Reload the server to apply.">PLE table</span><span class="mm-name" id="pleName">Built-in</span></div>
-        <div class="btn-row"><button class="secondary small" id="pickPleBtn" type="button">Choose…</button><button class="secondary small hidden" id="clearPleBtn" type="button">Clear</button></div>
-        <div class="hint" id="pleHint"></div>
+        <div class="btn-row"><button class="secondary small" id="pickPleBtn" type="button" aria-label="Choose PLE table">Choose…</button><button class="secondary small hidden" id="clearPleBtn" type="button" aria-label="Clear PLE table">Clear</button></div>
+        <div class="hint" id="pleHint" aria-live="polite"></div>
       </div>
       <details class="fold" id="libraryFold">
         <summary><span>Library</span><span class="sum" id="librarySum">—</span></summary>

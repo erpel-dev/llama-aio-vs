@@ -1519,6 +1519,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       defaultUri: vscode.Uri.file(path.dirname(model)),
     });
     if (!selected?.[0]) return;
+    if (this.store.isRemote()) throw new Error("The connection changed to a remote server. Configure its PLE table on the server machine.");
     if (this.store.getState().selectedModelPath !== model) throw new Error("The selected model changed. Choose the PLE table again for the current model.");
     await this.store.updateLoadSettings({ plePath: selected[0].fsPath });
     await this.pushState();
