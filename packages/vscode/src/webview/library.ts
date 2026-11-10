@@ -22,6 +22,7 @@ export const lib = {
   hfRepos: [] as any,
   hfFiles: null as any,
   hfRequest: 0,
+  hfFitsOnly: false,
   page: 0,
   downloads: [] as any,
   countLabel: '',
@@ -301,9 +302,24 @@ export function renderLibraryList() {
     if (lib.hfFiles.companionHint) {
       html += '<div class="hint">Also fetches ' + escText(lib.hfFiles.companionHint) + '</div>';
     }
-    (lib.hfFiles.files || []).forEach(function (file) {
+    const hfFiles = lib.hfFiles.files || [];
+    const rated = hfFiles.filter(function (f) { return f.fit; });
+    const fitting = rated.filter(function (f) { return f.fit !== 'wont-fit'; });
+    if (rated.length) {
+      html += '<div class="lib-filters" style="margin:0 0 6px">' +
+        '<button type="button" class="chip' + (lib.hfFitsOnly ? ' active' : '') + '" data-act="hf-fits-toggle" aria-pressed="' + (lib.hfFitsOnly ? 'true' : 'false') + '">Fits here<span class="n">' + fitting.length + '</span></button>' +
+        '<span class="lib-detail" title="Estimated from the file size before download: weights plus a small allowance. The Memory card gives the exact verdict once the file is on disk.">≈ of ' + escText(rated[0].capacityLabel || '') + '</span></div>';
+    }
+    const shown = lib.hfFitsOnly && rated.length ? hfFiles.filter(function (f) { return f.fit !== 'wont-fit'; }) : hfFiles;
+    if (lib.hfFitsOnly && rated.length && !shown.length) html += '<div class="hint">No file in this repo fits here. Turn off “Fits here” to see them all.</div>';
+    const FIT_TEXT = { fits: 'Fits', tight: 'Tight', 'wont-fit': 'Too big' };
+    shown.forEach(function (file) {
       html += '<div class="lib-file"><span class="grow"><b>' + escText(file.label) + '</b>';
       if (file.detail) html += '<span class="lib-detail">' + escText(file.detail) + '</span>';
+      if (file.fit) {
+        html += '<span class="lib-fit ' + file.fit + '">' + FIT_TEXT[file.fit] + ' · needs ≈' + escText(file.needLabel || '') +
+          (file.fit === 'wont-fit' && fitting.length ? ' · a smaller file in this list fits' : '') + '</span>';
+      }
       html += '</span><button type="button" class="secondary small" data-act="hf-download" data-model="' + escAttr(lib.hfFiles.modelId) + '" data-file="' + escAttr(file.path) + '">Download</button></div>';
     });
     html += '<button type="button" class="secondary lib-wide" data-act="hf-back">Back to search</button>';
@@ -496,6 +512,9 @@ export function onLibraryClick(e) {
       renderLibraryDialog();
     } else if (act === 'hf-search') {
       startLibrarySearch();
+    } else if (act === 'hf-fits-toggle') {
+      lib.hfFitsOnly = !lib.hfFitsOnly;
+      renderLibraryList();
     } else if (act === 'hf-back') {
       resetLibraryNavigation(lib.hfMode === 'files' || lib.hfMode === 'license' ? 'search' : 'local');
       renderLibraryList();

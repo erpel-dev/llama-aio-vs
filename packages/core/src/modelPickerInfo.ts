@@ -198,3 +198,26 @@ export function pickerGpus(cpuOnly: boolean, llamaServerBinary?: string): GpuMem
   }
   return detectGpus(false, llamaServerBinary);
 }
+
+export interface RemoteFitEstimate {
+  fit: "fits" | "tight" | "wont-fit";
+  /** Rough bytes needed: file size plus a runtime and small-context allowance. */
+  needBytes: number;
+  capacityBytes: number;
+}
+
+/**
+ * Fit of a GGUF that is not on disk yet, from its listed size alone. The
+ * header (layers, KV dimensions) is unknown before download, so this is a
+ * deliberately rough lower bound: weights ≈ file size, plus 10% (at least
+ * 1 GiB) for runtime overhead and a modest context. Callers label it as an
+ * estimate; the exact verdict comes from the Memory card after download.
+ */
+export function estimateRemoteFit(fileBytes: number, capacityBytes: number): RemoteFitEstimate | undefined {
+  if (!(fileBytes > 0) || !(capacityBytes > 0)) {
+    return undefined;
+  }
+  const needBytes = fileBytes + Math.max(1024 ** 3, fileBytes * 0.1);
+  const fit = needBytes > capacityBytes ? "wont-fit" : needBytes > capacityBytes - 1.5 * 1024 ** 3 ? "tight" : "fits";
+  return { fit, needBytes, capacityBytes };
+}

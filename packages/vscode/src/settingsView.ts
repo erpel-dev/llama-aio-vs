@@ -1,5 +1,6 @@
 import { randomBytes } from "crypto";
 import * as fs from "fs";
+import { estimateRemoteFit, formatBytes } from "@llama-aio/core";
 import { WebUiGateway } from "@llama-aio/core";
 import { explainLocalModelModes, explainRemoteModelModes, resolveServerModelModes, serverReasoningLevels, type ModelCapabilities } from "@llama-aio/core";
 import { readLocalApiKey } from "@llama-aio/core";
@@ -685,6 +686,12 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             }
             break;
           }
+          case "sendTest":
+            void this.runTestMessage(typeof msg.text === "string" ? msg.text : "");
+            break;
+          case "cancelTest":
+            this.testCancel?.cancel();
+            break;
           case "openAdvanced":
             this.openAdvancedPanel();
             break;
@@ -1828,6 +1835,12 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     try {
       const files = await this.hf().listGgufFiles(modelId);
       const picker = downloadPickerFiles(files);
+      // Rough fit before download: free VRAM across GPUs, or system RAM on CPU.
+      const cpuOnly = this.cpuOnlyBackend() || !this.lastGpus.length;
+      const capacity = cpuOnly
+        ? os.totalmem()
+        : this.lastGpus.reduce((sum, g) => sum + Math.max(0, g.totalBytes - (g.usedBytes || 0)), 0);
+      const capacityLabel = `${formatBytes(capacity)} ${cpuOnly ? "RAM" : "free VRAM"}`;
       this.post({
         type: "libraryHfFiles",
         requestId,
@@ -1838,6 +1851,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           path: file.path,
           label: listingBaseName(file.path),
           detail: describeLanguageGgufFile(file, files),
+          ...(() => {
+            const est = picker.companionOnly ? undefined : estimateRemoteFit(file.size, capacity);
+            return est ? { fit: est.fit, needLabel: formatBytes(est.needBytes), capacityLabel } : {};
+          })(),
         })),
       });
     } catch (e) {
@@ -2072,6 +2089,50 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       }
     }
     await vscode.env.openExternal(vscode.Uri.parse(endpoint));
+  }
+
+  private testCancel?: vscode.CancellationTokenSource;
+
+  /**
+   * Send one message through this extension's own Language Model provider,
+   * the same path Copilot Chat uses, and show the reply in the sidebar. Speed
+   * and context numbers arrive through the normal perf updates.
+   */
+  private async runTestMessage(text: string): Promise<void> {
+    const prompt = text.trim().slice(0, 2000);
+    if (!prompt || this.testCancel) {
+      return;
+    }
+    const cancel = new vscode.CancellationTokenSource();
+    this.testCancel = cancel;
+    const timer = setTimeout(() => cancel.cancel(), 180_000);
+    const started = Date.now();
+    this.post({ type: "testResult", status: "running" });
+    try {
+      const [model] = await vscode.lm.selectChatModels({ vendor: "llama-aio" });
+      if (!model) {
+        throw new Error("The server is not ready yet. Start it, then try again.");
+      }
+      const response = await model.sendRequest([vscode.LanguageModelChatMessage.User(prompt)], {}, cancel.token);
+      let reply = "";
+      for await (const part of response.stream) {
+        if (part instanceof vscode.LanguageModelTextPart) {
+          reply += part.value;
+        }
+      }
+      this.post(cancel.token.isCancellationRequested
+        ? { type: "testResult", status: "cancelled" }
+        : { type: "testResult", status: "done", text: reply.trim().slice(0, 1200), ms: Date.now() - started });
+    } catch (e) {
+      this.post(cancel.token.isCancellationRequested
+        ? { type: "testResult", status: "cancelled" }
+        : { type: "testResult", status: "error", error: e instanceof Error ? e.message : String(e) });
+    } finally {
+      clearTimeout(timer);
+      cancel.dispose();
+      this.testCancel = undefined;
+      await this.pushState();
+    }
   }
 
   private webUiGateway?: WebUiGateway;
