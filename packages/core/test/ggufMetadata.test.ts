@@ -488,7 +488,7 @@ describe("readModelCapabilities cache", () => {
     assert.notEqual(first, second);
   });
 
-  it("re-reads after invalidation even when mtime and size stay the same", () => {
+  it("detects an in-place replacement even when mtime and size stay the same", () => {
     const p = path.join(os.tmpdir(), `llama-aio-caps-inv-${process.pid}.gguf`);
     tmp.push(p);
     writeCaps("qwen3", "alpha", p);
@@ -499,7 +499,7 @@ describe("readModelCapabilities cache", () => {
 
     writeCaps("qwen3", "bravo", p);
     fs.utimesSync(p, stamp, stamp);
-    assert.equal(readModelCapabilities(p).name, "alpha", "same mtime/size served from cache");
+    assert.equal(readModelCapabilities(p).name, "bravo", "ctime detects preserved-mtime replacements");
 
     invalidateModelCapabilitiesCache(p);
     assert.equal(readModelCapabilities(p).name, "bravo");

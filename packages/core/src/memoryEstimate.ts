@@ -868,7 +868,7 @@ export function perLayerMoeExpertShare(caps: ModelCapabilities): number {
  */
 export function resolvePleShare(caps: ModelCapabilities): number {
   if (caps.pleShare !== undefined && Number.isFinite(caps.pleShare)) {
-    return Math.min(0.95, Math.max(0, caps.pleShare));
+    return Math.min(caps.pleOverridePath ? 1 : 0.95, Math.max(0, caps.pleShare));
   }
   return 0;
 }
@@ -1118,7 +1118,9 @@ export function estimateMemory(
   // PLE n-gram tables are host lookups (llama.cpp LAYER_INPUT) — never on GPU.
   let gpuWeights = fileSize * frac;
   if (!cpuOnly && onGpu > 0 && pleBytes > 0) {
-    gpuWeights = Math.max(0, gpuWeights - pleBytes);
+    gpuWeights = caps.pleOverridePath
+      ? Math.max(0, (fileSize - pleBytes) * frac)
+      : Math.max(0, gpuWeights - pleBytes);
   }
   if (!cpuOnly && caps.isMoe && settings.nCpuMoe > 0 && onGpu > 0 && moeExpertShare > 0) {
     const moeCpuLayers = Math.min(settings.nCpuMoe, onGpu);

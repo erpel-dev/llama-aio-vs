@@ -68,6 +68,7 @@ The llama icon is supplied for both the provider and its models. VS Code 1.142 i
 - **Backends:** Vulkan (default, good for AMD), CUDA (NVIDIA), CPU, or a `llama-server` already on your `PATH`. Upgrades are swapped in only after a successful download; pin a release tag or install from an archive if you need to.
 - **Licences:** the Hugging Face picker shows each model's licence and warns before downloading anything that isn't clearly permissive.
 - **Vision:** attach an `mmproj` projector to send images (added automatically when one sits next to the model).
+- **PLE tables:** for a model with per-layer embeddings, use **PLE table → Choose…** to attach a local PLE-only GGUF, then **Reload**. **Clear** restores the built-in table; a PLE-less backbone needs an attachment. Requires llama.cpp b12233 or a compatible build with `--shard` / `--ple`. Use a table from the same checkpoint; its precision may differ from the backbone. Memory estimates include the replacement table once. See [PLE settings](docs/performance-settings.md#external-ple-tables).
 - **Files:** everything lives under `~/.llama-aio-vs/` — binaries, models, `config.json`, and the server log.
 
 ## Settings

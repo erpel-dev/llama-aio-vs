@@ -11,7 +11,7 @@ import {
 } from "./config";
 import { isLoopbackHost, isWildcardHost, urlHostname } from "./serverHttp";
 import { Event } from "./events";
-import { clampLoadSettingsToModel, isQwen4expArchitecture, readModelCapabilities } from "./ggufMetadata";
+import { clampLoadSettingsToModel, isPleOnlyGguf, isQwen4expArchitecture, readEffectiveModelCapabilities, readModelCapabilities, totalModelBytes } from "./ggufMetadata";
 import { detectGpusAsync, preferredMainGpu, type GpuMemoryInfo } from "./gpuInfo";
 import { normalizeTensorSplit, parseTensorSplit, remapLegacyGpuOrder } from "./gpuSplit";
 import { LlamaInstaller } from "./llamaInstaller";
@@ -62,7 +62,17 @@ export class SettingsStore {
   getState(): ExtensionState {
     const raw = toExtensionState(this.config.getState());
     let loadSettings = normalizeLoadSettings(raw.loadSettings);
-    const caps = raw.modelCapabilities;
+    let caps = raw.modelCapabilities;
+    if (loadSettings.plePath && raw.selectedModelPath) {
+      try {
+        caps = readEffectiveModelCapabilities(raw.selectedModelPath, loadSettings.plePath);
+      } catch (e) {
+        // Keep the picker and Clear usable if an attached file is moved/deleted.
+        // Do not display a misleading fit verdict for an invalid attachment.
+        if (caps) caps = { ...caps, fileSizeBytes: undefined,
+          pleOverrideError: e instanceof Error ? e.message : String(e) };
+      }
+    }
     if (caps?.maxContextLength) {
       loadSettings = clampLoadSettingsToModel(loadSettings, caps);
     }
@@ -122,6 +132,11 @@ export class SettingsStore {
     await this.config.updateState((raw) => {
       const state = toExtensionState(raw);
       let loadSettings = normalizeLoadSettings({ ...state.loadSettings, ...patch });
+      if (patch.plePath !== undefined && loadSettings.plePath) {
+        if (!state.selectedModelPath) throw new Error("Select the main model before attaching a PLE table.");
+        if (loadSettings.plePath.includes(",")) throw new Error("PLE paths cannot contain commas (llama.cpp shard separator).");
+        readEffectiveModelCapabilities(state.selectedModelPath, loadSettings.plePath);
+      }
       if (
         speculativeUsesMtp(patch.speculativeMode) &&
         !isMtpSidecarFile({ path: loadSettings.draftModelPath || "" }) &&
@@ -163,6 +178,12 @@ export class SettingsStore {
   ): Promise<ExtensionState> {
     const generation = ++this.selectionGeneration;
     const prev = this.getState();
+    if (isPleOnlyGguf(modelPath)) {
+      const split = totalModelBytes(modelPath);
+      if (split.shardCount <= 1 || split.shardsFound !== split.shardCount) {
+        throw new Error("This is a PLE-only table. Select the main model, then attach it under PLE table.");
+      }
+    }
     const caps = readModelCapabilities(modelPath);
     const pathChanged = !!modelPath && modelPath !== prev.selectedModelPath;
     const recommend = options?.recommendDefaults ?? pathChanged;
@@ -171,6 +192,7 @@ export class SettingsStore {
     const attachCompanions = options?.attachMmproj || pathChanged;
     loadSettings = {
       ...loadSettings,
+      plePath: pathChanged ? "" : loadSettings.plePath,
       mmprojPath: resolveMmprojPath(modelPath, loadSettings.mmprojPath, attachCompanions),
       draftModelPath: resolveMtpDraftPath(
         modelPath,
@@ -192,7 +214,8 @@ export class SettingsStore {
       const gpu = gpus.reduce<(typeof gpus)[number] | undefined>((best, next) =>
         !best || next.totalBytes > best.totalBytes ? next : best, undefined
       );
-      loadSettings = recommendLoadSettings(loadSettings, caps, { cpuOnly, gpu, gpus });
+      const effectiveCaps = loadSettings.plePath ? readEffectiveModelCapabilities(modelPath, loadSettings.plePath) : caps;
+      loadSettings = recommendLoadSettings(loadSettings, effectiveCaps, { cpuOnly, gpu, gpus });
     }
     loadSettings = clampLoadSettingsToModel(loadSettings, caps);
     if (pathChanged) {

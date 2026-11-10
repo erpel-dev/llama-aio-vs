@@ -15,6 +15,7 @@ export interface LlamaServerFeatures {
   cacheRam?: boolean;
   mmprojDevice?: boolean;
   draftDevice?: boolean;
+  externalPle?: "--shard" | "--ple";
 }
 
 export const NO_SERVER_FEATURES: Readonly<LlamaServerFeatures> = Object.freeze({
@@ -34,6 +35,8 @@ export function parseLlamaServerFeatures(help: string): LlamaServerFeatures {
     cacheRam: !!definition("--cache-ram"),
     mmprojDevice: !!definition("--mmproj-device"),
     draftDevice: !!definition("--spec-draft-device"),
+    ...(definition("--shard") ? { externalPle: "--shard" as const }
+      : definition("--ple") ? { externalPle: "--ple" as const } : {}),
   };
 }
 

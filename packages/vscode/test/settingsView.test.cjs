@@ -28,6 +28,7 @@ require.cache.vscode = {
       },
       showInformationMessage: async () => undefined,
       showErrorMessage: async () => undefined,
+      showOpenDialog: async () => undefined,
       withProgress: async (_o, fn) => fn({ report() {} }),
       // Advanced settings tab: a fake panel whose messages tests can drive.
       createWebviewPanel: () => {
@@ -51,7 +52,7 @@ require.cache.vscode = {
     env: {},
     UIKind: { Desktop: 1, Web: 2 },
     extensions: { getExtension: (id) => (copilotChatInstalled && id === "GitHub.copilot-chat" ? {} : undefined) },
-    Uri: { joinPath: (base, ...parts) => ({ fsPath: path.join(base.fsPath, ...parts) }) },
+    Uri: { file: fsPath => ({ fsPath }), joinPath: (base, ...parts) => ({ fsPath: path.join(base.fsPath, ...parts) }) },
     ProgressLocation: {},
     ViewColumn: {},
     EventEmitter: class {},
@@ -295,6 +296,41 @@ function setup(loadOverrides = {}, remoteInfo, serverFeatures = core.NO_SERVER_F
   );
   return { send: (m) => handler(m), posted, getState: () => state, launched, provider };
 }
+
+describe("PLE attachment controls", () => {
+  it("picks a table without replacing the model, lists Reload changes, and clears it", async t => {
+    t.mock.method(require("vscode").window, "showOpenDialog", async () => [{ fsPath: "/m/ple-q8.gguf" }]);
+    const ui = setup({}, undefined, { ...core.NO_SERVER_FEATURES, probed: true, externalPle: "--shard" }, { ...caps, pleSupported: true });
+    await ui.send({ type: "pickPle" });
+    assert.equal(ui.getState().selectedModelPath, caps.path);
+    assert.equal(ui.getState().loadSettings.plePath, "/m/ple-q8.gguf");
+    let payload = ui.posted.filter(m => m.type === "state").at(-1).payload;
+    assert.ok(payload.changes.some(c => c.key === "plePath" && c.to === "ple-q8.gguf"));
+    assert.equal(payload.pleTable.path, "/m/ple-q8.gguf");
+    await ui.send({ type: "clearPle" });
+    assert.equal(ui.getState().loadSettings.plePath, "");
+    payload = ui.posted.filter(m => m.type === "state").at(-1).payload;
+    assert.equal(payload.changes.some(c => c.key === "plePath"), false);
+  });
+  it("refuses unsupported and remote picks before opening a dialog", async t => {
+    const dialog = t.mock.method(require("vscode").window, "showOpenDialog");
+    await assert.rejects(setup().provider.pickPle(), /Update llama.cpp/);
+    await assert.rejects(setup({}, { state: "ready" }).provider.pickPle(), /remote server/);
+    assert.equal(dialog.mock.callCount(), 0);
+  });
+  it("leaves a selection unchanged when the dialog is cancelled", async () => {
+    const ui = setup({ plePath: "/m/existing.gguf" }, undefined, { ...core.NO_SERVER_FEATURES, externalPle: "--ple" });
+    await ui.provider.pickPle();
+    assert.equal(ui.getState().loadSettings.plePath, "/m/existing.gguf");
+  });
+  it("discarding a pre-feature launch snapshot restores the built-in table", async () => {
+    const ui = setup();
+    delete ui.launched.loadSettings.plePath;
+    await ui.send({ type: "saveLoad", payload: { plePath: "/m/new.gguf" }, silent: true });
+    await ui.send({ type: "discardChanges" });
+    assert.equal(ui.getState().loadSettings.plePath, "");
+  });
+});
 
 describe("SettingsViewProvider memory path", () => {
   for (const fail of [false, true]) {

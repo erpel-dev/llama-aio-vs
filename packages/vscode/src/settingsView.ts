@@ -557,6 +557,13 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             this.notifyChatModels();
             await this.pushState();
             break;
+          case "pickPle":
+            await this.pickPle();
+            break;
+          case "clearPle":
+            if (!this.store.isRemote()) await this.store.updateLoadSettings({ plePath: "" });
+            await this.pushState();
+            break;
           case "pickChatTemplate":
             try {
               await vscode.commands.executeCommand("llamaAio.selectChatTemplate");
@@ -929,7 +936,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       const restore = this.processManager.isCpuBackend()
         ? { ...launched.loadSettings, ...pickCpuIgnoredFields(state.loadSettings) }
         : launched.loadSettings;
-      await this.store.updateLoadSettings(restore);
+      await this.store.updateLoadSettings({ ...restore, plePath: restore.plePath || "" });
     }
     const mode = this.processManager.effectiveLaunchMode();
     if (launched.launchMode && launched.launchMode !== mode) {
@@ -1329,6 +1336,13 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         defaults: DEFAULT_LOAD_SETTINGS,
         serverFeatures: remoteMode ? NO_SERVER_FEATURES : this.serverFeatures,
         chatTemplateProblem: chatTemplateFileProblem(state.loadSettings) || "",
+        pleTable: {
+          supported: !!caps?.pleSupported || (caps?.pleShare || 0) > 0,
+          path: state.loadSettings.plePath,
+          bytes: caps?.pleOverrideBytes || 0,
+          problem: caps?.pleOverrideError || "",
+          missing: !!caps?.pleMissing,
+        },
         build,
         backendOptions,
         selectedUiBackend,
@@ -1489,6 +1503,25 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       type: "draftModelSelected",
       path: draftPath || "",
     });
+  }
+
+  /** Attach a local table without changing the main model selection. */
+  async pickPle(): Promise<void> {
+    if (this.store.isRemote()) throw new Error("PLE tables are configured on the remote server.");
+    const model = this.store.getState().selectedModelPath;
+    if (!model) throw new Error("Select the main model before attaching a PLE table.");
+    const features = await this.processManager.getServerFeatures();
+    if (!features.externalPle) throw new Error("Update llama.cpp to b12233 or a compatible build with --shard/--ple support.");
+    const selected = await vscode.window.showOpenDialog({
+      canSelectMany: false, canSelectFiles: true, canSelectFolders: false,
+      title: "Select a PLE-only GGUF from the same model checkpoint",
+      openLabel: "Attach PLE table", filters: { "GGUF files": ["gguf"] },
+      defaultUri: vscode.Uri.file(path.dirname(model)),
+    });
+    if (!selected?.[0]) return;
+    if (this.store.getState().selectedModelPath !== model) throw new Error("The selected model changed. Choose the PLE table again for the current model.");
+    await this.store.updateLoadSettings({ plePath: selected[0].fsPath });
+    await this.pushState();
   }
 
   /** Update the vision projector hint immediately (before a full pushState finishes). */
@@ -1678,18 +1711,18 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         return;
       }
       try {
-        const caps = readPickerCapabilities(filePath);
+        const current = sameModelFile(filePath, state.selectedModelPath);
+        const caps = current ? state.modelCapabilities : readPickerCapabilities(filePath);
         if (!caps) {
           continue;
         }
         if (isDflashDraftArchitecture(caps.architecture)) {
           drafts[filePath] = true;
         }
-        const current = sameModelFile(filePath, this.store.getState().selectedModelPath);
         const load = clampLoadSettingsToModel(settings, caps);
         const { view } = computeMemoryView(
           caps,
-          current ? load : { ...load, draftModelPath: "", mmprojPath: "" },
+          current ? load : { ...load, draftModelPath: "", mmprojPath: "", plePath: "" },
           cpuOnly ? [] : this.lastGpus,
           { cpuOnly }
         );
@@ -1988,6 +2021,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     const state = this.store.getState();
     const hits = (candidate: string | undefined) =>
       !!candidate && plan.files.some((filePath) => sameModelFile(filePath, canonicalModelPath(candidate)));
+    if (hits(state.loadSettings.plePath) || hits(this.processManager.getLaunchedConfig?.()?.loadSettings?.plePath)) {
+      vscode.window.showWarningMessage("This file is attached as a PLE table. Clear the attachment and reload or stop the server before removing it.");
+      return;
+    }
     // Resolve aliases before unlinking: afterward realpath cannot resolve a
     // selected path reached through a symlinked models directory.
     const clearModel = hits(state.selectedModelPath);
@@ -2012,6 +2049,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           ...state.loadSettings,
           ...(clearMm ? { mmprojPath: "" } : {}),
           ...(clearDraft ? { draftModelPath: "" } : {}),
+          ...(clearModel ? { plePath: "" } : {}),
         },
       });
     }

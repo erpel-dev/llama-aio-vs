@@ -186,6 +186,11 @@
         <input type="checkbox" id="mmprojOffloadToGpu" aria-label="Offload multimodal projector to GPU" class="hidden" checked />
       </div>
       <button class="link-btn hidden" id="attachMmprojBtn" type="button" title="Attach a multimodal projector (--mmproj)">+ Attach projector…</button>
+      <div class="row hidden" id="pleAttach">
+        <div class="label"><span class="name tip" data-flag="--ple, --shard" data-help="Replace the per-layer embedding table with a PLE-only GGUF from the same checkpoint. Reload the server to apply.">PLE table</span><span class="mm-name" id="pleName">Built-in</span></div>
+        <div class="btn-row"><button class="secondary small" id="pickPleBtn" type="button">Choose…</button><button class="secondary small hidden" id="clearPleBtn" type="button">Clear</button></div>
+        <div class="hint" id="pleHint"></div>
+      </div>
       <details class="fold" id="libraryFold">
         <summary><span>Library</span><span class="sum" id="librarySum">—</span></summary>
         <div class="fold-body">

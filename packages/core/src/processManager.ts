@@ -19,7 +19,7 @@ import {
   TerminalLaunchError,
   type LaunchMode,
 } from "./externalTerminal";
-import { clampLoadSettingsToModel, readModelCapabilities } from "./ggufMetadata";
+import { clampLoadSettingsToModel, readEffectiveModelCapabilities, readModelCapabilities } from "./ggufMetadata";
 import { detectGpus, detectGpusAsync, type GpuMemoryInfo } from "./gpuInfo";
 import { remapLegacyGpuOrder } from "./gpuSplit";
 import { envForInstalledBinary, LlamaInstaller } from "./llamaInstaller";
@@ -664,7 +664,8 @@ export class ProcessManager {
       throw new Error("No model selected. Choose a GGUF before copying the command line.");
     }
     let loadSettings = state.loadSettings;
-    const caps = state.modelCapabilities;
+    const caps = state.loadSettings.plePath
+      ? readEffectiveModelCapabilities(model, state.loadSettings.plePath) : state.modelCapabilities;
     if (caps) {
       loadSettings = clampLoadSettingsToModel(loadSettings, caps);
     }
@@ -748,6 +749,14 @@ export class ProcessManager {
     if (!fs.existsSync(model)) {
       throw new Error(`Model file not found: ${model}`);
     }
+    const attachedCaps = state.loadSettings.plePath
+      ? readEffectiveModelCapabilities(model, state.loadSettings.plePath) : undefined;
+    if (!state.loadSettings.plePath && state.modelCapabilities?.pleMissing) {
+      throw new Error("This backbone has no PLE table. Attach a compatible PLE-only GGUF before starting.");
+    }
+    if (attachedCaps && !(await this.getServerFeatures()).externalPle) {
+      throw new Error("External PLE tables require llama.cpp b12233 or a compatible build advertising --shard/--ple. Update llama.cpp or clear the PLE attachment.");
+    }
     const templateProblem = chatTemplateFileProblem(state.loadSettings);
     if (templateProblem) {
       throw new Error(templateProblem);
@@ -827,13 +836,13 @@ export class ProcessManager {
     }
 
     let loadSettings = state.loadSettings;
-    let caps = state.modelCapabilities;
+    let caps = attachedCaps || state.modelCapabilities;
     try {
-      caps = state.modelCapabilities || readModelCapabilities(model);
+      caps = attachedCaps || (state.modelCapabilities?.path === model ? state.modelCapabilities : readModelCapabilities(model));
       loadSettings = clampLoadSettingsToModel(loadSettings, caps);
       if (!state.modelCapabilities || state.modelCapabilities.path !== model) {
         await this.store.setState({
-          modelCapabilities: caps,
+          modelCapabilities: attachedCaps ? readModelCapabilities(model) : caps,
           modelMaxContext: caps.maxContextLength,
           loadSettings,
         });

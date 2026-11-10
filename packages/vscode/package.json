@@ -103,6 +103,10 @@
         "title": "Llama AIO: Choose Vision Projector (mmproj)…"
       },
       {
+        "command": "llamaAio.selectPle",
+        "title": "Llama AIO: Choose PLE Table…"
+      },
+      {
         "command": "llamaAio.selectChatTemplate",
         "title": "Llama AIO: Choose Jinja Chat Template…"
       },

@@ -2903,6 +2903,22 @@ function syncPerformanceFeatureUi() {
   const p = lastPayload || {};
   const f = p.serverFeatures || {};
   const remote = p.serverMode === 'remote';
+  const ple = p.pleTable || {};
+  const plePath = ple.path || '';
+  const pleRow = $('pleAttach');
+  if (pleRow) {
+    pleRow.classList.toggle('hidden', !ple.supported && !plePath);
+    $('pleName').textContent = plePath ? plePath.replace(/\\/g, '/').split('/').pop() : ple.missing ? 'Not attached' : 'Built-in';
+    $('pleName').title = plePath;
+    $('pickPleBtn').disabled = remote || !f.externalPle;
+    $('clearPleBtn').classList.toggle('hidden', !plePath);
+    $('clearPleBtn').disabled = remote;
+    $('pleHint').textContent = remote ? 'The remote server controls PLE tables.'
+      : ple.problem ? ple.problem
+      : ple.missing ? 'This backbone needs an external PLE table. Choose a PLE-only GGUF from the same checkpoint.'
+      : !f.externalPle ? 'Update llama.cpp to b12233 or a compatible build to attach an external PLE table.'
+      : (plePath ? fmtBytes(ple.bytes) + ' · Reload to apply. ' : '') + 'Use a PLE-only GGUF from the same checkpoint; matching dimensions do not verify its origin.';
+  }
   const suffix = remote ? 'The remote server controls this setting.'
     : f.probed ? 'Inactive on this llama.cpp build. Update llama.cpp to use it.'
       : 'Inactive until support is verified. Install or select a runnable llama.cpp build.';
@@ -3566,6 +3582,16 @@ if (clearDraftBtn) {
   });
 }
 const pickMmprojBtn = $('pickMmprojBtn');
+const pickPleBtn = $('pickPleBtn');
+if (pickPleBtn) pickPleBtn.addEventListener('click', () => {
+  if (saveLoadTimer) clearTimeout(saveLoadTimer);
+  vscode.postMessage({ type: 'pickPle' });
+});
+const clearPleBtn = $('clearPleBtn');
+if (clearPleBtn) clearPleBtn.addEventListener('click', () => {
+  if (saveLoadTimer) clearTimeout(saveLoadTimer);
+  vscode.postMessage({ type: 'clearPle' });
+});
 if (pickMmprojBtn) {
   pickMmprojBtn.addEventListener('click', () => {
     if (saveLoadTimer) clearTimeout(saveLoadTimer);
