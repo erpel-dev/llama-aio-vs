@@ -13,6 +13,7 @@
  *
  * POST /scenario {"name": "running"|"stopped"|"dirty"|"spill"|"cpu"} resets state.
  * GET  /debug returns the last messages exchanged.
+ * --features modern --ple-choice /path/to/ple.gguf exercises the PLE picker.
  */
 const Module = require("module");
 const http = require("http");
@@ -33,6 +34,7 @@ const vscodeMock = {
     showWarningMessage: async () => undefined,
     showInformationMessage: async () => undefined,
     showErrorMessage: async (m) => console.error("[showErrorMessage]", m),
+    showOpenDialog: async () => argOf("--ple-choice", "") ? [{ fsPath: argOf("--ple-choice", "") }] : undefined,
     withProgress: async (_o, fn) => fn({ report() {} }),
     showTextDocument: async () => undefined,
     createOutputChannel: () => ({ appendLine() {}, append() {}, show() {}, clear() {}, dispose() {} }),
@@ -175,6 +177,13 @@ const store = {
   getConfig: () => ({ get: (k) => config.get(k), update: async (k, v) => void config.set(k, v) }),
   updateLoadSettings: async (p) => {
     state = { ...state, loadSettings: { ...state.loadSettings, ...p } };
+    if (Object.hasOwn(p, "plePath") && state.selectedModelPath) {
+      try {
+        state.modelCapabilities = core.readEffectiveModelCapabilities(state.selectedModelPath, state.loadSettings.plePath);
+      } catch (e) {
+        state.modelCapabilities = { ...state.modelCapabilities, fileSizeBytes: undefined, pleOverrideError: String(e.message || e) };
+      }
+    }
   },
   updateRequestSettings: async (p) => {
     state = { ...state, requestSettings: { ...state.requestSettings, ...p } };
@@ -276,7 +285,7 @@ const processManager = {
   getServerFeatures: async () => {
     // Explicit fixtures for exercising guards without a GPU or an installed build.
     const fixture = argOf("--features", "");
-    if (fixture === "modern") return { probed: true, moeCache: true, draftSampling: true, draftUbatch: true, cacheRam: true, mmprojDevice: true, draftDevice: true };
+    if (fixture === "modern") return { probed: true, moeCache: true, draftSampling: true, draftUbatch: true, cacheRam: true, mmprojDevice: true, draftDevice: true, externalPle: "--shard" };
     if (fixture === "old") return { ...core.NO_SERVER_FEATURES, probed: true };
     return realBinary ? core.probeLlamaServerFeatures({ binary: realBinary, command: realBinary,
       prefixArgs: [], env: core.withBinaryDirEnv(realBinary) }) : { ...core.NO_SERVER_FEATURES };

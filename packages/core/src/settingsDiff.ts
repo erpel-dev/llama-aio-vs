@@ -48,6 +48,7 @@ const LABELS: Partial<Record<keyof LlamaLoadSettings, string>> = {
   ngramSizeM: "n-gram draft",
   ngramMinHits: "n-gram hits",
   mmprojPath: "vision projector",
+  plePath: "PLE table",
   mmprojOffloadToGpu: "vision on GPU",
   tensorSplit: "tensor split",
   splitMode: "split mode",
@@ -76,7 +77,7 @@ function fmtValue(key: keyof LlamaLoadSettings, v: unknown): string {
   if (key === "gpuOffload" && typeof v === "number" && v >= 99) {
     return "all";
   }
-  if ((key === "draftModelPath" || key === "mmprojPath" || key === "chatTemplateFile") && typeof v === "string") {
+  if ((key === "draftModelPath" || key === "mmprojPath" || key === "plePath" || key === "chatTemplateFile") && typeof v === "string") {
     return baseName(v);
   }
   if (key === "chatTemplateSource") {

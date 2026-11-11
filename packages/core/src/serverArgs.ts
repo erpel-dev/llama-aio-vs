@@ -4,6 +4,7 @@ import { effectiveGpuSplitMode, effectiveOffloadDeviceOrder, parseTensorSplit } 
 import type { GpuMemoryInfo } from "./gpuInfo";
 import {
   heuristicPleShare,
+  pleFileStamp,
   isQwen4expArchitecture,
   shouldPinPleToCpu,
   type ModelCapabilities,
@@ -142,6 +143,9 @@ export function buildServerArgs(
     features?: LlamaServerFeatures }
 ): string[] {
   const settings = normalizeLoadSettings(rawSettings);
+  if (!settings.plePath && options?.caps?.pleMissing) {
+    throw new Error("This backbone has no PLE table. Attach a compatible PLE-only GGUF before starting.");
+  }
   const checkDevice = (device: string): string => {
     if (device && device !== "none" && options?.gpus && !options.gpus.some(gpu => gpu.llamaDeviceId === device)) {
       throw new Error(`Selected llama.cpp device ${device} is unavailable. Choose an available device or Auto.`);
@@ -168,6 +172,16 @@ export function buildServerArgs(
     "-np",
     String(settings.maxConcurrentPredictions),
   ];
+
+  if (settings.plePath) {
+    if (!options?.features?.externalPle) {
+      throw new Error("External PLE tables require a llama.cpp build advertising --ple/--shard (upstream b12233 or newer). Update llama.cpp or clear the PLE attachment.");
+    }
+    if (settings.plePath.includes(",")) {
+      throw new Error("The PLE path cannot contain a comma: llama.cpp interprets commas as shard separators.");
+    }
+    args.push(options.features.externalPle, settings.plePath);
+  }
 
   // --cache-reuse: min chunk size reused via KV shifting (0 = off).
   const cacheReuse = Math.max(0, settings.cacheReuse ?? 0);
@@ -501,6 +515,8 @@ export function serverConfigFingerprint(
   const spec = settings.speculativeMode;
   return JSON.stringify({
     modelPath: (modelPath || "").trim(),
+    plePath: settings.plePath,
+    pleStamp: settings.plePath ? pleFileStamp(settings.plePath) : undefined,
     launchMode: launchMode || "",
     contextLength: settings.contextLength,
     gpuOffload: settings.gpuOffload,

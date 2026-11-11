@@ -7,6 +7,33 @@ Available in both VS Code and the terminal UI. Changes take effect on the next l
 | `moeCacheMiB` | GPU expert cache (MiB), `--moe-cache-mib` | `0` (off) |
 | `draftSampling` | Draft sampling, `--spec-draft-sampling` | `auto` |
 | `draftBatchSize` | Draft batch size, `--spec-draft-n-ubatch` | `0` (inherit main physical batch) |
+| `plePath` | External PLE-only GGUF, `--shard` / `--ple` | Empty (built-in table) |
+
+## External PLE tables
+
+In the VS Code sidebar, select the main model, then use **PLE table → Choose…**
+to attach a local PLE-only GGUF. The Command Palette also has **Llama AIO: Choose
+PLE Table…**. Choose **Reload** to apply a change; **Clear** restores the built-in
+table. A backbone exported without PLE requires an attachment before starting.
+The terminal UI shares `state.loadSettings.plePath` in `config.json`; it does not
+have a separate PLE picker yet. Switching main models clears the attachment.
+
+Support is detected from the active executable's help (`--shard` or `--ple`),
+including compatible forks/backports. Upstream first shipped it in **b12233**.
+An unsupported binary refuses to start with an attachment. Remote servers manage
+their own tables.
+
+Use a table from the **same checkpoint** as the backbone. Different quantization
+precisions are supported. The file must contain only `per_layer_token_embd.weight`;
+Llama AIO checks its dimensions (including hashed PLE head ranges when present).
+Matching dimensions cannot establish checkpoint provenance. See
+[upstream conversion and loading instructions](https://github.com/ggml-org/llama.cpp/blob/master/docs/models.md#exporting-per-layer-embeddings-separately).
+
+Memory estimates replace the original table, count the external table once,
+and recalculate MoE/FFN proportions and lazy-loading placement. A dedicated PLE
+backbone shard may be absent only when the remaining declared tensor count
+confirms that one tensor is missing. External PLE files are not automatically
+deleted with a model, since several quants may share them.
 
 ## Compatibility
 

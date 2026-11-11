@@ -19,7 +19,7 @@ import {
   TerminalLaunchError,
   type LaunchMode,
 } from "./externalTerminal";
-import { clampLoadSettingsToModel, readModelCapabilities } from "./ggufMetadata";
+import { clampLoadSettingsToModel, readEffectiveModelCapabilities, readModelCapabilities } from "./ggufMetadata";
 import { detectGpus, detectGpusAsync, type GpuMemoryInfo } from "./gpuInfo";
 import { remapLegacyGpuOrder } from "./gpuSplit";
 import { envForInstalledBinary, LlamaInstaller } from "./llamaInstaller";
@@ -55,12 +55,27 @@ import {
 import { joinServerUrl, serverJson, serverRequest } from "./serverHttp";
 import { formatCommandDisplay, normalizeLoadSettingsForCpuBackend, performanceFeatureNotes } from "./serverArgs";
 import { NO_SERVER_FEATURES, probeLlamaServerFeatures, probeLlamaServerFeaturesSync, type LlamaServerFeatures } from "./llamaFeatures";
-import { LlamaLoadSettings, ServerStatus } from "./types";
+import { ExtensionState, LlamaLoadSettings, ServerStatus } from "./types";
 import { activeInstallLock } from "./installSwap";
 import { acquireLaunchLock, activeLaunchLock, LaunchLockHandle } from "./launchLock";
 import { ensureLocalApiKey } from "./localApiKey";
 import { rocmRuntimeMissingReason } from "./rocmRuntime";
 import { syclRuntimeMissingReason } from "./syclRuntime";
+
+/** Validate before stopping a healthy server, including the explicit Reload path. */
+async function validatePleSelection(
+  model: string, state: ExtensionState, features: () => Promise<LlamaServerFeatures>
+) {
+  const caps = state.loadSettings.plePath
+    ? readEffectiveModelCapabilities(model, state.loadSettings.plePath) : undefined;
+  if (!state.loadSettings.plePath && state.modelCapabilities?.pleMissing) {
+    throw new Error("This backbone has no PLE table. Attach a compatible PLE-only GGUF before starting.");
+  }
+  if (caps && !(await features()).externalPle) {
+    throw new Error("External PLE tables require llama.cpp b12233 or a compatible build advertising --shard/--ple. Update llama.cpp or clear the PLE attachment.");
+  }
+  return caps;
+}
 
 interface LockFile {
   pid: number;
@@ -664,7 +679,8 @@ export class ProcessManager {
       throw new Error("No model selected. Choose a GGUF before copying the command line.");
     }
     let loadSettings = state.loadSettings;
-    const caps = state.modelCapabilities;
+    const caps = state.loadSettings.plePath
+      ? readEffectiveModelCapabilities(model, state.loadSettings.plePath) : state.modelCapabilities;
     if (caps) {
       loadSettings = clampLoadSettingsToModel(loadSettings, caps);
     }
@@ -748,6 +764,7 @@ export class ProcessManager {
     if (!fs.existsSync(model)) {
       throw new Error(`Model file not found: ${model}`);
     }
+    const attachedCaps = await validatePleSelection(model, state, () => this.getServerFeatures());
     const templateProblem = chatTemplateFileProblem(state.loadSettings);
     if (templateProblem) {
       throw new Error(templateProblem);
@@ -827,13 +844,13 @@ export class ProcessManager {
     }
 
     let loadSettings = state.loadSettings;
-    let caps = state.modelCapabilities;
+    let caps = attachedCaps || state.modelCapabilities;
     try {
-      caps = state.modelCapabilities || readModelCapabilities(model);
+      caps = attachedCaps || (state.modelCapabilities?.path === model ? state.modelCapabilities : readModelCapabilities(model));
       loadSettings = clampLoadSettingsToModel(loadSettings, caps);
       if (!state.modelCapabilities || state.modelCapabilities.path !== model) {
         await this.store.setState({
-          modelCapabilities: caps,
+          modelCapabilities: attachedCaps ? readModelCapabilities(model) : caps,
           modelMaxContext: caps.maxContextLength,
           loadSettings,
         });
@@ -1282,6 +1299,8 @@ export class ProcessManager {
     let fileLock: LaunchLockHandle | undefined;
     try {
       fileLock = acquireLaunchLock("reload");
+      const desired = this.store.getState();
+      await validatePleSelection(desired.selectedModelPath, desired, () => this.getServerFeatures());
       report("Stopping server for reload…");
       await this.stopServer(true);
       await sleep(400);

@@ -444,6 +444,8 @@ export interface LlamaLoadSettings {
    * the next-n heads live in a sibling `mtp-*.gguf` (Gemma 4) rather than the language GGUF.
    */
   draftModelPath: string;
+  /** External PLE-only GGUF (--ple). Empty uses the model's built-in table. */
+  plePath: string;
   /** Draft model GPU layers (`--spec-draft-ngl`); 99 ≈ all */
   draftGpuOffload: number;
   /** Empty follows the target; otherwise a llama.cpp device ID or none (CPU). */
@@ -566,6 +568,7 @@ export const DEFAULT_LOAD_SETTINGS: LlamaLoadSettings = {
   draftSampling: "auto",
   draftBatchSize: 0,
   draftModelPath: "",
+  plePath: "",
   draftGpuOffload: 99,
   draftDevice: "",
   cacheRamMiB: undefined,
@@ -687,6 +690,7 @@ export function normalizeLoadSettings(raw: Partial<LlamaLoadSettings> | undefine
       ? s.draftSampling : "auto",
     draftBatchSize: int(s.draftBatchSize, 0, 1_048_576, d.draftBatchSize),
     draftModelPath: typeof s.draftModelPath === "string" ? s.draftModelPath.trim() : "",
+    plePath: typeof s.plePath === "string" ? s.plePath.trim() : "",
     draftGpuOffload: int(s.draftGpuOffload, 0, 999, d.draftGpuOffload),
     draftDevice: normalizeDeviceId(s.draftDevice),
     cacheRamMiB: s.cacheRamMiB == null || String(s.cacheRamMiB).trim() === ""

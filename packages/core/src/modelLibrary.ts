@@ -4,6 +4,7 @@ import * as path from "path";
 import type { ConfigAccessor } from "./config";
 import { getModelsDir } from "./paths";
 import { speculativeUsesDflash, speculativeUsesMtp } from "./types";
+import { isPleOnlyGguf } from "./ggufMetadata";
 
 export interface LocalModelEntry {
   path: string;
@@ -226,7 +227,7 @@ export function extractQuantToken(name: string): string | undefined {
 
 export type GgufListedFile = { path: string; size: number };
 
-export type GgufFileRole = "language" | "mmproj" | "imatrix" | "mtp-sidecar" | "mtp-baked";
+export type GgufFileRole = "language" | "mmproj" | "imatrix" | "mtp-sidecar" | "mtp-baked" | "ple";
 
 function isNearCopySize(a: number, b: number): boolean {
   const lo = Math.min(a, b);
@@ -268,6 +269,7 @@ export function classifyGgufFile(file: GgufListedFile, siblings: GgufListedFile[
   if (isImatrixFileName(file.path)) {
     return "imatrix";
   }
+  if (fs.existsSync(file.path) && isPleOnlyGguf(file.path)) return "ple";
   if (isConfidentMtpSidecarPath(file.path)) {
     return "mtp-sidecar";
   }
@@ -703,7 +705,8 @@ function shouldSkipLanguageFile(name: string, size: number, siblings: GgufListed
   if (SKIP_NAME_RE.test(listingBaseName(name)) || isMmprojFileName(name) || isImatrixFileName(name)) {
     return true;
   }
-  if (classifyGgufFile({ path: name, size }, siblings) === "mtp-sidecar") {
+  const role = classifyGgufFile({ path: name, size }, siblings);
+  if (role === "mtp-sidecar" || (role === "ple" && !SHARD_NAME_RE.test(listingBaseName(name)))) {
     return true;
   }
   if (size < MIN_MODEL_BYTES) {
@@ -932,7 +935,7 @@ export function collapseLocalModelEntries(entries: LocalModelEntry[]): LocalMode
     group.push(e);
     groups.set(key, group);
   }
-  const collapsed = [...groups.values()].map((group) => {
+  const collapsed = [...groups.values()].filter(group => group.some(e => !isPleOnlyGguf(e.path))).map((group) => {
     const sorted = [...group].sort((a, b) => listingBaseName(a.path).localeCompare(listingBaseName(b.path)));
     const first = sorted[0]!;
     return {
@@ -1035,7 +1038,7 @@ export function withRecentExternalModels(
     } catch {
       continue;
     }
-    if (shouldSkipLanguageFile(path.basename(file), size)) continue;
+    if (shouldSkipLanguageFile(file, size)) continue;
     extra.push({ path: file, source: OPENED_MODEL_SOURCE, sizeBytes: size });
   }
   return extra.length ? [...entries, ...collapseLocalModelEntries(extra)] : entries;
@@ -1532,6 +1535,11 @@ export function removalPathsForQuant(
     }
     const owned = isOwnedModelPath(filePath, modelsDir);
     const sameDir = path.dirname(canon) === path.dirname(canonicalModelPath(quantPath));
+    // External PLE files may be shared across quants. They are never automatic companions to delete.
+    if (allowCompanion && isPleOnlyGguf(filePath)) {
+      rejected.push(filePath);
+      return;
+    }
     if (!owned || (allowCompanion && !sameDir)) {
       rejected.push(filePath);
       return;

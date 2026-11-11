@@ -34,6 +34,8 @@ export type ToHostMessage =
   | { type: "clearDraftModel" }
   | { type: "pickMmproj" }
   | { type: "clearMmproj" }
+  | { type: "pickPle" }
+  | { type: "clearPle" }
   | { type: "pickChatTemplate" }
   // llama.cpp install
   | { type: "installLlamaCpp"; payload?: string }

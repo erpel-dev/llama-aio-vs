@@ -98,7 +98,7 @@ export function miniGguf(kv: Record<string, MiniGgufValue>): Buffer {
  */
 export function miniGgufWithTensors(
   kv: Record<string, MiniGgufValue>,
-  tensors: Array<{ name: string; bytes: number }>
+  tensors: Array<{ name: string; bytes: number; dimensions?: number[]; type?: number; offset?: number }>
 ): Buffer {
   const parts: Buffer[] = [];
   const u32 = (n: number) => {
@@ -140,8 +140,10 @@ export function miniGgufWithTensors(
   }
   let offset = 0;
   for (const t of tensors) {
+    if (t.offset !== undefined) offset = Math.max(offset, t.offset);
     const bytes = Math.max(0, Math.floor(t.bytes));
-    parts.push(str(t.name), u32(1), u64(Math.max(1, bytes)), u32(0), u64(offset));
+    const dimensions = t.dimensions || [Math.max(1, bytes)];
+    parts.push(str(t.name), u32(dimensions.length), ...dimensions.map(u64), u32(t.type ?? 0), u64(offset));
     offset += bytes;
   }
   const preamble = Buffer.concat(parts);
