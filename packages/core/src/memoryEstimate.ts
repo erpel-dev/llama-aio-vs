@@ -28,7 +28,7 @@ import {
 } from "./types";
 
 export interface MemoryBarSegment {
-  key: "weights" | "vision" | "kv" | "overhead" | "draft";
+  key: "weights" | "expertCache" | "vision" | "kv" | "overhead" | "draft";
   label: string;
   bytes: number;
 }
@@ -320,7 +320,8 @@ function buildGpuBarChart(
   return {
     title,
     segments: [
-      { key: "weights" as const, label: expertCache > 0 ? "Weights + GPU expert cache" : "Weights", bytes: weights + expertCache },
+      { key: "weights" as const, label: "Weights", bytes: weights },
+      { key: "expertCache" as const, label: "GPU expert cache", bytes: expertCache },
       { key: "vision" as const, label: "Vision (CLIP)", bytes: vision },
       { key: "draft" as const, label: specLabel, bytes: spec },
       { key: "kv" as const, label: "KV cache (full ctx)", bytes: kv },
@@ -1426,7 +1427,7 @@ export function estimateMemory(
     }
   }
   if (moeCacheBytes > 0) {
-    warnings.push(`GPU expert cache budget: ${formatBytes(moeCacheBytes)} of additional VRAM; host experts remain in system RAM. Included in the Weights bars. Actual allocation depends on expert layout.`);
+    warnings.push(`GPU expert cache budget: ${formatBytes(moeCacheBytes)} of additional VRAM; host experts remain in system RAM. Shown separately in the GPU bars. Actual allocation depends on expert layout.`);
   }
   if (!cpuOnly && !caps.isMoe && settings.nCpuFfn > 0) {
     warnings.push(

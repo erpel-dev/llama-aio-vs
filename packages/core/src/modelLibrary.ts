@@ -615,6 +615,25 @@ function hfHubCacheDirs(): string[] {
   return dirs;
 }
 
+function strataModelDirs(): string[] {
+  const home = os.homedir();
+  const dataHome = (process.env.XDG_DATA_HOME || "").trim();
+  const settingsFile = path.join(dataHome ? expand(dataHome) : path.join(home, ".local", "share"), "strata", "app-settings.json");
+  const dataDirs: string[] = [];
+  try {
+    const settings = JSON.parse(fs.readFileSync(settingsFile, "utf8")) as { data_dir?: unknown };
+    if (typeof settings.data_dir === "string" && settings.data_dir.trim()) {
+      const dir = expand(settings.data_dir);
+      if (path.isAbsolute(dir)) dataDirs.push(dir);
+    }
+  } catch {
+    // Strata need not be installed or have saved settings yet.
+  }
+  dataDirs.push(path.join(home, "Documents", "Strata"));
+  // Desktop uses Models; older launcher configurations also use models.
+  return dataDirs.flatMap(dir => [path.join(dir, "Models"), path.join(dir, "models")]);
+}
+
 /** Default / well-known GGUF roots used by common local-LLM tools. */
 export function discoverModelRoots(config: ConfigAccessor): ScanRoot[] {
   const home = os.homedir();
@@ -644,6 +663,9 @@ export function discoverModelRoots(config: ConfigAccessor): ScanRoot[] {
 
   for (const dir of hfHubCacheDirs()) {
     roots.push({ dir, source: "Hugging Face cache", maxDepth: 6 });
+  }
+  for (const dir of strataModelDirs()) {
+    roots.push({ dir, source: "Strata" });
   }
 
   // Other common tools (Linux + Windows locations)
@@ -710,7 +732,11 @@ function shouldSkipLanguageFile(name: string, size: number, siblings: GgufListed
     return true;
   }
   if (size < MIN_MODEL_BYTES) {
-    return true;
+    // Some split models keep only metadata/small tensors in the first shard.
+    // Judge the complete group so the launch path still points at shard 1.
+    const group = localShardGroupKey(name);
+    if (!group || siblings.filter(file => localShardGroupKey(file.path) === group)
+      .reduce((sum, file) => sum + file.size, 0) < MIN_MODEL_BYTES) return true;
   }
   if (name.endsWith(".partial") || name.endsWith(".incomplete") || name.endsWith(".tmp")) {
     return true;

@@ -412,6 +412,7 @@ input:disabled, select:disabled { opacity: 0.5; }
 }
 .mem-stack > span { display: block; height: 100%; min-width: 0; }
 .mem-stack .seg-weights { background: #3b82f6; }
+.mem-stack .seg-expertCache { background: #eab308; }
 .mem-stack .seg-vision { background: #f97316; }
 .mem-stack .seg-draft { background: #14b8a6; }
 .mem-stack .seg-kv { background: #a855f7; }
@@ -437,6 +438,7 @@ input:disabled, select:disabled { opacity: 0.5; }
   vertical-align: middle;
 }
 .mem-legend .seg-weights { background: #3b82f6; }
+.mem-legend .seg-expertCache { background: #eab308; }
 .mem-legend .seg-vision { background: #f97316; }
 .mem-legend .seg-draft { background: #14b8a6; }
 .mem-legend .seg-kv { background: #a855f7; }

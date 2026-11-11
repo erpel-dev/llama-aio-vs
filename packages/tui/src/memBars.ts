@@ -5,6 +5,7 @@ export type MemBarTone = "ok" | "warn" | "bad" | "muted";
 
 export const MEM_SEG_FG = {
   weights: theme.memWeights,
+  expertCache: theme.memExpertCache,
   vision: theme.memVision,
   draft: theme.memDraft,
   kv: theme.memKv,
@@ -42,7 +43,7 @@ export function chartSubtitle(chart: MemoryBarChart): { text: string; tone: MemB
 }
 
 export type MemBarPart = {
-  key: "weights" | "vision" | "kv" | "overhead" | "draft" | "free";
+  key: "weights" | "expertCache" | "vision" | "kv" | "overhead" | "draft" | "free";
   cols: number;
   fg: string;
 };

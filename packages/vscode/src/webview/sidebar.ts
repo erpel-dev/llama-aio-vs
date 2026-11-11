@@ -2012,7 +2012,7 @@ function requestEstimate() {
 function refreshMemoryLive() { requestEstimate(); }
 function scheduleLiveMemory() { requestEstimate(); }
 
-const SEG_LABEL = { weights: 'Weights', vision: 'Projector', draft: 'Spec', kv: 'KV', overhead: 'Overhead' };
+const SEG_LABEL = { weights: 'Weights', expertCache: 'Expert cache', vision: 'Projector', draft: 'Spec', kv: 'KV', overhead: 'Overhead' };
 
 function memBar(device, targetFree) {
   const bar = document.createElement('div');
@@ -2090,7 +2090,7 @@ function renderMemoryView(view) {
       if (s.bytes > 0) totals[s.key] = (totals[s.key] || 0) + s.bytes;
     }
   }
-  for (const key of ['weights', 'vision', 'draft', 'kv', 'overhead']) {
+  for (const key of ['weights', 'expertCache', 'vision', 'draft', 'kv', 'overhead']) {
     if (!totals[key]) continue;
     const span = document.createElement('span');
     const swatch = document.createElement('i');

@@ -446,6 +446,35 @@ describe("SettingsViewProvider memory path", () => {
     assert.equal(state.payload.gpus[0].shortName, "RX 9070");
   });
 
+  it("renders expert cache as a separate colored segment and legend, hiding it when off", async t => {
+    const { JSDOM } = require("jsdom");
+    const html = fs.readFileSync(path.join(__dirname, "../src/webview/sidebar.html"), "utf8").replace(/\{\{\w+\}\}/g, "");
+    const dom = new JSDOM(html, { runScripts: "outside-only", pretendToBeVisual: true, url: "https://preview.invalid" });
+    t.after(() => dom.window.close());
+    dom.window.acquireVsCodeApi = () => ({ postMessage() {}, getState: () => null, setState() {} });
+    dom.window.eval(fs.readFileSync(path.join(__dirname, "../out/webview/sidebar.js"), "utf8"));
+    const model = { ...caps, isMoe: true, expertCount: 128, expertUsedCount: 8, moeExpertShare: 0.9 };
+    const ui = setup({ nCpuMoe: 48, moeCacheMiB: 4096 }, undefined,
+      { ...core.NO_SERVER_FEATURES, probed: true, moeCache: true }, model);
+    await ui.send({ type: "ready" });
+    const payload = ui.posted.find(m => m.type === "state").payload;
+    const paint = memoryView => dom.window.dispatchEvent(new dom.window.MessageEvent("message", {
+      data: { type: "state", payload: { ...payload, memoryView } }
+    }));
+    paint(payload.memoryView);
+    const doc = dom.window.document;
+    assert.ok(doc.querySelector("#memDevices .seg-expertCache"));
+    assert.match(doc.querySelector("#memDevices .seg-expertCache").title, /GPU expert cache/);
+    assert.match(doc.getElementById("memLegend").textContent, /Expert cache 4/);
+    const css = fs.readFileSync(path.join(__dirname, "../src/webview/sidebar.css"), "utf8");
+    const style = doc.createElement("style"); style.textContent = css; doc.head.appendChild(style);
+    assert.notEqual(dom.window.getComputedStyle(doc.querySelector(".mem-stack .seg-expertCache")).backgroundColor,
+      dom.window.getComputedStyle(doc.querySelector(".mem-stack .seg-weights")).backgroundColor);
+    paint(core.computeMemoryView(model, { ...ui.getState().loadSettings, moeCacheMiB: 0 }, gpus).view);
+    assert.equal(doc.querySelector("#memDevices .seg-expertCache"), null);
+    assert.doesNotMatch(doc.getElementById("memLegend").textContent, /Expert cache/);
+  });
+
   for (const supported of [false, true]) {
     it(`accounts for expert caching only on a supporting binary (${supported}) and preserves saved choices`, async () => {
       const features = { probed: true, moeCache: supported, draftSampling: supported, draftUbatch: supported };

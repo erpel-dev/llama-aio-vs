@@ -7,6 +7,7 @@ import type { ConfigAccessor } from "../src/config";
 import {
   buildLibraryGroups,
   buildLibraryGroupsAsync,
+  discoverModelRoots,
   findSiblingMmproj,
   findSiblingMtpDraft,
   invalidateModelLibraryCache,
@@ -45,6 +46,74 @@ function writeSparseGguf(file: string, size = LANGUAGE_MIN): void {
     fs.closeSync(fd);
   }
 }
+
+describe("Strata model discovery", () => {
+  function fixture(t: import("node:test").TestContext) {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "llama-strata-"));
+    t.mock.method(require("os"), "homedir", () => home);
+    const previous = process.env.XDG_DATA_HOME;
+    delete process.env.XDG_DATA_HOME;
+    invalidateModelLibraryCache();
+    t.after(() => {
+      if (previous === undefined) delete process.env.XDG_DATA_HOME;
+      else process.env.XDG_DATA_HOME = previous;
+      invalidateModelLibraryCache();
+      fs.rmSync(home, { recursive: true, force: true });
+    });
+    return { home, config: configFor(path.join(home, "aio")) };
+  }
+
+  it("finds default nested GGUF shards under Strata and excludes projectors", t => {
+    const { home, config } = fixture(t);
+    const models = path.join(home, "Documents", "Strata", "Models");
+    const quant = path.join(models, "org", "model-Q4");
+    fs.mkdirSync(quant, { recursive: true });
+    const first = path.join(quant, "model-Q4-00001-of-00002.gguf");
+    const firstBytes = 11 * 1024 * 1024;
+    writeSparseGguf(first, firstBytes);
+    writeSparseGguf(path.join(quant, "model-Q4-00002-of-00002.gguf"));
+    writeSparseGguf(path.join(models, "mmproj-F16.gguf"));
+    const entries = listLocalModelEntries(config).filter(e => e.source === "Strata");
+    assert.equal(entries.length, 1);
+    assert.equal(entries[0].path, first);
+    assert.equal(entries[0].sizeBytes, firstBytes + LANGUAGE_MIN);
+    assert.equal(isOwnedModelPath(first, path.join(home, "aio")), false);
+  });
+
+  it("honors Strata's data_dir and deduplicates Models/models aliases", t => {
+    const { home, config } = fixture(t);
+    const dataDir = path.join(home, "Dokumente", "Strata");
+    const models = path.join(dataDir, "Models");
+    fs.mkdirSync(models, { recursive: true });
+    const model = path.join(models, "installed-Q4.gguf");
+    writeSparseGguf(model);
+    if (process.platform !== "win32") fs.symlinkSync("Models", path.join(dataDir, "models"));
+    const settings = path.join(home, ".local", "share", "strata", "app-settings.json");
+    fs.mkdirSync(path.dirname(settings), { recursive: true });
+    fs.writeFileSync(settings, JSON.stringify({ data_dir: dataDir }));
+    const roots = discoverModelRoots(config).filter(r => r.source === "Strata" && fs.existsSync(r.dir));
+    assert.deepEqual(roots.map(r => r.dir), [models]);
+    assert.deepEqual(listLocalModelEntries(config).filter(e => e.source === "Strata").map(e => e.path), [model]);
+  });
+
+  it("uses XDG_DATA_HOME settings and supports lowercase launcher model folders", t => {
+    const { home, config } = fixture(t);
+    process.env.XDG_DATA_HOME = path.join(home, "data");
+    const settings = path.join(process.env.XDG_DATA_HOME, "strata", "app-settings.json");
+    fs.mkdirSync(path.dirname(settings), { recursive: true });
+    const models = path.join(home, "custom-strata", "models");
+    fs.mkdirSync(models, { recursive: true });
+    const model = path.join(models, "installed.gguf");
+    writeSparseGguf(model);
+    fs.writeFileSync(settings, JSON.stringify({ data_dir: path.dirname(models) }));
+    assert.deepEqual(listLocalModelEntries(config).filter(e => e.source === "Strata").map(e => e.path), [model]);
+    for (const invalid of ["{", "null", '{"data_dir":42}', '{"data_dir":"relative/path"}']) {
+      fs.writeFileSync(settings, invalid);
+      assert.ok(discoverModelRoots(config).some(r => r.source === "Strata" && r.dir === path.join(home, "Documents", "Strata", "Models")));
+      assert.equal(discoverModelRoots(config).some(r => r.dir === models), false);
+    }
+  });
+});
 
 describe("listLocalModelEntries cache", () => {
   const dirs: string[] = [];

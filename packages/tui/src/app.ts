@@ -562,6 +562,7 @@ export async function runApp(services: AppServices): Promise<void> {
   function memBarRow(): {
     row: BoxRenderable;
     weights: TextRenderable;
+    expertCache: TextRenderable;
     vision: TextRenderable;
     draft: TextRenderable;
     kv: TextRenderable;
@@ -571,6 +572,7 @@ export async function runApp(services: AppServices): Promise<void> {
     const mk = (fg: string) =>
       mount(Text({ content: "", fg, height: 1, flexShrink: 0 })) as TextRenderable;
     const weights = mk(theme.memWeights);
+    const expertCache = mk(theme.memExpertCache);
     const vision = mk(theme.memVision);
     const draft = mk(theme.memDraft);
     const kv = mk(theme.memKv);
@@ -585,12 +587,13 @@ export async function runApp(services: AppServices): Promise<void> {
       })
     ) as BoxRenderable;
     row.add(weights);
+    row.add(expertCache);
     row.add(vision);
     row.add(draft);
     row.add(kv);
     row.add(overhead);
     row.add(free);
-    return { row, weights, vision, draft, kv, overhead, free };
+    return { row, weights, expertCache, vision, draft, kv, overhead, free };
   }
 
   function paintMemBar(
@@ -598,9 +601,10 @@ export async function runApp(services: AppServices): Promise<void> {
     chart: MemoryBarChart | null,
     width: number
   ): void {
-    const empty = { weights: "", vision: "", draft: "", kv: "", overhead: "", free: "░".repeat(width) };
+    const empty = { expertCache: "", weights: "", vision: "", draft: "", kv: "", overhead: "", free: "░".repeat(width) };
     if (!chart) {
       cells.weights.content = empty.weights;
+      cells.expertCache.content = empty.expertCache;
       cells.vision.content = empty.vision;
       cells.draft.content = empty.draft;
       cells.kv.content = empty.kv;
@@ -611,6 +615,7 @@ export async function runApp(services: AppServices): Promise<void> {
     }
     const parts = barParts(chart, width);
     const byKey = {
+      expertCache: "",
       weights: "",
       vision: "",
       draft: "",
@@ -622,13 +627,14 @@ export async function runApp(services: AppServices): Promise<void> {
       byKey[p.key] = barCell(p.cols);
     }
     cells.weights.content = byKey.weights;
+    cells.expertCache.content = byKey.expertCache;
     cells.vision.content = byKey.vision;
     cells.draft.content = byKey.draft;
     cells.kv.content = byKey.kv;
     cells.overhead.content = byKey.overhead;
     cells.free.content =
       byKey.free ||
-      (byKey.weights || byKey.vision || byKey.draft || byKey.kv || byKey.overhead ? "" : "░".repeat(width));
+      (byKey.weights || byKey.expertCache || byKey.vision || byKey.draft || byKey.kv || byKey.overhead ? "" : "░".repeat(width));
   }
 
   const loadMemNote = mount(
@@ -658,6 +664,9 @@ export async function runApp(services: AppServices): Promise<void> {
   ) as BoxRenderable;
   loadMemLegendRow.add(
     mount(Text({ content: "█ Weights", fg: theme.memWeights })) as TextRenderable
+  );
+  loadMemLegendRow.add(
+    mount(Text({ content: "█ Expert cache", fg: theme.memExpertCache })) as TextRenderable
   );
   loadMemLegendRow.add(
     mount(Text({ content: "█ Vision", fg: theme.memVision })) as TextRenderable

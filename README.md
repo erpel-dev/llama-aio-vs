@@ -13,7 +13,7 @@ Llama AIO installs llama.cpp for you, finds or downloads GGUF models, tells you 
 
 1. Open the **Llama AIO** view in the activity bar.
 2. Install llama.cpp (Vulkan, CUDA or CPU — picked for your hardware).
-3. Choose a model: **Change…** lists GGUF files already on disk (Llama AIO, LM Studio, Unsloth, Hugging Face cache) or searches Hugging Face. First time? Use the one-click starter model.
+3. Choose a model: **Change…** lists GGUF files already on disk (Llama AIO, LM Studio, Strata, Unsloth, Hugging Face cache) or searches Hugging Face. First time? Use the one-click starter model.
 4. Press **Start**, then pick **Llama AIO: …** in the Copilot Chat model picker.
 
 ## Know if it fits — before you load it

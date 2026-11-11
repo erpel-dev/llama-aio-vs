@@ -113,6 +113,10 @@ describe("GPU expert cache memory budget", () => {
     assert.equal(cached.totalCpuBytes, original.totalCpuBytes);
     assert.equal(cached.charts.vram.totalBytes, cached.totalGpuBytes);
     assert.equal(cached.charts.vram.segments.reduce((n, s) => n + s.bytes, 0), cached.totalGpuBytes);
+    assert.deepEqual(cached.charts.vram.segments.find(s => s.key === "expertCache"),
+      { key: "expertCache", label: "GPU expert cache", bytes: 4 * GiB });
+    assert.equal(cached.charts.vram.segments.find(s => s.key === "weights")!.bytes,
+      original.charts.vram.segments.find(s => s.key === "weights")!.bytes);
   });
   it("reserves the whole budget on the sole GPU with eligible experts", () => {
     const gpus = [gpu("CUDA0"), gpu("CUDA1")];
