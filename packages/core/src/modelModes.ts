@@ -793,6 +793,27 @@ export function resolveModeParams(
   return { modeName, params: modeSet.modes[modeName] || {} };
 }
 
+const EFFORT_ORDER = ["none", ...SERVER_EFFORTS];
+
+/**
+ * The mode that answers soonest: one that turns thinking off, else the lowest
+ * reasoning effort, else the default. Used for quick checks such as the
+ * sidebar's test message, where a long thinking phase on CPU looks like a hang.
+ */
+export function quickestModeName(modeSet: ModelModeSet): string {
+  const entries = Object.entries(modeSet.modes);
+  const noThink = entries.find(([, p]) => p.chat_template_kwargs?.enable_thinking === false);
+  if (noThink) return noThink[0];
+  let best: { name: string; rank: number } | undefined;
+  for (const [name, p] of entries) {
+    const effort = p.chat_template_kwargs?.reasoning_effort;
+    const rank = typeof effort === "string" ? EFFORT_ORDER.indexOf(effort) : -1;
+    if (rank >= 0 && (!best || rank < best.rank)) best = { name, rank };
+  }
+  if (best) return best.name;
+  return modeSet.modes[modeSet.defaultMode] ? modeSet.defaultMode : entries[0]?.[0] ?? modeSet.defaultMode;
+}
+
 /** Merge mode sampling + chat_template_kwargs into an OpenAI chat body. */
 export function applyModeToRequestBody(
   body: Record<string, unknown>,

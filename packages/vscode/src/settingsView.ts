@@ -148,6 +148,15 @@ function describeModeSampling(
   };
 }
 
+const TEST_MESSAGE_TIMEOUT_MS = 180_000;
+/** The time limit is ours, not the user's Cancel: say what happened and what to try. */
+const TEST_TIMEOUT_RESULT = {
+  type: "testResult",
+  status: "error",
+  error: "No reply within 3 minutes. The server is running, but this model is too slow here for a quick test. " +
+    "Try a smaller model or quantization, or a GPU backend.",
+} as const;
+
 export class SettingsViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = "llamaAio.settingsView";
 
@@ -2147,7 +2156,8 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     }
     const cancel = new vscode.CancellationTokenSource();
     this.testCancel = cancel;
-    const timer = setTimeout(() => cancel.cancel(), 180_000);
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; cancel.cancel(); }, TEST_MESSAGE_TIMEOUT_MS);
     const started = Date.now();
     this.post({ type: "testResult", status: "running" });
     try {
@@ -2155,18 +2165,21 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       if (!model) {
         throw new Error("The server is not ready yet. Start it, then try again.");
       }
-      const response = await model.sendRequest([vscode.LanguageModelChatMessage.User(prompt)], {}, cancel.token);
+      // Quickest mode (thinking off where the model allows it): this checks
+      // that the model answers, not how well it reasons.
+      const response = await model.sendRequest([vscode.LanguageModelChatMessage.User(prompt)],
+        { modelOptions: { llamaAioQuickReply: true } }, cancel.token);
       let reply = "";
       for await (const part of response.stream) {
         if (part instanceof vscode.LanguageModelTextPart) {
           reply += part.value;
         }
       }
-      this.post(cancel.token.isCancellationRequested
+      this.post(timedOut ? TEST_TIMEOUT_RESULT : cancel.token.isCancellationRequested
         ? { type: "testResult", status: "cancelled" }
         : { type: "testResult", status: "done", text: reply.trim().slice(0, 1200), ms: Date.now() - started });
     } catch (e) {
-      this.post(cancel.token.isCancellationRequested
+      this.post(timedOut ? TEST_TIMEOUT_RESULT : cancel.token.isCancellationRequested
         ? { type: "testResult", status: "cancelled" }
         : { type: "testResult", status: "error", error: e instanceof Error ? e.message : String(e) });
     } finally {

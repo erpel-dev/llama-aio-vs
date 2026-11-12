@@ -35,6 +35,7 @@ import {
   resolveRemoteModelModes,
   resolveServerModelModes,
   type ChatTemplateCaps,
+  quickestModeName,
   resolveModeParams,
   rewriteToolInput,
   serverJson,
@@ -862,9 +863,14 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
       ...(options as { modelConfiguration?: Record<string, unknown> }).modelConfiguration,
       ...options.modelOptions,
     };
+    // The sidebar's test message asks for the quickest mode so a thinking
+    // model on CPU answers within the test's time limit.
+    const quickReply = modelConfiguration.llamaAioQuickReply === true;
+    delete modelConfiguration.llamaAioQuickReply;
     let appliedModeName: string | undefined;
     if (modeSet) {
-      const { modeName, params } = resolveModeParams(modeSet, modelConfiguration);
+      const { modeName, params } = resolveModeParams(modeSet,
+        quickReply ? { ...modelConfiguration, reasoningEffort: quickestModeName(modeSet) } : modelConfiguration);
       appliedModeName = modeName;
       if (params.chat_template_kwargs?.clear_thinking === true || params.chat_template_kwargs?.preserve_thinking === false) {
         converted = clearEarlierReasoning(converted);
