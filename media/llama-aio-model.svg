@@ -1,24 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor">
-  <!-- Filled llama head for the Copilot/Cursor model picker (icon font glyph). -->
-  <!-- Ears (same winding as the head so they fill). -->
-  <path d="M9.15 8.7 L11.35 7.85 L5.85 2.15 Z"/>
-  <path d="M14.85 8.7 L18.15 2.15 L12.65 7.85 Z"/>
-  <!-- Head + neck -->
-  <path d="
-    M12 5.05
-    c-2.9 0-5.25 2.4-5.25 5.45
-    c0 1.48.55 2.75 1.42 3.68
-    c.4.42.6.98.6 1.55
-    v2.2
-    c0 .75.6 1.35 1.35 1.35
-    h3.76
-    c.75 0 1.35-.6 1.35-1.35
-    v-2.2
-    c0-.57.2-1.13.6-1.55
-    C16.7 13.25 17.25 12 17.25 10.5
-    c0-3.05-2.35-5.45-5.25-5.45
-    z"/>
-  <!-- Eye holes: opposite winding from the head so they punch through. -->
-  <path d="M9.1 10.45 a 1.05 1.05 0 1 1 2.1 0 a 1.05 1.05 0 1 1 -2.1 0"/>
-  <path d="M12.8 10.45 a 1.05 1.05 0 1 1 2.1 0 a 1.05 1.05 0 1 1 -2.1 0"/>
+  <!-- Filled llama head (side profile) for the chat model picker; source of the icon-font glyph U+E001. -->
+  <!-- Head, ears and woolly neck in one contour; the eye is a second contour of opposite winding, so it punches through. -->
+  <path fill-rule="nonzero" d="M18.75 20V12.2c0-2.7-.7-4.6-1.8-5.85.55-1.5.65-3.25.15-4.85-1.15.75-1.95 1.95-2.3 3.3-.15-1.35-.7-2.6-1.6-3.55-.65 1.4-.8 2.95-.45 4.4C10.2 5.75 7.3 6.6 5.5 7.9c-1.55 1.1-1.45 3.15.3 3.6 1.9.45 4.1.2 5.4.15.85 0 1.35.65 1.35 1.5v.3c-.7.7-.7 1.8 0 2.5-.7.7-.7 1.8 0 2.5V20c.95.9 2.05 1.35 3.1 1.35s2.15-.45 3.1-1.35Z M13.3 7.35a1.25 1.25 0 1 0 0 2.5a1.25 1.25 0 1 0 0-2.5Z"/>
 </svg>
