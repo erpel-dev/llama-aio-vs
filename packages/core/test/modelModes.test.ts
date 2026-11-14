@@ -8,6 +8,7 @@ import {
   isGlimmerFamily,
   isQwen38Family,
   isQwen4expFamily,
+  quickestModeName,
   resolveModeParams,
   resolveModelModes,
 } from "../src/modelModes";
@@ -286,5 +287,28 @@ describe("applyModeToRequestBody", () => {
     applyModeToRequestBody(body, params);
     assert.equal(body.top_k, 64);
     assert.deepEqual(body.chat_template_kwargs, { enable_thinking: false });
+  });
+});
+
+describe("quickestModeName", () => {
+  const set = (modes: Record<string, Record<string, unknown>>, defaultMode = Object.keys(modes)[0]) =>
+    ({ familyLabel: "t", defaultMode, modes: Object.fromEntries(Object.entries(modes).map(([k, v]) => [k, { chat_template_kwargs: v }])) });
+
+  it("prefers a mode that turns thinking off", () => {
+    assert.equal(quickestModeName(set({ Think: { enable_thinking: true }, "No Think": { enable_thinking: false } })), "No Think");
+  });
+
+  it("falls back to the lowest reasoning effort", () => {
+    assert.equal(quickestModeName(set({ High: { reasoning_effort: "high" }, Low: { reasoning_effort: "low" }, Med: { reasoning_effort: "medium" } })), "Low");
+  });
+
+  it("keeps the default when no mode is quicker", () => {
+    assert.equal(quickestModeName(set({ A: {}, B: {} }, "B")), "B");
+  });
+
+  it("picks No Think for real Qwen3.5 profiles", () => {
+    const real = resolveModelModes(undefined, "qwen3.5-2b-q4_k_m");
+    assert.ok(real);
+    assert.equal(real.modes[quickestModeName(real)].chat_template_kwargs?.enable_thinking, false);
   });
 });
