@@ -182,8 +182,11 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
   private pushInFlight: Promise<void> | undefined;
   private pushTrailing: Promise<void> | undefined;
   /** Last loopback scan. The 5s status poll reuses this instead of running `ss` every tick. */
-  private localServerScan?: { at: number; servers: DiscoveredLlamaServer[] };
-  private localServerScanRun?: Promise<DiscoveredLlamaServer[]>;
+  /** Results and in-flight scan, both tied to the port list they were started with. */
+  private localServerScan?: { at: number; key: string; servers: DiscoveredLlamaServer[] };
+  private localServerScanRun?: { key: string; run: Promise<DiscoveredLlamaServer[]> };
+  /** The machine-wide scan; a field so tests can hold a scan open. */
+  private discoverLocalServers = discoverLoopbackLlamaServersOnThisMachineAsync;
   private apiKeys?: ApiKeyStore;
   private hfTokens?: HfTokenStore;
 
@@ -1013,24 +1016,31 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       this.localServerScan = undefined;
       return [];
     }
+    // A scan started for another port list is never used or cached: after the list
+    // changes, the next look starts a scan for the new list at once.
+    const extraPorts = this.store.getConfig().get<number[]>("extraServerPorts") || [];
+    const key = extraPorts.join(",");
     const now = Date.now();
-    if (this.localServerScan && now - this.localServerScan.at < 20_000) {
+    if (this.localServerScan?.key === key && now - this.localServerScan.at < 20_000) {
       return this.localServerScan.servers;
     }
-    if (!this.localServerScanRun) {
+    if (this.localServerScanRun?.key !== key) {
       const skip = status.ownedByThisExtension && status.pid ? [status.pid] : [];
-      const extraPorts = this.store.getConfig().get<number[]>("extraServerPorts") || [];
-      this.localServerScanRun = discoverLoopbackLlamaServersOnThisMachineAsync(skip, extraPorts)
-        .catch(() => [])
-        .then((servers) => {
-          this.localServerScan = { at: Date.now(), servers };
-          return servers;
-        })
-        .finally(() => {
-          this.localServerScanRun = undefined;
-        });
+      const scan: { key: string; run: Promise<DiscoveredLlamaServer[]> } = {
+        key,
+        run: this.discoverLocalServers(skip, extraPorts)
+          .catch(() => [])
+          .then((servers) => {
+            if (this.localServerScanRun === scan) this.localServerScan = { at: Date.now(), key, servers };
+            return servers;
+          })
+          .finally(() => {
+            if (this.localServerScanRun === scan) this.localServerScanRun = undefined;
+          }),
+      };
+      this.localServerScanRun = scan;
     }
-    return this.localServerScanRun;
+    return this.localServerScanRun.run;
   }
 
   /** Fields the sidebar needs to draw remote mode. Included in state and status patches. */
