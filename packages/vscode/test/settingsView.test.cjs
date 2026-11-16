@@ -30,6 +30,8 @@ require.cache.vscode = {
       showErrorMessage: async () => undefined,
       showOpenDialog: async () => undefined,
       showInputBox: async () => undefined,
+      // Attachment pickers list library files first; by default tests take "Browse…".
+      showQuickPick: async (items) => items.find((i) => i.browse),
       withProgress: async (_o, fn) => fn({ report() {} }),
       // Advanced settings tab: a fake panel whose messages tests can drive.
       createWebviewPanel: () => {
@@ -53,6 +55,7 @@ require.cache.vscode = {
     env: {},
     UIKind: { Desktop: 1, Web: 2 },
     extensions: { getExtension: (id) => (copilotChatInstalled && id === "GitHub.copilot-chat" ? {} : undefined) },
+    QuickPickItemKind: { Separator: -1, Default: 0 },
     Uri: { file: fsPath => ({ fsPath }), joinPath: (base, ...parts) => ({ fsPath: path.join(base.fsPath, ...parts) }) },
     ProgressLocation: {},
     ViewColumn: {},
@@ -207,6 +210,7 @@ function setup(loadOverrides = {}, remoteInfo, serverFeatures = core.NO_SERVER_F
     requestSettings: { ...core.DEFAULT_REQUEST_SETTINGS },
   };
   const config = new Map([["launchMode", "externalTerminal"]]);
+  if (opts.modelsDir) config.set("modelsDir", opts.modelsDir);
   const loraApplied = [];
   const launched = {
     modelPath: caps.path,
@@ -798,5 +802,94 @@ describe("local server scan and the port list", () => {
     assert.deepEqual(calls.map((c) => c.ports), [[9123], []]);
     calls[1].resolve([]);
     assert.deepEqual(await after, []);
+  });
+});
+
+describe("attachment pickers search the library", () => {
+  const lora = { ...core.NO_SERVER_FEATURES, probed: true, lora: true };
+  function library(t) {
+    const dir = fs.mkdtempSync(path.join(require("os").tmpdir(), "llama-aio-pick-"));
+    core.invalidateModelLibraryCache();
+    t.after(() => { core.invalidateModelLibraryCache(); fs.rmSync(dir, { recursive: true, force: true }); });
+    // Minimal GGUF v3 header with string metadata only.
+    const gguf = kv => {
+      const u32 = n => { const b = Buffer.alloc(4); b.writeUInt32LE(n); return b; };
+      const u64 = n => { const b = Buffer.alloc(8); b.writeBigUInt64LE(BigInt(n)); return b; };
+      const text = v => Buffer.concat([u64(Buffer.byteLength(v)), Buffer.from(v)]);
+      const entries = Object.entries(kv);
+      return Buffer.concat([Buffer.from("GGUF"), u32(3), u64(0), u64(entries.length),
+        ...entries.flatMap(([k, v]) => [text(k), u32(8), text(v)])]);
+    };
+    const adapter = (name, arch) => {
+      const file = path.join(dir, name);
+      fs.writeFileSync(file, gguf({ "general.architecture": arch, "general.type": "adapter", "adapter.type": "lora" }));
+      return file;
+    };
+    return { dir, adapter };
+  }
+  const mine = (items, dir) => items.filter(i => i.candidate && i.candidate.path.startsWith(dir));
+
+  it("offers adapters found in the model folders and adds the chosen one without a file dialog", async t => {
+    const { dir, adapter } = library(t);
+    const good = adapter("sql-lora.gguf", caps.architecture);
+    const wrong = adapter("other-family-lora.gguf", "some-other-arch");
+    const dialog = t.mock.method(require("vscode").window, "showOpenDialog");
+    let offered;
+    t.mock.method(require("vscode").window, "showQuickPick", async (items, options) => {
+      offered = { items, options };
+      return items.find(i => i.candidate && i.candidate.path === good);
+    });
+    const ui = setup({}, undefined, lora, caps, { modelsDir: dir });
+    await ui.send({ type: "pickLora" });
+    assert.deepEqual(ui.getState().loadSettings.loraAdapters, [{ path: good, scale: 1, enabled: true }]);
+    assert.equal(dialog.mock.callCount(), 0);
+    const rows = mine(offered.items, dir);
+    assert.deepEqual(rows.map(i => [i.label, i.candidate.usable]), [["sql-lora.gguf", true], ["other-family-lora.gguf", false]]);
+    assert.ok(offered.items.indexOf(rows[1]) > offered.items.findIndex(i => i.label === "Cannot be used with this model"));
+    assert.equal(offered.items.at(-1).browse, true, "Browse stays available");
+    assert.match(offered.options.placeHolder, /found in your model folders/);
+    assert.ok(wrong);
+
+    // Opening the picker again marks the adapter as already added; choosing it changes nothing.
+    t.mock.method(require("vscode").window, "showQuickPick", async items => {
+      offered = { items };
+      return items.find(i => i.candidate && i.candidate.path === good);
+    });
+    await ui.send({ type: "pickLora" });
+    assert.match(mine(offered.items, dir)[0].label, /^\$\(check\) sql-lora\.gguf$/);
+    assert.match(mine(offered.items, dir)[0].description, /Already added/);
+    assert.equal(ui.getState().loadSettings.loraAdapters.length, 1);
+  });
+
+  it("explains instead of adding when an unusable file is chosen, and does nothing when dismissed", async t => {
+    const { dir, adapter } = library(t);
+    const wrong = adapter("other-family-lora.gguf", "some-other-arch");
+    const ui = setup({}, undefined, lora, caps, { modelsDir: dir });
+    t.mock.method(require("vscode").window, "showQuickPick", async items => items.find(i => i.candidate && i.candidate.path === wrong));
+    const before = shown.length;
+    await ui.send({ type: "pickLora" });
+    assert.deepEqual(ui.getState().loadSettings.loraAdapters, []);
+    assert.match(shown.slice(before).at(-1).msg, /other-family-lora\.gguf cannot be used with this model.*some-other-arch/);
+    t.mock.method(require("vscode").window, "showQuickPick", async () => undefined);
+    const dialog = t.mock.method(require("vscode").window, "showOpenDialog");
+    await ui.send({ type: "pickLora" });
+    assert.equal(dialog.mock.callCount(), 0);
+    assert.deepEqual(ui.getState().loadSettings.loraAdapters, []);
+  });
+
+  it("says when nothing was found and still offers Browse, for LoRA and PLE", async t => {
+    const { dir } = library(t);
+    const prompts = [];
+    t.mock.method(require("vscode").window, "showQuickPick", async (items, options) => {
+      prompts.push({ options, mine: mine(items, dir), browse: items.some(i => i.browse) });
+      return undefined;
+    });
+    await setup({}, undefined, lora, caps, { modelsDir: dir }).provider.pickLora();
+    await setup({}, undefined, { ...core.NO_SERVER_FEATURES, externalPle: "--ple" }, caps, { modelsDir: dir }).provider.pickPle();
+    assert.equal(prompts.length, 2);
+    for (const p of prompts) {
+      assert.deepEqual(p.mine, []);
+      assert.equal(p.browse, true);
+    }
   });
 });

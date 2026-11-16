@@ -59,7 +59,7 @@ import { LaunchToken, LAUNCH_IN_PROGRESS_MSG, ProcessManager } from "@llama-aio/
 import { SettingsStore } from "@llama-aio/core";
 import { resolveLaunchMode } from "@llama-aio/core";
 import { parseServerPortList } from "@llama-aio/core";
-import { checkLoraAdapter, modelLineage, type LoraAdapterSetting } from "@llama-aio/core";
+import { checkLoraAdapter, findLoraCandidates, findPleCandidates, modelLineage, type AttachmentCandidate, type LoraAdapterSetting } from "@llama-aio/core";
 import { BUILTIN_CHAT_TEMPLATES, capsMissDefaultSwaPattern, chatTemplateFileProblem, COMMON_CHAT_TEMPLATES, DEFAULT_LOAD_SETTINGS, DEFAULT_REQUEST_SETTINGS, effectiveServerUiState, isQwen4expArchitecture, LlamaLoadSettings, normalizeSpeculativeMode, RequestSettings } from "@llama-aio/core";
 import { isDflashDraftArchitecture, recommendedMaxDraftTokens, speculativeUsesMtp, speculativeUsesNgram } from "@llama-aio/core";
 import {
@@ -1597,6 +1597,51 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       : "Llama AIO looks for servers on the known default ports only.");
   }
 
+  /**
+   * Offer the files found in the model folders, best fit first, with "Browse…"
+   * for anything else. Returns a path, "browse", or undefined when dismissed or
+   * when the chosen file cannot be used (the reason is shown).
+   */
+  private async pickAttachment(
+    title: string,
+    emptyText: string,
+    candidates: AttachmentCandidate[],
+    attachedText: string
+  ): Promise<string | undefined> {
+    type Item = vscode.QuickPickItem & { candidate?: AttachmentCandidate; browse?: boolean };
+    const row = (c: AttachmentCandidate): Item => ({
+      label: (c.attached ? "$(check) " : "") + path.basename(c.path),
+      description: [c.attached ? attachedText : c.verdict, formatModelSize(c.sizeBytes), c.source].filter(Boolean).join(" · "),
+      detail: [c.note, path.dirname(c.path)].filter(Boolean).join("  —  "),
+      candidate: c,
+    });
+    const usable = candidates.filter(c => c.usable);
+    const unusable = candidates.filter(c => !c.usable);
+    const items: Item[] = [
+      ...usable.map(row),
+      ...(unusable.length
+        ? [{ label: "Cannot be used with this model", kind: vscode.QuickPickItemKind.Separator } as Item, ...unusable.map(row)]
+        : []),
+      { label: "", kind: vscode.QuickPickItemKind.Separator },
+      { label: "$(folder-opened) Browse for a file…", description: "Pick a GGUF from anywhere on disk", browse: true },
+    ];
+    const picked = await vscode.window.showQuickPick(items, {
+      title,
+      placeHolder: usable.length ? `${usable.length} found in your model folders. Choose one, or browse.`
+        : `${emptyText}. Browse for a file.`,
+      matchOnDescription: true, matchOnDetail: true, ignoreFocusOut: true,
+    });
+    if (!picked) return undefined;
+    if (picked.browse) return "browse";
+    const c = picked.candidate;
+    if (!c || c.attached) return undefined;
+    if (!c.usable) {
+      void vscode.window.showWarningMessage(`${path.basename(c.path)} cannot be used with this model. ${c.note}`);
+      return undefined;
+    }
+    return c.path;
+  }
+
   /** Add LoRA adapter files to the selected model. The file list applies on reload. */
   async pickLora(): Promise<void> {
     if (this.store.isRemote()) throw new Error("LoRA adapters are configured on the remote server.");
@@ -1604,17 +1649,30 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     if (!model) throw new Error("Select the main model before adding a LoRA adapter.");
     const features = await this.processManager.getServerFeatures();
     if (!features.lora) throw new Error("This llama.cpp build has no --lora option. Update llama.cpp to use LoRA adapters.");
-    const selected = await vscode.window.showOpenDialog({
-      canSelectMany: true, canSelectFiles: true, canSelectFolders: false,
-      title: "Select LoRA adapters (GGUF) trained on this model",
-      openLabel: "Add LoRA adapter", filters: { "GGUF files": ["gguf"] },
-      defaultUri: vscode.Uri.file(path.dirname(model)),
-    });
-    if (!selected?.length) return;
+    const state = this.store.getState();
+    const choice = await this.pickAttachment(
+      "Add a LoRA adapter to " + path.basename(model),
+      "No LoRA adapters found in your model folders",
+      findLoraCandidates(this.store.getConfig(), model, state.modelCapabilities, state.loadSettings.loraAdapters.map(a => a.path)),
+      "Already added"
+    );
+    if (!choice) return;
+    let picked: string[];
+    if (choice === "browse") {
+      const selected = await vscode.window.showOpenDialog({
+        canSelectMany: true, canSelectFiles: true, canSelectFolders: false,
+        title: "Select LoRA adapters (GGUF) trained on this model",
+        openLabel: "Add LoRA adapter", filters: { "GGUF files": ["gguf"] },
+        defaultUri: vscode.Uri.file(path.dirname(model)),
+      });
+      if (!selected?.length) return;
+      picked = selected.map(uri => uri.fsPath);
+    } else {
+      picked = [choice];
+    }
     if (this.store.isRemote() || this.store.getState().selectedModelPath !== model) {
       throw new Error("The selected model changed. Add the adapter again for the current model.");
     }
-    const picked = selected.map(uri => uri.fsPath);
     await this.changeLora(list => [
       ...list,
       ...picked.filter(p => !list.some(a => a.path === p)).map(p => ({ path: p, scale: 1, enabled: true })),
@@ -1650,16 +1708,27 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     if (!model) throw new Error("Select the main model before attaching a PLE table.");
     const features = await this.processManager.getServerFeatures();
     if (!features.externalPle) throw new Error("Update llama.cpp to b12233 or a compatible build with --shard/--ple support.");
-    const selected = await vscode.window.showOpenDialog({
-      canSelectMany: false, canSelectFiles: true, canSelectFolders: false,
-      title: "Select a PLE-only GGUF from the same model checkpoint",
-      openLabel: "Attach PLE table", filters: { "GGUF files": ["gguf"] },
-      defaultUri: vscode.Uri.file(path.dirname(model)),
-    });
-    if (!selected?.[0]) return;
+    const choice = await this.pickAttachment(
+      "Choose a PLE table for " + path.basename(model),
+      "No PLE-only GGUFs found in your model folders",
+      findPleCandidates(this.store.getConfig(), model, this.store.getState().loadSettings.plePath),
+      "Attached now"
+    );
+    if (!choice) return;
+    let picked = choice;
+    if (choice === "browse") {
+      const selected = await vscode.window.showOpenDialog({
+        canSelectMany: false, canSelectFiles: true, canSelectFolders: false,
+        title: "Select a PLE-only GGUF from the same model checkpoint",
+        openLabel: "Attach PLE table", filters: { "GGUF files": ["gguf"] },
+        defaultUri: vscode.Uri.file(path.dirname(model)),
+      });
+      if (!selected?.[0]) return;
+      picked = selected[0].fsPath;
+    }
     if (this.store.isRemote()) throw new Error("The connection changed to a remote server. Configure its PLE table on the server machine.");
     if (this.store.getState().selectedModelPath !== model) throw new Error("The selected model changed. Choose the PLE table again for the current model.");
-    await this.store.updateLoadSettings({ plePath: selected[0].fsPath });
+    await this.store.updateLoadSettings({ plePath: picked });
     await this.pushState();
   }
 
