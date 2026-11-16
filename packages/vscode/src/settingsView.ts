@@ -960,7 +960,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         ? { ...launched.loadSettings, ...pickCpuIgnoredFields(state.loadSettings) }
         : launched.loadSettings;
       await this.store.updateLoadSettings({ ...restore, plePath: restore.plePath || "", loraAdapters: restore.loraAdapters || [] });
-      await this.processManager.applyLoraScales().catch(() => undefined);
+      // Discard restores the launch-time strengths; a failure here must be seen, not swallowed.
+      await this.processManager.applyLoraScales().catch(e => vscode.window.showErrorMessage(
+        `The running server did not take the restored LoRA strengths: ${e instanceof Error ? e.message : String(e)} Reload to apply them.`));
     }
     const mode = this.processManager.effectiveLaunchMode();
     if (launched.launchMode && launched.launchMode !== mode) {
@@ -1581,11 +1583,21 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
   /** Save an adapter change, then send strengths to the running server when no reload is needed. */
   private async changeLora(change: (list: LoraAdapterSetting[]) => LoraAdapterSetting[]): Promise<void> {
     if (this.store.isRemote()) return;
+    const before = this.store.getState().loadSettings.loraAdapters;
     try {
-      await this.store.updateLoadSettings({ loraAdapters: change(this.store.getState().loadSettings.loraAdapters) });
-      await this.processManager.applyLoraScales();
+      await this.store.updateLoadSettings({ loraAdapters: change(before) });
     } catch (e) {
       vscode.window.showErrorMessage(`LoRA adapter: ${e instanceof Error ? e.message : String(e)}`);
+      await this.pushState();
+      return;
+    }
+    try {
+      await this.processManager.applyLoraScales();
+    } catch (e) {
+      // The server kept its old strengths: put the sidebar back so it never shows a state that is not applied.
+      await this.store.updateLoadSettings({ loraAdapters: before }).catch(() => undefined);
+      vscode.window.showErrorMessage(
+        `The running server did not take the LoRA change, so it was undone: ${e instanceof Error ? e.message : String(e)}`);
     }
     await this.pushState();
   }

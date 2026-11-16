@@ -154,10 +154,23 @@ describe("LoRA server settings", () => {
 
   it("maps strengths to the server's adapter ids, with switched-off adapters at 0", () => {
     const wanted = [{ path: "/l/a.gguf", scale: 0.8, enabled: true }, { path: "/l/b.gguf", scale: 1, enabled: false }];
-    assert.deepEqual(planLoraScales(wanted, [{ id: 3, path: "/l/b.gguf" }, { id: 7, path: "/l/a.gguf" }]),
+    const loaded = ["/l/a.gguf", "/l/b.gguf"];
+    assert.deepEqual(planLoraScales(loaded, wanted, [{ id: 3, path: "/l/b.gguf" }, { id: 7, path: "/l/a.gguf" }]),
       [{ id: 7, scale: 0.8 }, { id: 3, scale: 0 }]);
-    assert.deepEqual(planLoraScales(wanted, [{ id: 0 }, { id: 1 }]), [{ id: 0, scale: 0.8 }, { id: 1, scale: 0 }]);
-    assert.throws(() => planLoraScales(wanted, [{ id: 0, path: "/l/a.gguf" }]), /did not load b\.gguf/);
+    assert.deepEqual(planLoraScales(loaded, wanted, [{ id: 0 }, { id: 1 }]), [{ id: 0, scale: 0.8 }, { id: 1, scale: 0 }]);
+    assert.throws(() => planLoraScales(loaded, wanted, [{ id: 0, path: "/l/a.gguf" }]), /did not load b\.gguf/);
+  });
+
+  it("keeps loaded adapters live while file changes wait for a reload", () => {
+    const server = [{ id: 0, path: "/l/a.gguf", scale: 1 }, { id: 1, path: "/l/b.gguf", scale: 0.6 }];
+    // A loaded, B added but not loaded yet: switching A off still reaches the server.
+    assert.deepEqual(planLoraScales(["/l/a.gguf"], [
+      { path: "/l/a.gguf", scale: 1, enabled: false }, { path: "/l/new.gguf", scale: 1, enabled: true },
+    ], [server[0]]), [{ id: 0, scale: 0 }]);
+    // B removed in the sidebar but still loaded: A changes, B keeps what the server has until Reload.
+    assert.deepEqual(planLoraScales(["/l/a.gguf", "/l/b.gguf"], [{ path: "/l/a.gguf", scale: 0.3, enabled: true }], server),
+      [{ id: 0, scale: 0.3 }, { id: 1, scale: 0.6 }]);
+    assert.deepEqual(planLoraScales([], [{ path: "/l/a.gguf", scale: 1, enabled: true }], []), []);
   });
 
   it("explains llama-server's adapter load errors", () => {

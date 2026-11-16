@@ -66,18 +66,27 @@ export function describeLoraLoadError(logLine: string): string | undefined {
 }
 
 /**
- * Body for POST /lora-adapters. The server lists adapters in --lora order with
- * the path it was given, so match by path and fall back to position.
+ * Body for POST /lora-adapters, covering every adapter the server loaded.
+ *
+ * `loaded` is the file list the server was started with, in --lora order; the
+ * server reports the same order and the path it was given, so adapters are
+ * matched by path with position as a fallback. Each loaded adapter gets the
+ * strength the sidebar now wants. One that was removed in the sidebar but is
+ * still loaded keeps the strength the server reports until Reload, and one
+ * that was added but is not loaded yet is left out: both are pending changes.
  */
 export function planLoraScales(
+  loaded: string[],
   wanted: LoraAdapterSetting[],
-  server: Array<{ id: number; path?: string }>
+  server: Array<{ id: number; path?: string; scale?: number }>
 ): Array<{ id: number; scale: number }> {
   const same = (a: string, b: string) => path.resolve(a) === path.resolve(b);
-  return wanted.map((adapter, index) => {
-    const hit = server.find(s => typeof s.path === "string" && same(s.path, adapter.path)) ?? server[index];
-    if (!hit) throw new Error(`The server did not load ${path.basename(adapter.path)}.`);
-    return { id: hit.id, scale: effectiveLoraScale(adapter) };
+  return loaded.map((loadedPath, index) => {
+    const hit = server.find(s => typeof s.path === "string" && same(s.path, loadedPath)) ?? server[index];
+    if (!hit) throw new Error(`The server did not load ${path.basename(loadedPath)}.`);
+    const want = wanted.find(a => same(a.path, loadedPath));
+    const current = Number(hit.scale);
+    return { id: hit.id, scale: want ? effectiveLoraScale(want) : Number.isFinite(current) ? current : 0 };
   });
 }
 

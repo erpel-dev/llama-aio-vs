@@ -241,7 +241,7 @@ function setup(loadOverrides = {}, remoteInfo, serverFeatures = core.NO_SERVER_F
     isHttpReady: async () => true,
     resolveBinary: () => "",
     getServerFeatures: async () => ({ ...serverFeatures }),
-    applyLoraScales: async () => { loraApplied.push(JSON.parse(JSON.stringify(state.loadSettings.loraAdapters || []))); return true; },
+    applyLoraScales: async () => { if (opts.loraFails) throw new Error("server said no"); loraApplied.push(JSON.parse(JSON.stringify(state.loadSettings.loraAdapters || []))); },
     isCpuBackend: () => !!opts.cpu,
     effectiveLaunchMode: () => config.get("launchMode") === "background" ? "background" : "externalTerminal",
     launchModeFallbackReason: () => undefined,
@@ -703,6 +703,16 @@ describe("LoRA adapter controls", () => {
     ]);
     await ui.send({ type: "discardChanges" });
     assert.deepEqual(ui.getState().loadSettings.loraAdapters, saved);
+  });
+  it("undoes a change the running server did not take, and says so", async t => {
+    const errors = t.mock.method(require("vscode").window, "showErrorMessage", async () => undefined);
+    const saved = [{ path: "/l/a.gguf", scale: 1, enabled: true }];
+    const ui = setup({ loraAdapters: saved }, undefined, lora, caps, { loraFails: true });
+    await ui.send({ type: "setLora", path: "/l/a.gguf", enabled: false });
+    assert.deepEqual(ui.getState().loadSettings.loraAdapters, saved, "the sidebar must not show an unapplied state");
+    assert.match(errors.mock.calls.at(-1).arguments[0], /did not take the LoRA change, so it was undone: server said no/);
+    const payload = ui.posted.filter(m => m.type === "state").at(-1).payload;
+    assert.equal(payload.lora.adapters[0].enabled, true);
   });
   it("adds picked files once, and refuses unsupported builds and remote servers", async t => {
     const dialog = t.mock.method(require("vscode").window, "showOpenDialog", async () => [{ fsPath: "/l/a.gguf" }, { fsPath: "/l/b.gguf" }]);

@@ -588,21 +588,43 @@ export class ProcessManager {
   /**
    * Send the sidebar's adapter strengths to the running server. Adapters load
    * at scale 1, so this runs after every start and whenever a strength or
-   * on/off switch changes. Returns false when
-   * the file list differs from what the server loaded: that needs a reload.
+   * on/off switch changes. It covers every adapter the server has loaded, also
+   * while added or removed files wait for a reload. Throws when the server
+   * does not take the strengths: the caller must not report them as applied.
    */
-  async applyLoraScales(): Promise<boolean> {
-    if (this.store.isRemote()) return false;
+  async applyLoraScales(): Promise<void> {
+    if (this.store.isRemote()) return;
     const launched = this.getLaunchedConfig();
-    const loaded = launched?.loadSettings?.loraAdapters || [];
+    const loaded = (launched?.loadSettings?.loraAdapters || []).map(a => a.path);
+    if (!loaded.length) return;
     const wanted = this.store.getState().loadSettings.loraAdapters;
-    if (!launched || !loaded.length) return false;
-    if (JSON.stringify(loaded.map(a => a.path)) !== JSON.stringify(wanted.map(a => a.path))) return false;
     const url = joinServerUrl(this.store.getEndpoint(), "/lora-adapters");
-    const server = await serverJson<Array<{ id: number; path: string }>>(url, { timeoutMs: 5000 });
-    const body = planLoraScales(wanted, server);
+    const server = await serverJson<Array<{ id: number; path?: string; scale?: number }>>(url, { timeoutMs: 5000 });
+    const body = planLoraScales(loaded, wanted, server);
     await serverJson<unknown>(url, { method: "POST", body, timeoutMs: 5000 });
-    return true;
+  }
+
+  /**
+   * Part of a successful start: a server that keeps disabled or scaled-down
+   * adapters at full strength must not be reported as ready. Retries briefly,
+   * then stops the server and fails the start.
+   */
+  private async applyLoraScalesOrStop(): Promise<void> {
+    let last: unknown;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (attempt) await sleep(500);
+      try {
+        await this.applyLoraScales();
+        return;
+      } catch (e) {
+        last = e;
+      }
+    }
+    await this.stopServer(true).catch(() => undefined);
+    throw new Error(
+      "llama-server started, but did not accept the LoRA adapter strengths, so it was stopped: " +
+      `${last instanceof Error ? last.message : String(last)} Start again, or remove the adapters.`
+    );
   }
 
   private isConfigDirty(lock: LockFile): boolean {
@@ -759,7 +781,7 @@ export class ProcessManager {
     try {
       fileLock = acquireLaunchLock("start");
       const status = await this.startInner(modelPath, report);
-      await this.applyLoraScales().catch(() => undefined);
+      await this.applyLoraScalesOrStop();
       return status;
     } finally {
       fileLock?.release();
@@ -1331,7 +1353,7 @@ export class ProcessManager {
       await sleep(400);
       // Keep boot active across inner start — don't nest beginBoot/endBoot via start().
       const status = await this.startInner(undefined, report);
-      await this.applyLoraScales().catch(() => undefined);
+      await this.applyLoraScalesOrStop();
       return status;
     } finally {
       fileLock?.release();
