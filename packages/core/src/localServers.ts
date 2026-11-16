@@ -21,7 +21,8 @@ export interface DiscoveredLlamaServer {
   /** Unknown when discovered through Strata's public health endpoint. */
   pid?: number;
   /** Sidebar wording. Only llama-server may be adopted or stopped; the others are separate apps. */
-  name: "llama-server" | "Strata" | "BigMoeOnEdge" | "Project Maya" | "RustingStrata";
+  name: "llama-server" | "llamafile" | "Strata" | "BigMoeOnEdge" | "Project Maya" | "RustingStrata"
+    | "Ollama" | "LM Studio" | "vLLM" | "SGLang" | "TabbyAPI" | "KoboldCpp";
 }
 
 /**
@@ -64,6 +65,10 @@ export function localListenerName(commandLine: string | undefined): DiscoveredLl
   }
   if (cmd.includes("llama-server")) {
     return "llama-server";
+  }
+  // llamafile bundles llama.cpp's server in one executable (`x.llamafile`, or `llamafile -m x.gguf`).
+  if (/(^|[^\w-])[\w.-]*\.?llamafile(\.exe)?([^\w-]|$)/.test(cmd)) {
+    return "llamafile";
   }
   // bmoe-desktop runs bmoe-server as a child process; only the server listens for the API.
   if (/(^|[^\w-])bmoe-server(\.exe)?([^\w-]|$)/.test(cmd)) {
@@ -154,6 +159,67 @@ export async function probeLocalRustingStrataServer(url: string): Promise<boolea
   } catch {
     return false;
   }
+}
+
+const PROBE = { apiKey: "", timeoutMs: 750 } as const;
+const probeOptions = () => ({ ...PROBE, signal: AbortSignal.timeout(750) });
+
+/** GET `path` on a loopback URL without any key. Undefined for another host or no answer. */
+async function probeGet(url: string, path: string): Promise<{ status: number; body: string } | undefined> {
+  try {
+    if (!isLoopbackHost(new URL(url).hostname)) return undefined;
+    const res = await serverRequest(`${url}${path}`, probeOptions());
+    return { status: res.statusCode || 0, body: await readBody(res, 256 * 1024) };
+  } catch {
+    return undefined;
+  }
+}
+
+function parseJson(body: string | undefined): any {
+  try { return JSON.parse(body || ""); } catch { return undefined; }
+}
+
+/** Ollama (server/routes.go): `GET /` answers the plain text "Ollama is running"; default port 11434. */
+export async function probeLocalOllamaServer(url: string): Promise<boolean> {
+  const root = await probeGet(url, "/");
+  if (root?.status !== 200 || root.body.trim() !== "Ollama is running") return false;
+  const version = parseJson((await probeGet(url, "/api/version"))?.body);
+  return typeof version?.version === "string";
+}
+
+/**
+ * LM Studio's native REST API lists models with a publisher and LM Studio's own
+ * fields: /api/v1/models (0.4.0 and newer) or /api/v0/models (0.3.6 and newer).
+ * Its docs use port 1234. A server with authentication switched on is not identified.
+ */
+export async function probeLocalLmStudioServer(url: string): Promise<boolean> {
+  const v1 = parseJson((await probeGet(url, "/api/v1/models"))?.body);
+  if (Array.isArray(v1?.models)) {
+    return v1.models.length === 0 || v1.models.some((m: any) =>
+      typeof m?.publisher === "string" && typeof m?.key === "string" && Array.isArray(m?.loaded_instances));
+  }
+  const v0 = parseJson((await probeGet(url, "/api/v0/models"))?.body);
+  return v0?.object === "list" && Array.isArray(v0.data) && v0.data.some((m: any) =>
+    typeof m?.publisher === "string" && typeof m?.compatibility_type === "string" && typeof m?.state === "string");
+}
+
+/** True when GET /v1/models lists at least one model owned by `owner` (vLLM, SGLang, TabbyAPI set their own name). */
+async function modelsOwnedBy(url: string, owner: string): Promise<boolean> {
+  const list = parseJson((await probeGet(url, "/v1/models"))?.body);
+  return Array.isArray(list?.data) && list.data.some((m: any) => m?.owned_by === owner);
+}
+
+/** vLLM (entrypoints/serve/engine/protocol.py): model cards are owned_by "vllm". */
+export const probeLocalVllmServer = (url: string) => modelsOwnedBy(url, "vllm");
+/** SGLang (srt/entrypoints/openai/protocol.py): model cards are owned_by "sglang". */
+export const probeLocalSglangServer = (url: string) => modelsOwnedBy(url, "sglang");
+/** TabbyAPI (endpoints/core/types/model.py): model cards are owned_by "tabbyAPI"; default port 5000. */
+export const probeLocalTabbyApiServer = (url: string) => modelsOwnedBy(url, "tabbyAPI");
+
+/** KoboldCpp (koboldcpp.py): /api/extra/version answers result "KoboldCpp"; default port 5001. */
+export async function probeLocalKoboldCppServer(url: string): Promise<boolean> {
+  const info = parseJson((await probeGet(url, "/api/extra/version"))?.body);
+  return info?.result === "KoboldCpp" && typeof info.version === "string";
 }
 
 /** Identify Strata without process access (notably python.exe on Windows). */
@@ -391,6 +457,12 @@ const OTHER_HTTP_PROBES: ReadonlyArray<{
   { name: "BigMoeOnEdge", ports: BIGMOEONEDGE_DEFAULT_PORTS, probe: probeLocalBigMoeOnEdgeServer },
   { name: "Project Maya", ports: PROJECT_MAYA_DEFAULT_PORTS, probe: probeLocalProjectMayaServer },
   { name: "RustingStrata", ports: RUSTINGSTRATA_DEFAULT_PORTS, probe: probeLocalRustingStrataServer },
+  { name: "Ollama", ports: [11434], probe: probeLocalOllamaServer },
+  { name: "LM Studio", ports: [1234], probe: probeLocalLmStudioServer },
+  { name: "vLLM", ports: [8000], probe: probeLocalVllmServer },
+  { name: "SGLang", ports: [30000], probe: probeLocalSglangServer },
+  { name: "TabbyAPI", ports: [5000], probe: probeLocalTabbyApiServer },
+  { name: "KoboldCpp", ports: [5001], probe: probeLocalKoboldCppServer },
 ];
 
 /** Process discovery plus public health probes, without blocking the event loop. */

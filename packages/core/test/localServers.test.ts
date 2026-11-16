@@ -9,6 +9,12 @@ import {
   parseNetstatListeners,
   parseSsListeners,
   probeLocalBigMoeOnEdgeServer,
+  probeLocalKoboldCppServer,
+  probeLocalLmStudioServer,
+  probeLocalOllamaServer,
+  probeLocalSglangServer,
+  probeLocalTabbyApiServer,
+  probeLocalVllmServer,
   probeLocalProjectMayaServer,
   probeLocalRustingStrataServer,
   probeLocalStrataServer,
@@ -86,6 +92,9 @@ describe("discoverLoopbackLlamaServers", () => {
     assert.equal(localListenerName("/x/bmoe-server-tests --gtest"), undefined);
     assert.equal(localListenerName("/home/me/RustingStrata/target/release/rustingstrata serve model.gguf"), "RustingStrata");
     assert.equal(localListenerName("C:\\tools\\rustingstrata.exe"), "RustingStrata");
+    assert.equal(localListenerName("/home/me/models/mistral-7b-instruct.llamafile --server --port 8080"), "llamafile");
+    assert.equal(localListenerName("llamafile -m model.gguf --server"), "llamafile");
+    assert.equal(localListenerName("/x/llamafile-tests"), undefined);
     assert.equal(strataListenerRole("/home/me/RustingStrata/target/release/rustingstrata"), undefined, "not Strata itself");
   });
 
@@ -339,5 +348,38 @@ describe("Project Maya and RustingStrata discovery without process metadata", ()
   it("does not probe non-loopback hosts", async () => {
     assert.equal(await probeLocalProjectMayaServer("http://192.0.2.1:8080"), false);
     assert.equal(await probeLocalRustingStrataServer("http://192.0.2.1:8080"), false);
+  });
+});
+
+describe("other common local servers, identified by their own replies", () => {
+  const models = (owner: string) => JSON.stringify({ object: "list", data: [{ id: "m", object: "model", owned_by: owner }] });
+  type Case = [string, (url: string) => Promise<boolean>, Record<string, [number, string]>, boolean];
+  const cases: Case[] = [
+    ["Ollama", probeLocalOllamaServer, { "/": [200, "Ollama is running"], "/api/version": [200, '{"version":"0.12.3"}'] }, true],
+    ["Ollama look-alike without /api/version", probeLocalOllamaServer, { "/": [200, "Ollama is running"] }, false],
+    ["a page on Ollama's check", probeLocalOllamaServer, { "/": [200, "<html>Ollama is running</html>"] }, false],
+    ["LM Studio 0.4 (/api/v1/models)", probeLocalLmStudioServer, { "/api/v1/models": [200, JSON.stringify({ models: [
+      { type: "llm", publisher: "qwen", key: "qwen/qwen3.5-2b", display_name: "Qwen3.5 2B", loaded_instances: [] }] })] }, true],
+    ["LM Studio 0.4 with no models", probeLocalLmStudioServer, { "/api/v1/models": [200, '{"models":[]}'] }, true],
+    ["LM Studio 0.3 (/api/v0/models)", probeLocalLmStudioServer, { "/api/v0/models": [200, JSON.stringify({ object: "list", data: [
+      { id: "qwen3.5-2b", object: "model", type: "llm", publisher: "qwen", arch: "qwen35", compatibility_type: "gguf", quantization: "Q4_K_M", state: "not-loaded", max_context_length: 32768 }] })] }, true],
+    ["an OpenAI model list on LM Studio's port", probeLocalLmStudioServer, { "/api/v0/models": [200, models("organization_owner")] }, false],
+    ["vLLM", probeLocalVllmServer, { "/v1/models": [200, models("vllm")] }, true],
+    ["llama-server's model list as vLLM", probeLocalVllmServer, { "/v1/models": [200, models("llamacpp")] }, false],
+    ["SGLang", probeLocalSglangServer, { "/v1/models": [200, models("sglang")] }, true],
+    ["TabbyAPI", probeLocalTabbyApiServer, { "/v1/models": [200, models("tabbyAPI")] }, true],
+    ["vLLM's list as TabbyAPI", probeLocalTabbyApiServer, { "/v1/models": [200, models("vllm")] }, false],
+    ["KoboldCpp", probeLocalKoboldCppServer, { "/api/extra/version": [200, '{"result":"KoboldCpp","version":"1.103","protected":false}'] }, true],
+    ["another /api/extra/version", probeLocalKoboldCppServer, { "/api/extra/version": [200, '{"result":"Other","version":"1"}'] }, false],
+  ];
+  for (const [what, probe, replies, expected] of cases) {
+    it(`${expected ? "identifies" : "ignores"} ${what}`, () =>
+      withReplies(replies, async (url) => assert.equal(await probe(url), expected)));
+  }
+
+  it("does not probe non-loopback hosts", async () => {
+    for (const probe of [probeLocalOllamaServer, probeLocalLmStudioServer, probeLocalVllmServer, probeLocalKoboldCppServer]) {
+      assert.equal(await probe("http://192.0.2.1:11434"), false);
+    }
   });
 });
