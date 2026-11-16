@@ -981,7 +981,7 @@ export function collapseLocalModelEntries(entries: LocalModelEntry[]): LocalMode
  * {@link invalidateModelLibraryCache}.
  */
 export const MODEL_LIBRARY_CACHE_TTL_MS = 10_000;
-type LibraryScanKind = "language" | "mmproj" | "mtp-draft";
+type LibraryScanKind = "language" | "mmproj" | "mtp-draft" | "lora" | "ple";
 const libraryCache = new Map<string, { at: number; entries: LocalModelEntry[] }>();
 
 /** Drop cached library scans (after downloads, imports, deletions, or a manual refresh). */
@@ -1091,6 +1091,47 @@ export function listMtpDraftEntries(config: ConfigAccessor): LocalModelEntry[] {
     }
     return [...map.values()].sort((a, b) => path.basename(a.path).localeCompare(path.basename(b.path)));
   });
+}
+
+/**
+ * GGUFs of one attachment role in the library folders, plus the folder of
+ * `nearPath` (a model opened from outside the library keeps its companions
+ * beside it). Shards of a split model are left out: they belong to the model.
+ */
+function listAttachmentEntries(
+  kind: "lora" | "ple",
+  config: ConfigAccessor,
+  nearPath: string | undefined,
+  isRole: (filePath: string) => boolean
+): LocalModelEntry[] {
+  const skip = (name: string) => !name.toLowerCase().endsWith(".gguf") ||
+    SHARD_NAME_RE.test(listingBaseName(name)) || !isRole(name);
+  const byName = (a: LocalModelEntry, b: LocalModelEntry) => path.basename(a.path).localeCompare(path.basename(b.path));
+  const entries = cachedScan(kind, config, () => {
+    const map = new Map<string, LocalModelEntry>();
+    for (const root of discoverModelRoots(config)) walkGgufs(root, map, skip);
+    return [...map.values()];
+  });
+  if (!nearPath) return entries.sort(byName);
+  const map = new Map<string, LocalModelEntry>();
+  for (const e of entries) map.set(canonicalModelPath(e.path), e);
+  const near = new Map<string, LocalModelEntry>();
+  walkGgufs({ dir: path.dirname(nearPath), source: "Next to the model", maxDepth: 0 }, near, skip);
+  for (const e of near.values()) {
+    const key = canonicalModelPath(e.path);
+    if (!map.has(key)) map.set(key, e);
+  }
+  return [...map.values()].sort(byName);
+}
+
+/** LoRA adapter GGUFs in the library folders and next to `nearPath`. */
+export function listLoraAdapterEntries(config: ConfigAccessor, nearPath?: string): LocalModelEntry[] {
+  return listAttachmentEntries("lora", config, nearPath, isLoraAdapterGguf);
+}
+
+/** PLE-only GGUFs in the library folders and next to `nearPath`. */
+export function listPleTableEntries(config: ConfigAccessor, nearPath?: string): LocalModelEntry[] {
+  return listAttachmentEntries("ple", config, nearPath, isPleOnlyGguf);
 }
 
 /**
