@@ -8,6 +8,16 @@ import {
   parseLsofListeners,
   parseNetstatListeners,
   parseSsListeners,
+  probeLocalBigMoeOnEdgeServer,
+  probeLocalKoboldCppServer,
+  probeLocalLmStudioServer,
+  probeLocalOllamaServer,
+  probeLocalOpenAiCompatibleServer,
+  probeLocalSglangServer,
+  probeLocalTabbyApiServer,
+  probeLocalVllmServer,
+  probeLocalProjectMayaServer,
+  probeLocalRustingStrataServer,
   probeLocalStrataServer,
   strataListenerRole,
 } from "../src/localServers";
@@ -77,6 +87,16 @@ describe("discoverLoopbackLlamaServers", () => {
     assert.deepEqual(found, [{ url: "http://127.0.0.1:8080", port: 8080, pid: 15, name: "Strata" }]);
     assert.equal(localListenerName("node /app/server.js"), undefined);
     assert.equal(localListenerName("/opt/llama/llama-server -m x.gguf"), "llama-server");
+    assert.equal(localListenerName("/usr/local/bin/bmoe-server -m model.gguf -c 32768"), "BigMoeOnEdge");
+    assert.equal(localListenerName("C:\\Program Files\\BigMoeOnEdge\\bmoe-server.exe --port 8765"), "BigMoeOnEdge");
+    assert.equal(localListenerName("/Applications/BigMoeOnEdge.app/Contents/MacOS/bmoe-desktop"), undefined, "the app window does not serve the API");
+    assert.equal(localListenerName("/x/bmoe-server-tests --gtest"), undefined);
+    assert.equal(localListenerName("/home/me/RustingStrata/target/release/rustingstrata serve model.gguf"), "RustingStrata");
+    assert.equal(localListenerName("C:\\tools\\rustingstrata.exe"), "RustingStrata");
+    assert.equal(localListenerName("/home/me/models/mistral-7b-instruct.llamafile --server --port 8080"), "llamafile");
+    assert.equal(localListenerName("llamafile -m model.gguf --server"), "llamafile");
+    assert.equal(localListenerName("/x/llamafile-tests"), undefined);
+    assert.equal(strataListenerRole("/home/me/RustingStrata/target/release/rustingstrata"), undefined, "not Strata itself");
   });
 
   it("discovers the new default port and custom ports without a --port argument", () => {
@@ -229,5 +249,174 @@ describe("parseNetstatListeners", () => {
       found.map((s) => s.url),
       ["http://127.0.0.1:8080", "http://127.0.0.1:8742"]
     );
+  });
+});
+
+describe("BigMoeOnEdge discovery without process metadata", () => {
+  const info = { version: "0.9.0", overlap_available: true, planner_available: true, host: {}, state: "ready", error: "", model: {}, generating: false, calibrating: false };
+  const cases: Array<[string, number, string, boolean]> = [
+    ["its /api/info", 200, JSON.stringify(info), true],
+    ["its /api/info with no model loaded", 200, JSON.stringify({ ...info, state: "empty", model: null }), true],
+    ["its API-key refusal", 401, '{"error":{"message":"an API key is required: send it as Authorization: Bearer <key> (or X-Api-Key: <key>)"}}', true],
+    ["another server's /api/info", 200, '{"version":"1.2.3","state":"ready"}', false],
+    ["another server's 401", 401, '{"error":"unauthorized"}', false],
+    ["a web page", 200, "<html>Other application</html>", false],
+  ];
+  for (const [what, status, body, expected] of cases) {
+    it(`${expected ? "identifies" : "ignores"} ${what}`, async () => {
+      setServerApiKeyProvider(() => "private-key-for-another-server");
+      const server = createServer((req, res) => {
+        assert.equal(req.headers.authorization, undefined, "never sends the managed server's key");
+        if (req.url !== "/api/info") {
+          res.writeHead(404);
+          res.end();
+          return;
+        }
+        res.writeHead(status, { "content-type": "application/json" });
+        res.end(body);
+      });
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+      try {
+        const addr = server.address();
+        assert.ok(addr && typeof addr !== "string");
+        assert.equal(await probeLocalBigMoeOnEdgeServer(`http://127.0.0.1:${addr.port}`), expected);
+      } finally {
+        setServerApiKeyProvider(undefined);
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
+    });
+  }
+
+  it("does not probe non-loopback hosts or invalid URLs", async () => {
+    assert.equal(await probeLocalBigMoeOnEdgeServer("http://192.0.2.1:8765"), false);
+    assert.equal(await probeLocalBigMoeOnEdgeServer("invalid"), false);
+  });
+});
+
+/** Serve one canned reply per path on loopback and run `fn` against its URL. */
+async function withReplies(replies: Record<string, [number, string]>, fn: (url: string) => Promise<void>) {
+  setServerApiKeyProvider(() => "private-key-for-another-server");
+  const server = createServer((req, res) => {
+    assert.equal(req.headers.authorization, undefined, "never sends the managed server's key");
+    const [status, body] = replies[req.url || ""] ?? [404, "{}"];
+    res.writeHead(status, { "content-type": "application/json" });
+    res.end(body);
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const addr = server.address();
+    assert.ok(addr && typeof addr !== "string");
+    await fn(`http://127.0.0.1:${addr.port}`);
+  } finally {
+    setServerApiKeyProvider(undefined);
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+}
+
+describe("Project Maya and RustingStrata discovery without process metadata", () => {
+  // Project Maya serve/server.py /health (v1.1.65); PolyStrata and Strata answer with service: "strata".
+  const maya = { status: "ok", max_context: 131072, model: "glm-5.3-flash", max_text_file: 1, model_label: "GLM-5.3-Flash · Maya-S24",
+    images: false, api_key: false, defaults: {}, videos: false, version: "1.1.65", mcp_tools: false, unloaded: false,
+    history_thinking: true, ablate: null };
+  const polystrata = { status: "ok", max_context: 131072, model: "qwen3.8", images: false, api_key: false,
+    image_generation: false, api_monitor: false, loaded: true, service: "strata" };
+  const mayaCases: Array<[string, Record<string, [number, string]>, boolean]> = [
+    ["Project Maya's /health", { "/health": [200, JSON.stringify(maya)] }, true],
+    ["PolyStrata's /health", { "/health": [200, JSON.stringify(polystrata)] }, false],
+    ["llama-server's /health", { "/health": [200, '{"status":"ok"}'] }, false],
+    ["a page", { "/health": [200, "<html></html>"] }, false],
+  ];
+  for (const [what, replies, expected] of mayaCases) {
+    it(`Project Maya: ${expected ? "identifies" : "ignores"} ${what}`, () =>
+      withReplies(replies, async (url) => assert.equal(await probeLocalProjectMayaServer(url), expected)));
+  }
+
+  // RustingStrata src/main.rs /health (v1.2.4).
+  const rustCases: Array<[string, Record<string, [number, string]>, boolean]> = [
+    ["a loaded model", { "/health": [200, '{"status":"ok","waiting":0,"slots":1}'] }, true],
+    ["no model", { "/health": [503, '{"status":"no model"}'] }, true],
+    ["a model loading", { "/health": [503, '{"status":"loading"}'] }, true],
+    ["llama-server ready", { "/health": [200, '{"status":"ok"}'] }, false],
+    ["llama-server loading", { "/health": [503, '{"error":{"code":503,"message":"Loading model","type":"unavailable_error"}}'] }, false],
+    ["extra fields", { "/health": [200, '{"status":"ok","waiting":0,"slots":1,"service":"strata"}'] }, false],
+    ["Project Maya", { "/health": [200, JSON.stringify(maya)] }, false],
+  ];
+  for (const [what, replies, expected] of rustCases) {
+    it(`RustingStrata: ${expected ? "identifies" : "ignores"} ${what}`, () =>
+      withReplies(replies, async (url) => assert.equal(await probeLocalRustingStrataServer(url), expected)));
+  }
+
+  it("does not probe non-loopback hosts", async () => {
+    assert.equal(await probeLocalProjectMayaServer("http://192.0.2.1:8080"), false);
+    assert.equal(await probeLocalRustingStrataServer("http://192.0.2.1:8080"), false);
+  });
+});
+
+describe("other common local servers, identified by their own replies", () => {
+  const models = (owner: string) => JSON.stringify({ object: "list", data: [{ id: "m", object: "model", owned_by: owner }] });
+  type Case = [string, (url: string) => Promise<boolean>, Record<string, [number, string]>, boolean];
+  const cases: Case[] = [
+    ["Ollama", probeLocalOllamaServer, { "/": [200, "Ollama is running"], "/api/version": [200, '{"version":"0.12.3"}'] }, true],
+    ["Ollama look-alike without /api/version", probeLocalOllamaServer, { "/": [200, "Ollama is running"] }, false],
+    ["a page on Ollama's check", probeLocalOllamaServer, { "/": [200, "<html>Ollama is running</html>"] }, false],
+    ["LM Studio 0.4 (/api/v1/models)", probeLocalLmStudioServer, { "/api/v1/models": [200, JSON.stringify({ models: [
+      { type: "llm", publisher: "qwen", key: "qwen/qwen3.5-2b", display_name: "Qwen3.5 2B", loaded_instances: [] }] })] }, true],
+    ["LM Studio 0.4 with no models", probeLocalLmStudioServer, { "/api/v1/models": [200, '{"models":[]}'] }, true],
+    ["LM Studio 0.3 (/api/v0/models)", probeLocalLmStudioServer, { "/api/v0/models": [200, JSON.stringify({ object: "list", data: [
+      { id: "qwen3.5-2b", object: "model", type: "llm", publisher: "qwen", arch: "qwen35", compatibility_type: "gguf", quantization: "Q4_K_M", state: "not-loaded", max_context_length: 32768 }] })] }, true],
+    ["an OpenAI model list on LM Studio's port", probeLocalLmStudioServer, { "/api/v0/models": [200, models("organization_owner")] }, false],
+    ["vLLM", probeLocalVllmServer, { "/v1/models": [200, models("vllm")] }, true],
+    ["llama-server's model list as vLLM", probeLocalVllmServer, { "/v1/models": [200, models("llamacpp")] }, false],
+    ["SGLang", probeLocalSglangServer, { "/v1/models": [200, models("sglang")] }, true],
+    ["TabbyAPI", probeLocalTabbyApiServer, { "/v1/models": [200, models("tabbyAPI")] }, true],
+    ["vLLM's list as TabbyAPI", probeLocalTabbyApiServer, { "/v1/models": [200, models("vllm")] }, false],
+    ["KoboldCpp", probeLocalKoboldCppServer, { "/api/extra/version": [200, '{"result":"KoboldCpp","version":"1.103","protected":false}'] }, true],
+    ["another /api/extra/version", probeLocalKoboldCppServer, { "/api/extra/version": [200, '{"result":"Other","version":"1"}'] }, false],
+  ];
+  for (const [what, probe, replies, expected] of cases) {
+    it(`${expected ? "identifies" : "ignores"} ${what}`, () =>
+      withReplies(replies, async (url) => assert.equal(await probe(url), expected)));
+  }
+
+  it("does not probe non-loopback hosts", async () => {
+    for (const probe of [probeLocalOllamaServer, probeLocalLmStudioServer, probeLocalVllmServer, probeLocalKoboldCppServer]) {
+      assert.equal(await probe("http://192.0.2.1:11434"), false);
+    }
+  });
+});
+
+describe("ports the person adds", () => {
+  const cases: Array<[string, Record<string, [number, string]>, boolean]> = [
+    ["an OpenAI-compatible model list", { "/v1/models": [200, '{"object":"list","data":[{"id":"my-model","object":"model"}]}'] }, true],
+    ["an empty model list", { "/v1/models": [200, '{"object":"list","data":[]}'] }, true],
+    ["a server that wants a key", { "/v1/models": [401, '{"error":"unauthorized"}'] }, true],
+    ["a web page", { "/v1/models": [200, "<html></html>"] }, false],
+    ["a list without ids", { "/v1/models": [200, '{"data":[{"name":"x"}]}'] }, false],
+    ["nothing at /v1/models", {}, false],
+  ];
+  for (const [what, replies, expected] of cases) {
+    it(`${expected ? "offers" : "ignores"} ${what}`, () =>
+      withReplies(replies, async (url) => assert.equal(await probeLocalOpenAiCompatibleServer(url), expected)));
+  }
+
+  it("names a known server on an added port, and offers any other OpenAI-compatible one", async () => {
+    const { discoverLoopbackLlamaServersOnThisMachineAsync } = await import("../src/localServers");
+    const servers = [
+      createServer((req, res) => { res.end(req.url === "/api/extra/version" ? '{"result":"KoboldCpp","version":"1"}' : '{"object":"list","data":[]}'); }),
+      createServer((req, res) => { res.end(req.url === "/v1/models" ? '{"object":"list","data":[{"id":"x"}]}' : "{}"); }),
+      createServer((_req, res) => { res.end("<html>not a model server</html>"); }),
+    ];
+    const ports: number[] = [];
+    for (const s of servers) {
+      await new Promise<void>((resolve) => s.listen(0, "127.0.0.1", resolve));
+      ports.push((s.address() as { port: number }).port);
+    }
+    try {
+      const found = await discoverLoopbackLlamaServersOnThisMachineAsync([], ports);
+      const mine = found.filter((s) => ports.includes(s.port)).map((s) => [s.port, s.name]);
+      assert.deepEqual(mine, [[ports[0], "KoboldCpp"], [ports[1], "OpenAI-compatible server"]]);
+    } finally {
+      for (const s of servers) await new Promise<void>((resolve) => s.close(() => resolve()));
+    }
   });
 });

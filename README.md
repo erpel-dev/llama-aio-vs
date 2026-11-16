@@ -61,6 +61,7 @@ The llama icon is supplied for both the provider and its models. VS Code 1.142 i
 ## Good to know
 
 - **Strata:** the sidebar detects Desktop's public API on `47831`, the standalone server on `8095`, the launcher on `8080`, and the source-run host on `8791`, then offers **Connect**. Other ports are discovered when process information is available. Served model names, canonical aliases, and Desktop model labels select the matching chat profile, including Swift 1.5 and short IDs such as `q2_0` for Qwen3.8 Flash-Next. Desktop chooses a different free port if `47831` is occupied.
+- **Other local servers:** the sidebar also offers **Connect** for servers it recognises on their default ports: Ollama (`11434`), LM Studio (`1234`), vLLM (`8000`), SGLang (`30000`), TabbyAPI (`5000`), KoboldCpp (`5001`), BigMoeOnEdge (`8765`), Project Maya (`8080`, `8095`) and RustingStrata (`8080`). A llamafile, `bmoe-server` or `rustingstrata` process is found on any port where process names are visible. Each server is recognised by a reply only that program gives, so another server on the same port is not mistaken for it; a server with an API key switched on may not be recognised. PolyStrata answers like Strata and is listed as Strata. Up to three suggestions are shown. They connect like any other OpenAI-compatible server that is not llama.cpp; to look on more ports, run **Llama AIO: Look for Servers on More Ports…** (also linked in the Connect form); any OpenAI-compatible server on those ports is offered too. For anything else use **Connect to a Server…**.
 - **Remote context:** temporary outages and Strata reloads keep the last known model, profile, and context visible for the current connection. Chat waits for a loaded model, and a newly reported context replaces the remembered value, including when it is smaller.
 - **Large prompts:** compatible llama.cpp servers count the rendered text prompt before inference and reserve the remaining space for the reply. Other servers retain estimates and decide whether the request fits. The sidebar shows “Waiting for first token…” during prefill.
 - **Library refresh:** use the refresh button beside the library filter after copying models into a watched folder. Filters also match GGUF filenames when metadata supplies a different display name.
@@ -80,6 +81,7 @@ Run **Llama AIO: Open Configuration File** to edit `~/.llama-aio-vs/config.json`
 | --- | --- |
 | `port` / `host` | Server address (default `8742` / `127.0.0.1`) |
 | `modelsDir` / `extraModelDirs` | Where models are downloaded / extra folders to scan |
+| `extraServerPorts` | More ports on this machine to look on for a server to connect to, e.g. `[8001, 9000]` |
 | `hfToken` | Token for gated or private Hugging Face models. VS Code stores the token in Secret Storage (sidebar → Hugging Face token) and migrates an existing value out of `config.json`; the TUI reads `HF_TOKEN` / `HUGGING_FACE_HUB_TOKEN` or this key. |
 | `backend` | `auto`, `vulkan`, `cuda`, `cpu`, `rocm`, … |
 | `launchMode` | `externalTerminal` (default) or `background` |

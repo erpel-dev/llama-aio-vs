@@ -29,6 +29,7 @@ require.cache.vscode = {
       showInformationMessage: async () => undefined,
       showErrorMessage: async () => undefined,
       showOpenDialog: async () => undefined,
+      showInputBox: async () => undefined,
       // Attachment pickers list library files first; by default tests take "Browse…".
       showQuickPick: async (items) => items.find((i) => i.browse),
       withProgress: async (_o, fn) => fn({ report() {} }),
@@ -732,6 +733,75 @@ describe("LoRA adapter controls", () => {
     await assert.rejects(setup().provider.pickLora(), /no --lora option/);
     await assert.rejects(setup({}, { state: "ready" }).provider.pickLora(), /remote server/);
     assert.equal(dialog.mock.callCount(), calls);
+  });
+});
+
+describe("more ports to look on", () => {
+  it("saves typed ports from the sidebar link and looks again", async t => {
+    const vs = require("vscode").window;
+    let asked;
+    t.mock.method(vs, "showInputBox", async (o) => { asked = o; return "9000, 8001 9000"; });
+    const ui = setup();
+    await ui.send({ type: "extraServerPorts" });
+    assert.deepEqual(ui.provider.store.getConfig().get("extraServerPorts"), [9000, 8001]);
+    assert.equal(asked.validateInput("8001, x"), '"x" is not a port number (1 to 65535).');
+    assert.equal(asked.validateInput("8001"), undefined);
+    t.mock.method(vs, "showInputBox", async () => undefined);
+    await ui.send({ type: "extraServerPorts" });
+    assert.deepEqual(ui.provider.store.getConfig().get("extraServerPorts"), [9000, 8001], "cancel keeps the list");
+    t.mock.method(vs, "showInputBox", async () => "");
+    await ui.send({ type: "extraServerPorts" });
+    assert.deepEqual(ui.provider.store.getConfig().get("extraServerPorts"), []);
+  });
+});
+
+describe("local server scan and the port list", () => {
+  function held(ui) {
+    const calls = [];
+    ui.provider.discoverLocalServers = (_skip, ports) => {
+      let resolve;
+      const promise = new Promise((r) => { resolve = r; });
+      calls.push({ ports: [...ports], resolve });
+      return promise;
+    };
+    return calls;
+  }
+  const stopped = { running: false, starting: false };
+  const srv = (port) => [{ url: `http://127.0.0.1:${port}`, port, name: "OpenAI-compatible server" }];
+
+  for (const order of ["old scan finishes first", "new scan finishes first"]) {
+    it(`a scan started before the ports changed never fills the cache (${order})`, async () => {
+      const ui = setup();
+      const calls = held(ui);
+      const config = ui.provider.store.getConfig();
+      const first = ui.provider.localServersForSidebar(stopped);
+      await config.update("extraServerPorts", [9123]);
+      const second = ui.provider.localServersForSidebar(stopped);
+      assert.deepEqual(calls.map((c) => c.ports), [[], [9123]], "the new list is looked at at once");
+      if (order === "old scan finishes first") {
+        calls[0].resolve(srv(1111)); calls[1].resolve(srv(9123));
+      } else {
+        calls[1].resolve(srv(9123)); await second; calls[0].resolve(srv(1111));
+      }
+      await Promise.all([first, second]);
+      assert.deepEqual(await ui.provider.localServersForSidebar(stopped), srv(9123));
+      assert.equal(calls.length, 2, "the cached result for the current list is reused");
+    });
+  }
+
+  it("removing every added port drops what they found", async () => {
+    const ui = setup();
+    const calls = held(ui);
+    const config = ui.provider.store.getConfig();
+    await config.update("extraServerPorts", [9123]);
+    const first = ui.provider.localServersForSidebar(stopped);
+    calls[0].resolve(srv(9123));
+    await first;
+    await config.update("extraServerPorts", []);
+    const after = ui.provider.localServersForSidebar(stopped);
+    assert.deepEqual(calls.map((c) => c.ports), [[9123], []]);
+    calls[1].resolve([]);
+    assert.deepEqual(await after, []);
   });
 });
 

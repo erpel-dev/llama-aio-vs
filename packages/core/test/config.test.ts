@@ -264,3 +264,15 @@ describe("ConfigFile", () => {
     config.dispose();
   });
 });
+
+describe("extra server ports", () => {
+  it("keeps whole ports once, and reads typed lists", async () => {
+    const { normalizeServerPorts, parseServerPortList } = await import("../src/config");
+    assert.deepEqual(normalizeServerPorts([8001, "9000", 8001, 0, 70000, 1.5, "x", null]), [8001, 9000]);
+    assert.deepEqual(normalizeServerPorts("8001"), []);
+    assert.deepEqual(parseServerPortList("8001, 9000 9100;9100"), { ports: [8001, 9000, 9100] });
+    assert.deepEqual(parseServerPortList(""), { ports: [] });
+    assert.deepEqual(parseServerPortList("8001, abc"), { invalid: "abc" });
+    assert.deepEqual(parseServerPortList("70000"), { invalid: "70000" });
+  });
+});

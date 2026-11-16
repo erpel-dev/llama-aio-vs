@@ -58,6 +58,7 @@ import { PerfStats } from "@llama-aio/core";
 import { LaunchToken, LAUNCH_IN_PROGRESS_MSG, ProcessManager } from "@llama-aio/core";
 import { SettingsStore } from "@llama-aio/core";
 import { resolveLaunchMode } from "@llama-aio/core";
+import { parseServerPortList } from "@llama-aio/core";
 import { checkLoraAdapter, findLoraCandidates, findPleCandidates, modelLineage, type AttachmentCandidate, type LoraAdapterSetting } from "@llama-aio/core";
 import { BUILTIN_CHAT_TEMPLATES, capsMissDefaultSwaPattern, chatTemplateFileProblem, COMMON_CHAT_TEMPLATES, DEFAULT_LOAD_SETTINGS, DEFAULT_REQUEST_SETTINGS, effectiveServerUiState, isQwen4expArchitecture, LlamaLoadSettings, normalizeSpeculativeMode, RequestSettings } from "@llama-aio/core";
 import { isDflashDraftArchitecture, recommendedMaxDraftTokens, speculativeUsesMtp, speculativeUsesNgram } from "@llama-aio/core";
@@ -181,8 +182,11 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
   private pushInFlight: Promise<void> | undefined;
   private pushTrailing: Promise<void> | undefined;
   /** Last loopback scan. The 5s status poll reuses this instead of running `ss` every tick. */
-  private localServerScan?: { at: number; servers: DiscoveredLlamaServer[] };
-  private localServerScanRun?: Promise<DiscoveredLlamaServer[]>;
+  /** Results and in-flight scan, both tied to the port list they were started with. */
+  private localServerScan?: { at: number; key: string; servers: DiscoveredLlamaServer[] };
+  private localServerScanRun?: { key: string; run: Promise<DiscoveredLlamaServer[]> };
+  /** The machine-wide scan; a field so tests can hold a scan open. */
+  private discoverLocalServers = discoverLoopbackLlamaServersOnThisMachineAsync;
   private apiKeys?: ApiKeyStore;
   private hfTokens?: HfTokenStore;
 
@@ -573,6 +577,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           case "clearPle":
             if (!this.store.isRemote()) await this.store.updateLoadSettings({ plePath: "" });
             await this.pushState();
+            break;
+          case "extraServerPorts":
+            await this.editExtraServerPorts();
             break;
           case "pickLora":
             await this.pickLora();
@@ -1009,23 +1016,31 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       this.localServerScan = undefined;
       return [];
     }
+    // A scan started for another port list is never used or cached: after the list
+    // changes, the next look starts a scan for the new list at once.
+    const extraPorts = this.store.getConfig().get<number[]>("extraServerPorts") || [];
+    const key = extraPorts.join(",");
     const now = Date.now();
-    if (this.localServerScan && now - this.localServerScan.at < 20_000) {
+    if (this.localServerScan?.key === key && now - this.localServerScan.at < 20_000) {
       return this.localServerScan.servers;
     }
-    if (!this.localServerScanRun) {
+    if (this.localServerScanRun?.key !== key) {
       const skip = status.ownedByThisExtension && status.pid ? [status.pid] : [];
-      this.localServerScanRun = discoverLoopbackLlamaServersOnThisMachineAsync(skip)
-        .catch(() => [])
-        .then((servers) => {
-          this.localServerScan = { at: Date.now(), servers };
-          return servers;
-        })
-        .finally(() => {
-          this.localServerScanRun = undefined;
-        });
+      const scan: { key: string; run: Promise<DiscoveredLlamaServer[]> } = {
+        key,
+        run: this.discoverLocalServers(skip, extraPorts)
+          .catch(() => [])
+          .then((servers) => {
+            if (this.localServerScanRun === scan) this.localServerScan = { at: Date.now(), key, servers };
+            return servers;
+          })
+          .finally(() => {
+            if (this.localServerScanRun === scan) this.localServerScanRun = undefined;
+          }),
+      };
+      this.localServerScanRun = scan;
     }
-    return this.localServerScanRun;
+    return this.localServerScanRun.run;
   }
 
   /** Fields the sidebar needs to draw remote mode. Included in state and status patches. */
@@ -1554,6 +1569,32 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       builtIn: caps?.builtInAdapters ?? null,
       lineage: modelLineage(caps) ?? null,
     };
+  }
+
+  /** Ask which extra loopback ports to look on for servers, save them, and look again at once. */
+  async editExtraServerPorts(): Promise<void> {
+    const current = this.store.getConfig().get<number[]>("extraServerPorts") || [];
+    const text = await vscode.window.showInputBox({
+      title: "Look for servers on more ports",
+      prompt: "Ports on this machine to check for an OpenAI-compatible server, besides the known defaults. " +
+        "Separate them with commas or spaces. Leave empty to check only the defaults.",
+      placeHolder: "8001, 9000",
+      value: current.join(", "),
+      ignoreFocusOut: true,
+      validateInput: (value) => {
+        const parsed = parseServerPortList(value);
+        return "invalid" in parsed ? `"${parsed.invalid}" is not a port number (1 to 65535).` : undefined;
+      },
+    });
+    if (text === undefined) return;
+    const parsed = parseServerPortList(text);
+    if ("invalid" in parsed) return;
+    await this.store.getConfig().update("extraServerPorts", parsed.ports);
+    this.localServerScan = undefined;
+    await this.pushState();
+    void vscode.window.showInformationMessage(parsed.ports.length
+      ? `Llama AIO also looks for servers on port${parsed.ports.length === 1 ? "" : "s"} ${parsed.ports.join(", ")}.`
+      : "Llama AIO looks for servers on the known default ports only.");
   }
 
   /**

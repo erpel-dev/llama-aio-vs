@@ -36,6 +36,7 @@ export type ToHostMessage =
   | { type: "clearMmproj" }
   | { type: "pickPle" }
   | { type: "clearPle" }
+  | { type: "extraServerPorts" }
   | { type: "pickLora" }
   | { type: "removeLora"; path: string }
   | { type: "setLora"; path: string; scale?: number; enabled?: boolean }
