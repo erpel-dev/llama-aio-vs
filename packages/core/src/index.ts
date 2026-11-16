@@ -14,6 +14,7 @@ export * from "./execRunner";
 export * from "./externalTerminal";
 export * from "./ggufMetadata";
 export * from "./loraAdapter";
+export * from "./attachmentCandidates";
 export * from "./gpuInfo";
 export * from "./hfLicense";
 export * from "./huggingFace";
