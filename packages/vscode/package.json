@@ -107,6 +107,10 @@
         "title": "Llama AIO: Choose PLE Table…"
       },
       {
+        "command": "llamaAio.selectLora",
+        "title": "Llama AIO: Add LoRA Adapter…"
+      },
+      {
         "command": "llamaAio.selectChatTemplate",
         "title": "Llama AIO: Choose Jinja Chat Template…"
       },

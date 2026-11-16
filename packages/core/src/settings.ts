@@ -11,7 +11,8 @@ import {
 } from "./config";
 import { isLoopbackHost, isWildcardHost, urlHostname } from "./serverHttp";
 import { Event } from "./events";
-import { clampLoadSettingsToModel, isPleOnlyGguf, isQwen4expArchitecture, readEffectiveModelCapabilities, readModelCapabilities, totalModelBytes } from "./ggufMetadata";
+import { checkLoraAdapter } from "./loraAdapter";
+import { clampLoadSettingsToModel, isLoraAdapterGguf, isPleOnlyGguf, isQwen4expArchitecture, readEffectiveModelCapabilities, readModelCapabilities, totalModelBytes } from "./ggufMetadata";
 import { detectGpusAsync, preferredMainGpu, type GpuMemoryInfo } from "./gpuInfo";
 import { normalizeTensorSplit, parseTensorSplit, remapLegacyGpuOrder } from "./gpuSplit";
 import { LlamaInstaller } from "./llamaInstaller";
@@ -137,6 +138,15 @@ export class SettingsStore {
         if (loadSettings.plePath.includes(",")) throw new Error("PLE paths cannot contain commas (llama.cpp shard separator).");
         readEffectiveModelCapabilities(state.selectedModelPath, loadSettings.plePath);
       }
+      if (patch.loraAdapters !== undefined) {
+        const before = new Set(state.loadSettings.loraAdapters?.map(a => a.path));
+        for (const adapter of loadSettings.loraAdapters.filter(a => !before.has(a.path))) {
+          if (!state.selectedModelPath) throw new Error("Select the main model before adding a LoRA adapter.");
+          if (adapter.path.includes(",")) throw new Error("LoRA paths cannot contain commas (llama.cpp separator).");
+          const check = checkLoraAdapter(adapter.path, state.modelCapabilities);
+          if (check.fit === "invalid" || check.fit === "wrong-architecture") throw new Error(check.message);
+        }
+      }
       if (
         speculativeUsesMtp(patch.speculativeMode) &&
         !isMtpSidecarFile({ path: loadSettings.draftModelPath || "" }) &&
@@ -178,6 +188,9 @@ export class SettingsStore {
   ): Promise<ExtensionState> {
     const generation = ++this.selectionGeneration;
     const prev = this.getState();
+    if (isLoraAdapterGguf(modelPath)) {
+      throw new Error("This is a LoRA adapter. Select the main model, then add it under LoRA adapters.");
+    }
     if (isPleOnlyGguf(modelPath)) {
       const split = totalModelBytes(modelPath);
       if (split.shardCount <= 1 || split.shardsFound !== split.shardCount) {
@@ -193,6 +206,8 @@ export class SettingsStore {
     loadSettings = {
       ...loadSettings,
       plePath: pathChanged ? "" : loadSettings.plePath,
+      // An adapter belongs to the model it was trained on.
+      loraAdapters: pathChanged ? [] : loadSettings.loraAdapters,
       mmprojPath: resolveMmprojPath(modelPath, loadSettings.mmprojPath, attachCompanions),
       draftModelPath: resolveMtpDraftPath(
         modelPath,

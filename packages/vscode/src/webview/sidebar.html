@@ -191,6 +191,13 @@
         <div class="btn-row"><button class="secondary small" id="pickPleBtn" type="button" aria-label="Choose PLE table">Choose…</button><button class="secondary small hidden" id="clearPleBtn" type="button" aria-label="Clear PLE table">Clear</button></div>
         <div class="hint" id="pleHint" aria-live="polite"></div>
       </div>
+      <div class="row hidden" id="loraAttach">
+        <div class="label"><span class="name tip" data-flag="--lora" data-help="LoRA adapters change a model's behaviour without replacing it. Adding or removing a file needs a reload. Strength and on/off apply to the running server at once.">LoRA adapters</span><span class="mm-name" id="loraSum"></span></div>
+        <div class="btn-row"><button class="secondary small" id="pickLoraBtn" type="button" aria-label="Add LoRA adapter">Add…</button></div>
+        <div id="loraList"></div>
+        <div class="hint" id="loraHint" aria-live="polite"></div>
+      </div>
+      <div class="hint hidden" id="modelLineage"></div>
       <details class="fold" id="libraryFold">
         <summary><span>Library</span><span class="sum" id="librarySum">—</span></summary>
         <div class="fold-body">

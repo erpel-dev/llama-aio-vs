@@ -1065,6 +1065,18 @@ button.link-btn:hover { text-decoration: underline; }
 #pleAttach .label { flex-wrap: nowrap; }
 #pleName { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #pleHint { overflow-wrap: anywhere; }
+#loraAttach .label { flex-wrap: nowrap; }
+#loraList { display: flex; flex-direction: column; gap: 4px; width: 100%; }
+#loraList:empty { display: none; }
+.lora-item { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 2px 6px; padding: 4px 6px; border: 1px solid var(--border); border-radius: 5px; font-size: 11px; }
+.lora-item .lora-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lora-item .lora-strength { grid-column: 1 / -1; display: flex; align-items: center; gap: 6px; color: var(--muted); }
+.lora-item .lora-strength input { flex: 1; min-width: 0; }
+.lora-item .lora-strength output { width: 2.6em; text-align: right; font-variant-numeric: tabular-nums; color: var(--fg); }
+.lora-item .lora-note { grid-column: 1 / -1; color: var(--muted); overflow-wrap: anywhere; }
+.lora-item .lora-note:empty { display: none; }
+.lora-item .lora-note.warn { color: var(--warn, var(--vscode-editorWarning-foreground)); }
+#loraHint, #modelLineage { overflow-wrap: anywhere; }
 .mm-attach .seg-btn { padding: 0 6px; font-size: 10.5px; }
 .mm-attach .icon-btn { width: 20px; height: 20px; background: transparent; color: var(--muted); font-size: 11px; }
 .mm-attach .icon-btn:hover { background: color-mix(in srgb, var(--fg) 10%, transparent); color: var(--fg); }

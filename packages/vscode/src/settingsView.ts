@@ -58,6 +58,7 @@ import { PerfStats } from "@llama-aio/core";
 import { LaunchToken, LAUNCH_IN_PROGRESS_MSG, ProcessManager } from "@llama-aio/core";
 import { SettingsStore } from "@llama-aio/core";
 import { resolveLaunchMode } from "@llama-aio/core";
+import { checkLoraAdapter, modelLineage, type LoraAdapterSetting } from "@llama-aio/core";
 import { BUILTIN_CHAT_TEMPLATES, capsMissDefaultSwaPattern, chatTemplateFileProblem, COMMON_CHAT_TEMPLATES, DEFAULT_LOAD_SETTINGS, DEFAULT_REQUEST_SETTINGS, effectiveServerUiState, isQwen4expArchitecture, LlamaLoadSettings, normalizeSpeculativeMode, RequestSettings } from "@llama-aio/core";
 import { isDflashDraftArchitecture, recommendedMaxDraftTokens, speculativeUsesMtp, speculativeUsesNgram } from "@llama-aio/core";
 import {
@@ -573,6 +574,19 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             if (!this.store.isRemote()) await this.store.updateLoadSettings({ plePath: "" });
             await this.pushState();
             break;
+          case "pickLora":
+            await this.pickLora();
+            break;
+          case "removeLora":
+            await this.changeLora(list => list.filter(a => a.path !== msg.path));
+            break;
+          case "setLora":
+            await this.changeLora(list => list.map(a => a.path !== msg.path ? a : {
+              ...a,
+              ...(typeof msg.scale === "number" ? { scale: msg.scale } : {}),
+              ...(typeof msg.enabled === "boolean" ? { enabled: msg.enabled } : {}),
+            }));
+            break;
           case "pickChatTemplate":
             try {
               await vscode.commands.executeCommand("llamaAio.selectChatTemplate");
@@ -945,7 +959,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       const restore = this.processManager.isCpuBackend()
         ? { ...launched.loadSettings, ...pickCpuIgnoredFields(state.loadSettings) }
         : launched.loadSettings;
-      await this.store.updateLoadSettings({ ...restore, plePath: restore.plePath || "" });
+      await this.store.updateLoadSettings({ ...restore, plePath: restore.plePath || "", loraAdapters: restore.loraAdapters || [] });
+      // Discard restores the launch-time strengths; a failure here must be seen, not swallowed.
+      await this.processManager.applyLoraScales().catch(e => vscode.window.showErrorMessage(
+        `The running server did not take the restored LoRA strengths: ${e instanceof Error ? e.message : String(e)} Reload to apply them.`));
     }
     const mode = this.processManager.effectiveLaunchMode();
     if (launched.launchMode && launched.launchMode !== mode) {
@@ -1345,6 +1362,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         defaults: DEFAULT_LOAD_SETTINGS,
         serverFeatures: remoteMode ? NO_SERVER_FEATURES : this.serverFeatures,
         chatTemplateProblem: chatTemplateFileProblem(state.loadSettings) || "",
+        lora: this.loraPayload(state, caps, launched?.loadSettings, remoteMode),
         pleTable: {
           supported: !!caps?.pleSupported || (caps?.pleShare || 0) > 0,
           path: state.loadSettings.plePath,
@@ -1512,6 +1530,76 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       type: "draftModelSelected",
       path: draftPath || "",
     });
+  }
+
+  private loraPayload(
+    state: ReturnType<SettingsStore["getState"]>,
+    caps: ReturnType<SettingsStore["getState"]>["modelCapabilities"],
+    launched: LlamaLoadSettings | undefined,
+    remote: boolean
+  ) {
+    const loaded = new Set((launched?.loraAdapters || []).map(a => a.path));
+    return {
+      adapters: remote ? [] : state.loadSettings.loraAdapters.map(a => {
+        const check = checkLoraAdapter(a.path, caps);
+        return {
+          path: a.path, scale: a.scale, enabled: a.enabled,
+          bytes: check.info?.sizeBytes || 0,
+          fit: check.fit, message: check.message,
+          activated: !!check.info?.activated,
+          // Loaded adapters take strength changes at once; new ones wait for a reload.
+          loaded: loaded.has(a.path),
+        };
+      }),
+      builtIn: caps?.builtInAdapters ?? null,
+      lineage: modelLineage(caps) ?? null,
+    };
+  }
+
+  /** Add LoRA adapter files to the selected model. The file list applies on reload. */
+  async pickLora(): Promise<void> {
+    if (this.store.isRemote()) throw new Error("LoRA adapters are configured on the remote server.");
+    const model = this.store.getState().selectedModelPath;
+    if (!model) throw new Error("Select the main model before adding a LoRA adapter.");
+    const features = await this.processManager.getServerFeatures();
+    if (!features.lora) throw new Error("This llama.cpp build has no --lora option. Update llama.cpp to use LoRA adapters.");
+    const selected = await vscode.window.showOpenDialog({
+      canSelectMany: true, canSelectFiles: true, canSelectFolders: false,
+      title: "Select LoRA adapters (GGUF) trained on this model",
+      openLabel: "Add LoRA adapter", filters: { "GGUF files": ["gguf"] },
+      defaultUri: vscode.Uri.file(path.dirname(model)),
+    });
+    if (!selected?.length) return;
+    if (this.store.isRemote() || this.store.getState().selectedModelPath !== model) {
+      throw new Error("The selected model changed. Add the adapter again for the current model.");
+    }
+    const picked = selected.map(uri => uri.fsPath);
+    await this.changeLora(list => [
+      ...list,
+      ...picked.filter(p => !list.some(a => a.path === p)).map(p => ({ path: p, scale: 1, enabled: true })),
+    ]);
+  }
+
+  /** Save an adapter change, then send strengths to the running server when no reload is needed. */
+  private async changeLora(change: (list: LoraAdapterSetting[]) => LoraAdapterSetting[]): Promise<void> {
+    if (this.store.isRemote()) return;
+    const before = this.store.getState().loadSettings.loraAdapters;
+    try {
+      await this.store.updateLoadSettings({ loraAdapters: change(before) });
+    } catch (e) {
+      vscode.window.showErrorMessage(`LoRA adapter: ${e instanceof Error ? e.message : String(e)}`);
+      await this.pushState();
+      return;
+    }
+    try {
+      await this.processManager.applyLoraScales();
+    } catch (e) {
+      // The server kept its old strengths: put the sidebar back so it never shows a state that is not applied.
+      await this.store.updateLoadSettings({ loraAdapters: before }).catch(() => undefined);
+      vscode.window.showErrorMessage(
+        `The running server did not take the LoRA change, so it was undone: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    await this.pushState();
   }
 
   /** Attach a local table without changing the main model selection. */

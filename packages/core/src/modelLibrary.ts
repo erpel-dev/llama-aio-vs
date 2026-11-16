@@ -4,7 +4,7 @@ import * as path from "path";
 import type { ConfigAccessor } from "./config";
 import { getModelsDir } from "./paths";
 import { speculativeUsesDflash, speculativeUsesMtp } from "./types";
-import { isPleOnlyGguf } from "./ggufMetadata";
+import { isLoraAdapterGguf, isPleOnlyGguf } from "./ggufMetadata";
 
 export interface LocalModelEntry {
   path: string;
@@ -227,7 +227,7 @@ export function extractQuantToken(name: string): string | undefined {
 
 export type GgufListedFile = { path: string; size: number };
 
-export type GgufFileRole = "language" | "mmproj" | "imatrix" | "mtp-sidecar" | "mtp-baked" | "ple";
+export type GgufFileRole = "language" | "mmproj" | "imatrix" | "mtp-sidecar" | "mtp-baked" | "ple" | "lora";
 
 function isNearCopySize(a: number, b: number): boolean {
   const lo = Math.min(a, b);
@@ -270,6 +270,7 @@ export function classifyGgufFile(file: GgufListedFile, siblings: GgufListedFile[
     return "imatrix";
   }
   if (fs.existsSync(file.path) && isPleOnlyGguf(file.path)) return "ple";
+  if (fs.existsSync(file.path) && isLoraAdapterGguf(file.path)) return "lora";
   if (isConfidentMtpSidecarPath(file.path)) {
     return "mtp-sidecar";
   }
@@ -728,7 +729,7 @@ function shouldSkipLanguageFile(name: string, size: number, siblings: GgufListed
     return true;
   }
   const role = classifyGgufFile({ path: name, size }, siblings);
-  if (role === "mtp-sidecar" || (role === "ple" && !SHARD_NAME_RE.test(listingBaseName(name)))) {
+  if (role === "lora" || role === "mtp-sidecar" || (role === "ple" && !SHARD_NAME_RE.test(listingBaseName(name)))) {
     return true;
   }
   if (size < MIN_MODEL_BYTES) {
@@ -961,7 +962,7 @@ export function collapseLocalModelEntries(entries: LocalModelEntry[]): LocalMode
     group.push(e);
     groups.set(key, group);
   }
-  const collapsed = [...groups.values()].filter(group => group.some(e => !isPleOnlyGguf(e.path))).map((group) => {
+  const collapsed = [...groups.values()].filter(group => group.some(e => !isPleOnlyGguf(e.path) && !isLoraAdapterGguf(e.path))).map((group) => {
     const sorted = [...group].sort((a, b) => listingBaseName(a.path).localeCompare(listingBaseName(b.path)));
     const first = sorted[0]!;
     return {

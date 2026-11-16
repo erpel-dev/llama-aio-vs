@@ -16,11 +16,13 @@ export interface LlamaServerFeatures {
   mmprojDevice?: boolean;
   draftDevice?: boolean;
   externalPle?: "--shard" | "--ple";
+  /** `--lora` (strengths are set through /lora-adapters after start). */
+  lora?: boolean;
 }
 
 export const NO_SERVER_FEATURES: Readonly<LlamaServerFeatures> = Object.freeze({
   probed: false, moeCache: false, draftSampling: false, draftUbatch: false,
-  cacheRam: false, mmprojDevice: false, draftDevice: false,
+  cacheRam: false, mmprojDevice: false, draftDevice: false, lora: false,
 });
 
 export function parseLlamaServerFeatures(help: string): LlamaServerFeatures {
@@ -35,6 +37,7 @@ export function parseLlamaServerFeatures(help: string): LlamaServerFeatures {
     cacheRam: !!definition("--cache-ram"),
     mmprojDevice: !!definition("--mmproj-device"),
     draftDevice: !!definition("--spec-draft-device"),
+    lora: !!definition("--lora"),
     ...(definition("--shard") ? { externalPle: "--shard" as const }
       : definition("--ple") ? { externalPle: "--ple" as const } : {}),
   };

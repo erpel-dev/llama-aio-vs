@@ -49,6 +49,7 @@ const LABELS: Partial<Record<keyof LlamaLoadSettings, string>> = {
   ngramMinHits: "n-gram hits",
   mmprojPath: "vision projector",
   plePath: "PLE table",
+  loraAdapters: "LoRA adapters",
   mmprojOffloadToGpu: "vision on GPU",
   tensorSplit: "tensor split",
   splitMode: "split mode",
@@ -59,6 +60,10 @@ const LABELS: Partial<Record<keyof LlamaLoadSettings, string>> = {
   chatTemplateJinja: "jinja",
 };
 
+function loraPaths(v: unknown): string[] {
+  return Array.isArray(v) ? v.map(a => String(a?.path || "")).filter(Boolean) : [];
+}
+
 function baseName(p: string): string {
   const s = String(p || "").replace(/\\/g, "/");
   return s.slice(s.lastIndexOf("/") + 1) || "none";
@@ -67,6 +72,10 @@ function baseName(p: string): string {
 function fmtValue(key: keyof LlamaLoadSettings, v: unknown): string {
   if (v === undefined || v === null || v === "") {
     return key === "tensorSplit" ? "auto" : "none";
+  }
+  if (key === "loraAdapters") {
+    const names = loraPaths(v).map(baseName);
+    return names.length ? names.join(", ") : "none";
   }
   if (typeof v === "boolean") {
     return v ? "on" : "off";
@@ -106,7 +115,10 @@ export function diffLoadSettings(
     if (a === undefined && b === undefined) {
       continue;
     }
-    if (JSON.stringify(a ?? null) === JSON.stringify(b ?? null)) {
+    if (key === "loraAdapters") {
+      // Only the file list needs a reload; strength and on/off are applied live.
+      if (JSON.stringify(loraPaths(a)) === JSON.stringify(loraPaths(b))) continue;
+    } else if (JSON.stringify(a ?? null) === JSON.stringify(b ?? null)) {
       continue;
     }
     out.push({ key, label: LABELS[key]!, from: fmtValue(key, a), to: fmtValue(key, b) });

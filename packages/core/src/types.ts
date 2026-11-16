@@ -357,6 +357,41 @@ export function recommendedNgramSizes(
   return modDefault ? { ngramSizeN: 12, ngramSizeM: 48 } : { ngramSizeN: n, ngramSizeM: m };
 }
 
+/** One LoRA adapter attached to the selected model. */
+export interface LoraAdapterSetting {
+  path: string;
+  /** Strength (llama.cpp scale). 1 applies the adapter as trained. */
+  scale: number;
+  /** Off keeps the adapter loaded with scale 0, so it can be switched on without a reload. */
+  enabled: boolean;
+}
+
+export const LORA_SCALE_MAX = 2;
+export const LORA_ADAPTERS_MAX = 8;
+
+export function normalizeLoraAdapters(raw: unknown): LoraAdapterSetting[] {
+  if (!Array.isArray(raw)) return [];
+  const out: LoraAdapterSetting[] = [];
+  const seen = new Set<string>();
+  for (const item of raw) {
+    const p = typeof item?.path === "string" ? item.path.trim() : "";
+    if (!p || seen.has(p) || out.length >= LORA_ADAPTERS_MAX) continue;
+    seen.add(p);
+    const scale = Number(item.scale);
+    out.push({
+      path: p,
+      scale: Number.isFinite(scale) ? Math.min(LORA_SCALE_MAX, Math.max(0, Math.round(scale * 100) / 100)) : 1,
+      enabled: item.enabled !== false,
+    });
+  }
+  return out;
+}
+
+/** The scale llama-server should use for an adapter: 0 when switched off. */
+export function effectiveLoraScale(adapter: LoraAdapterSetting): number {
+  return adapter.enabled ? adapter.scale : 0;
+}
+
 export interface LlamaLoadSettings {
   /** Context length (--ctx-size) */
   contextLength: number;
@@ -446,6 +481,11 @@ export interface LlamaLoadSettings {
   draftModelPath: string;
   /** External PLE-only GGUF (--ple). Empty uses the model's built-in table. */
   plePath: string;
+  /**
+   * LoRA adapter GGUFs loaded with the model (`--lora`). The file list needs a
+   * reload; `scale` and `enabled` are applied live through POST /lora-adapters.
+   */
+  loraAdapters: LoraAdapterSetting[];
   /** Draft model GPU layers (`--spec-draft-ngl`); 99 ≈ all */
   draftGpuOffload: number;
   /** Empty follows the target; otherwise a llama.cpp device ID or none (CPU). */
@@ -569,6 +609,7 @@ export const DEFAULT_LOAD_SETTINGS: LlamaLoadSettings = {
   draftBatchSize: 0,
   draftModelPath: "",
   plePath: "",
+  loraAdapters: [],
   draftGpuOffload: 99,
   draftDevice: "",
   cacheRamMiB: undefined,
@@ -691,6 +732,7 @@ export function normalizeLoadSettings(raw: Partial<LlamaLoadSettings> | undefine
     draftBatchSize: int(s.draftBatchSize, 0, 1_048_576, d.draftBatchSize),
     draftModelPath: typeof s.draftModelPath === "string" ? s.draftModelPath.trim() : "",
     plePath: typeof s.plePath === "string" ? s.plePath.trim() : "",
+    loraAdapters: normalizeLoraAdapters(s.loraAdapters),
     draftGpuOffload: int(s.draftGpuOffload, 0, 999, d.draftGpuOffload),
     draftDevice: normalizeDeviceId(s.draftDevice),
     cacheRamMiB: s.cacheRamMiB == null || String(s.cacheRamMiB).trim() === ""

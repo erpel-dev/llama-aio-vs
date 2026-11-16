@@ -183,6 +183,21 @@ export function buildServerArgs(
     args.push(options.features.externalPle, settings.plePath);
   }
 
+  if (settings.loraAdapters.length) {
+    if (!options?.features?.lora) {
+      throw new Error("LoRA adapters need a llama.cpp build with --lora. Update llama.cpp or remove the adapters.");
+    }
+    for (const adapter of settings.loraAdapters) {
+      if (adapter.path.includes(",")) {
+        throw new Error(`The LoRA path cannot contain a comma: llama.cpp reads commas as separators (${adapter.path}).`);
+      }
+    }
+    // One comma-separated value: repeating --lora is deprecated. Not --lora-scaled FNAME:SCALE,
+    // which splits on ':' and so breaks Windows drive paths. Adapters load at scale 1; the
+    // strengths are set through POST /lora-adapters as soon as the server is ready.
+    args.push("--lora", settings.loraAdapters.map(a => a.path).join(","));
+  }
+
   // --cache-reuse: min chunk size reused via KV shifting (0 = off).
   const cacheReuse = Math.max(0, settings.cacheReuse ?? 0);
   if (options?.features?.cacheRam && settings.cacheRamMiB !== undefined) {
@@ -517,6 +532,8 @@ export function serverConfigFingerprint(
     modelPath: (modelPath || "").trim(),
     plePath: settings.plePath,
     pleStamp: settings.plePath ? pleFileStamp(settings.plePath) : undefined,
+    // Paths only: strength and on/off are applied to the running server.
+    loraPaths: settings.loraAdapters.length ? settings.loraAdapters.map(a => a.path) : undefined,
     launchMode: launchMode || "",
     contextLength: settings.contextLength,
     gpuOffload: settings.gpuOffload,
