@@ -8,6 +8,7 @@ import {
   parseLsofListeners,
   parseNetstatListeners,
   parseSsListeners,
+  probeLocalBigMoeOnEdgeServer,
   probeLocalStrataServer,
   strataListenerRole,
 } from "../src/localServers";
@@ -77,6 +78,10 @@ describe("discoverLoopbackLlamaServers", () => {
     assert.deepEqual(found, [{ url: "http://127.0.0.1:8080", port: 8080, pid: 15, name: "Strata" }]);
     assert.equal(localListenerName("node /app/server.js"), undefined);
     assert.equal(localListenerName("/opt/llama/llama-server -m x.gguf"), "llama-server");
+    assert.equal(localListenerName("/usr/local/bin/bmoe-server -m model.gguf -c 32768"), "BigMoeOnEdge");
+    assert.equal(localListenerName("C:\\Program Files\\BigMoeOnEdge\\bmoe-server.exe --port 8765"), "BigMoeOnEdge");
+    assert.equal(localListenerName("/Applications/BigMoeOnEdge.app/Contents/MacOS/bmoe-desktop"), undefined, "the app window does not serve the API");
+    assert.equal(localListenerName("/x/bmoe-server-tests --gtest"), undefined);
   });
 
   it("discovers the new default port and custom ports without a --port argument", () => {
@@ -229,5 +234,46 @@ describe("parseNetstatListeners", () => {
       found.map((s) => s.url),
       ["http://127.0.0.1:8080", "http://127.0.0.1:8742"]
     );
+  });
+});
+
+describe("BigMoeOnEdge discovery without process metadata", () => {
+  const info = { version: "0.9.0", overlap_available: true, planner_available: true, host: {}, state: "ready", error: "", model: {}, generating: false, calibrating: false };
+  const cases: Array<[string, number, string, boolean]> = [
+    ["its /api/info", 200, JSON.stringify(info), true],
+    ["its /api/info with no model loaded", 200, JSON.stringify({ ...info, state: "empty", model: null }), true],
+    ["its API-key refusal", 401, '{"error":{"message":"an API key is required: send it as Authorization: Bearer <key> (or X-Api-Key: <key>)"}}', true],
+    ["another server's /api/info", 200, '{"version":"1.2.3","state":"ready"}', false],
+    ["another server's 401", 401, '{"error":"unauthorized"}', false],
+    ["a web page", 200, "<html>Other application</html>", false],
+  ];
+  for (const [what, status, body, expected] of cases) {
+    it(`${expected ? "identifies" : "ignores"} ${what}`, async () => {
+      setServerApiKeyProvider(() => "private-key-for-another-server");
+      const server = createServer((req, res) => {
+        assert.equal(req.headers.authorization, undefined, "never sends the managed server's key");
+        if (req.url !== "/api/info") {
+          res.writeHead(404);
+          res.end();
+          return;
+        }
+        res.writeHead(status, { "content-type": "application/json" });
+        res.end(body);
+      });
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+      try {
+        const addr = server.address();
+        assert.ok(addr && typeof addr !== "string");
+        assert.equal(await probeLocalBigMoeOnEdgeServer(`http://127.0.0.1:${addr.port}`), expected);
+      } finally {
+        setServerApiKeyProvider(undefined);
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
+    });
+  }
+
+  it("does not probe non-loopback hosts or invalid URLs", async () => {
+    assert.equal(await probeLocalBigMoeOnEdgeServer("http://192.0.2.1:8765"), false);
+    assert.equal(await probeLocalBigMoeOnEdgeServer("invalid"), false);
   });
 });

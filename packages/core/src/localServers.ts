@@ -20,8 +20,8 @@ export interface DiscoveredLlamaServer {
   port: number;
   /** Unknown when discovered through Strata's public health endpoint. */
   pid?: number;
-  /** Sidebar wording. Strata is not llama-server and must not be adopted or stopped. */
-  name: "llama-server" | "Strata";
+  /** Sidebar wording. Only llama-server may be adopted or stopped; the others are separate apps. */
+  name: "llama-server" | "Strata" | "BigMoeOnEdge";
 }
 
 /**
@@ -65,6 +65,10 @@ export function localListenerName(commandLine: string | undefined): DiscoveredLl
   if (cmd.includes("llama-server")) {
     return "llama-server";
   }
+  // bmoe-desktop runs bmoe-server as a child process; only the server listens for the API.
+  if (/(^|[^\w-])bmoe-server(\.exe)?([^\w-]|$)/.test(cmd)) {
+    return "BigMoeOnEdge";
+  }
   const role = strataListenerRole(commandLine);
   return role === "internal" ? undefined : role ? "Strata" : undefined;
 }
@@ -74,6 +78,34 @@ export const MAX_DISCOVERED_SERVERS = 3;
 
 /** Desktop host, standalone server, launcher, and source-run host defaults. */
 export const STRATA_DEFAULT_PORTS = [47831, 8095, 8080, 8791] as const;
+
+/** BigMoeOnEdge's bmoe-server default (`server/server.h`, kDefaultPort). */
+export const BIGMOEONEDGE_DEFAULT_PORTS = [8765] as const;
+
+/**
+ * Identify BigMoeOnEdge's bmoe-server without process access. Its /api/info
+ * reports planner and expert-overlap flags no other local server has. When it
+ * was started with an API key, /api/info answers 401 with its own wording.
+ */
+export async function probeLocalBigMoeOnEdgeServer(url: string): Promise<boolean> {
+  try {
+    if (!isLoopbackHost(new URL(url).hostname)) {
+      return false;
+    }
+    // Never send the managed server's API key to another program.
+    const res = await serverRequest(`${url}/api/info`, { apiKey: "", timeoutMs: 750, signal: AbortSignal.timeout(750) });
+    const body = await readBody(res, 64 * 1024);
+    if (res.statusCode === 401) {
+      return /API key is required: send it as Authorization: Bearer <key> \(or X-Api-Key: <key>\)/i.test(body);
+    }
+    const info = JSON.parse(body);
+    return res.statusCode === 200 && !!info && typeof info === "object" && typeof info.version === "string"
+      && typeof info.planner_available === "boolean" && typeof info.overlap_available === "boolean"
+      && typeof info.state === "string";
+  } catch {
+    return false;
+  }
+}
 
 /** Identify Strata without process access (notably python.exe on Windows). */
 export async function probeLocalStrataServer(url: string): Promise<boolean> {
@@ -301,11 +333,15 @@ export function discoverLoopbackLlamaServersOnThisMachine(skipPids: readonly num
 export async function discoverLoopbackLlamaServersOnThisMachineAsync(
   skipPids: readonly number[] = []
 ): Promise<DiscoveredLlamaServer[]> {
-  const [sockets, strata] = await Promise.all([
+  const [sockets, strata, bmoe] = await Promise.all([
     runStepsAsync(listListeningSockets()),
     Promise.all(STRATA_DEFAULT_PORTS.map(async (port) => {
       const url = `http://127.0.0.1:${port}`;
       return await probeLocalStrataServer(url) ? { url, port, name: "Strata" as const } : undefined;
+    })),
+    Promise.all(BIGMOEONEDGE_DEFAULT_PORTS.map(async (port) => {
+      const url = `http://127.0.0.1:${port}`;
+      return await probeLocalBigMoeOnEdgeServer(url) ? { url, port, name: "BigMoeOnEdge" as const } : undefined;
     })),
   ]);
   const commandLines = new Map<number, string | undefined>();
@@ -335,6 +371,12 @@ export async function discoverLoopbackLlamaServersOnThisMachineAsync(
       }
       found.push(server);
     }
+  }
+  // The HTTP probe finds bmoe-server where process names are hidden (another user, a sandbox).
+  for (const server of bmoe) {
+    if (!server || found.some((s) => s.port === server.port)) continue;
+    if ((sockets ?? []).some((s) => s.port === server.port && skipPids.includes(s.pid))) continue;
+    found.push(server);
   }
   return found.slice(0, MAX_DISCOVERED_SERVERS);
 }
