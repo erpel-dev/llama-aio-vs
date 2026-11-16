@@ -13,6 +13,7 @@ export * from "./events";
 export * from "./execRunner";
 export * from "./externalTerminal";
 export * from "./ggufMetadata";
+export * from "./loraAdapter";
 export * from "./gpuInfo";
 export * from "./hfLicense";
 export * from "./huggingFace";

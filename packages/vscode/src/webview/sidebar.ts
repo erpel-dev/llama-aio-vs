@@ -2923,6 +2923,7 @@ function syncPerformanceFeatureUi() {
       : !f.externalPle ? 'Update llama.cpp to b12233 or a compatible build to attach an external PLE table.'
       : (plePath ? fmtBytes(ple.bytes) + ' · Reload to apply. ' : '') + 'Use a PLE-only GGUF from the same checkpoint; matching dimensions do not verify its origin.';
   }
+  renderLora(p, f, remote);
   const suffix = remote ? 'The remote server controls this setting.'
     : f.probed ? 'Inactive on this llama.cpp build. Update llama.cpp to use it.'
       : 'Inactive until support is verified. Install or select a runnable llama.cpp build.';
@@ -3585,6 +3586,86 @@ if (clearDraftBtn) {
     vscode.postMessage({ type: 'clearDraftModel' });
   });
 }
+function baseFileName(p) {
+  return String(p || '').replace(/\\/g, '/').split('/').pop();
+}
+
+/** LoRA adapter rows, plus what the model file says about adapters and lineage of its own. */
+function renderLora(p, f, remote) {
+  const lora = p.lora || {};
+  const adapters = lora.adapters || [];
+  const row = $('loraAttach');
+  const hasModel = !!(p.state && p.state.selectedModelPath);
+  row.classList.toggle('hidden', remote || !hasModel);
+  const active = adapters.filter((a) => a.enabled && a.loaded).length;
+  const waiting = adapters.filter((a) => !a.loaded).length;
+  const running = !!(p.status && p.status.running);
+  $('loraSum').textContent = !adapters.length ? 'None'
+    : !running ? adapters.filter((a) => a.enabled).length + ' of ' + adapters.length + ' on'
+    : active + ' active' + (waiting ? ' · ' + waiting + ' after reload' : '');
+  $('pickLoraBtn').disabled = remote || !f.lora;
+  $('loraList').innerHTML = adapters.map((a, i) => {
+    const name = baseFileName(a.path);
+    const state = !running ? '' : a.loaded ? (a.enabled ? 'Active' : 'Off') : 'After reload';
+    const notes = [];
+    if (a.message) notes.push('<div class="lora-note warn">' + escText(a.message) + '</div>');
+    if (a.activated) notes.push('<div class="lora-note">Activated adapter: it only takes effect after its trigger phrase appears in the prompt.</div>');
+    return '<div class="lora-item">' +
+      '<input type="checkbox" data-lora-toggle="' + i + '" aria-label="Use ' + escAttr(name) + '"' + (a.enabled ? ' checked' : '') + '>' +
+      '<span class="lora-name" title="' + escAttr(a.path) + '">' + escText(name) + '</span>' +
+      '<button class="secondary small" type="button" data-act="lora-remove" data-lora="' + i + '" aria-label="Remove ' + escAttr(name) + '">Remove</button>' +
+      '<div class="lora-note">' + escText([a.bytes ? fmtBytes(a.bytes) : '', state].filter(Boolean).join(' · ')) + '</div>' +
+      '<label class="lora-strength">Strength<input type="range" min="0" max="2" step="0.05" value="' + a.scale + '" data-lora-scale="' + i + '" aria-label="Strength of ' + escAttr(name) + '"' + (a.enabled ? '' : ' disabled') + '><output>' + Number(a.scale).toFixed(2) + '</output></label>' +
+      notes.join('') + '</div>';
+  }).join('');
+  $('loraHint').textContent = !f.lora ? (f.probed ? 'This llama.cpp build has no --lora option. Update llama.cpp to use LoRA adapters.' : 'Available once a runnable llama.cpp build is installed.')
+    : !adapters.length ? 'Add a LoRA adapter (GGUF) trained on this model.'
+    : waiting && running ? 'Reload to load the new adapter. Strength and on/off apply at once for loaded adapters.'
+    : running ? 'Strength and on/off apply to the running server at once.'
+    : '';
+  const lineage = [];
+  if (lora.builtIn) {
+    lineage.push(lora.builtIn.count + ' built-in adapter' + (lora.builtIn.count === 1 ? '' : 's') +
+      (lora.builtIn.rank ? ' · rank ' + lora.builtIn.rank : '') + ' · part of this model file, switched by control tokens');
+  }
+  if (lora.lineage) {
+    lineage.push('Based on ' + lora.lineage.baseModelName + (lora.lineage.finetune ? ' (' + lora.lineage.finetune + ')' : '') +
+      ', according to the file. Whether a LoRA was merged in cannot be detected.');
+  }
+  $('modelLineage').textContent = lineage.join(' · ');
+  $('modelLineage').classList.toggle('hidden', !lineage.length);
+}
+
+const loraList = $('loraList');
+if (loraList) {
+  const adapterAt = (i) => ((lastPayload && lastPayload.lora && lastPayload.lora.adapters) || [])[Number(i)];
+  loraList.addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-act]');
+    if (!btn) return;
+    const a = adapterAt(btn.dataset.lora);
+    if (a && btn.dataset.act === 'lora-remove') vscode.postMessage({ type: 'removeLora', path: a.path });
+  });
+  // Show the number while dragging; send once on release so the server gets one request.
+  loraList.addEventListener('input', (e) => {
+    const t = e.target;
+    if (t.dataset.loraScale !== undefined) t.parentElement.querySelector('output').textContent = Number(t.value).toFixed(2);
+  });
+  loraList.addEventListener('change', (e) => {
+    const t = e.target;
+    if (t.dataset.loraScale !== undefined) {
+      const a = adapterAt(t.dataset.loraScale);
+      if (a) vscode.postMessage({ type: 'setLora', path: a.path, scale: Number(t.value) });
+    } else if (t.dataset.loraToggle !== undefined) {
+      const a = adapterAt(t.dataset.loraToggle);
+      if (a) vscode.postMessage({ type: 'setLora', path: a.path, enabled: t.checked });
+    }
+  });
+}
+const pickLoraBtn = $('pickLoraBtn');
+if (pickLoraBtn) pickLoraBtn.addEventListener('click', () => {
+  if (saveLoadTimer) clearTimeout(saveLoadTimer);
+  vscode.postMessage({ type: 'pickLora' });
+});
 const pickMmprojBtn = $('pickMmprojBtn');
 const pickPleBtn = $('pickPleBtn');
 if (pickPleBtn) pickPleBtn.addEventListener('click', () => {

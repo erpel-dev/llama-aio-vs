@@ -12,7 +12,7 @@ const help = `--moe-cache-mib N                       GPU cache size in MiB
 --spec-draft-sampling {greedy,probabilistic}
                                        how the draft is sampled
 `;
-const all = { cacheRam: false, mmprojDevice: false, draftDevice: false, probed: true, moeCache: true, draftSampling: true, draftUbatch: true };
+const all = { cacheRam: false, mmprojDevice: false, draftDevice: false, lora: false, probed: true, moeCache: true, draftSampling: true, draftUbatch: true };
 
 describe("optional llama.cpp feature detection", () => {
   it("probes new runtime controls instead of relying on build numbers", () => {

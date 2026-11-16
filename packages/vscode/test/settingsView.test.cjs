@@ -206,6 +206,7 @@ function setup(loadOverrides = {}, remoteInfo, serverFeatures = core.NO_SERVER_F
     requestSettings: { ...core.DEFAULT_REQUEST_SETTINGS },
   };
   const config = new Map([["launchMode", "externalTerminal"]]);
+  const loraApplied = [];
   const launched = {
     modelPath: caps.path,
     loadSettings: JSON.parse(JSON.stringify(opts.cpu ? core.normalizeLoadSettingsForCpuBackend(state.loadSettings) : state.loadSettings)),
@@ -240,6 +241,7 @@ function setup(loadOverrides = {}, remoteInfo, serverFeatures = core.NO_SERVER_F
     isHttpReady: async () => true,
     resolveBinary: () => "",
     getServerFeatures: async () => ({ ...serverFeatures }),
+    applyLoraScales: async () => { loraApplied.push(JSON.parse(JSON.stringify(state.loadSettings.loraAdapters || []))); return true; },
     isCpuBackend: () => !!opts.cpu,
     effectiveLaunchMode: () => config.get("launchMode") === "background" ? "background" : "externalTerminal",
     launchModeFallbackReason: () => undefined,
@@ -294,7 +296,7 @@ function setup(loadOverrides = {}, remoteInfo, serverFeatures = core.NO_SERVER_F
     {},
     {}
   );
-  return { send: (m) => handler(m), posted, getState: () => state, launched, provider };
+  return { send: (m) => handler(m), posted, getState: () => state, launched, provider, loraApplied };
 }
 
 describe("PLE attachment controls", () => {
@@ -619,5 +621,102 @@ describe("SettingsViewProvider memory path", () => {
     await Promise.all([first, second]);
     const states = t.posted.filter((m) => m.type === "state");
     assert.equal(states.at(-1).payload.state.loadSettings.contextLength, 16384);
+  });
+});
+
+describe("LoRA adapter controls", () => {
+  const lora = { ...core.NO_SERVER_FEATURES, probed: true, lora: true };
+  const adapters = [
+    { path: "/l/sql-lora.gguf", scale: 0.8, enabled: true, bytes: 1024, fit: "match", message: "", activated: false, loaded: true },
+    { path: "/l/new-lora.gguf", scale: 1, enabled: true, bytes: 2048, fit: "unknown-base", message: "The adapter does not name its base model.", activated: true, loaded: false },
+  ];
+  it("renders adapter rows and sends strength, on/off, remove and add", async t => {
+    const { JSDOM } = require("jsdom");
+    const html = fs.readFileSync(path.join(__dirname, "../src/webview/sidebar.html"), "utf8").replace(/\{\{\w+\}\}/g, "");
+    const dom = new JSDOM(html, { runScripts: "outside-only", pretendToBeVisual: true, url: "https://preview.invalid" });
+    t.after(() => dom.window.close());
+    const sent = [];
+    dom.window.acquireVsCodeApi = () => ({ postMessage: m => sent.push(m), getState: () => null, setState() {} });
+    dom.window.eval(fs.readFileSync(path.join(__dirname, "../out/webview/sidebar.js"), "utf8"));
+    const ui = setup({}, undefined, lora);
+    await ui.provider.pushState();
+    const payload = ui.posted.filter(m => m.type === "state").at(-1).payload;
+    const paint = patch => dom.window.dispatchEvent(new dom.window.MessageEvent("message", { data: { type: "state", payload: { ...payload, ...patch } } }));
+    const el = id => dom.window.document.getElementById(id);
+    const fire = (node, type) => node.dispatchEvent(new dom.window.Event(type, { bubbles: true }));
+    paint({});
+    assert.equal(el("loraAttach").classList.contains("hidden"), false);
+    assert.equal(el("loraSum").textContent, "None");
+    assert.equal(el("modelLineage").classList.contains("hidden"), true);
+    el("pickLoraBtn").click();
+    assert.equal(sent.at(-1).type, "pickLora");
+
+    paint({ lora: { adapters, builtIn: null, lineage: null }, status: { ...payload.status, running: false } });
+    assert.equal(el("loraSum").textContent, "2 of 2 on", "stopped server: nothing is active yet");
+    paint({ lora: { adapters, builtIn: null, lineage: null }, status: { ...payload.status, running: true } });
+    const rows = [...el("loraList").querySelectorAll(".lora-item")];
+    assert.equal(rows.length, 2);
+    assert.match(rows[0].textContent, /sql-lora\.gguf.*Active/);
+    assert.match(rows[1].textContent, /After reload/);
+    assert.match(rows[1].textContent, /does not name its base model/);
+    assert.match(rows[1].textContent, /trigger phrase/);
+    assert.equal(el("loraSum").textContent, "1 active · 1 after reload");
+    assert.match(el("loraHint").textContent, /Reload to load the new adapter/);
+
+    const slider = rows[0].querySelector("input[type=range]");
+    slider.value = "0.35";
+    fire(slider, "input");
+    assert.equal(rows[0].querySelector("output").textContent, "0.35");
+    assert.notEqual(sent.at(-1).type, "setLora", "dragging does not post");
+    fire(slider, "change");
+    assert.deepEqual({ ...sent.at(-1) }, { type: "setLora", path: "/l/sql-lora.gguf", scale: 0.35 });
+    const toggle = rows[0].querySelector("input[type=checkbox]");
+    toggle.checked = false;
+    fire(toggle, "change");
+    assert.deepEqual({ ...sent.at(-1) }, { type: "setLora", path: "/l/sql-lora.gguf", enabled: false });
+    rows[1].querySelector("[data-act=lora-remove]").click();
+    assert.deepEqual({ ...sent.at(-1) }, { type: "removeLora", path: "/l/new-lora.gguf" });
+
+    paint({ lora: { adapters: [], builtIn: { count: 12, rank: 32 }, lineage: { finetune: "Storywriter", baseModelName: "Granite 8B" } } });
+    assert.match(el("modelLineage").textContent, /12 built-in adapters · rank 32/);
+    assert.match(el("modelLineage").textContent, /Based on Granite 8B \(Storywriter\).*cannot be detected/);
+    paint({ serverFeatures: { ...core.NO_SERVER_FEATURES, probed: true } });
+    assert.equal(el("pickLoraBtn").disabled, true);
+    assert.match(el("loraHint").textContent, /no --lora option/);
+    paint({ serverMode: "remote" });
+    assert.equal(el("loraAttach").classList.contains("hidden"), true);
+  });
+  it("applies strength and on/off live, and lists only file changes for Reload", async () => {
+    const saved = [{ path: "/l/a.gguf", scale: 1, enabled: true }];
+    const ui = setup({ loraAdapters: saved }, undefined, lora);
+    await ui.send({ type: "setLora", path: "/l/a.gguf", scale: 0.4 });
+    await ui.send({ type: "setLora", path: "/l/a.gguf", enabled: false });
+    assert.deepEqual(ui.getState().loadSettings.loraAdapters, [{ path: "/l/a.gguf", scale: 0.4, enabled: false }]);
+    assert.deepEqual(ui.loraApplied.at(-1), [{ path: "/l/a.gguf", scale: 0.4, enabled: false }]);
+    let payload = ui.posted.filter(m => m.type === "state").at(-1).payload;
+    assert.equal(payload.changes.some(c => c.key === "loraAdapters"), false);
+    assert.equal(payload.lora.adapters[0].loaded, true);
+    await ui.send({ type: "removeLora", path: "/l/a.gguf" });
+    payload = ui.posted.filter(m => m.type === "state").at(-1).payload;
+    assert.deepEqual(payload.changes.filter(c => c.key === "loraAdapters"), [
+      { key: "loraAdapters", label: "LoRA adapters", from: "a.gguf", to: "none" },
+    ]);
+    await ui.send({ type: "discardChanges" });
+    assert.deepEqual(ui.getState().loadSettings.loraAdapters, saved);
+  });
+  it("adds picked files once, and refuses unsupported builds and remote servers", async t => {
+    const dialog = t.mock.method(require("vscode").window, "showOpenDialog", async () => [{ fsPath: "/l/a.gguf" }, { fsPath: "/l/b.gguf" }]);
+    const ui = setup({ loraAdapters: [{ path: "/l/a.gguf", scale: 0.5, enabled: true }] }, undefined, lora);
+    await ui.send({ type: "pickLora" });
+    assert.deepEqual(ui.getState().loadSettings.loraAdapters, [
+      { path: "/l/a.gguf", scale: 0.5, enabled: true }, { path: "/l/b.gguf", scale: 1, enabled: true },
+    ]);
+    const payload = ui.posted.filter(m => m.type === "state").at(-1).payload;
+    assert.equal(payload.lora.adapters[1].loaded, false);
+    assert.equal(payload.lora.adapters[1].fit, "invalid", "a missing file is reported on its row");
+    const calls = dialog.mock.callCount();
+    await assert.rejects(setup().provider.pickLora(), /no --lora option/);
+    await assert.rejects(setup({}, { state: "ready" }).provider.pickLora(), /remote server/);
+    assert.equal(dialog.mock.callCount(), calls);
   });
 });

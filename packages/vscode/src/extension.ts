@@ -1250,6 +1250,8 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("llamaAio.selectMmproj", pickMmproj),
     vscode.commands.registerCommand("llamaAio.selectPle", () => settingsView.pickPle().catch(e =>
       vscode.window.showErrorMessage(`Select PLE table failed: ${e instanceof Error ? e.message : String(e)}`))),
+    vscode.commands.registerCommand("llamaAio.selectLora", () => settingsView.pickLora().catch(e =>
+      vscode.window.showErrorMessage(`Add LoRA adapter failed: ${e instanceof Error ? e.message : String(e)}`))),
     vscode.commands.registerCommand("llamaAio.selectChatTemplate", pickChatTemplate),
 
     vscode.commands.registerCommand("llamaAio.startServer", async () => {

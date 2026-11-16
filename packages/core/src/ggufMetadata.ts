@@ -76,6 +76,15 @@ export interface ModelCapabilities {
    * compute); Qwen3.8-Flash-Next's table is tens of GiB.
    */
   pleShare?: number;
+  /**
+   * LoRA adapters stored inside the model file (`{arch}.adapters.count`), switched by
+   * control tokens. They are part of the model and cannot be detached or scaled.
+   */
+  builtInAdapters?: { count: number; rank?: number };
+  /** `general.finetune`: the variant name the file gives itself. Lineage only. */
+  finetune?: string;
+  /** `general.base_model.0.name`. A merged LoRA cannot be detected; this is what the file claims. */
+  baseModelName?: string;
   /** The backbone declares per-layer embeddings, including PLE-less exports. */
   pleSupported?: boolean;
   pleMissing?: boolean;
@@ -1005,6 +1014,7 @@ function readModelCapabilitiesUncached(filePath: string): ModelCapabilities {
     ffnLength,
     denseFfnShare,
     pleShare,
+    ...modelLineage(meta, arch),
     pleSupported: (pickArchNumber("embedding_length_per_layer_input") || 0) > 0 || (measuredPleShare || 0) > 0,
     pleMissing: (pickArchNumber("embedding_length_per_layer_input") || 0) > 0 && shardsFound === shardCount && measuredPleShare === undefined,
     expertCount,
@@ -1075,6 +1085,99 @@ export function pleFileStamp(filePath: string): string | undefined {
     const st = fs.statSync(filePath);
     return `${st.size}:${st.mtimeMs}:${st.ctimeMs}:${st.ino}`;
   } catch { return undefined; }
+}
+
+function metaString(meta: Record<string, GgufValue>, key: string): string | undefined {
+  const v = meta[key];
+  return typeof v === "string" && v.trim() ? v.trim() : undefined;
+}
+
+function modelLineage(meta: Record<string, GgufValue>, arch: string | undefined):
+  Pick<ModelCapabilities, "builtInAdapters" | "finetune" | "baseModelName"> {
+  const count = arch ? Number(meta[`${arch}.adapters.count`]) : NaN;
+  const rank = arch ? Number(meta[`${arch}.adapters.lora_rank`]) : NaN;
+  return {
+    ...(Number.isInteger(count) && count > 0
+      ? { builtInAdapters: { count, ...(Number.isFinite(rank) && rank > 0 ? { rank } : {}) } } : {}),
+    finetune: metaString(meta, "general.finetune"),
+    baseModelName: metaString(meta, "general.base_model.0.name"),
+  };
+}
+
+/** What a LoRA adapter GGUF says about itself. */
+export interface LoraAdapterInfo {
+  path: string;
+  name?: string;
+  architecture?: string;
+  /** `general.base_model.0.name`, when the converter recorded it. */
+  baseModelName?: string;
+  alpha?: number;
+  /** Activated LoRA: only takes effect after its invocation tokens appear in the prompt. */
+  activated: boolean;
+  tensorCount: number;
+  sizeBytes: number;
+}
+
+// The role check runs for every GGUF in a library scan, so it reads only the
+// start of the file: converters write general.type among the first keys.
+const loraRoleCache = new Map<string, { stamp: string; result: boolean }>();
+const GGUF_TYPE_STRING = 8;
+export function isLoraAdapterGguf(filePath: string): boolean {
+  try {
+    // One open serves the cache stamp and the read; library scans budget their path stats.
+    const fd = fs.openSync(filePath, "r");
+    const key = path.resolve(filePath);
+    let stamp: string, read = 0, head: Buffer;
+    try {
+      const st = fs.fstatSync(fd);
+      stamp = `${st.size}:${st.mtimeMs}:${st.ctimeMs}:${st.ino}`;
+      const hit = loraRoleCache.get(key);
+      if (hit?.stamp === stamp) return hit.result;
+      head = Buffer.alloc(Math.min(st.size, 16 * 1024));
+      read = fs.readSync(fd, head, 0, head.length, 0);
+    } finally { fs.closeSync(fd); }
+    let result = false;
+    if (read >= 24 && head.readUInt32LE(0) === GGUF_MAGIC) {
+      const name = Buffer.from("general.type");
+      const at = head.subarray(0, read).indexOf(name);
+      const value = at + name.length;
+      // key string, then u32 value type, u64 length, bytes
+      if (at >= 8 && head.readBigUInt64LE(at - 8) === BigInt(name.length) && value + 12 <= read &&
+          head.readUInt32LE(value) === GGUF_TYPE_STRING) {
+        const len = Number(head.readBigUInt64LE(value + 4));
+        result = len === 7 && value + 12 + len <= read && head.toString("utf8", value + 12, value + 12 + len) === "adapter";
+      }
+    }
+    if (loraRoleCache.size >= 512) loraRoleCache.delete(loraRoleCache.keys().next().value!);
+    loraRoleCache.set(key, { stamp, result });
+    return result;
+  } catch {
+    return false;
+  }
+}
+
+/** Read a LoRA adapter's metadata. Throws when the file is not a LoRA adapter GGUF. */
+export function readLoraAdapterInfo(filePath: string): LoraAdapterInfo {
+  const header = readGgufHeaderFromFile(filePath);
+  const meta = header.meta;
+  if (meta["general.type"] !== "adapter") {
+    throw new Error("This GGUF is a model, not a LoRA adapter.");
+  }
+  if (meta["adapter.type"] !== "lora") {
+    throw new Error(`This adapter is of type "${String(meta["adapter.type"] ?? "unknown")}". Only LoRA adapters are supported.`);
+  }
+  const alpha = Number(meta["adapter.lora.alpha"]);
+  const invocation = meta["adapter.alora.invocation_tokens"];
+  return {
+    path: filePath,
+    name: metaString(meta, "general.name"),
+    architecture: metaString(meta, "general.architecture"),
+    baseModelName: metaString(meta, "general.base_model.0.name"),
+    ...(Number.isFinite(alpha) ? { alpha } : {}),
+    activated: Array.isArray(invocation) && invocation.length > 0,
+    tensorCount: header.tensors.length,
+    sizeBytes: fs.statSync(filePath).size,
+  };
 }
 
 // Role checks are frequent during library scans. Most GGUFs have more than one

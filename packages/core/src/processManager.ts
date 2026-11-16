@@ -54,6 +54,7 @@ import {
 } from "./remoteServer";
 import { joinServerUrl, serverJson, serverRequest } from "./serverHttp";
 import { formatCommandDisplay, normalizeLoadSettingsForCpuBackend, performanceFeatureNotes } from "./serverArgs";
+import { describeLoraLoadError, planLoraScales } from "./loraAdapter";
 import { NO_SERVER_FEATURES, probeLlamaServerFeatures, probeLlamaServerFeaturesSync, type LlamaServerFeatures } from "./llamaFeatures";
 import { ExtensionState, LlamaLoadSettings, ServerStatus } from "./types";
 import { activeInstallLock } from "./installSwap";
@@ -584,6 +585,26 @@ export class ProcessManager {
     };
   }
 
+  /**
+   * Send the sidebar's adapter strengths to the running server. Adapters load
+   * at scale 1, so this runs after every start and whenever a strength or
+   * on/off switch changes. Returns false when
+   * the file list differs from what the server loaded: that needs a reload.
+   */
+  async applyLoraScales(): Promise<boolean> {
+    if (this.store.isRemote()) return false;
+    const launched = this.getLaunchedConfig();
+    const loaded = launched?.loadSettings?.loraAdapters || [];
+    const wanted = this.store.getState().loadSettings.loraAdapters;
+    if (!launched || !loaded.length) return false;
+    if (JSON.stringify(loaded.map(a => a.path)) !== JSON.stringify(wanted.map(a => a.path))) return false;
+    const url = joinServerUrl(this.store.getEndpoint(), "/lora-adapters");
+    const server = await serverJson<Array<{ id: number; path: string }>>(url, { timeoutMs: 5000 });
+    const body = planLoraScales(wanted, server);
+    await serverJson<unknown>(url, { method: "POST", body, timeoutMs: 5000 });
+    return true;
+  }
+
   private isConfigDirty(lock: LockFile): boolean {
     return !this.lockMatchesDesired(lock);
   }
@@ -737,7 +758,9 @@ export class ProcessManager {
     let fileLock: LaunchLockHandle | undefined;
     try {
       fileLock = acquireLaunchLock("start");
-      return await this.startInner(modelPath, report);
+      const status = await this.startInner(modelPath, report);
+      await this.applyLoraScales().catch(() => undefined);
+      return status;
     } finally {
       fileLock?.release();
       this.releaseLaunch(owned);
@@ -1107,6 +1130,8 @@ export class ProcessManager {
     } else if (/openvino/i.test(blob)) {
       hint =
         "\n\nInstalled build looks like OpenVINO — set backend to Vulkan (AMD) or CPU, then re-run Install / Upgrade llama.cpp.";
+    } else if (blob.split("\n").some(line => describeLoraLoadError(line))) {
+      hint = `\n\n${blob.split("\n").map(line => describeLoraLoadError(line)).find(Boolean)}`;
     } else if (/out of memory|insufficient memory/i.test(blob)) {
       hint =
         "\n\nOut of memory while loading. Lower Context Length / GPU Offload, or use a smaller quant.";
@@ -1305,7 +1330,9 @@ export class ProcessManager {
       await this.stopServer(true);
       await sleep(400);
       // Keep boot active across inner start — don't nest beginBoot/endBoot via start().
-      return await this.startInner(undefined, report);
+      const status = await this.startInner(undefined, report);
+      await this.applyLoraScales().catch(() => undefined);
+      return status;
     } finally {
       fileLock?.release();
       this.releaseLaunch(owned);
