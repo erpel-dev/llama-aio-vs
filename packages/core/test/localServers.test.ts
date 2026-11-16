@@ -12,6 +12,7 @@ import {
   probeLocalKoboldCppServer,
   probeLocalLmStudioServer,
   probeLocalOllamaServer,
+  probeLocalOpenAiCompatibleServer,
   probeLocalSglangServer,
   probeLocalTabbyApiServer,
   probeLocalVllmServer,
@@ -380,6 +381,42 @@ describe("other common local servers, identified by their own replies", () => {
   it("does not probe non-loopback hosts", async () => {
     for (const probe of [probeLocalOllamaServer, probeLocalLmStudioServer, probeLocalVllmServer, probeLocalKoboldCppServer]) {
       assert.equal(await probe("http://192.0.2.1:11434"), false);
+    }
+  });
+});
+
+describe("ports the person adds", () => {
+  const cases: Array<[string, Record<string, [number, string]>, boolean]> = [
+    ["an OpenAI-compatible model list", { "/v1/models": [200, '{"object":"list","data":[{"id":"my-model","object":"model"}]}'] }, true],
+    ["an empty model list", { "/v1/models": [200, '{"object":"list","data":[]}'] }, true],
+    ["a server that wants a key", { "/v1/models": [401, '{"error":"unauthorized"}'] }, true],
+    ["a web page", { "/v1/models": [200, "<html></html>"] }, false],
+    ["a list without ids", { "/v1/models": [200, '{"data":[{"name":"x"}]}'] }, false],
+    ["nothing at /v1/models", {}, false],
+  ];
+  for (const [what, replies, expected] of cases) {
+    it(`${expected ? "offers" : "ignores"} ${what}`, () =>
+      withReplies(replies, async (url) => assert.equal(await probeLocalOpenAiCompatibleServer(url), expected)));
+  }
+
+  it("names a known server on an added port, and offers any other OpenAI-compatible one", async () => {
+    const { discoverLoopbackLlamaServersOnThisMachineAsync } = await import("../src/localServers");
+    const servers = [
+      createServer((req, res) => { res.end(req.url === "/api/extra/version" ? '{"result":"KoboldCpp","version":"1"}' : '{"object":"list","data":[]}'); }),
+      createServer((req, res) => { res.end(req.url === "/v1/models" ? '{"object":"list","data":[{"id":"x"}]}' : "{}"); }),
+      createServer((_req, res) => { res.end("<html>not a model server</html>"); }),
+    ];
+    const ports: number[] = [];
+    for (const s of servers) {
+      await new Promise<void>((resolve) => s.listen(0, "127.0.0.1", resolve));
+      ports.push((s.address() as { port: number }).port);
+    }
+    try {
+      const found = await discoverLoopbackLlamaServersOnThisMachineAsync([], ports);
+      const mine = found.filter((s) => ports.includes(s.port)).map((s) => [s.port, s.name]);
+      assert.deepEqual(mine, [[ports[0], "KoboldCpp"], [ports[1], "OpenAI-compatible server"]]);
+    } finally {
+      for (const s of servers) await new Promise<void>((resolve) => s.close(() => resolve()));
     }
   });
 });

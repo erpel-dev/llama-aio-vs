@@ -3881,6 +3881,7 @@ $('setApiKeyBtn').addEventListener('click', () => { closeMenu(); vscode.postMess
 $('forgetApiKeyBtn').addEventListener('click', () => { closeMenu(); vscode.postMessage({ type: 'forgetApiKey' }); });
 $('switchLocalBtn').addEventListener('click', () => { closeMenu(); vscode.postMessage({ type: 'switchToLocal' }); });
 $('connectCancelBtn').addEventListener('click', () => setConnectOpen(false));
+$('extraPortsBtn').addEventListener('click', () => vscode.postMessage({ type: 'extraServerPorts' }));
 $('connectBtn').addEventListener('click', () => {
   vscode.postMessage({
     type: 'connectRemote',

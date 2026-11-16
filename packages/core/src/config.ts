@@ -53,6 +53,11 @@ export interface AppPreferences {
   /** Empty means `<dataRoot>/models`. */
   modelsDir: string;
   extraModelDirs: string[];
+  /**
+   * More loopback ports to look on for a server to connect to, besides the
+   * known servers' defaults. Any OpenAI-compatible server there is offered.
+   */
+  extraServerPorts: number[];
   hfToken: string;
   autoStart: boolean;
   backend: string;
@@ -109,6 +114,7 @@ export const DEFAULT_APP_PREFERENCES: AppPreferences = {
   installDir: "",
   modelsDir: "",
   extraModelDirs: [],
+  extraServerPorts: [],
   hfToken: "",
   autoStart: false,
   backend: "auto",
@@ -164,6 +170,30 @@ export interface ConfigAccessor {
   update(key: string, value: unknown): Promise<void>;
 }
 
+export const MAX_EXTRA_SERVER_PORTS = 16;
+
+/** Whole port numbers 1 to 65535, each once, at most {@link MAX_EXTRA_SERVER_PORTS}. */
+export function normalizeServerPorts(raw: unknown): number[] {
+  if (!Array.isArray(raw)) return [];
+  const out: number[] = [];
+  for (const v of raw) {
+    const n = typeof v === "string" && v.trim() !== "" ? Number(v.trim()) : v;
+    if (typeof n === "number" && Number.isInteger(n) && n > 0 && n < 65536 && !out.includes(n)) out.push(n);
+    if (out.length >= MAX_EXTRA_SERVER_PORTS) break;
+  }
+  return out;
+}
+
+/** Parse what a person types, e.g. "8001, 9000 9100". Returns the ports, or the first entry that is not one. */
+export function parseServerPortList(text: string): { ports: number[] } | { invalid: string } {
+  const parts = text.split(/[\s,;]+/).filter(Boolean);
+  for (const p of parts) {
+    const n = Number(p);
+    if (!/^\d+$/.test(p) || n < 1 || n > 65535) return { invalid: p };
+  }
+  return { ports: normalizeServerPorts(parts.map(Number)) };
+}
+
 function normalizePreferences(raw: Partial<AppPreferences> | undefined): AppPreferences {
   const src = raw || {};
   const str = (value: unknown, fallback: string): string =>
@@ -177,6 +207,7 @@ function normalizePreferences(raw: Partial<AppPreferences> | undefined): AppPref
     extraModelDirs: Array.isArray(src.extraModelDirs)
       ? src.extraModelDirs.filter((d): d is string => typeof d === "string")
       : [],
+    extraServerPorts: normalizeServerPorts(src.extraServerPorts),
     hfToken: str(src.hfToken, ""),
     autoStart: src.autoStart === true,
     backend: str(src.backend, DEFAULT_APP_PREFERENCES.backend) || DEFAULT_APP_PREFERENCES.backend,

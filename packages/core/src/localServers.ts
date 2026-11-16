@@ -22,7 +22,7 @@ export interface DiscoveredLlamaServer {
   pid?: number;
   /** Sidebar wording. Only llama-server may be adopted or stopped; the others are separate apps. */
   name: "llama-server" | "llamafile" | "Strata" | "BigMoeOnEdge" | "Project Maya" | "RustingStrata"
-    | "Ollama" | "LM Studio" | "vLLM" | "SGLang" | "TabbyAPI" | "KoboldCpp";
+    | "Ollama" | "LM Studio" | "vLLM" | "SGLang" | "TabbyAPI" | "KoboldCpp" | "OpenAI-compatible server";
 }
 
 /**
@@ -220,6 +220,19 @@ export const probeLocalTabbyApiServer = (url: string) => modelsOwnedBy(url, "tab
 export async function probeLocalKoboldCppServer(url: string): Promise<boolean> {
   const info = parseJson((await probeGet(url, "/api/extra/version"))?.body);
   return info?.result === "KoboldCpp" && typeof info.version === "string";
+}
+
+/**
+ * Any OpenAI-compatible server: GET /v1/models lists models with ids. Used only
+ * on ports the person asked to be checked. A refusal for a missing key also
+ * counts there, so a server with a key can still be offered and connected to.
+ */
+export async function probeLocalOpenAiCompatibleServer(url: string): Promise<boolean> {
+  const res = await probeGet(url, "/v1/models");
+  if (!res) return false;
+  if (res.status === 401 || res.status === 403) return true;
+  const list = parseJson(res.body);
+  return res.status === 200 && Array.isArray(list?.data) && list.data.every((m: any) => typeof m?.id === "string");
 }
 
 /** Identify Strata without process access (notably python.exe on Windows). */
@@ -467,7 +480,8 @@ const OTHER_HTTP_PROBES: ReadonlyArray<{
 
 /** Process discovery plus public health probes, without blocking the event loop. */
 export async function discoverLoopbackLlamaServersOnThisMachineAsync(
-  skipPids: readonly number[] = []
+  skipPids: readonly number[] = [],
+  extraPorts: readonly number[] = []
 ): Promise<DiscoveredLlamaServer[]> {
   const [sockets, strata, others] = await Promise.all([
     runStepsAsync(listListeningSockets()),
@@ -480,6 +494,16 @@ export async function discoverLoopbackLlamaServersOnThisMachineAsync(
       return await probe(url) ? { url, port, name } : undefined;
     }))),
   ]);
+  // Ports the person added: name a known server where its reply says which, else any OpenAI-compatible one.
+  const extra = await Promise.all(extraPorts.map(async (port) => {
+    const url = `http://127.0.0.1:${port}`;
+    for (const { name, probe } of OTHER_HTTP_PROBES) {
+      if (await probe(url)) return { url, port, name };
+    }
+    if (await probeLocalStrataServer(url)) return { url, port, name: "Strata" as const };
+    return await probeLocalOpenAiCompatibleServer(url)
+      ? { url, port, name: "OpenAI-compatible server" as const } : undefined;
+  }));
   const commandLines = new Map<number, string | undefined>();
   for (const pid of new Set((sockets || []).map((sock) => sock.pid))) {
     if (!skipPids.includes(pid)) {
@@ -510,7 +534,7 @@ export async function discoverLoopbackLlamaServersOnThisMachineAsync(
   }
   // HTTP probes find these servers where process names are hidden (another user, a sandbox).
   // A port is listed once: what the process scan or Strata's probe found there wins.
-  for (const server of others) {
+  for (const server of [...others, ...extra]) {
     if (!server || found.some((s) => s.port === server.port)) continue;
     if ((sockets ?? []).some((s) => s.port === server.port && skipPids.includes(s.pid))) continue;
     found.push(server);

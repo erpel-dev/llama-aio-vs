@@ -58,6 +58,7 @@ import { PerfStats } from "@llama-aio/core";
 import { LaunchToken, LAUNCH_IN_PROGRESS_MSG, ProcessManager } from "@llama-aio/core";
 import { SettingsStore } from "@llama-aio/core";
 import { resolveLaunchMode } from "@llama-aio/core";
+import { parseServerPortList } from "@llama-aio/core";
 import { checkLoraAdapter, modelLineage, type LoraAdapterSetting } from "@llama-aio/core";
 import { BUILTIN_CHAT_TEMPLATES, capsMissDefaultSwaPattern, chatTemplateFileProblem, COMMON_CHAT_TEMPLATES, DEFAULT_LOAD_SETTINGS, DEFAULT_REQUEST_SETTINGS, effectiveServerUiState, isQwen4expArchitecture, LlamaLoadSettings, normalizeSpeculativeMode, RequestSettings } from "@llama-aio/core";
 import { isDflashDraftArchitecture, recommendedMaxDraftTokens, speculativeUsesMtp, speculativeUsesNgram } from "@llama-aio/core";
@@ -574,6 +575,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             if (!this.store.isRemote()) await this.store.updateLoadSettings({ plePath: "" });
             await this.pushState();
             break;
+          case "extraServerPorts":
+            await this.editExtraServerPorts();
+            break;
           case "pickLora":
             await this.pickLora();
             break;
@@ -1015,7 +1019,8 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     }
     if (!this.localServerScanRun) {
       const skip = status.ownedByThisExtension && status.pid ? [status.pid] : [];
-      this.localServerScanRun = discoverLoopbackLlamaServersOnThisMachineAsync(skip)
+      const extraPorts = this.store.getConfig().get<number[]>("extraServerPorts") || [];
+      this.localServerScanRun = discoverLoopbackLlamaServersOnThisMachineAsync(skip, extraPorts)
         .catch(() => [])
         .then((servers) => {
           this.localServerScan = { at: Date.now(), servers };
@@ -1554,6 +1559,32 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       builtIn: caps?.builtInAdapters ?? null,
       lineage: modelLineage(caps) ?? null,
     };
+  }
+
+  /** Ask which extra loopback ports to look on for servers, save them, and look again at once. */
+  async editExtraServerPorts(): Promise<void> {
+    const current = this.store.getConfig().get<number[]>("extraServerPorts") || [];
+    const text = await vscode.window.showInputBox({
+      title: "Look for servers on more ports",
+      prompt: "Ports on this machine to check for an OpenAI-compatible server, besides the known defaults. " +
+        "Separate them with commas or spaces. Leave empty to check only the defaults.",
+      placeHolder: "8001, 9000",
+      value: current.join(", "),
+      ignoreFocusOut: true,
+      validateInput: (value) => {
+        const parsed = parseServerPortList(value);
+        return "invalid" in parsed ? `"${parsed.invalid}" is not a port number (1 to 65535).` : undefined;
+      },
+    });
+    if (text === undefined) return;
+    const parsed = parseServerPortList(text);
+    if ("invalid" in parsed) return;
+    await this.store.getConfig().update("extraServerPorts", parsed.ports);
+    this.localServerScan = undefined;
+    await this.pushState();
+    void vscode.window.showInformationMessage(parsed.ports.length
+      ? `Llama AIO also looks for servers on port${parsed.ports.length === 1 ? "" : "s"} ${parsed.ports.join(", ")}.`
+      : "Llama AIO looks for servers on the known default ports only.");
   }
 
   /** Add LoRA adapter files to the selected model. The file list applies on reload. */

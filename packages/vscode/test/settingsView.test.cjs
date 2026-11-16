@@ -29,6 +29,7 @@ require.cache.vscode = {
       showInformationMessage: async () => undefined,
       showErrorMessage: async () => undefined,
       showOpenDialog: async () => undefined,
+      showInputBox: async () => undefined,
       withProgress: async (_o, fn) => fn({ report() {} }),
       // Advanced settings tab: a fake panel whose messages tests can drive.
       createWebviewPanel: () => {
@@ -728,5 +729,24 @@ describe("LoRA adapter controls", () => {
     await assert.rejects(setup().provider.pickLora(), /no --lora option/);
     await assert.rejects(setup({}, { state: "ready" }).provider.pickLora(), /remote server/);
     assert.equal(dialog.mock.callCount(), calls);
+  });
+});
+
+describe("more ports to look on", () => {
+  it("saves typed ports from the sidebar link and looks again", async t => {
+    const vs = require("vscode").window;
+    let asked;
+    t.mock.method(vs, "showInputBox", async (o) => { asked = o; return "9000, 8001 9000"; });
+    const ui = setup();
+    await ui.send({ type: "extraServerPorts" });
+    assert.deepEqual(ui.provider.store.getConfig().get("extraServerPorts"), [9000, 8001]);
+    assert.equal(asked.validateInput("8001, x"), '"x" is not a port number (1 to 65535).');
+    assert.equal(asked.validateInput("8001"), undefined);
+    t.mock.method(vs, "showInputBox", async () => undefined);
+    await ui.send({ type: "extraServerPorts" });
+    assert.deepEqual(ui.provider.store.getConfig().get("extraServerPorts"), [9000, 8001], "cancel keeps the list");
+    t.mock.method(vs, "showInputBox", async () => "");
+    await ui.send({ type: "extraServerPorts" });
+    assert.deepEqual(ui.provider.store.getConfig().get("extraServerPorts"), []);
   });
 });
