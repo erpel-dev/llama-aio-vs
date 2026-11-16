@@ -21,7 +21,7 @@ export interface DiscoveredLlamaServer {
   /** Unknown when discovered through Strata's public health endpoint. */
   pid?: number;
   /** Sidebar wording. Only llama-server may be adopted or stopped; the others are separate apps. */
-  name: "llama-server" | "Strata" | "BigMoeOnEdge";
+  name: "llama-server" | "Strata" | "BigMoeOnEdge" | "Project Maya" | "RustingStrata";
 }
 
 /**
@@ -69,6 +69,10 @@ export function localListenerName(commandLine: string | undefined): DiscoveredLl
   if (/(^|[^\w-])bmoe-server(\.exe)?([^\w-]|$)/.test(cmd)) {
     return "BigMoeOnEdge";
   }
+  // The Cargo binary is `rustingstrata`. Checked before Strata, whose own pattern needs "strata" as a whole word.
+  if (/(^|[^\w-])rustingstrata(\.exe)?([^\w-]|$)/.test(cmd)) {
+    return "RustingStrata";
+  }
   const role = strataListenerRole(commandLine);
   return role === "internal" ? undefined : role ? "Strata" : undefined;
 }
@@ -102,6 +106,51 @@ export async function probeLocalBigMoeOnEdgeServer(url: string): Promise<boolean
     return res.statusCode === 200 && !!info && typeof info === "object" && typeof info.version === "string"
       && typeof info.planner_available === "boolean" && typeof info.overlap_available === "boolean"
       && typeof info.state === "string";
+  } catch {
+    return false;
+  }
+}
+
+/** Project Maya's launcher (maya.py) serves its API on 8080; serve/server.py alone defaults to 8095. */
+export const PROJECT_MAYA_DEFAULT_PORTS = [8080, 8095] as const;
+
+/**
+ * Identify Project Maya. Its public /health carries a `model_label` and the
+ * refusal-ablation state (`ablate`) next to its version; it does not name a
+ * `service`, which is how it differs from Strata and PolyStrata.
+ */
+export async function probeLocalProjectMayaServer(url: string): Promise<boolean> {
+  try {
+    if (!isLoopbackHost(new URL(url).hostname)) return false;
+    const health = await serverJson<Record<string, unknown>>(`${url}/health`,
+      { apiKey: "", timeoutMs: 750, signal: AbortSignal.timeout(750) });
+    return !!health && typeof health.version === "string" && "model_label" in health && "ablate" in health
+      && "history_thinking" in health && !("service" in health);
+  } catch {
+    return false;
+  }
+}
+
+/** RustingStrata's default listen address (src/main.rs: 127.0.0.1:8080). */
+export const RUSTINGSTRATA_DEFAULT_PORTS = [8080] as const;
+
+/**
+ * Identify RustingStrata. Its /health needs no key: with a model loaded it
+ * reports exactly status, waiting and slots; without one it answers 503 with
+ * "no model" or "loading".
+ */
+export async function probeLocalRustingStrataServer(url: string): Promise<boolean> {
+  try {
+    if (!isLoopbackHost(new URL(url).hostname)) return false;
+    const res = await serverRequest(`${url}/health`, { apiKey: "", timeoutMs: 750, signal: AbortSignal.timeout(750) });
+    const health = JSON.parse(await readBody(res, 16 * 1024));
+    if (!health || typeof health !== "object" || Array.isArray(health)) return false;
+    const keys = Object.keys(health).sort().join(",");
+    if (res.statusCode === 200) {
+      return keys === "slots,status,waiting" && health.status === "ok"
+        && Number.isInteger(health.waiting) && Number.isInteger(health.slots);
+    }
+    return res.statusCode === 503 && keys === "status" && (health.status === "no model" || health.status === "loading");
   } catch {
     return false;
   }
@@ -329,20 +378,35 @@ export function discoverLoopbackLlamaServersOnThisMachine(skipPids: readonly num
   });
 }
 
-/** Process discovery plus public Strata health probes, without blocking the event loop. */
+/**
+ * Servers recognised by their own public replies on their default ports. Each
+ * probe checks a reply only that program gives, so another server on a shared
+ * port such as 8080 is not mistaken for it.
+ */
+const OTHER_HTTP_PROBES: ReadonlyArray<{
+  name: DiscoveredLlamaServer["name"];
+  ports: readonly number[];
+  probe: (url: string) => Promise<boolean>;
+}> = [
+  { name: "BigMoeOnEdge", ports: BIGMOEONEDGE_DEFAULT_PORTS, probe: probeLocalBigMoeOnEdgeServer },
+  { name: "Project Maya", ports: PROJECT_MAYA_DEFAULT_PORTS, probe: probeLocalProjectMayaServer },
+  { name: "RustingStrata", ports: RUSTINGSTRATA_DEFAULT_PORTS, probe: probeLocalRustingStrataServer },
+];
+
+/** Process discovery plus public health probes, without blocking the event loop. */
 export async function discoverLoopbackLlamaServersOnThisMachineAsync(
   skipPids: readonly number[] = []
 ): Promise<DiscoveredLlamaServer[]> {
-  const [sockets, strata, bmoe] = await Promise.all([
+  const [sockets, strata, others] = await Promise.all([
     runStepsAsync(listListeningSockets()),
     Promise.all(STRATA_DEFAULT_PORTS.map(async (port) => {
       const url = `http://127.0.0.1:${port}`;
       return await probeLocalStrataServer(url) ? { url, port, name: "Strata" as const } : undefined;
     })),
-    Promise.all(BIGMOEONEDGE_DEFAULT_PORTS.map(async (port) => {
+    Promise.all(OTHER_HTTP_PROBES.flatMap(({ name, ports, probe }) => ports.map(async (port) => {
       const url = `http://127.0.0.1:${port}`;
-      return await probeLocalBigMoeOnEdgeServer(url) ? { url, port, name: "BigMoeOnEdge" as const } : undefined;
-    })),
+      return await probe(url) ? { url, port, name } : undefined;
+    }))),
   ]);
   const commandLines = new Map<number, string | undefined>();
   for (const pid of new Set((sockets || []).map((sock) => sock.pid))) {
@@ -372,8 +436,9 @@ export async function discoverLoopbackLlamaServersOnThisMachineAsync(
       found.push(server);
     }
   }
-  // The HTTP probe finds bmoe-server where process names are hidden (another user, a sandbox).
-  for (const server of bmoe) {
+  // HTTP probes find these servers where process names are hidden (another user, a sandbox).
+  // A port is listed once: what the process scan or Strata's probe found there wins.
+  for (const server of others) {
     if (!server || found.some((s) => s.port === server.port)) continue;
     if ((sockets ?? []).some((s) => s.port === server.port && skipPids.includes(s.pid))) continue;
     found.push(server);

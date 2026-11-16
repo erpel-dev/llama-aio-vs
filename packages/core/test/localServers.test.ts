@@ -9,6 +9,8 @@ import {
   parseNetstatListeners,
   parseSsListeners,
   probeLocalBigMoeOnEdgeServer,
+  probeLocalProjectMayaServer,
+  probeLocalRustingStrataServer,
   probeLocalStrataServer,
   strataListenerRole,
 } from "../src/localServers";
@@ -82,6 +84,9 @@ describe("discoverLoopbackLlamaServers", () => {
     assert.equal(localListenerName("C:\\Program Files\\BigMoeOnEdge\\bmoe-server.exe --port 8765"), "BigMoeOnEdge");
     assert.equal(localListenerName("/Applications/BigMoeOnEdge.app/Contents/MacOS/bmoe-desktop"), undefined, "the app window does not serve the API");
     assert.equal(localListenerName("/x/bmoe-server-tests --gtest"), undefined);
+    assert.equal(localListenerName("/home/me/RustingStrata/target/release/rustingstrata serve model.gguf"), "RustingStrata");
+    assert.equal(localListenerName("C:\\tools\\rustingstrata.exe"), "RustingStrata");
+    assert.equal(strataListenerRole("/home/me/RustingStrata/target/release/rustingstrata"), undefined, "not Strata itself");
   });
 
   it("discovers the new default port and custom ports without a --port argument", () => {
@@ -275,5 +280,64 @@ describe("BigMoeOnEdge discovery without process metadata", () => {
   it("does not probe non-loopback hosts or invalid URLs", async () => {
     assert.equal(await probeLocalBigMoeOnEdgeServer("http://192.0.2.1:8765"), false);
     assert.equal(await probeLocalBigMoeOnEdgeServer("invalid"), false);
+  });
+});
+
+/** Serve one canned reply per path on loopback and run `fn` against its URL. */
+async function withReplies(replies: Record<string, [number, string]>, fn: (url: string) => Promise<void>) {
+  setServerApiKeyProvider(() => "private-key-for-another-server");
+  const server = createServer((req, res) => {
+    assert.equal(req.headers.authorization, undefined, "never sends the managed server's key");
+    const [status, body] = replies[req.url || ""] ?? [404, "{}"];
+    res.writeHead(status, { "content-type": "application/json" });
+    res.end(body);
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const addr = server.address();
+    assert.ok(addr && typeof addr !== "string");
+    await fn(`http://127.0.0.1:${addr.port}`);
+  } finally {
+    setServerApiKeyProvider(undefined);
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+}
+
+describe("Project Maya and RustingStrata discovery without process metadata", () => {
+  // Project Maya serve/server.py /health (v1.1.65); PolyStrata and Strata answer with service: "strata".
+  const maya = { status: "ok", max_context: 131072, model: "glm-5.3-flash", max_text_file: 1, model_label: "GLM-5.3-Flash · Maya-S24",
+    images: false, api_key: false, defaults: {}, videos: false, version: "1.1.65", mcp_tools: false, unloaded: false,
+    history_thinking: true, ablate: null };
+  const polystrata = { status: "ok", max_context: 131072, model: "qwen3.8", images: false, api_key: false,
+    image_generation: false, api_monitor: false, loaded: true, service: "strata" };
+  const mayaCases: Array<[string, Record<string, [number, string]>, boolean]> = [
+    ["Project Maya's /health", { "/health": [200, JSON.stringify(maya)] }, true],
+    ["PolyStrata's /health", { "/health": [200, JSON.stringify(polystrata)] }, false],
+    ["llama-server's /health", { "/health": [200, '{"status":"ok"}'] }, false],
+    ["a page", { "/health": [200, "<html></html>"] }, false],
+  ];
+  for (const [what, replies, expected] of mayaCases) {
+    it(`Project Maya: ${expected ? "identifies" : "ignores"} ${what}`, () =>
+      withReplies(replies, async (url) => assert.equal(await probeLocalProjectMayaServer(url), expected)));
+  }
+
+  // RustingStrata src/main.rs /health (v1.2.4).
+  const rustCases: Array<[string, Record<string, [number, string]>, boolean]> = [
+    ["a loaded model", { "/health": [200, '{"status":"ok","waiting":0,"slots":1}'] }, true],
+    ["no model", { "/health": [503, '{"status":"no model"}'] }, true],
+    ["a model loading", { "/health": [503, '{"status":"loading"}'] }, true],
+    ["llama-server ready", { "/health": [200, '{"status":"ok"}'] }, false],
+    ["llama-server loading", { "/health": [503, '{"error":{"code":503,"message":"Loading model","type":"unavailable_error"}}'] }, false],
+    ["extra fields", { "/health": [200, '{"status":"ok","waiting":0,"slots":1,"service":"strata"}'] }, false],
+    ["Project Maya", { "/health": [200, JSON.stringify(maya)] }, false],
+  ];
+  for (const [what, replies, expected] of rustCases) {
+    it(`RustingStrata: ${expected ? "identifies" : "ignores"} ${what}`, () =>
+      withReplies(replies, async (url) => assert.equal(await probeLocalRustingStrataServer(url), expected)));
+  }
+
+  it("does not probe non-loopback hosts", async () => {
+    assert.equal(await probeLocalProjectMayaServer("http://192.0.2.1:8080"), false);
+    assert.equal(await probeLocalRustingStrataServer("http://192.0.2.1:8080"), false);
   });
 });
