@@ -246,7 +246,12 @@ function setup(loadOverrides = {}, remoteInfo, serverFeatures = core.NO_SERVER_F
     isHttpReady: async () => true,
     resolveBinary: () => "",
     getServerFeatures: async () => ({ ...serverFeatures }),
-    applyLoraScales: async () => { if (opts.loraFails) throw new Error("server said no"); loraApplied.push(JSON.parse(JSON.stringify(state.loadSettings.loraAdapters || []))); },
+    applyLoraScales: async () => {
+      if (opts.loraFails) throw new Error("server said no");
+      const wanted = state.loadSettings.loraAdapters || [];
+      loraApplied.push(JSON.parse(JSON.stringify(wanted)));
+      launched.loadSettings.loraAdapters = launched.loadSettings.loraAdapters.map(a => wanted.find(w => w.path === a.path) ?? a);
+    },
     isCpuBackend: () => !!opts.cpu,
     effectiveLaunchMode: () => config.get("launchMode") === "background" ? "background" : "externalTerminal",
     launchModeFallbackReason: () => undefined,
@@ -707,7 +712,8 @@ describe("LoRA adapter controls", () => {
       { key: "loraAdapters", label: "LoRA adapters", from: "a.gguf", to: "none" },
     ]);
     await ui.send({ type: "discardChanges" });
-    assert.deepEqual(ui.getState().loadSettings.loraAdapters, saved);
+    assert.deepEqual(ui.getState().loadSettings.loraAdapters, [{ path: "/l/a.gguf", scale: 0.4, enabled: false }]);
+    assert.deepEqual(ui.loraApplied.at(-1), [], "Discard should not reapply launch-time strengths");
   });
   it("undoes a change the running server did not take, and says so", async t => {
     const errors = t.mock.method(require("vscode").window, "showErrorMessage", async () => undefined);

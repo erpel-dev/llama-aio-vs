@@ -13,6 +13,7 @@ describe("applying LoRA strengths to the running server", () => {
   let adapters: Array<{ id: number; path: string; scale: number }> = [];
   let posts: unknown[] = [];
   let failPost = false;
+  let holdNextGet: ((reply: () => void) => void) | undefined;
 
   before(async () => {
     server = http.createServer((req, res) => {
@@ -27,7 +28,11 @@ describe("applying LoRA strengths to the running server", () => {
           adapters = adapters.map(a => ({ ...a, scale: wanted.find(w => w.id === a.id)?.scale ?? 0 }));
           res.end(JSON.stringify({ success: true }));
         } else {
-          res.end(JSON.stringify(adapters));
+          const hold = holdNextGet;
+          holdNextGet = undefined;
+          const reply = () => res.end(JSON.stringify(adapters));
+          if (hold) hold(reply);
+          else reply();
         }
       });
     });
@@ -40,7 +45,7 @@ describe("applying LoRA strengths to the running server", () => {
     const store = {
       isRemote: () => false,
       getEndpoint: () => endpoint,
-      getState: () => ({ selectedModelPath: "/m/model.gguf", loadSettings: loadSettings({ loraAdapters: wanted }) }),
+      getState: () => ({ selectedModelPath: "/m/model.gguf", loadSettings: loadSettings({ loraAdapters: [...wanted] }) }),
     };
     const pm = new ProcessManager(store as never);
     const stopped: boolean[] = [];
@@ -59,6 +64,35 @@ describe("applying LoRA strengths to the running server", () => {
     const { pm } = manager([a, { ...b, enabled: false }], [a, { ...b, enabled: false }]);
     await pm.applyLoraScales();
     assert.deepEqual(posts, [[{ id: 0, scale: 0.8 }, { id: 1, scale: 0 }]]);
+  });
+
+  it("applies overlapping edits in order and records the final live strength for Discard", async () => {
+    const wanted = [{ ...a, scale: 0.2 }];
+    const { pm } = manager([a], wanted);
+    const store = (pm as unknown as { store: { getState(): unknown } }).store;
+    const getState = store.getState;
+    let snapshots = 0;
+    store.getState = () => { snapshots++; return getState(); };
+    let lock = { modelPath: "/m/model.gguf", startedAt: "", loadSettings: loadSettings({ loraAdapters: [a] }) };
+    Object.assign(pm, {
+      getLaunchedConfig: () => lock,
+      readLock: () => lock,
+      lockPidIsOurs: () => true,
+      writeLock: (value: typeof lock) => { lock = value; },
+    });
+    const pendingGet = new Promise<() => void>(resolve => { holdNextGet = resolve; });
+    const first = pm.applyLoraScales();
+    const reply = await pendingGet;
+    wanted[0] = { ...a, scale: 0.8 };
+    const second = pm.applyLoraScales();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    const snapshotsBeforeRelease = snapshots;
+    reply();
+    await Promise.all([first, second]);
+    assert.equal(snapshotsBeforeRelease, 1, "the second edit must wait for the first POST");
+    assert.deepEqual(posts, [[{ id: 0, scale: 0.2 }], [{ id: 0, scale: 0.8 }]]);
+    assert.equal(adapters[0].scale, 0.8);
+    assert.equal(lock.loadSettings.loraAdapters[0].scale, 0.8);
   });
 
   it("still reaches the server when an added file waits for a reload", async () => {
