@@ -82,9 +82,6 @@ export function localListenerName(commandLine: string | undefined): DiscoveredLl
   return role === "internal" ? undefined : role ? "Strata" : undefined;
 }
 
-/** How many suggestions the sidebar shows. */
-export const MAX_DISCOVERED_SERVERS = 3;
-
 /** Desktop host, standalone server, launcher, and source-run host defaults. */
 export const STRATA_DEFAULT_PORTS = [47831, 8095, 8080, 8791] as const;
 
@@ -431,8 +428,7 @@ export function discoverLoopbackLlamaServers(opts: {
     byProcess.set(`${server.pid}:${server.port}`, server);
   }
   return [...byProcess.values()]
-    .sort((a, b) => a.port - b.port || (a.pid ?? 0) - (b.pid ?? 0))
-    .slice(0, MAX_DISCOVERED_SERVERS);
+    .sort((a, b) => a.port - b.port || (a.pid ?? 0) - (b.pid ?? 0));
 }
 
 function* listListeningSockets(): ExecSteps<ListeningSocket[] | undefined> {
@@ -554,5 +550,5 @@ export async function discoverLoopbackLlamaServersOnThisMachineAsync(
     if ((sockets ?? []).some((s) => s.port === server.port && skipPids.includes(s.pid))) continue;
     found.push(server);
   }
-  return found.slice(0, MAX_DISCOVERED_SERVERS);
+  return found;
 }

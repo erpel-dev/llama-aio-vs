@@ -27,6 +27,7 @@ export type ToHostMessage =
   | { type: "estimate"; seq: number; payload: SettingsPatch; cpuOnly?: boolean }
   | { type: "applyLoadPatch"; payload: SettingsPatch; fitContext?: boolean; cpuOnly?: boolean }
   | { type: "discardChanges" }
+  | { type: "discardAttachments"; payload?: ViewModel }
   // Model, draft, projector, template pickers
   | { type: "downloadStarter" }
   | { type: "openModelFile" }
@@ -36,7 +37,7 @@ export type ToHostMessage =
   | { type: "clearMmproj" }
   | { type: "pickPle" }
   | { type: "clearPle" }
-  | { type: "extraServerPorts" }
+  | { type: "extraServerPorts"; requestId?: number }
   | { type: "pickLora" }
   | { type: "removeLora"; path: string }
   | { type: "setLora"; path: string; scale?: number; enabled?: boolean }
@@ -58,7 +59,7 @@ export type ToHostMessage =
   | { type: "setDuplicateToolCallGuardEnabled"; payload: { enabled: boolean } }
   // Remote server
   | { type: "refreshRemote" }
-  | { type: "testRemote"; url: string; apiKey?: string }
+  | { type: "testRemote"; url: string; apiKey?: string; requestId: number }
   | { type: "connectRemote"; url: string; label?: string; apiKey?: string }
   | { type: "switchToLocal" }
   | { type: "setApiKey" }
@@ -139,7 +140,8 @@ export type ToWebviewMessage =
   | { type: "advancedPanel"; open: boolean }
   | { type: "testResult"; status: "running" | "done" | "error" | "cancelled"; text?: string; error?: string; ms?: number }
   | { type: "remoteConnected" }
-  | { type: "remoteProbe"; payload?: ViewModel; error?: string }
+  | { type: "remoteProbe"; requestId: number; payload?: ViewModel; error?: string; label?: string }
+  | { type: "connectScan"; requestId?: number; servers: ViewModel[] }
   | {
       type: "focusLibrary";
       filter?: boolean;
@@ -188,7 +190,9 @@ export type ToWebviewMessage =
       modelId: string;
       companionOnly: boolean;
       companionHint: string;
-      files: Array<{ path: string; label: string; detail: string; fit?: "fits" | "tight" | "wont-fit"; needLabel?: string; capacityLabel?: string }>;
+      capacityLabel?: string;
+      usesRam?: boolean;
+      files: Array<{ path: string; label: string; detail: string; fit?: "fits" | "tight" | "wont-fit"; needLabel?: string }>;
     };
 
 export type ToWebviewType = ToWebviewMessage["type"];

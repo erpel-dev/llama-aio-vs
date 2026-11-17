@@ -214,7 +214,7 @@ export interface RemoteFitEstimate {
  * estimate; the exact verdict comes from the Memory card after download.
  */
 export function estimateRemoteFit(fileBytes: number, capacityBytes: number): RemoteFitEstimate | undefined {
-  if (!(fileBytes > 0) || !(capacityBytes > 0)) {
+  if (!(fileBytes > 0) || !Number.isFinite(capacityBytes) || capacityBytes < 0) {
     return undefined;
   }
   const needBytes = fileBytes + Math.max(1024 ** 3, fileBytes * 0.1);

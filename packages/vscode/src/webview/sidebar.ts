@@ -92,8 +92,9 @@ function loadChanges() {
 let sawCompletedReply = false;
 /** Whether the Get started checklist is showing (it then owns the next action). */
 let setupVisible = false;
-/** Result of the Get started test message, kept until the user clicks Done. */
+/** The test composer or its most recent result, kept until the user clicks Done. */
 let testState = null;
+let testDismissed = false;
 let lastMemoryView = null;
 let loadDefaults = {};
 /** "Custom" GPU layers stays open while the user works with the slider. */
@@ -105,28 +106,35 @@ let remoteInfo = null;
 let remoteHint = '';
 let nextRetryAt = 0;
 let probeTimer = null;
+let probeRequestId = 0;
+let renderedServers = '';
+let renderedLoraRows = '';
+const submittedLoraEdits = new Set<number>();
+let explicitConnectServers = null;
+let connectScanRequestId = 0;
 
 
 function setConnectOpen(open, prefill?) {
   connectOpen = !!open;
+  if (!connectOpen) {
+    explicitConnectServers = null;
+    connectScanRequestId++;
+  }
   document.body.classList.toggle('connect-open', connectOpen);
   const form = $('connectForm');
   if (form) form.classList.toggle('hidden', !connectOpen);
   if (connectOpen && prefill) {
-    const url = $('remoteUrlInput');
-    const label = $('remoteLabelInput');
-    if (url && prefill.url && document.activeElement !== url) url.value = prefill.url;
-    if (label && prefill.label != null && document.activeElement !== label) label.value = prefill.label;
+    $('remoteUrlInput').value = prefill.url || '';
+    $('remoteLabelInput').value = prefill.label || '';
+    $('remoteKeyInput').value = '';
   }
   const card = $('remoteModelCard');
   if (card) card.classList.toggle('hidden', !remoteMode || connectOpen);
-  if (!connectOpen) {
-    const list = $('probeList');
-    if (list) list.textContent = '';
-  }
+  renderFoundServers();
+  scheduleProbe();
 }
 
-function renderProbeList(info, error) {
+function renderProbeList(info, error, label) {
   const list = $('probeList');
   if (!list) return;
   list.textContent = '';
@@ -136,6 +144,11 @@ function renderProbeList(info, error) {
     row.textContent = error;
     list.appendChild(row);
     return;
+  }
+  if (label) {
+    const status = document.createElement('strong');
+    status.textContent = label;
+    list.appendChild(status);
   }
   const probes = (info && info.probes) || [];
   probes.forEach(function (p) {
@@ -455,37 +468,58 @@ function setServerCardKind(kind) {
 
 function listenHost(url) {
   try {
-    const u = new URL(url);
-    const host = u.hostname.indexOf(':') >= 0 ? '[' + u.hostname + ']' : u.hostname;
-    return host + ':' + (u.port || '');
+    return new URL(url).host;
   } catch (e) {
     return String(url || '');
   }
 }
 
 function renderFoundServers() {
+  const automatic = !remoteMode && !serverRunning && !serverStarting;
+  const explicit = connectOpen ? explicitConnectServers : null;
+  const servers = (explicit ?? (automatic ? foundServers : [])).filter(srv => srv?.url);
+  const status = $('connectScanStatus');
+  status.textContent = explicit && !servers.length ? 'No local servers found.' : '';
+  status.classList.toggle('hidden', !status.textContent);
   const box = $('foundServers');
-  if (!box) return;
-  const show = !remoteMode && !connectOpen && !serverRunning && !serverStarting && foundServers.length;
-  box.classList.toggle('hidden', !show);
-  box.textContent = '';
-  if (!show) return;
-  foundServers.forEach(function (srv) {
-    if (!srv || !srv.url) return;
+  box.classList.toggle('hidden', !servers.length);
+  const home = $(connectOpen ? 'connectServers' : 'foundServersHome');
+  if (box.parentElement !== home) home.appendChild(box);
+
+  // Keep focus and disclosure state when polling returns the same results.
+  const key = JSON.stringify(servers.map(srv => [srv.name, srv.url]));
+  if (key === renderedServers) return;
+  renderedServers = key;
+  const shown = $('foundServersList');
+  const extra = $('foundServersExtra');
+  const more = $('foundServersMore');
+  shown.replaceChildren();
+  extra.replaceChildren();
+  const previewCount = 2;
+  more.classList.toggle('hidden', servers.length <= previewCount);
+  const remaining = servers.length - previewCount;
+  $('foundServersMoreLabel').textContent = remaining > 0 ? remaining + ' more local server' + (remaining === 1 ? '' : 's') : '';
+  servers.forEach(function (srv, i) {
     const row = document.createElement('div');
     row.className = 'found-server';
-    const text = document.createElement('span');
-    text.textContent = (srv.name || 'llama-server') + ' is listening on ' + listenHost(srv.url);
+    const text = document.createElement('div');
+    const name = document.createElement('strong');
+    name.textContent = srv.name || 'llama-server';
+    const address = document.createElement('div');
+    address.className = 'found-address';
+    address.textContent = listenHost(srv.url);
+    text.append(name, address);
     const btn = document.createElement('button');
     btn.type = 'button';
-    btn.className = 'secondary';
-    btn.textContent = 'Connect';
+    btn.className = 'secondary small';
+    btn.textContent = 'Use';
+    btn.setAttribute('aria-label', 'Use ' + name.textContent + ' at ' + address.textContent);
     btn.addEventListener('click', function () {
-      vscode.postMessage({ type: 'connectRemote', url: srv.url, label: 'localhost', apiKey: '' });
+      openConnectForm({ url: srv.url, label: 'localhost' }, true);
+      $('remoteUrlInput').focus();
     });
-    row.appendChild(text);
-    row.appendChild(btn);
-    box.appendChild(row);
+    row.append(text, btn);
+    (i < previewCount ? shown : extra).appendChild(row);
   });
 }
 
@@ -666,12 +700,13 @@ function renderSetup() {
   const testing = !!(testState && testState.status === 'running');
   if (testing) {
     steps.try = { state: 'busy', detail: 'Waiting for the reply…' };
-  } else if (st.tried) {
-    steps.try = { state: 'done', detail: testState && testState.status === 'done' ? 'The model answered. Use it where you like:' : '' };
-  } else if (serverRunning) {
+  } else if (testState?.status === 'done') {
+    steps.try = { state: 'done', detail: 'The model answered.' };
+  } else if (serverRunning && (testState || !st.tried)) {
     steps.try = { state: 'now', detail: 'Send a test message to check that the model answers.' };
+  } else if (st.tried && !testState) {
+    steps.try = { state: 'done', detail: '' };
   }
-  renderSetupTest(serverRunning && (!st.tried || !!testState));
 
   const order = ['runtime', 'model', 'start', 'try'];
   const ids = { runtime: 'stepRuntime', model: 'stepModel', start: 'stepStart', try: 'stepTry' };
@@ -699,7 +734,9 @@ function renderSetup() {
   let action = '';
   let label = '';
   let disabled = false;
-  if (now === 'runtime') {
+  if (testing) {
+    action = 'cancelTest'; label = 'Cancel test';
+  } else if (now === 'runtime') {
     if (st.installFailed) {
       action = 'install'; label = 'Retry install';
       secondary.push(setupButton('installArchive', 'Install from archive…'), setupButton('backend', 'Other backends…'));
@@ -719,15 +756,15 @@ function renderSetup() {
   } else if (now === 'start') {
     action = 'start'; label = 'Start server';
   } else if (now === 'try') {
-    action = 'test'; label = testState && testState.status === 'error' ? 'Try again' : 'Send test message';
+    action = 'test'; label = testState?.status === 'error' ? 'Try again' : 'Send test message';
+    disabled = !$('setupTestInput').value.trim();
     secondary.push(lastPayload.copilotChatAvailable ? setupButton('openChat', 'Open Copilot Chat') : setupButton('webui', 'Open web UI'),
       setupButton('dismiss', 'Skip'));
-  } else if (testing) {
-    action = 'cancelTest'; label = 'Cancel';
-  } else if (st.tried && testState) {
+  } else if (testState?.status === 'done') {
     // Answered: say where to use the model, then let the user close the list.
     if (lastPayload.copilotChatAvailable) { action = 'openChat'; label = 'Open Copilot Chat'; }
     else { action = 'webui'; label = 'Open llama.cpp web UI'; }
+    if (serverRunning) secondary.push(setupButton('composeTest', 'Send another test'));
     secondary.push(setupButton('copyKey', 'Copy API key'), setupButton('copyEndpoint', 'Copy endpoint'), setupButton('dismiss', 'Done'));
   } else {
     // Everything that needs the user is busy (installing / downloading / loading).
@@ -738,35 +775,32 @@ function renderSetup() {
   primary.dataset.action = action;
   primary.textContent = label;
   primary.disabled = disabled;
-  $('setupSecondary').innerHTML = secondary.join('');
+  const secondaryHtml = secondary.join('');
+  if ($('setupSecondary').innerHTML !== secondaryHtml) $('setupSecondary').innerHTML = secondaryHtml;
+  renderSetupTest(action === 'test' || testing);
   const foot = $('setupFoot');
   if (foot) foot.classList.toggle('hidden', st.runtimeOk && st.hasModel);
 }
 
 /** Test box under the last Get started step: input, then the reply or the error. */
-function renderSetupTest(show) {
-  const box = $('setupTest');
-  if (!box) return;
-  box.classList.toggle('hidden', !show);
+function renderSetupTest(showInput) {
   const input = $('setupTestInput');
-  if (input) input.disabled = !!(testState && testState.status === 'running');
   const reply = $('setupTestReply');
-  if (!reply) return;
   const t = testState;
-  reply.classList.toggle('hidden', !t || t.status === 'running');
-  if (!t || t.status === 'running') return;
-  if (t.status === 'done') {
-    const p = lastPerf || {};
-    const bits = ['Worked'];
-    if (typeof p.completionTokens === 'number' && p.completionTokens > 0) bits.push(fmtNum(p.completionTokens) + ' tok' + (p.thinking ? ' incl. thinking' : ''));
-    if (typeof t.ms === 'number') bits.push((t.ms / 1000).toFixed(1) + ' s');
-    const rate = fmtRate(p.genTokPerSec);
-    if (rate) bits.push(rate + ' tok/s');
-    reply.innerHTML = escText(t.text || '(empty reply)') + '<span class="ok">' + escText(bits.join(' · ')) + '</span>';
-  } else if (t.status === 'cancelled') {
-    reply.innerHTML = '<span class="muted">Cancelled.</span>';
-  } else {
+  const hasResult = t && t.status !== 'running' && t.status !== 'editing';
+  $('setupTest').classList.toggle('hidden', !showInput && !hasResult);
+  $('setupTestPrompt').classList.toggle('hidden', !showInput);
+  input.disabled = t?.status === 'running';
+  reply.classList.toggle('hidden', !hasResult);
+  if (t?.status === 'done') {
+    const duration = typeof t.ms === 'number' ? ' · ' + (t.ms / 1000).toFixed(1) + ' s' : '';
+    reply.innerHTML = escText(t.text) + '<span class="ok">Reply received' + duration + '</span>';
+  } else if (t?.status === 'cancelled') {
+    reply.innerHTML = '<span class="muted">Test cancelled.</span>';
+  } else if (t?.status === 'error') {
     reply.innerHTML = '<span class="err">' + escText(t.error || 'The test message failed.') + '</span>';
+  } else {
+    reply.textContent = '';
   }
 }
 
@@ -800,9 +834,15 @@ function runSetupAction(action) {
     launch('start');
   } else if (action === 'openChat') {
     vscode.postMessage({ type: 'openCopilotChat' });
+  } else if (action === 'composeTest') {
+    testState = { status: 'editing' };
+    renderSetup();
+    $('setupTestInput').focus();
   } else if (action === 'test') {
+    if (testState?.status === 'running' || !serverRunning) return;
     const text = (($('setupTestInput') && $('setupTestInput').value) || '').trim();
     if (!text) return;
+    testDismissed = false;
     testState = { status: 'running' };
     renderSetup();
     vscode.postMessage({ type: 'sendTest', text: text });
@@ -815,7 +855,10 @@ function runSetupAction(action) {
   } else if (action === 'copyEndpoint') {
     vscode.postMessage({ type: 'copyText', text: lastEndpoint || (lastPayload && lastPayload.endpoint) || '' });
   } else if (action === 'dismiss') {
+    testDismissed = true;
     testState = null;
+    sawCompletedReply = true;
+    updatePrimaryAction();
     vscode.postMessage({ type: 'dismissSetup' });
   }
 }
@@ -1095,7 +1138,7 @@ function renderModelStatus() {
   const p = lastPayload;
   if (!p) return;
   const hasModel = !!(p.state && p.state.selectedModelPath);
-  const modelPending = serverRunning && pendingChanges.some(function (c) { return c.key === 'model'; });
+  const modelPending = (serverRunning || serverStarting) && pendingChanges.some(c => c.key === 'model');
   // The header names the running model and shows its state; the Model card
   // only speaks up when its selection differs from what the server runs.
   let cls = '';
@@ -1108,18 +1151,33 @@ function renderModelStatus() {
     if (!el) return;
     el.className = 'model-status' + (cls ? ' ' + cls : '') + (text ? '' : ' hidden');
     el.textContent = text;
-    el.title = modelPending ? 'The server is still running ' + (pendingModelChange().from || 'another model') + '.' : '';
+    el.title = modelPending ? (serverStarting ? 'The server is loading ' : 'The server is still running ') +
+      (pendingModelChange().from || 'another model') + '.' : '';
   });
+  const attachments = serverRunning && !serverStarting
+    ? pendingChanges.filter(c => ['loraAdapters', 'mmprojPath', 'plePath'].includes(c.key))
+    : [];
   const bar = $('modelReloadBar');
   if (bar) {
-    bar.classList.toggle('hidden', !modelPending);
+    bar.classList.toggle('hidden', !modelPending && !attachments.length);
+    $('modelDiscardBtn').classList.toggle('hidden', modelPending || !attachments.length);
+    $('modelReloadBtn').disabled = serverStarting;
     const t = $('modelReloadText');
     if (t && modelPending) {
-      t.innerHTML = 'Server runs <b>' + escText(pendingModelChange().from || 'another model') + '</b>. Switch to the selection?';
+      const model = '<b>' + escText(pendingModelChange().from || 'another model') + '</b>';
+      const prompt = serverStarting ? 'Server is loading ' + model + '. Reload when it is ready to switch to your selection.'
+        : 'Server runs ' + model + '. Switch to the selection?';
+      if (t.innerHTML !== prompt) t.innerHTML = prompt;
+    } else if (t) {
+      const prompt = attachments.length ? 'Reload to apply attachment changes · ' + attachments.map(c => c.label).join(', ') : '';
+      if (t.textContent !== prompt) t.textContent = prompt;
     }
   }
   const closedReload = $('modelClosedReload');
-  if (closedReload) closedReload.classList.toggle('hidden', !modelPending);
+  if (closedReload) {
+    closedReload.classList.toggle('hidden', !modelPending);
+    closedReload.disabled = serverStarting;
+  }
 
   const line = $('modelClosedLine');
   if (!line) return;
@@ -3604,9 +3662,9 @@ function renderLora(p, f, remote) {
     : !running ? adapters.filter((a) => a.enabled).length + ' of ' + adapters.length + ' on'
     : active + ' active' + (waiting ? ' · ' + waiting + ' after reload' : '');
   $('pickLoraBtn').disabled = remote || !f.lora;
-  $('loraList').innerHTML = adapters.map((a, i) => {
+  const rows = adapters.map((a, i) => {
     const name = baseFileName(a.path);
-    const state = !running ? '' : a.loaded ? (a.enabled ? 'Active' : 'Off') : 'After reload';
+    const state = !running ? '' : a.loaded ? (a.enabled ? 'Active on server' : 'Off on server') : 'Queued for reload';
     const notes = [];
     if (a.message) notes.push('<div class="lora-note warn">' + escText(a.message) + '</div>');
     if (a.activated) notes.push('<div class="lora-note">Activated adapter: it only takes effect after its trigger phrase appears in the prompt.</div>');
@@ -3618,9 +3676,26 @@ function renderLora(p, f, remote) {
       '<label class="lora-strength">Strength<input type="range" min="0" max="2" step="0.05" value="' + a.scale + '" data-lora-scale="' + i + '" aria-label="Strength of ' + escAttr(name) + '"' + (a.enabled ? '' : ' disabled') + '><output>' + Number(a.scale).toFixed(2) + '</output></label>' +
       notes.join('') + '</div>';
   }).join('');
+  if (rows !== renderedLoraRows) {
+    $('loraList').innerHTML = rows;
+    renderedLoraRows = rows;
+  } else {
+    // A rejected edit can return the same server state while the controls
+    // still hold the user's submitted values. Reconcile without replacing focus.
+    for (const i of submittedLoraEdits) {
+      const adapter = adapters[i];
+      const slider = document.querySelector<HTMLInputElement>('#loraList [data-lora-scale="' + i + '"]');
+      const toggle = document.querySelector<HTMLInputElement>('#loraList [data-lora-toggle="' + i + '"]');
+      if (!adapter || !slider || !toggle) continue;
+      slider.value = String(adapter.scale);
+      slider.parentElement.querySelector('output').textContent = Number(adapter.scale).toFixed(2);
+      toggle.checked = adapter.enabled;
+    }
+  }
+  submittedLoraEdits.clear();
   $('loraHint').textContent = !f.lora ? (f.probed ? 'This llama.cpp build has no --lora option. Update llama.cpp to use LoRA adapters.' : 'Available once a runnable llama.cpp build is installed.')
     : !adapters.length ? 'Add a LoRA adapter (GGUF) trained on this model.'
-    : waiting && running ? 'Reload to load the new adapter. Strength and on/off apply at once for loaded adapters.'
+    : waiting && running ? 'Strength and on/off apply now for loaded adapters. Queued adapters take effect on reload.'
     : running ? 'Strength and on/off apply to the running server at once.'
     : '';
   const lineage = [];
@@ -3654,10 +3729,16 @@ if (loraList) {
     const t = e.target;
     if (t.dataset.loraScale !== undefined) {
       const a = adapterAt(t.dataset.loraScale);
-      if (a) vscode.postMessage({ type: 'setLora', path: a.path, scale: Number(t.value) });
+      if (a) {
+        submittedLoraEdits.add(Number(t.dataset.loraScale));
+        vscode.postMessage({ type: 'setLora', path: a.path, scale: Number(t.value) });
+      }
     } else if (t.dataset.loraToggle !== undefined) {
       const a = adapterAt(t.dataset.loraToggle);
-      if (a) vscode.postMessage({ type: 'setLora', path: a.path, enabled: t.checked });
+      if (a) {
+        submittedLoraEdits.add(Number(t.dataset.loraToggle));
+        vscode.postMessage({ type: 'setLora', path: a.path, enabled: t.checked });
+      }
     }
   });
 }
@@ -3736,6 +3817,10 @@ if (dupToggle) {
   });
 }
 $('setupPrimaryBtn').addEventListener('click', () => runSetupAction($('setupPrimaryBtn').dataset.action || ''));
+$('setupTestInput').addEventListener('input', () => {
+  const button = $('setupPrimaryBtn');
+  if (button.dataset.action === 'test') button.disabled = !$('setupTestInput').value.trim();
+});
 $('setupSecondary').addEventListener('click', (e) => {
   const btn = e.target.closest ? e.target.closest('button[data-setup]') : null;
   if (btn) runSetupAction(btn.getAttribute('data-setup') || '');
@@ -3814,12 +3899,18 @@ $('reloadIconBtn').addEventListener('click', () => {
   }
   launch('reload');
 });
-$('discardBtn').addEventListener('click', () => {
+function discardPendingChanges() {
   if (saveLoadTimer) {
     clearTimeout(saveLoadTimer);
     saveLoadTimer = null;
   }
   vscode.postMessage({ type: 'discardChanges' });
+}
+$('discardBtn').addEventListener('click', discardPendingChanges);
+$('modelDiscardBtn').addEventListener('click', () => {
+  clearTimeout(saveLoadTimer);
+  saveLoadTimer = null;
+  vscode.postMessage({ type: 'discardAttachments', payload: formReady ? loadChanges() : undefined });
 });
 $('dirtyReloadBtn').addEventListener('click', () => launch('reload'));
 $('dirtyToggle').addEventListener('click', () => {
@@ -3855,19 +3946,29 @@ $('openWebUiBtn').addEventListener('click', () => {
   vscode.postMessage({ type: 'openWebUi' });
 });
 $('copyKeyBtn').addEventListener('click', () => { closeMenu(); vscode.postMessage({ type: 'copyLocalApiKey' }); });
+function clearScheduledProbe() {
+  clearTimeout(probeTimer);
+  probeRequestId++;
+  $('probeList').replaceChildren();
+}
+
 function scheduleProbe() {
-  if (probeTimer) clearTimeout(probeTimer);
+  clearScheduledProbe();
+  if (!connectOpen) return;
   const url = ($('remoteUrlInput') && $('remoteUrlInput').value || '').trim();
   if (url.length < 4) return;
+  const requestId = probeRequestId;
   probeTimer = setTimeout(function () {
     vscode.postMessage({
       type: 'testRemote',
-      url: url,
+      requestId,
+      url,
       apiKey: ($('remoteKeyInput') && $('remoteKeyInput').value) || '',
     });
   }, 600);
 }
-function openConnectForm(prefill?) {
+function openConnectForm(prefill?, replace = false) {
+  if (connectOpen && !replace) return;
   const payload = lastPayload || {};
   setConnectOpen(true, prefill || {
     url: payload.remoteUrl || payload.endpoint || '',
@@ -3881,7 +3982,8 @@ $('setApiKeyBtn').addEventListener('click', () => { closeMenu(); vscode.postMess
 $('forgetApiKeyBtn').addEventListener('click', () => { closeMenu(); vscode.postMessage({ type: 'forgetApiKey' }); });
 $('switchLocalBtn').addEventListener('click', () => { closeMenu(); vscode.postMessage({ type: 'switchToLocal' }); });
 $('connectCancelBtn').addEventListener('click', () => setConnectOpen(false));
-$('extraPortsBtn').addEventListener('click', () => vscode.postMessage({ type: 'extraServerPorts' }));
+$('extraPortsBtn').addEventListener('click', () =>
+  vscode.postMessage({ type: 'extraServerPorts', requestId: ++connectScanRequestId }));
 $('connectBtn').addEventListener('click', () => {
   vscode.postMessage({
     type: 'connectRemote',
@@ -4081,8 +4183,9 @@ $('libraryDialog').addEventListener('click', function (e) {
 window.addEventListener('message', (event: MessageEvent<ToWebviewMessage>) => {
   const msg = event.data;
   if (msg.type === 'libraryRefreshComplete') $('libraryRefreshBtn').disabled = false;
-  if (msg.type === 'testResult') {
-    testState = msg.status === 'cancelled' && !testState ? null : { status: msg.status, text: msg.text, error: msg.error, ms: msg.ms };
+  if (msg.type === 'testResult' && !testDismissed) {
+    testState = { status: msg.status, text: msg.text, error: msg.error, ms: msg.ms };
+    if (msg.status === 'done') sawCompletedReply = true;
     renderSetup();
   }
   if (msg.type === 'advancedPanel') {
@@ -4093,7 +4196,11 @@ window.addEventListener('message', (event: MessageEvent<ToWebviewMessage>) => {
   if (msg.type === 'openConnect') {
     openConnectForm(lastPayload && lastPayload.serverMode === 'remote' ? undefined : { url: '', label: '' });
   }
-  if (msg.type === 'remoteProbe') renderProbeList(msg.payload, msg.error || '');
+  if (msg.type === 'remoteProbe' && connectOpen && msg.requestId === probeRequestId) renderProbeList(msg.payload, msg.error || '', msg.label);
+  if (msg.type === 'connectScan' && connectOpen && msg.requestId === connectScanRequestId) {
+    explicitConnectServers = msg.servers;
+    renderFoundServers();
+  }
   if (msg.type === 'remoteConnected') setConnectOpen(false);
   if (msg.type === 'libraryFits') {
     lib.fits = msg.fits || {};

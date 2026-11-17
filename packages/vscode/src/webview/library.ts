@@ -22,7 +22,7 @@ export const lib = {
   hfRepos: [] as any,
   hfFiles: null as any,
   hfRequest: 0,
-  hfFitsOnly: false,
+  hfFitFilter: "all",
   page: 0,
   downloads: [] as any,
   countLabel: '',
@@ -41,6 +41,7 @@ export function resetLibraryNavigation(mode = 'local') {
   lib.hfBusy = false;
   lib.hfError = '';
   lib.hfFiles = null;
+  lib.hfFitFilter = 'all';
   lib.page = 0;
 }
 
@@ -94,6 +95,10 @@ export function refreshLibrarySum() {
   const n = lib.downloads.length;
   const dl = n ? (n + ' downloading') : '';
   const fold = $('libraryFold');
+  if (fold?.open && lib.hfMode !== 'local') {
+    el.textContent = dl ? 'Hugging Face · ' + dl : 'Hugging Face';
+    return;
+  }
   let label = lib.countLabel;
   if (fold && !fold.open && lib.countLabel) {
     const st = libraryStats();
@@ -187,6 +192,11 @@ export function passesLibraryFilter(g, quant) {
 export function renderLibraryFilters() {
   const root = $('libraryFilters');
   if (!root) return;
+  const browsingHf = lib.hfMode !== 'local';
+  root.hidden = browsingHf;
+  $('librarySort').hidden = browsingHf;
+  $('libraryRefreshBtn').hidden = browsingHf;
+  if (browsingHf) return;
   const st = libraryStats();
   if (lib.filterMode === 'hidden' && !st.hidden) lib.filterMode = 'all';
   const items: Array<[string, string, number]> = [
@@ -302,23 +312,37 @@ export function renderLibraryList() {
     if (lib.hfFiles.companionHint) {
       html += '<div class="hint">Also fetches ' + escText(lib.hfFiles.companionHint) + '</div>';
     }
-    const hfFiles = lib.hfFiles.files || [];
-    const rated = hfFiles.filter(function (f) { return f.fit; });
-    const fitting = rated.filter(function (f) { return f.fit !== 'wont-fit'; });
-    if (rated.length) {
-      html += '<div class="lib-filters" style="margin:0 0 6px">' +
-        '<button type="button" class="chip' + (lib.hfFitsOnly ? ' active' : '') + '" data-act="hf-fits-toggle" aria-pressed="' + (lib.hfFitsOnly ? 'true' : 'false') + '">Fits here<span class="n">' + fitting.length + '</span></button>' +
-        '<span class="lib-detail" title="Estimated from the file size before download: weights plus a small allowance. The Memory card gives the exact verdict once the file is on disk.">≈ of ' + escText(rated[0].capacityLabel || '') + '</span></div>';
+    const { companionOnly, capacityLabel, usesRam } = lib.hfFiles;
+    type HfFile = Extract<ToWebviewMessage, { type: 'libraryHfFiles' }>['files'][number];
+    const hfFiles: HfFile[] = lib.hfFiles.files || [];
+    const likely = hfFiles.filter(file => file.fit === 'fits' || file.fit === 'tight');
+    const unknown = hfFiles.filter(file => !file.fit);
+    if (!companionOnly && hfFiles.length) {
+      html += '<div class="lib-memory"><strong>' + escText(capacityLabel || 'Available memory unknown') + '</strong>' +
+        '<div>' + (usesRam ? 'System RAM is a capacity limit. Free RAM and GPU fit are unknown.' :
+          'Estimate from file size and a small runtime allowance. Context and offload settings affect fit.') + '</div></div>';
+      const categories = [
+        { key: 'all', label: 'All', count: hfFiles.length },
+        { key: 'likely', label: usesRam ? 'Within RAM capacity' : 'Likely fits', count: likely.length },
+        { key: 'unknown', label: 'Fit unknown', count: unknown.length },
+      ];
+      html += '<div class="lib-filters" role="group" aria-label="Filter by estimated fit">' +
+        categories.filter(c => c.key === 'all' || c.count > 0).map(c =>
+          '<button type="button" class="chip' + (lib.hfFitFilter === c.key ? ' active' : '') +
+          '" data-act="hf-fit-filter" data-fit="' + c.key + '" aria-pressed="' + (lib.hfFitFilter === c.key) +
+          '">' + c.label + '<span class="n">' + c.count + '</span></button>').join('') + '</div>';
     }
-    const shown = lib.hfFitsOnly && rated.length ? hfFiles.filter(function (f) { return f.fit !== 'wont-fit'; }) : hfFiles;
-    if (lib.hfFitsOnly && rated.length && !shown.length) html += '<div class="hint">No file in this repo fits here. Turn off “Fits here” to see them all.</div>';
-    const FIT_TEXT = { fits: 'Fits', tight: 'Tight', 'wont-fit': 'Too big' };
+    const shown = lib.hfFitFilter === 'likely' ? likely : lib.hfFitFilter === 'unknown' ? unknown : hfFiles;
+    const fitText = usesRam
+      ? { fits: 'Within RAM capacity', tight: 'Near RAM capacity', 'wont-fit': 'Exceeds RAM capacity' }
+      : { fits: 'Likely fits', tight: 'Tight on memory', 'wont-fit': 'Exceeds free memory' };
     shown.forEach(function (file) {
       html += '<div class="lib-file"><span class="grow"><b>' + escText(file.label) + '</b>';
       if (file.detail) html += '<span class="lib-detail">' + escText(file.detail) + '</span>';
       if (file.fit) {
-        html += '<span class="lib-fit ' + file.fit + '">' + FIT_TEXT[file.fit] + ' · needs ≈' + escText(file.needLabel || '') +
-          (file.fit === 'wont-fit' && fitting.length ? ' · a smaller file in this list fits' : '') + '</span>';
+        html += '<span class="lib-fit ' + file.fit + '">' + fitText[file.fit] + ' · needs ≈ ' + escText(file.needLabel || '') + '</span>';
+      } else if (!companionOnly) {
+        html += '<span class="lib-fit unknown">Fit unknown</span>';
       }
       html += '</span><button type="button" class="secondary small" data-act="hf-download" data-model="' + escAttr(lib.hfFiles.modelId) + '" data-file="' + escAttr(file.path) + '">Download</button></div>';
     });
@@ -512,9 +536,13 @@ export function onLibraryClick(e) {
       renderLibraryDialog();
     } else if (act === 'hf-search') {
       startLibrarySearch();
-    } else if (act === 'hf-fits-toggle') {
-      lib.hfFitsOnly = !lib.hfFitsOnly;
-      renderLibraryList();
+    } else if (act === 'hf-fit-filter') {
+      const fit = btn.getAttribute('data-fit') || '';
+      if (fit === 'all' || fit === 'likely' || fit === 'unknown') {
+        lib.hfFitFilter = fit;
+        renderLibraryList();
+        document.querySelector<HTMLButtonElement>('[data-act="hf-fit-filter"][aria-pressed="true"]')?.focus();
+      }
     } else if (act === 'hf-back') {
       resetLibraryNavigation(lib.hfMode === 'files' || lib.hfMode === 'license' ? 'search' : 'local');
       renderLibraryList();
