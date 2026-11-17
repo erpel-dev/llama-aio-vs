@@ -150,13 +150,14 @@ function describeModeSampling(
   };
 }
 
+type TestResult = Extract<ToWebviewMessage, { type: "testResult" }>;
+
 const TEST_MESSAGE_TIMEOUT_MS = 180_000;
 /** The time limit is ours, not the user's Cancel: say what happened and what to try. */
 const TEST_TIMEOUT_RESULT = {
   type: "testResult",
   status: "error",
-  error: "No reply within 3 minutes. The server is running, but this model is too slow here for a quick test. " +
-    "Try a smaller model or quantization, or a GPU backend.",
+  error: "No reply within 3 minutes. Try again, or try a smaller model if the server is slow to respond.",
 } as const;
 
 export class SettingsViewProvider implements vscode.WebviewViewProvider {
@@ -293,6 +294,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             // A (re)created webview starts without badges.
             this.libraryFitsPosted = undefined;
             await this.pushState();
+            if (this.lastTestResult) this.post(this.lastTestResult, from);
             this.flushDownloadPost();
             this.flushLibraryFocus();
             if (this.wantConnectForm) {
@@ -724,7 +726,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             break;
           }
           case "sendTest":
-            void this.runTestMessage(typeof msg.text === "string" ? msg.text : "");
+            await this.runTestMessage(typeof msg.text === "string" ? msg.text : "");
             break;
           case "cancelTest":
             this.testCancel?.cancel();
@@ -738,6 +740,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             );
             break;
           case "dismissSetup":
+            this.lastTestResult = undefined;
             await this.globalState?.update(SETUP_DONE_KEY, true);
             await this.pushState();
             break;
@@ -2369,51 +2372,66 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
   }
 
   private testCancel?: vscode.CancellationTokenSource;
+  private lastTestResult?: TestResult;
 
-  /**
-   * Send one message through this extension's own Language Model provider,
-   * the same path Copilot Chat uses, and show the reply in the sidebar. Speed
-   * and context numbers arrive through the normal perf updates.
-   */
+  private publishTestResult(result: TestResult): void {
+    this.lastTestResult = result;
+    this.post(result);
+  }
+
+  /** Send one quick request through the Language Model provider Copilot Chat uses. */
+  private async readTestReply(prompt: string, token: vscode.CancellationToken): Promise<string> {
+    const [model] = await vscode.lm.selectChatModels({ vendor: "llama-aio" });
+    if (token.isCancellationRequested) return "";
+    if (!model) {
+      throw new Error("The server is not ready yet. Start it, then try again.");
+    }
+    const response = await model.sendRequest([vscode.LanguageModelChatMessage.User(prompt)],
+      { modelOptions: { llamaAioQuickReply: true } }, token);
+    let reply = "";
+    for await (const part of response.stream) {
+      if (token.isCancellationRequested) break;
+      if (part instanceof vscode.LanguageModelTextPart) reply += part.value;
+    }
+    return reply.trim().slice(0, 1200);
+  }
+
   private async runTestMessage(text: string): Promise<void> {
     const prompt = text.trim().slice(0, 2000);
-    if (!prompt || this.testCancel) {
-      return;
-    }
+    if (!prompt || this.testCancel) return;
+
     const cancel = new vscode.CancellationTokenSource();
     this.testCancel = cancel;
-    let timedOut = false;
-    const timer = setTimeout(() => { timedOut = true; cancel.cancel(); }, TEST_MESSAGE_TIMEOUT_MS);
+    const token = cancel.token;
     const started = Date.now();
-    this.post({ type: "testResult", status: "running" });
+    let timedOut = false;
+    let result: TestResult;
+    let subscription: vscode.Disposable | undefined;
+    // Model discovery and response streams can outlive cancellation. Settle the
+    // sidebar independently so it can retry even while an old operation unwinds.
+    const cancelled = new Promise<undefined>(resolve => {
+      subscription = token.onCancellationRequested(() => resolve(undefined));
+    });
+    const timer = setTimeout(() => { timedOut = true; cancel.cancel(); }, TEST_MESSAGE_TIMEOUT_MS);
+    this.publishTestResult({ type: "testResult", status: "running" });
     try {
-      const [model] = await vscode.lm.selectChatModels({ vendor: "llama-aio" });
-      if (!model) {
-        throw new Error("The server is not ready yet. Start it, then try again.");
-      }
-      // Quickest mode (thinking off where the model allows it): this checks
-      // that the model answers, not how well it reasons.
-      const response = await model.sendRequest([vscode.LanguageModelChatMessage.User(prompt)],
-        { modelOptions: { llamaAioQuickReply: true } }, cancel.token);
-      let reply = "";
-      for await (const part of response.stream) {
-        if (part instanceof vscode.LanguageModelTextPart) {
-          reply += part.value;
-        }
-      }
-      this.post(timedOut ? TEST_TIMEOUT_RESULT : cancel.token.isCancellationRequested
-        ? { type: "testResult", status: "cancelled" }
-        : { type: "testResult", status: "done", text: reply.trim().slice(0, 1200), ms: Date.now() - started });
+      const reply = await Promise.race([this.readTestReply(prompt, token), cancelled]);
+      result = reply
+        ? { type: "testResult", status: "done", text: reply, ms: Date.now() - started }
+        : { type: "testResult", status: "error", error: "The model returned no text. Try again with a short test message." };
     } catch (e) {
-      this.post(timedOut ? TEST_TIMEOUT_RESULT : cancel.token.isCancellationRequested
-        ? { type: "testResult", status: "cancelled" }
-        : { type: "testResult", status: "error", error: e instanceof Error ? e.message : String(e) });
+      result = { type: "testResult", status: "error", error: e instanceof Error ? e.message : String(e) };
     } finally {
       clearTimeout(timer);
+      subscription?.dispose();
+      if (token.isCancellationRequested) {
+        result = timedOut ? TEST_TIMEOUT_RESULT : { type: "testResult", status: "cancelled" };
+      }
       cancel.dispose();
       this.testCancel = undefined;
-      await this.pushState();
     }
+    this.publishTestResult(result);
+    await this.pushState();
   }
 
   private webUiGateway?: WebUiGateway;
@@ -2443,6 +2461,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
   }
 
   dispose(): void {
+    this.testCancel?.cancel();
     this.webUiGateway?.close();
     this.webUiGateway = undefined;
   }

@@ -163,8 +163,10 @@
       </li>
     </ol>
     <div class="setup-test hidden" id="setupTest">
-      <label for="setupTestInput" class="hint" style="margin:0">Test message</label>
-      <textarea id="setupTestInput" rows="2" spellcheck="false">Say hello in one sentence.</textarea>
+      <div id="setupTestPrompt" class="setup-test-prompt">
+        <label for="setupTestInput" class="hint">Test message</label>
+        <textarea id="setupTestInput" rows="2" maxlength="2000" spellcheck="false">Say hello in one sentence.</textarea>
+      </div>
       <div class="setup-test-reply hidden" id="setupTestReply" aria-live="polite"></div>
     </div>
     <div class="setup-actions">

@@ -476,6 +476,8 @@ input:disabled, select:disabled { opacity: 0.5; }
 .setup-secondary button { flex: 1 1 auto; }
 .setup-foot { margin-top: 8px; }
 .setup-test { display: flex; flex-direction: column; gap: 4px; margin: 0 0 8px; }
+.setup-test-prompt { display: grid; gap: 4px; }
+.setup-test-prompt label { margin: 0; }
 .setup-test textarea { width: 100%; box-sizing: border-box; resize: vertical; background: var(--bg); color: var(--input-fg); border: 1px solid var(--border); border-radius: 4px; padding: 6px 8px; font: inherit; }
 .setup-test-reply { border: 1px solid var(--border); border-radius: 4px; padding: 6px 8px; background: var(--bg); overflow-wrap: anywhere; white-space: pre-wrap; max-height: 160px; overflow-y: auto; }
 .setup-test-reply .ok, .setup-test-reply .muted, .setup-test-reply .err { display: block; font-size: 11px; margin-top: 4px; }

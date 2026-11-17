@@ -58,6 +58,10 @@ require.cache.vscode = {
     QuickPickItemKind: { Separator: -1, Default: 0 },
     Uri: { file: fsPath => ({ fsPath }), joinPath: (base, ...parts) => ({ fsPath: path.join(base.fsPath, ...parts) }) },
     ProgressLocation: {},
+    lm: undefined,
+    LanguageModelChatMessage: undefined,
+    LanguageModelTextPart: undefined,
+    CancellationTokenSource: undefined,
     ViewColumn: {},
     EventEmitter: class {},
   },
@@ -897,5 +901,124 @@ describe("attachment pickers search the library", () => {
       assert.deepEqual(p.mine, []);
       assert.equal(p.browse, true);
     }
+  });
+});
+
+describe("onboarding test message", () => {
+  const vscode = require("vscode");
+
+  function mockTestModel(t, select) {
+    t.mock.property(vscode, "lm", { selectChatModels: select });
+    t.mock.property(vscode, "LanguageModelChatMessage", { User: text => text });
+    t.mock.property(vscode, "LanguageModelTextPart", class { constructor(value) { this.value = value; } });
+    t.mock.property(vscode, "CancellationTokenSource", class {
+      listeners = new Set();
+      token = {
+        isCancellationRequested: false,
+        onCancellationRequested: listener => {
+          this.listeners.add(listener);
+          return { dispose: () => this.listeners.delete(listener) };
+        },
+      };
+      cancel() {
+        this.token.isCancellationRequested = true;
+        for (const listener of this.listeners) listener();
+      }
+      dispose() { this.listeners.clear(); }
+    });
+  }
+
+  function captureResults() {
+    const results = [];
+    const provider = Object.create(SettingsViewProvider.prototype);
+    provider.post = result => results.push(result);
+    provider.pushState = async () => {};
+    return { provider, results };
+  }
+
+  it("offers retry when the stream returns no displayable text", async t => {
+    mockTestModel(t, async () => [{
+      sendRequest: async () => ({ stream: [new vscode.LanguageModelTextPart("   ")] }),
+    }]);
+    const { provider, results } = captureResults();
+    await provider.runTestMessage("Hello");
+    assert.deepEqual(results.map(r => r.status), ["running", "error"]);
+    assert.match(results.at(-1).error, /returned no text/);
+  });
+
+  for (const action of ["cancel", "timeout"]) {
+    it(`can retry after ${action} while an older model lookup is still pending`, async t => {
+      let resolveOld;
+      const old = new Promise(resolve => { resolveOld = resolve; });
+      const sendRequest = t.mock.fn(async () => ({
+        stream: [new vscode.LanguageModelTextPart("New reply")],
+      }));
+      const model = { sendRequest };
+      let lookups = 0;
+      mockTestModel(t, async () => lookups++ === 0 ? old : [model]);
+      const { provider, results } = captureResults();
+      if (action === "timeout") t.mock.timers.enable({ apis: ["setTimeout"] });
+
+      const first = provider.runTestMessage("First");
+      if (action === "timeout") t.mock.timers.tick(180_000);
+      else provider.testCancel.cancel();
+      await first;
+      assert.equal(results.at(-1).status, action === "timeout" ? "error" : "cancelled");
+      if (action === "timeout") assert.match(results.at(-1).error, /within 3 minutes/);
+
+      await provider.runTestMessage("Second");
+      assert.equal(results.at(-1).text, "New reply");
+      resolveOld([model]);
+      await old;
+      assert.equal(sendRequest.mock.callCount(), 1, "cancelled lookup must not send the old prompt");
+    });
+  }
+
+  it("shows the reply without an editable prompt and can send another test after onboarding completes", async t => {
+    const { JSDOM } = require("jsdom");
+    const html = fs.readFileSync(path.join(__dirname, "../src/webview/sidebar.html"), "utf8").replace(/\{\{\w+\}\}/g, "");
+    const dom = new JSDOM(html, { runScripts: "outside-only" });
+    t.after(() => dom.window.close());
+    const sent = [];
+    dom.window.acquireVsCodeApi = () => ({ postMessage: m => sent.push(m), getState: () => null, setState() {} });
+    dom.window.eval(fs.readFileSync(path.join(__dirname, "../out/webview/sidebar.js"), "utf8"));
+    const el = id => dom.window.document.getElementById(id);
+    const post = data => dom.window.dispatchEvent(new dom.window.MessageEvent("message", { data }));
+    const result = (status, extra) => post({ type: "testResult", status, ...extra });
+    const ui = setup();
+    await ui.provider.pushState();
+    const state = ui.posted.findLast(m => m.type === "state");
+    post(state);
+
+    const primary = el("setupPrimaryBtn");
+    const input = el("setupTestInput");
+    assert.equal(primary.dataset.action, "test");
+    primary.click();
+    assert.equal(primary.dataset.action, "cancelTest");
+    assert.equal(input.disabled, true);
+    post({ ...state, payload: { ...state.payload, onboardingDone: true } });
+    result("done", { text: "Hello!" });
+    assert.equal(el("setupTestPrompt").classList.contains("hidden"), true);
+    assert.match(el("setupTestReply").textContent, /Hello!/);
+    assert.equal(primary.dataset.action, "openChat");
+
+    el("setupSecondary").querySelector('[data-setup="composeTest"]').click();
+    assert.equal(el("setupTestPrompt").classList.contains("hidden"), false);
+    assert.equal(dom.window.document.activeElement, input);
+    input.value = "   ";
+    input.dispatchEvent(new dom.window.Event("input"));
+    assert.equal(primary.disabled, true);
+    input.value = "Try again";
+    input.dispatchEvent(new dom.window.Event("input"));
+    primary.click();
+    assert.equal(sent.at(-1).text, "Try again");
+    result("error", { error: "No reply" });
+    assert.equal(primary.textContent, "Try again");
+    assert.equal(input.disabled, false);
+    primary.click();
+    result("cancelled");
+    assert.equal(primary.dataset.action, "test");
+    assert.equal(input.disabled, false);
+    assert.match(el("setupTestReply").textContent, /Test cancelled/);
   });
 });

@@ -92,7 +92,7 @@ function loadChanges() {
 let sawCompletedReply = false;
 /** Whether the Get started checklist is showing (it then owns the next action). */
 let setupVisible = false;
-/** Result of the Get started test message, kept until the user clicks Done. */
+/** The test composer or its most recent result, kept until the user clicks Done. */
 let testState = null;
 let lastMemoryView = null;
 let loadDefaults = {};
@@ -696,12 +696,13 @@ function renderSetup() {
   const testing = !!(testState && testState.status === 'running');
   if (testing) {
     steps.try = { state: 'busy', detail: 'Waiting for the reply…' };
-  } else if (st.tried) {
-    steps.try = { state: 'done', detail: testState && testState.status === 'done' ? 'The model answered. Use it where you like:' : '' };
-  } else if (serverRunning) {
+  } else if (testState?.status === 'done') {
+    steps.try = { state: 'done', detail: 'The model answered.' };
+  } else if (serverRunning && (testState || !st.tried)) {
     steps.try = { state: 'now', detail: 'Send a test message to check that the model answers.' };
+  } else if (st.tried && !testState) {
+    steps.try = { state: 'done', detail: '' };
   }
-  renderSetupTest(serverRunning && (!st.tried || !!testState));
 
   const order = ['runtime', 'model', 'start', 'try'];
   const ids = { runtime: 'stepRuntime', model: 'stepModel', start: 'stepStart', try: 'stepTry' };
@@ -729,7 +730,9 @@ function renderSetup() {
   let action = '';
   let label = '';
   let disabled = false;
-  if (now === 'runtime') {
+  if (testing) {
+    action = 'cancelTest'; label = 'Cancel test';
+  } else if (now === 'runtime') {
     if (st.installFailed) {
       action = 'install'; label = 'Retry install';
       secondary.push(setupButton('installArchive', 'Install from archive…'), setupButton('backend', 'Other backends…'));
@@ -749,15 +752,15 @@ function renderSetup() {
   } else if (now === 'start') {
     action = 'start'; label = 'Start server';
   } else if (now === 'try') {
-    action = 'test'; label = testState && testState.status === 'error' ? 'Try again' : 'Send test message';
+    action = 'test'; label = testState?.status === 'error' ? 'Try again' : 'Send test message';
+    disabled = !$('setupTestInput').value.trim();
     secondary.push(lastPayload.copilotChatAvailable ? setupButton('openChat', 'Open Copilot Chat') : setupButton('webui', 'Open web UI'),
       setupButton('dismiss', 'Skip'));
-  } else if (testing) {
-    action = 'cancelTest'; label = 'Cancel';
-  } else if (st.tried && testState) {
+  } else if (testState?.status === 'done') {
     // Answered: say where to use the model, then let the user close the list.
     if (lastPayload.copilotChatAvailable) { action = 'openChat'; label = 'Open Copilot Chat'; }
     else { action = 'webui'; label = 'Open llama.cpp web UI'; }
+    if (serverRunning) secondary.push(setupButton('composeTest', 'Send another test'));
     secondary.push(setupButton('copyKey', 'Copy API key'), setupButton('copyEndpoint', 'Copy endpoint'), setupButton('dismiss', 'Done'));
   } else {
     // Everything that needs the user is busy (installing / downloading / loading).
@@ -768,35 +771,32 @@ function renderSetup() {
   primary.dataset.action = action;
   primary.textContent = label;
   primary.disabled = disabled;
-  $('setupSecondary').innerHTML = secondary.join('');
+  const secondaryHtml = secondary.join('');
+  if ($('setupSecondary').innerHTML !== secondaryHtml) $('setupSecondary').innerHTML = secondaryHtml;
+  renderSetupTest(action === 'test' || testing);
   const foot = $('setupFoot');
   if (foot) foot.classList.toggle('hidden', st.runtimeOk && st.hasModel);
 }
 
 /** Test box under the last Get started step: input, then the reply or the error. */
-function renderSetupTest(show) {
-  const box = $('setupTest');
-  if (!box) return;
-  box.classList.toggle('hidden', !show);
+function renderSetupTest(showInput) {
   const input = $('setupTestInput');
-  if (input) input.disabled = !!(testState && testState.status === 'running');
   const reply = $('setupTestReply');
-  if (!reply) return;
   const t = testState;
-  reply.classList.toggle('hidden', !t || t.status === 'running');
-  if (!t || t.status === 'running') return;
-  if (t.status === 'done') {
-    const p = lastPerf || {};
-    const bits = ['Worked'];
-    if (typeof p.completionTokens === 'number' && p.completionTokens > 0) bits.push(fmtNum(p.completionTokens) + ' tok' + (p.thinking ? ' incl. thinking' : ''));
-    if (typeof t.ms === 'number') bits.push((t.ms / 1000).toFixed(1) + ' s');
-    const rate = fmtRate(p.genTokPerSec);
-    if (rate) bits.push(rate + ' tok/s');
-    reply.innerHTML = escText(t.text || '(empty reply)') + '<span class="ok">' + escText(bits.join(' · ')) + '</span>';
-  } else if (t.status === 'cancelled') {
-    reply.innerHTML = '<span class="muted">Cancelled.</span>';
-  } else {
+  const hasResult = t && t.status !== 'running' && t.status !== 'editing';
+  $('setupTest').classList.toggle('hidden', !showInput && !hasResult);
+  $('setupTestPrompt').classList.toggle('hidden', !showInput);
+  input.disabled = t?.status === 'running';
+  reply.classList.toggle('hidden', !hasResult);
+  if (t?.status === 'done') {
+    const duration = typeof t.ms === 'number' ? ' · ' + (t.ms / 1000).toFixed(1) + ' s' : '';
+    reply.innerHTML = escText(t.text) + '<span class="ok">Reply received' + duration + '</span>';
+  } else if (t?.status === 'cancelled') {
+    reply.innerHTML = '<span class="muted">Test cancelled.</span>';
+  } else if (t?.status === 'error') {
     reply.innerHTML = '<span class="err">' + escText(t.error || 'The test message failed.') + '</span>';
+  } else {
+    reply.textContent = '';
   }
 }
 
@@ -830,7 +830,12 @@ function runSetupAction(action) {
     launch('start');
   } else if (action === 'openChat') {
     vscode.postMessage({ type: 'openCopilotChat' });
+  } else if (action === 'composeTest') {
+    testState = { status: 'editing' };
+    renderSetup();
+    $('setupTestInput').focus();
   } else if (action === 'test') {
+    if (testState?.status === 'running' || !serverRunning) return;
     const text = (($('setupTestInput') && $('setupTestInput').value) || '').trim();
     if (!text) return;
     testState = { status: 'running' };
@@ -846,6 +851,8 @@ function runSetupAction(action) {
     vscode.postMessage({ type: 'copyText', text: lastEndpoint || (lastPayload && lastPayload.endpoint) || '' });
   } else if (action === 'dismiss') {
     testState = null;
+    sawCompletedReply = true;
+    updatePrimaryAction();
     vscode.postMessage({ type: 'dismissSetup' });
   }
 }
@@ -3778,6 +3785,10 @@ if (dupToggle) {
   });
 }
 $('setupPrimaryBtn').addEventListener('click', () => runSetupAction($('setupPrimaryBtn').dataset.action || ''));
+$('setupTestInput').addEventListener('input', () => {
+  const button = $('setupPrimaryBtn');
+  if (button.dataset.action === 'test') button.disabled = !$('setupTestInput').value.trim();
+});
 $('setupSecondary').addEventListener('click', (e) => {
   const btn = e.target.closest ? e.target.closest('button[data-setup]') : null;
   if (btn) runSetupAction(btn.getAttribute('data-setup') || '');
@@ -4135,7 +4146,8 @@ window.addEventListener('message', (event: MessageEvent<ToWebviewMessage>) => {
   const msg = event.data;
   if (msg.type === 'libraryRefreshComplete') $('libraryRefreshBtn').disabled = false;
   if (msg.type === 'testResult') {
-    testState = msg.status === 'cancelled' && !testState ? null : { status: msg.status, text: msg.text, error: msg.error, ms: msg.ms };
+    testState = { status: msg.status, text: msg.text, error: msg.error, ms: msg.ms };
+    if (msg.status === 'done') sawCompletedReply = true;
     renderSetup();
   }
   if (msg.type === 'advancedPanel') {
