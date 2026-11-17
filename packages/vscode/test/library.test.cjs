@@ -106,6 +106,9 @@ it('keeps unknown files out of the likely-fit count and filter', () => {
     ],
   });
   const html = () => t.element('libraryList').innerHTML;
+  assert.equal(t.element('libraryFilters').hidden, true);
+  assert.equal(t.element('librarySort').hidden, true);
+  assert.equal(t.element('librarySum').textContent, 'Hugging Face');
   assert.match(html(), /Likely fits<span class="n">2/);
   assert.match(html(), /Fit unknown<span class="n">1/);
   t.click('hf-fit-filter', { 'data-fit': 'likely' });
@@ -117,4 +120,8 @@ it('keeps unknown files out of the likely-fit count and filter', () => {
   assert.doesNotMatch(html(), /small\.gguf|tight\.gguf|large\.gguf/);
   t.click('hf-fit-filter', { 'data-fit': 'all' });
   assert.equal((html().match(/class="lib-file"/g) || []).length, 4);
+  t.resetLibraryNavigation('local');
+  t.renderLibraryList();
+  assert.equal(t.element('libraryFilters').hidden, false);
+  assert.equal(t.element('librarySort').hidden, false);
 });

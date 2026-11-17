@@ -95,6 +95,10 @@ export function refreshLibrarySum() {
   const n = lib.downloads.length;
   const dl = n ? (n + ' downloading') : '';
   const fold = $('libraryFold');
+  if (fold?.open && lib.hfMode !== 'local') {
+    el.textContent = dl ? 'Hugging Face · ' + dl : 'Hugging Face';
+    return;
+  }
   let label = lib.countLabel;
   if (fold && !fold.open && lib.countLabel) {
     const st = libraryStats();
@@ -188,6 +192,11 @@ export function passesLibraryFilter(g, quant) {
 export function renderLibraryFilters() {
   const root = $('libraryFilters');
   if (!root) return;
+  const browsingHf = lib.hfMode !== 'local';
+  root.hidden = browsingHf;
+  $('librarySort').hidden = browsingHf;
+  $('libraryRefreshBtn').hidden = browsingHf;
+  if (browsingHf) return;
   const st = libraryStats();
   if (lib.filterMode === 'hidden' && !st.hidden) lib.filterMode = 'all';
   const items: Array<[string, string, number]> = [

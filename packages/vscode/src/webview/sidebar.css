@@ -1090,7 +1090,8 @@ button.link-btn:hover { text-decoration: underline; }
 button.link-btn { background: transparent; color: var(--muted); padding: 2px 0; font-weight: 400; font-size: 11px; }
 button.link-btn:hover { color: var(--link); }
 .model-reload { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px; margin: 4px 0 8px; padding: 6px 8px; border-radius: 5px; font-size: 11px; border: 1px solid color-mix(in srgb, var(--warn) 40%, var(--border)); background: color-mix(in srgb, var(--warn) 8%, transparent); }
-.model-reload .grow { flex: 1; min-width: 0; }
+.model-reload .btn-row button { flex: 0 1 auto; white-space: nowrap; }
+#libraryFilters[hidden], .lib-tools [hidden] { display: none; }
 .lib-tools { display: flex; gap: 4px; margin: 0 0 6px; }
 .lib-tools input[type="text"] { flex: 1; min-width: 0; width: auto; padding: 5px 8px; }
 .lib-tools select { flex: none; width: auto; font-size: 11px; }
