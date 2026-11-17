@@ -21,8 +21,8 @@ function setup() {
     document: { getElementById: element, querySelector: () => null } });
   vm.runInContext(source, context);
   const api = context.module.exports;
-  const click = act => {
-    const button = { getAttribute: key => key === 'data-act' ? act : '', closest: () => null };
+  const click = (act, attrs = {}) => {
+    const button = { getAttribute: key => key === 'data-act' ? act : attrs[key] ?? '', closest: () => null };
     api.onLibraryClick({ target: { closest: selector => selector === '[data-act]' ? button : null } });
   };
   return { ...api, element, messages, click };
@@ -89,4 +89,32 @@ it('finds a model by filename even when GGUF metadata supplies its display name'
   t.element('libraryFilter').value = 'nonexistent';
   t.renderLibraryList();
   assert.match(t.element('libraryList').innerHTML, /No local model matches/);
+});
+
+it('keeps unknown files out of the likely-fit count and filter', () => {
+  const t = setup();
+  t.resetLibraryNavigation('files');
+  t.lib.hfFiles = { modelId: 'org/repo' };
+  t.applyLibraryHfMessage({
+    type: 'libraryHfFiles', requestId: t.lib.hfRequest, modelId: 'org/repo',
+    capacityLabel: '16 GiB free VRAM now',
+    files: [
+      { label: 'small.gguf', path: 'small.gguf', fit: 'fits' },
+      { label: 'tight.gguf', path: 'tight.gguf', fit: 'tight' },
+      { label: 'large.gguf', path: 'large.gguf', fit: 'wont-fit' },
+      { label: 'unknown.gguf', path: 'unknown.gguf' },
+    ],
+  });
+  const html = () => t.element('libraryList').innerHTML;
+  assert.match(html(), /Likely fits<span class="n">2/);
+  assert.match(html(), /Fit unknown<span class="n">1/);
+  t.click('hf-fit-filter', { 'data-fit': 'likely' });
+  assert.match(html(), /small\.gguf/);
+  assert.match(html(), /tight\.gguf/);
+  assert.doesNotMatch(html(), /unknown\.gguf|large\.gguf/);
+  t.click('hf-fit-filter', { 'data-fit': 'unknown' });
+  assert.match(html(), /unknown\.gguf/);
+  assert.doesNotMatch(html(), /small\.gguf|tight\.gguf|large\.gguf/);
+  t.click('hf-fit-filter', { 'data-fit': 'all' });
+  assert.equal((html().match(/class="lib-file"/g) || []).length, 4);
 });

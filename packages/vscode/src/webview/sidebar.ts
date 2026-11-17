@@ -105,6 +105,9 @@ let remoteInfo = null;
 let remoteHint = '';
 let nextRetryAt = 0;
 let probeTimer = null;
+let probeRequestId = 0;
+let renderedServers = '';
+let renderedLoraRows = '';
 
 
 function setConnectOpen(open, prefill?) {
@@ -113,17 +116,14 @@ function setConnectOpen(open, prefill?) {
   const form = $('connectForm');
   if (form) form.classList.toggle('hidden', !connectOpen);
   if (connectOpen && prefill) {
-    const url = $('remoteUrlInput');
-    const label = $('remoteLabelInput');
-    if (url && prefill.url && document.activeElement !== url) url.value = prefill.url;
-    if (label && prefill.label != null && document.activeElement !== label) label.value = prefill.label;
+    $('remoteUrlInput').value = prefill.url || '';
+    $('remoteLabelInput').value = prefill.label || '';
+    $('remoteKeyInput').value = '';
   }
   const card = $('remoteModelCard');
   if (card) card.classList.toggle('hidden', !remoteMode || connectOpen);
-  if (!connectOpen) {
-    const list = $('probeList');
-    if (list) list.textContent = '';
-  }
+  renderFoundServers();
+  scheduleProbe();
 }
 
 function renderProbeList(info, error) {
@@ -136,6 +136,16 @@ function renderProbeList(info, error) {
     row.textContent = error;
     list.appendChild(row);
     return;
+  }
+  const state = ({
+    ready: 'Model ready', busy: 'Server busy',
+    limited: info?.modelId ? 'Model ready · limited capabilities' : 'Reachable · model unconfirmed',
+    loading: 'Loading model', 'no-model': 'No model loaded', auth: 'API key required', unreachable: 'Not reachable',
+  })[info?.state];
+  if (state) {
+    const status = document.createElement('strong');
+    status.textContent = state;
+    list.appendChild(status);
   }
   const probes = (info && info.probes) || [];
   probes.forEach(function (p) {
@@ -455,37 +465,57 @@ function setServerCardKind(kind) {
 
 function listenHost(url) {
   try {
-    const u = new URL(url);
-    const host = u.hostname.indexOf(':') >= 0 ? '[' + u.hostname + ']' : u.hostname;
-    return host + ':' + (u.port || '');
+    return new URL(url).host;
   } catch (e) {
     return String(url || '');
   }
 }
 
 function renderFoundServers() {
+  const available = !remoteMode && !serverRunning && !serverStarting;
+  $('connectDiscovery').classList.toggle('hidden', !available);
   const box = $('foundServers');
-  if (!box) return;
-  const show = !remoteMode && !connectOpen && !serverRunning && !serverStarting && foundServers.length;
-  box.classList.toggle('hidden', !show);
-  box.textContent = '';
-  if (!show) return;
-  foundServers.forEach(function (srv) {
-    if (!srv || !srv.url) return;
+  box.classList.toggle('hidden', !available || !foundServers.length);
+  const home = $(connectOpen ? 'connectServers' : 'foundServersHome');
+  if (box.parentElement !== home) home.appendChild(box);
+  if (!available) return;
+
+  // Polling sends the same results often. Keep the user's focus and the
+  // disclosure state when the list has not changed.
+  const servers = foundServers.filter(srv => srv?.url);
+  const key = JSON.stringify(servers.map(srv => [srv.name, srv.url]));
+  if (key === renderedServers) return;
+  renderedServers = key;
+  const shown = $('foundServersList');
+  const extra = $('foundServersExtra');
+  const more = $('foundServersMore');
+  shown.replaceChildren();
+  extra.replaceChildren();
+  const previewCount = 2;
+  more.classList.toggle('hidden', servers.length <= previewCount);
+  const remaining = servers.length - previewCount;
+  $('foundServersMoreLabel').textContent = remaining > 0 ? remaining + ' more local server' + (remaining === 1 ? '' : 's') : '';
+  servers.forEach(function (srv, i) {
     const row = document.createElement('div');
     row.className = 'found-server';
-    const text = document.createElement('span');
-    text.textContent = (srv.name || 'llama-server') + ' is listening on ' + listenHost(srv.url);
+    const text = document.createElement('div');
+    const name = document.createElement('strong');
+    name.textContent = srv.name || 'llama-server';
+    const address = document.createElement('div');
+    address.className = 'found-address';
+    address.textContent = listenHost(srv.url);
+    text.append(name, address);
     const btn = document.createElement('button');
     btn.type = 'button';
-    btn.className = 'secondary';
-    btn.textContent = 'Connect';
+    btn.className = 'secondary small';
+    btn.textContent = 'Use';
+    btn.setAttribute('aria-label', 'Use ' + name.textContent + ' at ' + address.textContent);
     btn.addEventListener('click', function () {
-      vscode.postMessage({ type: 'connectRemote', url: srv.url, label: 'localhost', apiKey: '' });
+      openConnectForm({ url: srv.url, label: 'localhost' });
+      $('remoteUrlInput').focus();
     });
-    row.appendChild(text);
-    row.appendChild(btn);
-    box.appendChild(row);
+    row.append(text, btn);
+    (i < previewCount ? shown : extra).appendChild(row);
   });
 }
 
@@ -1110,12 +1140,20 @@ function renderModelStatus() {
     el.textContent = text;
     el.title = modelPending ? 'The server is still running ' + (pendingModelChange().from || 'another model') + '.' : '';
   });
+  const attachments = serverRunning && !serverStarting
+    ? pendingChanges.filter(c => ['loraAdapters', 'mmprojPath', 'plePath'].includes(c.key))
+    : [];
   const bar = $('modelReloadBar');
   if (bar) {
-    bar.classList.toggle('hidden', !modelPending);
+    bar.classList.toggle('hidden', serverStarting || (!modelPending && !attachments.length));
+    $('modelDiscardBtn').classList.toggle('hidden', !attachments.length);
     const t = $('modelReloadText');
     if (t && modelPending) {
-      t.innerHTML = 'Server runs <b>' + escText(pendingModelChange().from || 'another model') + '</b>. Switch to the selection?';
+      const prompt = 'Server runs <b>' + escText(pendingModelChange().from || 'another model') + '</b>. Switch to the selection?';
+      if (t.innerHTML !== prompt) t.innerHTML = prompt;
+    } else if (t) {
+      const prompt = attachments.length ? 'Reload to apply attachment changes · ' + attachments.map(c => c.label).join(', ') : '';
+      if (t.textContent !== prompt) t.textContent = prompt;
     }
   }
   const closedReload = $('modelClosedReload');
@@ -3604,9 +3642,9 @@ function renderLora(p, f, remote) {
     : !running ? adapters.filter((a) => a.enabled).length + ' of ' + adapters.length + ' on'
     : active + ' active' + (waiting ? ' · ' + waiting + ' after reload' : '');
   $('pickLoraBtn').disabled = remote || !f.lora;
-  $('loraList').innerHTML = adapters.map((a, i) => {
+  const rows = adapters.map((a, i) => {
     const name = baseFileName(a.path);
-    const state = !running ? '' : a.loaded ? (a.enabled ? 'Active' : 'Off') : 'After reload';
+    const state = !running ? '' : a.loaded ? (a.enabled ? 'Active on server' : 'Off on server') : 'Queued for reload';
     const notes = [];
     if (a.message) notes.push('<div class="lora-note warn">' + escText(a.message) + '</div>');
     if (a.activated) notes.push('<div class="lora-note">Activated adapter: it only takes effect after its trigger phrase appears in the prompt.</div>');
@@ -3618,9 +3656,13 @@ function renderLora(p, f, remote) {
       '<label class="lora-strength">Strength<input type="range" min="0" max="2" step="0.05" value="' + a.scale + '" data-lora-scale="' + i + '" aria-label="Strength of ' + escAttr(name) + '"' + (a.enabled ? '' : ' disabled') + '><output>' + Number(a.scale).toFixed(2) + '</output></label>' +
       notes.join('') + '</div>';
   }).join('');
+  if (rows !== renderedLoraRows) {
+    $('loraList').innerHTML = rows;
+    renderedLoraRows = rows;
+  }
   $('loraHint').textContent = !f.lora ? (f.probed ? 'This llama.cpp build has no --lora option. Update llama.cpp to use LoRA adapters.' : 'Available once a runnable llama.cpp build is installed.')
     : !adapters.length ? 'Add a LoRA adapter (GGUF) trained on this model.'
-    : waiting && running ? 'Reload to load the new adapter. Strength and on/off apply at once for loaded adapters.'
+    : waiting && running ? 'Strength and on/off apply now for loaded adapters. Queued adapters take effect on reload.'
     : running ? 'Strength and on/off apply to the running server at once.'
     : '';
   const lineage = [];
@@ -3814,13 +3856,15 @@ $('reloadIconBtn').addEventListener('click', () => {
   }
   launch('reload');
 });
-$('discardBtn').addEventListener('click', () => {
+function discardPendingChanges() {
   if (saveLoadTimer) {
     clearTimeout(saveLoadTimer);
     saveLoadTimer = null;
   }
   vscode.postMessage({ type: 'discardChanges' });
-});
+}
+$('discardBtn').addEventListener('click', discardPendingChanges);
+$('modelDiscardBtn').addEventListener('click', discardPendingChanges);
 $('dirtyReloadBtn').addEventListener('click', () => launch('reload'));
 $('dirtyToggle').addEventListener('click', () => {
   const list = $('dirtyList');
@@ -3855,14 +3899,23 @@ $('openWebUiBtn').addEventListener('click', () => {
   vscode.postMessage({ type: 'openWebUi' });
 });
 $('copyKeyBtn').addEventListener('click', () => { closeMenu(); vscode.postMessage({ type: 'copyLocalApiKey' }); });
+function clearScheduledProbe() {
+  clearTimeout(probeTimer);
+  probeRequestId++;
+  $('probeList').replaceChildren();
+}
+
 function scheduleProbe() {
-  if (probeTimer) clearTimeout(probeTimer);
+  clearScheduledProbe();
+  if (!connectOpen) return;
   const url = ($('remoteUrlInput') && $('remoteUrlInput').value || '').trim();
   if (url.length < 4) return;
+  const requestId = probeRequestId;
   probeTimer = setTimeout(function () {
     vscode.postMessage({
       type: 'testRemote',
-      url: url,
+      requestId,
+      url,
       apiKey: ($('remoteKeyInput') && $('remoteKeyInput').value) || '',
     });
   }, 600);
@@ -4093,7 +4146,7 @@ window.addEventListener('message', (event: MessageEvent<ToWebviewMessage>) => {
   if (msg.type === 'openConnect') {
     openConnectForm(lastPayload && lastPayload.serverMode === 'remote' ? undefined : { url: '', label: '' });
   }
-  if (msg.type === 'remoteProbe') renderProbeList(msg.payload, msg.error || '');
+  if (msg.type === 'remoteProbe' && connectOpen && msg.requestId === probeRequestId) renderProbeList(msg.payload, msg.error || '');
   if (msg.type === 'remoteConnected') setConnectOpen(false);
   if (msg.type === 'libraryFits') {
     lib.fits = msg.fits || {};

@@ -667,11 +667,11 @@ describe("LoRA adapter controls", () => {
     const rows = [...el("loraList").querySelectorAll(".lora-item")];
     assert.equal(rows.length, 2);
     assert.match(rows[0].textContent, /sql-lora\.gguf.*Active/);
-    assert.match(rows[1].textContent, /After reload/);
+    assert.match(rows[1].textContent, /Queued for reload/);
     assert.match(rows[1].textContent, /does not name its base model/);
     assert.match(rows[1].textContent, /trigger phrase/);
     assert.equal(el("loraSum").textContent, "1 active · 1 after reload");
-    assert.match(el("loraHint").textContent, /Reload to load the new adapter/);
+    assert.match(el("loraHint").textContent, /Queued adapters take effect on reload/);
 
     const slider = rows[0].querySelector("input[type=range]");
     slider.value = "0.35";

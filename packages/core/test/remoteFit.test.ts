@@ -10,5 +10,6 @@ it("estimateRemoteFit: file size plus allowance against capacity", () => {
   assert.equal(estimateRemoteFit(19.8 * GiB, 16 * GiB)?.fit, "wont-fit");
   assert.equal(estimateRemoteFit(1.2 * GiB, 16 * GiB)?.needBytes, 2.2 * GiB); // 1 GiB minimum allowance
   assert.equal(estimateRemoteFit(0, 16 * GiB), undefined);
-  assert.equal(estimateRemoteFit(4 * GiB, 0), undefined, "unknown capacity gives no verdict");
+  assert.equal(estimateRemoteFit(4 * GiB, 0)?.fit, "wont-fit", "zero bytes is a valid measurement");
+  assert.equal(estimateRemoteFit(4 * GiB, NaN), undefined, "unknown capacity gives no verdict");
 });

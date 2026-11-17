@@ -508,7 +508,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             await this.pushState();
             break;
           case "testRemote":
-            await this.testRemote(String(msg.url || ""), String(msg.apiKey || ""));
+            await this.testRemote(String(msg.url || ""), String(msg.apiKey || ""), msg.requestId);
             break;
           case "connectRemote":
             await this.connectRemote(String(msg.url || ""), String(msg.label || ""), String(msg.apiKey || ""));
@@ -1084,13 +1084,13 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private async testRemote(rawUrl: string, apiKey: string): Promise<void> {
+  private async testRemote(rawUrl: string, apiKey: string, requestId: number): Promise<void> {
     let url: string;
     try {
       url = normalizeServerUrl(rawUrl);
     } catch (e) {
       this.post({
-        type: "remoteProbe",
+        type: "remoteProbe", requestId,
         error: e instanceof Error ? e.message : String(e),
       });
       return;
@@ -1099,10 +1099,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     const key = apiKey.trim() || (origin ? await this.apiKeys?.load(origin) : undefined);
     try {
       const info = await probeRemoteServer(url, { apiKey: key });
-      this.post({ type: "remoteProbe", payload: info });
+      this.post({ type: "remoteProbe", requestId, payload: info });
     } catch (e) {
       this.post({
-        type: "remoteProbe",
+        type: "remoteProbe", requestId,
         error: e instanceof Error ? e.message : String(e),
       });
     }
@@ -2102,25 +2102,30 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     try {
       const files = await this.hf().listGgufFiles(modelId);
       const picker = downloadPickerFiles(files);
-      // Rough fit before download: free VRAM across GPUs, or system RAM on CPU.
-      const cpuOnly = this.cpuOnlyBackend() || !this.lastGpus.length;
-      const capacity = cpuOnly
-        ? os.totalmem()
-        : this.lastGpus.reduce((sum, g) => sum + Math.max(0, g.totalBytes - (g.usedBytes || 0)), 0);
-      const capacityLabel = `${formatBytes(capacity)} ${cpuOnly ? "RAM" : "free VRAM"}`;
+      // This only compares a file against currently available memory. A loaded
+      // model, device placement, and the chosen context can change the outcome.
+      const cpuOnly = this.cpuOnlyBackend();
+      const gpus = this.lastGpus;
+      const freeGpuBytes = gpus.length && gpus.every(g => g.usedBytes != null)
+        ? gpus.reduce((sum, g) => sum + Math.max(0, g.totalBytes - (g.usedBytes ?? 0)), 0)
+        : undefined;
+      const capacity = cpuOnly ? os.freemem() : freeGpuBytes;
+      const capacityLabel = capacity == null ? undefined :
+        `${formatBytes(capacity)} ${cpuOnly ? "free system RAM" : gpus.length > 1 ? "total free VRAM across GPUs" : "free VRAM"} now`;
       this.post({
         type: "libraryHfFiles",
         requestId,
         modelId,
         companionOnly: picker.companionOnly,
         companionHint: picker.companionOnly ? "" : companionDownloadHint(files),
+        capacityLabel,
         files: picker.files.map((file) => ({
           path: file.path,
           label: listingBaseName(file.path),
           detail: describeLanguageGgufFile(file, files),
           ...(() => {
-            const est = picker.companionOnly ? undefined : estimateRemoteFit(file.size, capacity);
-            return est ? { fit: est.fit, needLabel: formatBytes(est.needBytes), capacityLabel } : {};
+            const est = picker.companionOnly || capacity == null ? undefined : estimateRemoteFit(file.size, capacity);
+            return est ? { fit: est.fit, needLabel: formatBytes(est.needBytes) } : {};
           })(),
         })),
       });

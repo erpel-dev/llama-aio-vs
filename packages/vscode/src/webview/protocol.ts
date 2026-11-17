@@ -58,7 +58,7 @@ export type ToHostMessage =
   | { type: "setDuplicateToolCallGuardEnabled"; payload: { enabled: boolean } }
   // Remote server
   | { type: "refreshRemote" }
-  | { type: "testRemote"; url: string; apiKey?: string }
+  | { type: "testRemote"; url: string; apiKey?: string; requestId: number }
   | { type: "connectRemote"; url: string; label?: string; apiKey?: string }
   | { type: "switchToLocal" }
   | { type: "setApiKey" }
@@ -139,7 +139,7 @@ export type ToWebviewMessage =
   | { type: "advancedPanel"; open: boolean }
   | { type: "testResult"; status: "running" | "done" | "error" | "cancelled"; text?: string; error?: string; ms?: number }
   | { type: "remoteConnected" }
-  | { type: "remoteProbe"; payload?: ViewModel; error?: string }
+  | { type: "remoteProbe"; requestId: number; payload?: ViewModel; error?: string }
   | {
       type: "focusLibrary";
       filter?: boolean;
@@ -188,7 +188,8 @@ export type ToWebviewMessage =
       modelId: string;
       companionOnly: boolean;
       companionHint: string;
-      files: Array<{ path: string; label: string; detail: string; fit?: "fits" | "tight" | "wont-fit"; needLabel?: string; capacityLabel?: string }>;
+      capacityLabel?: string;
+      files: Array<{ path: string; label: string; detail: string; fit?: "fits" | "tight" | "wont-fit"; needLabel?: string }>;
     };
 
 export type ToWebviewType = ToWebviewMessage["type"];

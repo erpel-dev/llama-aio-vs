@@ -89,22 +89,34 @@
     <div class="actions-row" id="primaryRow">
       <button class="primary" id="primaryBtn" data-action="start">Start</button>
     </div>
-    <div class="found-servers hidden local-only" id="foundServers"></div>
+    <div id="foundServersHome">
+      <div class="found-servers hidden" id="foundServers">
+        <div class="card-title">On this machine</div>
+        <div class="found-list" id="foundServersList"></div>
+        <details class="hidden" id="foundServersMore">
+          <summary id="foundServersMoreLabel"></summary>
+          <div class="found-list" id="foundServersExtra"></div>
+        </details>
+      </div>
+    </div>
     <div class="connect-form hidden" id="connectForm">
       <div class="card-title" style="margin-bottom:4px">Connect to a server</div>
+      <div id="connectDiscovery">
+        <div id="connectServers"></div>
+        <button class="link-btn" id="extraPortsBtn" type="button">Scan other ports…</button>
+      </div>
       <label for="remoteUrlInput">Server URL</label>
       <input type="text" id="remoteUrlInput" placeholder="https://gpu-box.lan:8080" spellcheck="false" />
       <label for="remoteLabelInput">Name <span style="opacity:.7">(optional)</span></label>
       <input type="text" id="remoteLabelInput" placeholder="gpu-box" />
       <label for="remoteKeyInput">API key <span style="opacity:.7">(optional · Secret Storage)</span></label>
       <input type="password" id="remoteKeyInput" placeholder="only if the server uses --api-key" autocomplete="off" />
-      <div id="probeList" style="margin-top:8px"></div>
+      <div id="probeList" aria-live="polite"></div>
       <div class="actions-row">
         <button class="primary" id="connectBtn" type="button">Connect</button>
         <button class="secondary" id="connectCancelBtn" type="button">Cancel</button>
       </div>
       <div class="hint">Your local model and load settings stay saved. Switch to this machine brings them back.</div>
-      <button class="link-btn" id="extraPortsBtn" type="button">Look for servers on more ports on this machine…</button>
     </div>
     <div class="remote-strip remote-only hidden" id="remoteStrip"></div>
     <div class="actions-row remote-only hidden" id="remoteActions">
@@ -178,6 +190,13 @@
         <button class="primary hidden" id="starterModelBtn">Download starter ({{starterLabel}})</button>
         <div class="hint hidden" id="starterModelHint" style="margin-top:0">{{starterSize}} · {{starterDetail}}</div>
       </div>
+      <div class="model-reload hidden" id="modelReloadBar">
+        <span id="modelReloadText" aria-live="polite"></span>
+        <div class="btn-row">
+          <button class="secondary small hidden" type="button" id="modelDiscardBtn" aria-label="Discard all pending load changes">Discard pending</button>
+          <button class="primary small" type="button" data-model-reload>Reload server</button>
+        </div>
+      </div>
       <div class="mm-attach hidden" id="mmprojAttach">
         <span class="tip mm-label" data-flag="-mm, --mmproj" data-help="Multimodal projector GGUF. llama-server loads it with the language model. Supported inputs depend on the projector and client. Reload the server to apply.">Projector</span>
         <span class="mm-name" id="mmprojName"></span>
@@ -223,10 +242,7 @@
         </div>
       </details>
       <div class="lib-quick hidden" id="libraryQuick"></div>
-      <div class="model-reload hidden" id="modelReloadBar">
-        <span class="grow" id="modelReloadText"></span>
-        <button class="primary small" type="button" data-model-reload>Reload server</button>
-      </div>
+
     </details>
     <div class="model-closed-line" id="modelClosedLine">
       <span class="grow" id="modelClosedMeta"></span>
