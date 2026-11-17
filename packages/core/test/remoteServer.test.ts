@@ -28,6 +28,14 @@ describe("legacyRemoteHostUrl", () => {
   });
 });
 
+it("uses reachability language for a preview and connection language after connecting", () => {
+  assert.equal(remoteStateLabel("ready"), "Connected");
+  assert.equal(remoteStateLabel("ready", { modelConfirmed: true }), "Reachable · model ready");
+  assert.equal(remoteStateLabel("limited", { modelConfirmed: true }), "Reachable · limited capabilities");
+  assert.equal(remoteStateLabel("limited", { modelConfirmed: false }), "Reachable · model unconfirmed");
+  assert.equal(remoteStateLabel("auth", { modelConfirmed: false }), "API key required");
+});
+
 describe("probeRemoteServer", () => {
   let server: Server;
   let base = "";

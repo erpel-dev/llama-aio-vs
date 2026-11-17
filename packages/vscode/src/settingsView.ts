@@ -22,6 +22,7 @@ import {
   originOf,
   probeRemoteServer,
   remoteStateLabel,
+  effectiveLoraScale,
   remoteLifecycleMessage,
   type GpuMemoryInfo,
   type DiscoveredLlamaServer,
@@ -1141,7 +1142,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     const key = apiKey.trim() || (origin ? await this.apiKeys?.load(origin) : undefined);
     try {
       const info = await probeRemoteServer(url, { apiKey: key });
-      this.post({ type: "remoteProbe", requestId, payload: info, label: remoteStateLabel(info.state) });
+      this.post({
+        type: "remoteProbe", requestId, payload: info,
+        label: remoteStateLabel(info.state, { modelConfirmed: Boolean(info.modelId) }),
+      });
     } catch (e) {
       this.post({
         type: "remoteProbe", requestId,
@@ -1420,7 +1424,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         defaults: DEFAULT_LOAD_SETTINGS,
         serverFeatures: remoteMode ? NO_SERVER_FEATURES : this.serverFeatures,
         chatTemplateProblem: chatTemplateFileProblem(state.loadSettings) || "",
-        lora: this.loraPayload(state, caps, launched?.loadSettings, remoteMode),
+        lora: this.loraPayload(state, caps, launched, remoteMode),
         pleTable: {
           supported: !!caps?.pleSupported || (caps?.pleShare || 0) > 0,
           path: state.loadSettings.plePath,
@@ -1594,12 +1598,17 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
   private loraPayload(
     state: ReturnType<SettingsStore["getState"]>,
     caps: ReturnType<SettingsStore["getState"]>["modelCapabilities"],
-    launched: LlamaLoadSettings | undefined,
+    launched: ReturnType<ProcessManager["getLaunchedConfig"]>,
     remote: boolean
   ) {
-    const loaded = new Set((launched?.loraAdapters || []).map(a => a.path));
+    const saved = state.loadSettings.loraAdapters;
+    const sameModel = launched && state.selectedModelPath &&
+      path.resolve(launched.modelPath) === path.resolve(state.selectedModelPath);
+    const loaded = sameModel ? launched.loadSettings?.loraAdapters || [] : [];
+    const loadedPaths = new Set(loaded.map(a => path.resolve(a.path)));
+    const savedPaths = new Set(saved.map(a => path.resolve(a.path)));
     return {
-      adapters: remote ? [] : state.loadSettings.loraAdapters.map(a => {
+      adapters: remote ? [] : saved.map(a => {
         const check = checkLoraAdapter(a.path, caps);
         return {
           path: a.path, scale: a.scale, enabled: a.enabled,
@@ -1607,9 +1616,11 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           fit: check.fit, message: check.message,
           activated: !!check.info?.activated,
           // Loaded adapters take strength changes at once; new ones wait for a reload.
-          loaded: loaded.has(a.path),
+          loaded: loadedPaths.has(path.resolve(a.path)),
         };
       }),
+      pendingRemovals: remote ? [] : loaded.filter(a => !savedPaths.has(path.resolve(a.path)))
+        .map(a => ({ path: a.path, scale: effectiveLoraScale(a) })),
       builtIn: caps?.builtInAdapters ?? null,
       lineage: modelLineage(caps) ?? null,
     };

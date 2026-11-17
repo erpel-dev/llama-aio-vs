@@ -111,7 +111,8 @@
       <label for="remoteLabelInput">Name <span style="opacity:.7">(optional)</span></label>
       <input type="text" id="remoteLabelInput" placeholder="gpu-box" />
       <label for="remoteKeyInput">API key <span style="opacity:.7">(optional · Secret Storage)</span></label>
-      <input type="password" id="remoteKeyInput" placeholder="only if the server uses --api-key" autocomplete="off" />
+      <input type="password" id="remoteKeyInput" placeholder="only if the server uses --api-key" autocomplete="off" aria-describedby="remoteKeyHint" />
+      <div class="hint" id="remoteKeyHint" aria-live="polite"></div>
       <div id="probeList" aria-live="polite"></div>
       <div class="actions-row">
         <button class="primary" id="connectBtn" type="button">Connect</button>

@@ -4,6 +4,7 @@
  * are typed by ./protocol, so a renamed or misspelled message fails the build.
  */
 import { $, vscode } from "./api";
+import { normalizeServerUrl, originOf } from "../../../core/src/serverUrl";
 import type { ToWebviewMessage } from "./protocol";
 import { escAttr, escText, fmtBytes, fmtEta, fmtNum, fmtParams, fmtRate, fmtServerRate, fmtTokK, fmtTokShort, fmtUptime, friendlyNetworkError, pickNum, promptEtaSeconds } from "./format";
 import {
@@ -107,6 +108,7 @@ let remoteHint = '';
 let nextRetryAt = 0;
 let probeTimer = null;
 let probeRequestId = 0;
+let draftApiKeyOrigin: string | undefined;
 let renderedServers = '';
 let renderedLoraRows = '';
 const submittedLoraEdits = new Set<number>();
@@ -126,7 +128,10 @@ function setConnectOpen(open, prefill?) {
   if (connectOpen && prefill) {
     $('remoteUrlInput').value = prefill.url || '';
     $('remoteLabelInput').value = prefill.label || '';
-    $('remoteKeyInput').value = '';
+  }
+  if (!connectOpen || prefill) {
+    clearDraftApiKey();
+    $('remoteKeyHint').textContent = '';
   }
   const card = $('remoteModelCard');
   if (card) card.classList.toggle('hidden', !remoteMode || connectOpen);
@@ -3655,16 +3660,19 @@ function renderLora(p, f, remote) {
   const row = $('loraAttach');
   const hasModel = !!(p.state && p.state.selectedModelPath);
   row.classList.toggle('hidden', remote || !hasModel);
-  const active = adapters.filter((a) => a.enabled && a.loaded).length;
-  const waiting = adapters.filter((a) => !a.loaded).length;
   const running = !!(p.status && p.status.running);
-  $('loraSum').textContent = !adapters.length ? 'None'
-    : !running ? adapters.filter((a) => a.enabled).length + ' of ' + adapters.length + ' on'
-    : active + ' active' + (waiting ? ' · ' + waiting + ' after reload' : '');
+  const removals = running ? lora.pendingRemovals || [] : [];
+  const active = adapters.filter(a => a.enabled && a.loaded && a.scale > 0).length +
+    removals.filter(a => a.scale > 0).length;
+  const waiting = adapters.filter(a => !a.loaded).length;
+  $('loraSum').textContent = !adapters.length && !removals.length ? 'None'
+    : !running ? adapters.filter(a => a.enabled).length + ' of ' + adapters.length + ' on'
+    : active + ' active' + (waiting ? ' · ' + waiting + ' after reload' : '') +
+      (removals.length ? ' · ' + removals.length + ' pending removal' : '');
   $('pickLoraBtn').disabled = remote || !f.lora;
-  const rows = adapters.map((a, i) => {
+  const editableRows = adapters.map((a, i) => {
     const name = baseFileName(a.path);
-    const state = !running ? '' : a.loaded ? (a.enabled ? 'Active on server' : 'Off on server') : 'Queued for reload';
+    const state = !running ? '' : a.loaded ? (a.enabled && a.scale > 0 ? 'Active on server' : 'Off on server') : 'Queued for reload';
     const notes = [];
     if (a.message) notes.push('<div class="lora-note warn">' + escText(a.message) + '</div>');
     if (a.activated) notes.push('<div class="lora-note">Activated adapter: it only takes effect after its trigger phrase appears in the prompt.</div>');
@@ -3676,6 +3684,13 @@ function renderLora(p, f, remote) {
       '<label class="lora-strength">Strength<input type="range" min="0" max="2" step="0.05" value="' + a.scale + '" data-lora-scale="' + i + '" aria-label="Strength of ' + escAttr(name) + '"' + (a.enabled ? '' : ' disabled') + '><output>' + Number(a.scale).toFixed(2) + '</output></label>' +
       notes.join('') + '</div>';
   }).join('');
+  const removedRows = removals.map(a =>
+    '<div class="lora-item"><span class="lora-removed-name" title="' + escAttr(a.path) + '">' +
+    escText(baseFileName(a.path)) + '</span><div class="lora-note">' +
+    escText((a.scale > 0 ? 'Active at ' + Number(a.scale).toFixed(2) : 'Off on server') +
+      ' · Removed on reload') + '</div></div>'
+  ).join('');
+  const rows = editableRows + removedRows;
   if (rows !== renderedLoraRows) {
     $('loraList').innerHTML = rows;
     renderedLoraRows = rows;
@@ -3694,6 +3709,7 @@ function renderLora(p, f, remote) {
   }
   submittedLoraEdits.clear();
   $('loraHint').textContent = !f.lora ? (f.probed ? 'This llama.cpp build has no --lora option. Update llama.cpp to use LoRA adapters.' : 'Available once a runnable llama.cpp build is installed.')
+    : removals.length ? 'Pending removals stay loaded until reload. Use Discard attachments to undo them.'
     : !adapters.length ? 'Add a LoRA adapter (GGUF) trained on this model.'
     : waiting && running ? 'Strength and on/off apply now for loaded adapters. Queued adapters take effect on reload.'
     : running ? 'Strength and on/off apply to the running server at once.'
@@ -3952,18 +3968,42 @@ function clearScheduledProbe() {
   $('probeList').replaceChildren();
 }
 
+function currentRemoteOrigin(url: string): string | undefined {
+  try {
+    return originOf(normalizeServerUrl(url));
+  } catch {
+    return undefined;
+  }
+}
+
+function clearDraftApiKey() {
+  $('remoteKeyInput').value = '';
+  draftApiKeyOrigin = undefined;
+}
+
+function keyForRemoteUrl(url: string): string {
+  return draftApiKeyOrigin && draftApiKeyOrigin === currentRemoteOrigin(url) ? $('remoteKeyInput').value : '';
+}
+
 function scheduleProbe() {
   clearScheduledProbe();
   if (!connectOpen) return;
-  const url = ($('remoteUrlInput') && $('remoteUrlInput').value || '').trim();
+  const url = $('remoteUrlInput').value.trim();
+  const origin = currentRemoteOrigin(url);
+  $('remoteKeyInput').disabled = !origin;
+  if (draftApiKeyOrigin && draftApiKeyOrigin !== origin) {
+    clearDraftApiKey();
+    $('remoteKeyHint').textContent = 'Server address changed. Re-enter the API key if needed.';
+  }
   if (url.length < 4) return;
+  const apiKey = keyForRemoteUrl(url);
   const requestId = probeRequestId;
   probeTimer = setTimeout(function () {
     vscode.postMessage({
       type: 'testRemote',
       requestId,
       url,
-      apiKey: ($('remoteKeyInput') && $('remoteKeyInput').value) || '',
+      apiKey,
     });
   }, 600);
 }
@@ -3985,17 +4025,22 @@ $('connectCancelBtn').addEventListener('click', () => setConnectOpen(false));
 $('extraPortsBtn').addEventListener('click', () =>
   vscode.postMessage({ type: 'extraServerPorts', requestId: ++connectScanRequestId }));
 $('connectBtn').addEventListener('click', () => {
+  const url = $('remoteUrlInput').value;
+  clearScheduledProbe();
   vscode.postMessage({
-    type: 'connectRemote',
-    url: ($('remoteUrlInput') && $('remoteUrlInput').value) || '',
-    label: ($('remoteLabelInput') && $('remoteLabelInput').value) || '',
-    apiKey: ($('remoteKeyInput') && $('remoteKeyInput').value) || '',
+    type: 'connectRemote', url,
+    label: $('remoteLabelInput').value,
+    apiKey: keyForRemoteUrl(url),
   });
-  const key = $('remoteKeyInput');
-  if (key) key.value = '';
+  clearDraftApiKey();
 });
 $('remoteUrlInput').addEventListener('input', scheduleProbe);
-$('remoteKeyInput').addEventListener('input', scheduleProbe);
+$('remoteKeyInput').addEventListener('input', () => {
+  draftApiKeyOrigin = currentRemoteOrigin($('remoteUrlInput').value);
+  if (!draftApiKeyOrigin) clearDraftApiKey();
+  $('remoteKeyHint').textContent = '';
+  scheduleProbe();
+});
 $('remotePrimaryBtn').addEventListener('click', () => {
   const action = $('remotePrimaryBtn').dataset.action;
   if (action === 'setApiKey') vscode.postMessage({ type: 'setApiKey' });
