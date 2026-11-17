@@ -688,6 +688,12 @@ describe("LoRA adapter controls", () => {
     toggle.checked = false;
     fire(toggle, "change");
     assert.deepEqual({ ...sent.at(-1) }, { type: "setLora", path: "/l/sql-lora.gguf", enabled: false });
+    slider.focus();
+    paint({ lora: { adapters, builtIn: null, lineage: null }, status: { ...payload.status, running: true } });
+    assert.equal(dom.window.document.activeElement, slider);
+    assert.equal(slider.value, "0.8");
+    assert.equal(rows[0].querySelector("output").textContent, "0.80");
+    assert.equal(toggle.checked, true);
     rows[1].querySelector("[data-act=lora-remove]").click();
     assert.deepEqual({ ...sent.at(-1) }, { type: "removeLora", path: "/l/new-lora.gguf" });
 
@@ -719,6 +725,21 @@ describe("LoRA adapter controls", () => {
     assert.deepEqual(ui.getState().loadSettings.loraAdapters, [{ path: "/l/a.gguf", scale: 0.4, enabled: false }]);
     assert.deepEqual(ui.loraApplied.at(-1), [], "Discard should not reapply launch-time strengths");
   });
+  it("discards attachment edits without reverting pending context or thread settings", async () => {
+    const saved = [{ path: "/l/a.gguf", scale: 0.4, enabled: true }];
+    const ui = setup({ loraAdapters: saved, mmprojPath: "/m/projector.gguf", plePath: "/m/ple.gguf" }, undefined, lora);
+    await ui.send({ type: "removeLora", path: "/l/a.gguf" });
+    await ui.provider.store.updateLoadSettings({ contextLength: 32768, mmprojPath: "", plePath: "" });
+    await ui.send({ type: "discardAttachments", payload: { cpuThreads: 5 } });
+    const settings = ui.getState().loadSettings;
+    assert.deepEqual(settings.loraAdapters, saved);
+    assert.deepEqual(ui.loraApplied.at(-1), saved);
+    assert.equal(settings.mmprojPath, "/m/projector.gguf");
+    assert.equal(settings.plePath, "/m/ple.gguf");
+    assert.equal(settings.contextLength, 32768);
+    assert.equal(settings.cpuThreads, 5);
+  });
+
   it("undoes a change the running server did not take, and says so", async t => {
     const errors = t.mock.method(require("vscode").window, "showErrorMessage", async () => undefined);
     const saved = [{ path: "/l/a.gguf", scale: 1, enabled: true }];
@@ -765,6 +786,59 @@ describe("more ports to look on", () => {
   });
 });
 
+it("falls back to labeled total RAM when free GPU memory is unavailable", async t => {
+  const ui = setup();
+  t.mock.method(os, "totalmem", () => 16 * 1024 ** 3);
+  t.mock.method(os, "freemem", () => 0);
+  ui.provider.hf = () => ({
+    listGgufFiles: async () => [{ path: "model-Q4_K_M.gguf", size: 2 * 1024 ** 3, url: "" }],
+  });
+  await ui.send({ type: "listLibraryHfFiles", modelId: "owner/model", requestId: 1 });
+  const reply = ui.posted.findLast(m => m.type === "libraryHfFiles");
+  assert.equal(reply.usesRam, true);
+  assert.match(reply.capacityLabel, /total system RAM/);
+  assert.equal(reply.files[0].fit, "fits");
+});
+
+it("preserves a connection draft and shows explicit scan results while the local server runs", async t => {
+  const { JSDOM } = require("jsdom");
+  const html = fs.readFileSync(path.join(__dirname, "../src/webview/sidebar.html"), "utf8").replace(/\{\{\w+\}\}/g, "");
+  const dom = new JSDOM(html, { runScripts: "outside-only" });
+  t.after(() => dom.window.close());
+  const sent = [];
+  dom.window.acquireVsCodeApi = () => ({ postMessage: m => sent.push(m), getState: () => null, setState() {} });
+  dom.window.eval(fs.readFileSync(path.join(__dirname, "../out/webview/sidebar.js"), "utf8"));
+  const el = id => dom.window.document.getElementById(id);
+  const post = data => dom.window.dispatchEvent(new dom.window.MessageEvent("message", { data }));
+  const ui = setup();
+  await ui.provider.pushState();
+  post(ui.posted.findLast(m => m.type === "state"));
+  post({ type: "openConnect" });
+  el("remoteUrlInput").value = "http://127.0.0.1:9123";
+  el("remoteKeyInput").value = "temporary-test-key";
+  el("remoteKeyInput").focus();
+  post({ type: "openConnect" });
+  assert.equal(el("remoteUrlInput").value, "http://127.0.0.1:9123");
+  assert.equal(el("remoteKeyInput").value, "temporary-test-key");
+  el("extraPortsBtn").click();
+  const requestId = sent.at(-1).requestId;
+  assert.equal(sent.at(-1).type, "extraServerPorts");
+  post({ type: "connectScan", requestId, servers: [{ url: "http://127.0.0.1:9124" }] });
+  assert.equal(el("foundServers").classList.contains("hidden"), false);
+  el("foundServersList").querySelector("button").click();
+  assert.equal(el("remoteUrlInput").value, "http://127.0.0.1:9124");
+  assert.equal(el("remoteKeyInput").value, "");
+
+  el("connectCancelBtn").click();
+  post({
+    type: "statusPatch",
+    payload: { starting: true, changes: [{ key: "model", from: "first.gguf", to: "second.gguf" }] },
+  });
+  assert.equal(el("modelReloadBar").classList.contains("hidden"), false);
+  assert.match(el("modelReloadText").textContent, /loading first\.gguf/);
+  assert.equal(el("modelReloadBtn").disabled, true);
+});
+
 describe("local server scan and the port list", () => {
   function held(ui) {
     const calls = [];
@@ -798,6 +872,18 @@ describe("local server scan and the port list", () => {
       assert.equal(calls.length, 2, "the cached result for the current list is reused");
     });
   }
+
+  it("allows explicit discovery while in remote mode without scanning on status polls", async () => {
+    const ui = setup({}, { state: "ready" });
+    await ui.provider.store.getConfig().update("extraServerPorts", [9123]);
+    const calls = held(ui);
+    assert.deepEqual(await ui.provider.localServersForSidebar(stopped), []);
+    assert.equal(calls.length, 0);
+    const explicit = ui.provider.localServersForSidebar(stopped, false, true);
+    assert.deepEqual(calls.map(c => c.ports), [[9123]]);
+    calls[0].resolve(srv(9123));
+    assert.deepEqual(await explicit, srv(9123));
+  });
 
   it("removing every added port drops what they found", async () => {
     const ui = setup();
@@ -974,6 +1060,43 @@ describe("onboarding test message", () => {
     });
   }
 
+  it("waits for the old stream to end before starting a retry", async t => {
+    let finishStream;
+    const oldStream = new Promise(resolve => { finishStream = resolve; });
+    const sendRequest = t.mock.fn(async ([prompt]) => ({
+      stream: prompt === "First" ? (async function* () {
+        await oldStream;
+        yield new vscode.LanguageModelTextPart("Old reply");
+      })() : [new vscode.LanguageModelTextPart("New reply")],
+    }));
+    mockTestModel(t, async () => [{ sendRequest }]);
+    const { provider, results } = captureResults();
+    const first = provider.runTestMessage("First");
+    await new Promise(resolve => setImmediate(resolve));
+    provider.testCancel.cancel();
+    await first;
+    const retry = provider.runTestMessage("Retry");
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(sendRequest.mock.callCount(), 1);
+    finishStream();
+    await retry;
+    assert.equal(sendRequest.mock.callCount(), 2);
+    assert.equal(results.at(-1).text, "New reply");
+  });
+
+  it("does not bring onboarding back when a dismissed test finishes", async t => {
+    let select;
+    const lookup = new Promise(resolve => { select = resolve; });
+    mockTestModel(t, () => lookup);
+    const { provider, results } = captureResults();
+    const test = provider.runTestMessage("First");
+    await provider.handleMessage({ type: "dismissSetup" });
+    select([]);
+    await test;
+    assert.deepEqual(results.map(r => r.status), ["running"]);
+    assert.equal(provider.lastTestResult, undefined);
+  });
+
   it("shows the reply without an editable prompt and can send another test after onboarding completes", async t => {
     const { JSDOM } = require("jsdom");
     const html = fs.readFileSync(path.join(__dirname, "../src/webview/sidebar.html"), "utf8").replace(/\{\{\w+\}\}/g, "");
@@ -1020,5 +1143,9 @@ describe("onboarding test message", () => {
     assert.equal(primary.dataset.action, "test");
     assert.equal(input.disabled, false);
     assert.match(el("setupTestReply").textContent, /Test cancelled/);
+    result("done", { text: "Second reply" });
+    el("setupSecondary").querySelector('[data-setup="dismiss"]').click();
+    result("done", { text: "Result sent before the host handled dismiss" });
+    assert.equal(el("setupBox").classList.contains("hidden"), true);
   });
 });

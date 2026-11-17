@@ -312,17 +312,18 @@ export function renderLibraryList() {
     if (lib.hfFiles.companionHint) {
       html += '<div class="hint">Also fetches ' + escText(lib.hfFiles.companionHint) + '</div>';
     }
-    const { companionOnly, capacityLabel } = lib.hfFiles;
+    const { companionOnly, capacityLabel, usesRam } = lib.hfFiles;
     type HfFile = Extract<ToWebviewMessage, { type: 'libraryHfFiles' }>['files'][number];
     const hfFiles: HfFile[] = lib.hfFiles.files || [];
     const likely = hfFiles.filter(file => file.fit === 'fits' || file.fit === 'tight');
     const unknown = hfFiles.filter(file => !file.fit);
     if (!companionOnly && hfFiles.length) {
       html += '<div class="lib-memory"><strong>' + escText(capacityLabel || 'Available memory unknown') + '</strong>' +
-        '<div>Estimate from file size and a small runtime allowance. Your context and offload settings affect the actual fit.</div></div>';
+        '<div>' + (usesRam ? 'System RAM is a capacity limit. Free RAM and GPU fit are unknown.' :
+          'Estimate from file size and a small runtime allowance. Context and offload settings affect fit.') + '</div></div>';
       const categories = [
         { key: 'all', label: 'All', count: hfFiles.length },
-        { key: 'likely', label: 'Likely fits', count: likely.length },
+        { key: 'likely', label: usesRam ? 'Within RAM capacity' : 'Likely fits', count: likely.length },
         { key: 'unknown', label: 'Fit unknown', count: unknown.length },
       ];
       html += '<div class="lib-filters" role="group" aria-label="Filter by estimated fit">' +
@@ -332,7 +333,9 @@ export function renderLibraryList() {
           '">' + c.label + '<span class="n">' + c.count + '</span></button>').join('') + '</div>';
     }
     const shown = lib.hfFitFilter === 'likely' ? likely : lib.hfFitFilter === 'unknown' ? unknown : hfFiles;
-    const fitText = { fits: 'Likely fits', tight: 'Tight on memory', 'wont-fit': 'Exceeds free memory' };
+    const fitText = usesRam
+      ? { fits: 'Within RAM capacity', tight: 'Near RAM capacity', 'wont-fit': 'Exceeds RAM capacity' }
+      : { fits: 'Likely fits', tight: 'Tight on memory', 'wont-fit': 'Exceeds free memory' };
     shown.forEach(function (file) {
       html += '<div class="lib-file"><span class="grow"><b>' + escText(file.label) + '</b>';
       if (file.detail) html += '<span class="lib-detail">' + escText(file.detail) + '</span>';

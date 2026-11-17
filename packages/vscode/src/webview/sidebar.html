@@ -103,6 +103,7 @@
       <div class="card-title" style="margin-bottom:4px">Connect to a server</div>
       <div id="connectDiscovery">
         <div id="connectServers"></div>
+        <div class="hint hidden" id="connectScanStatus" aria-live="polite"></div>
         <button class="link-btn" id="extraPortsBtn" type="button">Scan other ports…</button>
       </div>
       <label for="remoteUrlInput">Server URL</label>
@@ -195,8 +196,8 @@
       <div class="model-reload hidden" id="modelReloadBar">
         <span id="modelReloadText" aria-live="polite"></span>
         <div class="btn-row">
-          <button class="secondary small hidden" type="button" id="modelDiscardBtn" aria-label="Discard all pending load changes">Discard pending</button>
-          <button class="primary small" type="button" data-model-reload>Reload server</button>
+          <button class="secondary small hidden" type="button" id="modelDiscardBtn">Discard attachments</button>
+          <button class="primary small" type="button" id="modelReloadBtn" data-model-reload>Reload server</button>
         </div>
       </div>
       <div class="mm-attach hidden" id="mmprojAttach">

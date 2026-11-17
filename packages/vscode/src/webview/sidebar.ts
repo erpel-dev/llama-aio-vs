@@ -94,6 +94,7 @@ let sawCompletedReply = false;
 let setupVisible = false;
 /** The test composer or its most recent result, kept until the user clicks Done. */
 let testState = null;
+let testDismissed = false;
 let lastMemoryView = null;
 let loadDefaults = {};
 /** "Custom" GPU layers stays open while the user works with the slider. */
@@ -108,10 +109,17 @@ let probeTimer = null;
 let probeRequestId = 0;
 let renderedServers = '';
 let renderedLoraRows = '';
+const submittedLoraEdits = new Set<number>();
+let explicitConnectServers = null;
+let connectScanRequestId = 0;
 
 
 function setConnectOpen(open, prefill?) {
   connectOpen = !!open;
+  if (!connectOpen) {
+    explicitConnectServers = null;
+    connectScanRequestId++;
+  }
   document.body.classList.toggle('connect-open', connectOpen);
   const form = $('connectForm');
   if (form) form.classList.toggle('hidden', !connectOpen);
@@ -126,7 +134,7 @@ function setConnectOpen(open, prefill?) {
   scheduleProbe();
 }
 
-function renderProbeList(info, error) {
+function renderProbeList(info, error, label) {
   const list = $('probeList');
   if (!list) return;
   list.textContent = '';
@@ -137,14 +145,9 @@ function renderProbeList(info, error) {
     list.appendChild(row);
     return;
   }
-  const state = ({
-    ready: 'Model ready', busy: 'Server busy',
-    limited: info?.modelId ? 'Model ready · limited capabilities' : 'Reachable · model unconfirmed',
-    loading: 'Loading model', 'no-model': 'No model loaded', auth: 'API key required', unreachable: 'Not reachable',
-  })[info?.state];
-  if (state) {
+  if (label) {
     const status = document.createElement('strong');
-    status.textContent = state;
+    status.textContent = label;
     list.appendChild(status);
   }
   const probes = (info && info.probes) || [];
@@ -472,17 +475,18 @@ function listenHost(url) {
 }
 
 function renderFoundServers() {
-  const available = !remoteMode && !serverRunning && !serverStarting;
-  $('connectDiscovery').classList.toggle('hidden', !available);
+  const automatic = !remoteMode && !serverRunning && !serverStarting;
+  const explicit = connectOpen ? explicitConnectServers : null;
+  const servers = (explicit ?? (automatic ? foundServers : [])).filter(srv => srv?.url);
+  const status = $('connectScanStatus');
+  status.textContent = explicit && !servers.length ? 'No local servers found.' : '';
+  status.classList.toggle('hidden', !status.textContent);
   const box = $('foundServers');
-  box.classList.toggle('hidden', !available || !foundServers.length);
+  box.classList.toggle('hidden', !servers.length);
   const home = $(connectOpen ? 'connectServers' : 'foundServersHome');
   if (box.parentElement !== home) home.appendChild(box);
-  if (!available) return;
 
-  // Polling sends the same results often. Keep the user's focus and the
-  // disclosure state when the list has not changed.
-  const servers = foundServers.filter(srv => srv?.url);
+  // Keep focus and disclosure state when polling returns the same results.
   const key = JSON.stringify(servers.map(srv => [srv.name, srv.url]));
   if (key === renderedServers) return;
   renderedServers = key;
@@ -511,7 +515,7 @@ function renderFoundServers() {
     btn.textContent = 'Use';
     btn.setAttribute('aria-label', 'Use ' + name.textContent + ' at ' + address.textContent);
     btn.addEventListener('click', function () {
-      openConnectForm({ url: srv.url, label: 'localhost' });
+      openConnectForm({ url: srv.url, label: 'localhost' }, true);
       $('remoteUrlInput').focus();
     });
     row.append(text, btn);
@@ -838,6 +842,7 @@ function runSetupAction(action) {
     if (testState?.status === 'running' || !serverRunning) return;
     const text = (($('setupTestInput') && $('setupTestInput').value) || '').trim();
     if (!text) return;
+    testDismissed = false;
     testState = { status: 'running' };
     renderSetup();
     vscode.postMessage({ type: 'sendTest', text: text });
@@ -850,6 +855,7 @@ function runSetupAction(action) {
   } else if (action === 'copyEndpoint') {
     vscode.postMessage({ type: 'copyText', text: lastEndpoint || (lastPayload && lastPayload.endpoint) || '' });
   } else if (action === 'dismiss') {
+    testDismissed = true;
     testState = null;
     sawCompletedReply = true;
     updatePrimaryAction();
@@ -1132,7 +1138,7 @@ function renderModelStatus() {
   const p = lastPayload;
   if (!p) return;
   const hasModel = !!(p.state && p.state.selectedModelPath);
-  const modelPending = serverRunning && pendingChanges.some(function (c) { return c.key === 'model'; });
+  const modelPending = (serverRunning || serverStarting) && pendingChanges.some(c => c.key === 'model');
   // The header names the running model and shows its state; the Model card
   // only speaks up when its selection differs from what the server runs.
   let cls = '';
@@ -1145,18 +1151,22 @@ function renderModelStatus() {
     if (!el) return;
     el.className = 'model-status' + (cls ? ' ' + cls : '') + (text ? '' : ' hidden');
     el.textContent = text;
-    el.title = modelPending ? 'The server is still running ' + (pendingModelChange().from || 'another model') + '.' : '';
+    el.title = modelPending ? (serverStarting ? 'The server is loading ' : 'The server is still running ') +
+      (pendingModelChange().from || 'another model') + '.' : '';
   });
   const attachments = serverRunning && !serverStarting
     ? pendingChanges.filter(c => ['loraAdapters', 'mmprojPath', 'plePath'].includes(c.key))
     : [];
   const bar = $('modelReloadBar');
   if (bar) {
-    bar.classList.toggle('hidden', serverStarting || (!modelPending && !attachments.length));
-    $('modelDiscardBtn').classList.toggle('hidden', !attachments.length);
+    bar.classList.toggle('hidden', !modelPending && !attachments.length);
+    $('modelDiscardBtn').classList.toggle('hidden', modelPending || !attachments.length);
+    $('modelReloadBtn').disabled = serverStarting;
     const t = $('modelReloadText');
     if (t && modelPending) {
-      const prompt = 'Server runs <b>' + escText(pendingModelChange().from || 'another model') + '</b>. Switch to the selection?';
+      const model = '<b>' + escText(pendingModelChange().from || 'another model') + '</b>';
+      const prompt = serverStarting ? 'Server is loading ' + model + '. Reload when it is ready to switch to your selection.'
+        : 'Server runs ' + model + '. Switch to the selection?';
       if (t.innerHTML !== prompt) t.innerHTML = prompt;
     } else if (t) {
       const prompt = attachments.length ? 'Reload to apply attachment changes · ' + attachments.map(c => c.label).join(', ') : '';
@@ -1164,7 +1174,10 @@ function renderModelStatus() {
     }
   }
   const closedReload = $('modelClosedReload');
-  if (closedReload) closedReload.classList.toggle('hidden', !modelPending);
+  if (closedReload) {
+    closedReload.classList.toggle('hidden', !modelPending);
+    closedReload.disabled = serverStarting;
+  }
 
   const line = $('modelClosedLine');
   if (!line) return;
@@ -3666,7 +3679,20 @@ function renderLora(p, f, remote) {
   if (rows !== renderedLoraRows) {
     $('loraList').innerHTML = rows;
     renderedLoraRows = rows;
+  } else {
+    // A rejected edit can return the same server state while the controls
+    // still hold the user's submitted values. Reconcile without replacing focus.
+    for (const i of submittedLoraEdits) {
+      const adapter = adapters[i];
+      const slider = document.querySelector<HTMLInputElement>('#loraList [data-lora-scale="' + i + '"]');
+      const toggle = document.querySelector<HTMLInputElement>('#loraList [data-lora-toggle="' + i + '"]');
+      if (!adapter || !slider || !toggle) continue;
+      slider.value = String(adapter.scale);
+      slider.parentElement.querySelector('output').textContent = Number(adapter.scale).toFixed(2);
+      toggle.checked = adapter.enabled;
+    }
   }
+  submittedLoraEdits.clear();
   $('loraHint').textContent = !f.lora ? (f.probed ? 'This llama.cpp build has no --lora option. Update llama.cpp to use LoRA adapters.' : 'Available once a runnable llama.cpp build is installed.')
     : !adapters.length ? 'Add a LoRA adapter (GGUF) trained on this model.'
     : waiting && running ? 'Strength and on/off apply now for loaded adapters. Queued adapters take effect on reload.'
@@ -3703,10 +3729,16 @@ if (loraList) {
     const t = e.target;
     if (t.dataset.loraScale !== undefined) {
       const a = adapterAt(t.dataset.loraScale);
-      if (a) vscode.postMessage({ type: 'setLora', path: a.path, scale: Number(t.value) });
+      if (a) {
+        submittedLoraEdits.add(Number(t.dataset.loraScale));
+        vscode.postMessage({ type: 'setLora', path: a.path, scale: Number(t.value) });
+      }
     } else if (t.dataset.loraToggle !== undefined) {
       const a = adapterAt(t.dataset.loraToggle);
-      if (a) vscode.postMessage({ type: 'setLora', path: a.path, enabled: t.checked });
+      if (a) {
+        submittedLoraEdits.add(Number(t.dataset.loraToggle));
+        vscode.postMessage({ type: 'setLora', path: a.path, enabled: t.checked });
+      }
     }
   });
 }
@@ -3875,7 +3907,11 @@ function discardPendingChanges() {
   vscode.postMessage({ type: 'discardChanges' });
 }
 $('discardBtn').addEventListener('click', discardPendingChanges);
-$('modelDiscardBtn').addEventListener('click', discardPendingChanges);
+$('modelDiscardBtn').addEventListener('click', () => {
+  clearTimeout(saveLoadTimer);
+  saveLoadTimer = null;
+  vscode.postMessage({ type: 'discardAttachments', payload: formReady ? loadChanges() : undefined });
+});
 $('dirtyReloadBtn').addEventListener('click', () => launch('reload'));
 $('dirtyToggle').addEventListener('click', () => {
   const list = $('dirtyList');
@@ -3931,7 +3967,8 @@ function scheduleProbe() {
     });
   }, 600);
 }
-function openConnectForm(prefill?) {
+function openConnectForm(prefill?, replace = false) {
+  if (connectOpen && !replace) return;
   const payload = lastPayload || {};
   setConnectOpen(true, prefill || {
     url: payload.remoteUrl || payload.endpoint || '',
@@ -3945,7 +3982,8 @@ $('setApiKeyBtn').addEventListener('click', () => { closeMenu(); vscode.postMess
 $('forgetApiKeyBtn').addEventListener('click', () => { closeMenu(); vscode.postMessage({ type: 'forgetApiKey' }); });
 $('switchLocalBtn').addEventListener('click', () => { closeMenu(); vscode.postMessage({ type: 'switchToLocal' }); });
 $('connectCancelBtn').addEventListener('click', () => setConnectOpen(false));
-$('extraPortsBtn').addEventListener('click', () => vscode.postMessage({ type: 'extraServerPorts' }));
+$('extraPortsBtn').addEventListener('click', () =>
+  vscode.postMessage({ type: 'extraServerPorts', requestId: ++connectScanRequestId }));
 $('connectBtn').addEventListener('click', () => {
   vscode.postMessage({
     type: 'connectRemote',
@@ -4145,7 +4183,7 @@ $('libraryDialog').addEventListener('click', function (e) {
 window.addEventListener('message', (event: MessageEvent<ToWebviewMessage>) => {
   const msg = event.data;
   if (msg.type === 'libraryRefreshComplete') $('libraryRefreshBtn').disabled = false;
-  if (msg.type === 'testResult') {
+  if (msg.type === 'testResult' && !testDismissed) {
     testState = { status: msg.status, text: msg.text, error: msg.error, ms: msg.ms };
     if (msg.status === 'done') sawCompletedReply = true;
     renderSetup();
@@ -4158,7 +4196,11 @@ window.addEventListener('message', (event: MessageEvent<ToWebviewMessage>) => {
   if (msg.type === 'openConnect') {
     openConnectForm(lastPayload && lastPayload.serverMode === 'remote' ? undefined : { url: '', label: '' });
   }
-  if (msg.type === 'remoteProbe' && connectOpen && msg.requestId === probeRequestId) renderProbeList(msg.payload, msg.error || '');
+  if (msg.type === 'remoteProbe' && connectOpen && msg.requestId === probeRequestId) renderProbeList(msg.payload, msg.error || '', msg.label);
+  if (msg.type === 'connectScan' && connectOpen && msg.requestId === connectScanRequestId) {
+    explicitConnectServers = msg.servers;
+    renderFoundServers();
+  }
   if (msg.type === 'remoteConnected') setConnectOpen(false);
   if (msg.type === 'libraryFits') {
     lib.fits = msg.fits || {};

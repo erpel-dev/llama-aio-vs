@@ -27,6 +27,7 @@ export type ToHostMessage =
   | { type: "estimate"; seq: number; payload: SettingsPatch; cpuOnly?: boolean }
   | { type: "applyLoadPatch"; payload: SettingsPatch; fitContext?: boolean; cpuOnly?: boolean }
   | { type: "discardChanges" }
+  | { type: "discardAttachments"; payload?: ViewModel }
   // Model, draft, projector, template pickers
   | { type: "downloadStarter" }
   | { type: "openModelFile" }
@@ -36,7 +37,7 @@ export type ToHostMessage =
   | { type: "clearMmproj" }
   | { type: "pickPle" }
   | { type: "clearPle" }
-  | { type: "extraServerPorts" }
+  | { type: "extraServerPorts"; requestId?: number }
   | { type: "pickLora" }
   | { type: "removeLora"; path: string }
   | { type: "setLora"; path: string; scale?: number; enabled?: boolean }
@@ -139,7 +140,8 @@ export type ToWebviewMessage =
   | { type: "advancedPanel"; open: boolean }
   | { type: "testResult"; status: "running" | "done" | "error" | "cancelled"; text?: string; error?: string; ms?: number }
   | { type: "remoteConnected" }
-  | { type: "remoteProbe"; requestId: number; payload?: ViewModel; error?: string }
+  | { type: "remoteProbe"; requestId: number; payload?: ViewModel; error?: string; label?: string }
+  | { type: "connectScan"; requestId?: number; servers: ViewModel[] }
   | {
       type: "focusLibrary";
       filter?: boolean;
@@ -189,6 +191,7 @@ export type ToWebviewMessage =
       companionOnly: boolean;
       companionHint: string;
       capacityLabel?: string;
+      usesRam?: boolean;
       files: Array<{ path: string; label: string; detail: string; fit?: "fits" | "tight" | "wont-fit"; needLabel?: string }>;
     };
 

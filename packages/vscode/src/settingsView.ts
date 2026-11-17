@@ -21,6 +21,7 @@ import {
   normalizeServerUrl,
   originOf,
   probeRemoteServer,
+  remoteStateLabel,
   remoteLifecycleMessage,
   type GpuMemoryInfo,
   type DiscoveredLlamaServer,
@@ -410,6 +411,15 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             await this.pushState();
             break;
           }
+          case "discardAttachments":
+            if (this.store.isRemote()) break;
+            if (msg.payload) await this.store.updateLoadSettings(msg.payload as Partial<LlamaLoadSettings>);
+            try {
+              await this.discardUnappliedAttachments();
+            } finally {
+              await this.pushState();
+            }
+            break;
           case "discardChanges":
             await this.discardUnappliedChanges();
             await this.pushState();
@@ -581,7 +591,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             await this.pushState();
             break;
           case "extraServerPorts":
-            await this.editExtraServerPorts();
+            await this.editExtraServerPorts(from, msg.requestId);
             break;
           case "pickLora":
             await this.pickLora();
@@ -741,6 +751,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             break;
           case "dismissSetup":
             this.lastTestResult = undefined;
+            this.testCancel?.cancel();
             await this.globalState?.update(SETUP_DONE_KEY, true);
             await this.pushState();
             break;
@@ -953,6 +964,33 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     return changes;
   }
 
+  private discardUnappliedAttachments(): Promise<void> {
+    return this.queueLoraChange(async () => {
+      const launched = this.processManager.getLaunchedConfig();
+      const state = this.store.getState();
+      if (this.store.isRemote() || !launched?.loadSettings || !state.selectedModelPath ||
+        path.resolve(launched.modelPath) !== path.resolve(state.selectedModelPath)) return;
+
+      const loraPending = diffLoadSettings(launched.loadSettings, state.loadSettings).some(change => change.key === "loraAdapters");
+      const { mmprojPath, plePath, loraAdapters } = launched.loadSettings;
+      await this.store.updateLoadSettings({
+        mmprojPath: mmprojPath || "", plePath: plePath || "", loraAdapters: loraAdapters || [],
+      });
+      if (loraPending) {
+        try {
+          await this.processManager.applyLoraScales();
+        } catch (error) {
+          const current = this.store.getState();
+          if (current.selectedModelPath === state.selectedModelPath &&
+            JSON.stringify(current.loadSettings.loraAdapters) === JSON.stringify(loraAdapters || [])) {
+            await this.store.updateLoadSettings({ loraAdapters: state.loadSettings.loraAdapters });
+          }
+          throw error;
+        }
+      }
+    });
+  }
+
   /** Restore the running server settings, including live LoRA edits. */
   private discardUnappliedChanges(): Promise<void> {
     return this.queueLoraChange(() => this.restoreLaunchedSettings());
@@ -1014,22 +1052,23 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
    */
   private async localServersForSidebar(
     status: ReturnType<ProcessManager["getStatus"]>,
-    httpReady = false
+    httpReady = false,
+    explicitScan = false
   ): Promise<DiscoveredLlamaServer[]> {
-    if (this.store.isRemote() || status.running || status.starting || httpReady) {
+    if (!explicitScan && (this.store.isRemote() || status.running || status.starting || httpReady)) {
       this.localServerScan = undefined;
       return [];
     }
     // A scan started for another port list is never used or cached: after the list
     // changes, the next look starts a scan for the new list at once.
     const extraPorts = this.store.getConfig().get<number[]>("extraServerPorts") || [];
-    const key = extraPorts.join(",");
+    const skip = status.ownedByThisExtension && status.pid ? [status.pid] : [];
+    const key = JSON.stringify([extraPorts, skip]);
     const now = Date.now();
     if (this.localServerScan?.key === key && now - this.localServerScan.at < 20_000) {
       return this.localServerScan.servers;
     }
     if (this.localServerScanRun?.key !== key) {
-      const skip = status.ownedByThisExtension && status.pid ? [status.pid] : [];
       const scan: { key: string; run: Promise<DiscoveredLlamaServer[]> } = {
         key,
         run: this.discoverLocalServers(skip, extraPorts)
@@ -1102,7 +1141,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     const key = apiKey.trim() || (origin ? await this.apiKeys?.load(origin) : undefined);
     try {
       const info = await probeRemoteServer(url, { apiKey: key });
-      this.post({ type: "remoteProbe", requestId, payload: info });
+      this.post({ type: "remoteProbe", requestId, payload: info, label: remoteStateLabel(info.state) });
     } catch (e) {
       this.post({
         type: "remoteProbe", requestId,
@@ -1526,7 +1565,8 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       type: "statusPatch",
       payload: {
         configDirty: ui.starting ? false : !!status.configDirty,
-        changes: !ui.starting && status.configDirty ? this.pendingChanges() : [],
+        changes: ui.starting ? this.pendingChanges().filter(change => change.key === "model") :
+          status.configDirty ? this.pendingChanges() : [],
         running: ui.ready,
         starting: ui.starting,
         httpReady,
@@ -1576,7 +1616,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
   }
 
   /** Ask which extra loopback ports to look on for servers, save them, and look again at once. */
-  async editExtraServerPorts(): Promise<void> {
+  async editExtraServerPorts(from?: vscode.Webview, requestId?: number): Promise<void> {
     const current = this.store.getConfig().get<number[]>("extraServerPorts") || [];
     const text = await vscode.window.showInputBox({
       title: "Look for servers on more ports",
@@ -1595,6 +1635,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     if ("invalid" in parsed) return;
     await this.store.getConfig().update("extraServerPorts", parsed.ports);
     this.localServerScan = undefined;
+    if (from) {
+      const servers = await this.localServersForSidebar(this.processManager.getStatus(), false, true);
+      this.post({ type: "connectScan", requestId, servers }, from);
+    }
     await this.pushState();
     void vscode.window.showInformationMessage(parsed.ports.length
       ? `Llama AIO also looks for servers on port${parsed.ports.length === 1 ? "" : "s"} ${parsed.ports.join(", ")}.`
@@ -1687,7 +1731,8 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
   private changeLora(change: (list: LoraAdapterSetting[]) => LoraAdapterSetting[]): Promise<void> {
     const model = this.store.getState().selectedModelPath;
     return this.queueLoraChange(async () => {
-      if (this.store.getState().selectedModelPath === model) await this.saveLoraChange(change);
+      if (!this.store.isRemote() && this.store.getState().selectedModelPath === model) await this.saveLoraChange(change);
+      else await this.pushState();
     });
   }
 
@@ -2105,16 +2150,14 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     try {
       const files = await this.hf().listGgufFiles(modelId);
       const picker = downloadPickerFiles(files);
-      // This only compares a file against currently available memory. A loaded
-      // model, device placement, and the chosen context can change the outcome.
-      const cpuOnly = this.cpuOnlyBackend();
       const gpus = this.lastGpus;
-      const freeGpuBytes = gpus.length && gpus.every(g => g.usedBytes != null)
-        ? gpus.reduce((sum, g) => sum + Math.max(0, g.totalBytes - (g.usedBytes ?? 0)), 0)
-        : undefined;
-      const capacity = cpuOnly ? os.freemem() : freeGpuBytes;
-      const capacityLabel = capacity == null ? undefined :
-        `${formatBytes(capacity)} ${cpuOnly ? "free system RAM" : gpus.length > 1 ? "total free VRAM across GPUs" : "free VRAM"} now`;
+      // Total RAM is a capacity ceiling. Free pages alone omit reclaimable
+      // memory on some systems, and missing GPU readings cannot predict VRAM fit.
+      const usesRam = this.cpuOnlyBackend() || !gpus.length || gpus.some(g => g.usedBytes == null);
+      const capacity = usesRam ? os.totalmem() :
+        gpus.reduce((sum, g) => sum + Math.max(0, g.totalBytes - (g.usedBytes ?? 0)), 0);
+      const capacityLabel = `${formatBytes(capacity)} ${usesRam ? "total system RAM" :
+        gpus.length > 1 ? "total free VRAM across GPUs now" : "free VRAM now"}`;
       this.post({
         type: "libraryHfFiles",
         requestId,
@@ -2122,12 +2165,13 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         companionOnly: picker.companionOnly,
         companionHint: picker.companionOnly ? "" : companionDownloadHint(files),
         capacityLabel,
+        usesRam,
         files: picker.files.map((file) => ({
           path: file.path,
           label: listingBaseName(file.path),
           detail: describeLanguageGgufFile(file, files),
           ...(() => {
-            const est = picker.companionOnly || capacity == null ? undefined : estimateRemoteFit(file.size, capacity);
+            const est = picker.companionOnly || (usesRam && capacity <= 0) ? undefined : estimateRemoteFit(file.size, capacity);
             return est ? { fit: est.fit, needLabel: formatBytes(est.needBytes) } : {};
           })(),
         })),
@@ -2373,6 +2417,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
 
   private testCancel?: vscode.CancellationTokenSource;
   private lastTestResult?: TestResult;
+  private testResponseInFlight?: Promise<string>;
 
   private publishTestResult(result: TestResult): void {
     this.lastTestResult = result;
@@ -2386,6 +2431,22 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     if (!model) {
       throw new Error("The server is not ready yet. Start it, then try again.");
     }
+    // A cancelled model lookup has no server request to drain. Once streaming
+    // starts, wait for the previous request to unwind before using the slot.
+    if (this.testResponseInFlight) await this.testResponseInFlight.catch(() => undefined);
+    if (token.isCancellationRequested) return "";
+    const request = this.streamTestReply(model, prompt, token);
+    this.testResponseInFlight = request;
+    try {
+      return await request;
+    } finally {
+      this.testResponseInFlight = undefined;
+    }
+  }
+
+  private async streamTestReply(
+    model: vscode.LanguageModelChat, prompt: string, token: vscode.CancellationToken
+  ): Promise<string> {
     const response = await model.sendRequest([vscode.LanguageModelChatMessage.User(prompt)],
       { modelOptions: { llamaAioQuickReply: true } }, token);
     let reply = "";
@@ -2430,7 +2491,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       cancel.dispose();
       this.testCancel = undefined;
     }
-    this.publishTestResult(result);
+    if (this.lastTestResult?.status === "running") this.publishTestResult(result);
     await this.pushState();
   }
 
