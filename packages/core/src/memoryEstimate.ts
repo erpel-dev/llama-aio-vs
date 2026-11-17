@@ -1,3 +1,4 @@
+import * as fs from "fs";
 import * as os from "os";
 import { formatGpuDeviceLabel, GpuMemoryInfo, isIntegratedGpu } from "./gpuInfo";
 import {
@@ -1133,6 +1134,22 @@ export function estimateMemory(
     gpuWeights = Math.max(0, gpuWeights - fileSize * (ffnCpuLayers / nLayers) * denseFfnShare);
   }
   let cpuWeights = Math.max(0, fileSize - gpuWeights - (pleFromDisk ? pleBytes : 0));
+  // llama.cpp loads every attached adapter, including those at scale zero.
+  // File size approximates tensor bytes, and placement follows the base weights.
+  let loraBytes = 0;
+  let missingLora = false;
+  for (const adapter of settings.loraAdapters || []) {
+    try {
+      const stat = fs.statSync(adapter.path);
+      if (stat.isFile()) loraBytes += stat.size;
+      else missingLora = true;
+    } catch {
+      missingLora = true;
+    }
+  }
+  const loraGpuBytes = Math.round(loraBytes * Math.min(1, gpuWeights / Math.max(1, fileSize - pleBytes)));
+  gpuWeights += loraGpuBytes;
+  cpuWeights += loraBytes - loraGpuBytes;
   const mmprojBytes = mmprojFileSize(settings.mmprojPath);
   const mmprojMissing = !!(settings.mmprojPath || "").trim() && mmprojBytes <= 0;
   // CLIP is a separate model: GPU-offloaded by default, not tensor-split with the LLM.
@@ -1365,6 +1382,8 @@ export function estimateMemory(
   const systemRamTotalBytes = os.totalmem();
 
   const warnings: string[] = [];
+  if (loraBytes) warnings.push(`LoRA adapters: ~${formatBytes(loraBytes)} included in estimated weights, even when disabled.`);
+  if (missingLora) warnings.push("Some LoRA adapter files are unavailable. The estimate cannot include them.");
   if (settings.cacheRamMiB !== undefined && settings.cacheRamMiB !== 0) {
     warnings.push(settings.cacheRamMiB < 0
       ? "Prompt-cache RAM is unlimited. Cached states grow on demand and are additional to this model estimate."

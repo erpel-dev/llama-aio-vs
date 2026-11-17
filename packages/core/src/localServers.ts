@@ -204,17 +204,21 @@ export async function probeLocalLmStudioServer(url: string): Promise<boolean> {
 }
 
 /** True when GET /v1/models lists at least one model owned by `owner` (vLLM, SGLang, TabbyAPI set their own name). */
-async function modelsOwnedBy(url: string, owner: string): Promise<boolean> {
-  const list = parseJson((await probeGet(url, "/v1/models"))?.body);
+type ReadModelList = (url: string) => ReturnType<typeof probeGet>;
+const readModelList: ReadModelList = url => probeGet(url, "/v1/models");
+
+async function modelsOwnedBy(url: string, owner: string, read: ReadModelList): Promise<boolean> {
+  const res = await read(url);
+  const list = res?.status === 200 ? parseJson(res.body) : undefined;
   return Array.isArray(list?.data) && list.data.some((m: any) => m?.owned_by === owner);
 }
 
 /** vLLM (entrypoints/serve/engine/protocol.py): model cards are owned_by "vllm". */
-export const probeLocalVllmServer = (url: string) => modelsOwnedBy(url, "vllm");
+export const probeLocalVllmServer = (url: string, read = readModelList) => modelsOwnedBy(url, "vllm", read);
 /** SGLang (srt/entrypoints/openai/protocol.py): model cards are owned_by "sglang". */
-export const probeLocalSglangServer = (url: string) => modelsOwnedBy(url, "sglang");
+export const probeLocalSglangServer = (url: string, read = readModelList) => modelsOwnedBy(url, "sglang", read);
 /** TabbyAPI (endpoints/core/types/model.py): model cards are owned_by "tabbyAPI"; default port 5000. */
-export const probeLocalTabbyApiServer = (url: string) => modelsOwnedBy(url, "tabbyAPI");
+export const probeLocalTabbyApiServer = (url: string, read = readModelList) => modelsOwnedBy(url, "tabbyAPI", read);
 
 /** KoboldCpp (koboldcpp.py): /api/extra/version answers result "KoboldCpp"; default port 5001. */
 export async function probeLocalKoboldCppServer(url: string): Promise<boolean> {
@@ -227,8 +231,8 @@ export async function probeLocalKoboldCppServer(url: string): Promise<boolean> {
  * on ports the person asked to be checked. A refusal for a missing key also
  * counts there, so a server with a key can still be offered and connected to.
  */
-export async function probeLocalOpenAiCompatibleServer(url: string): Promise<boolean> {
-  const res = await probeGet(url, "/v1/models");
+export async function probeLocalOpenAiCompatibleServer(url: string, read = readModelList): Promise<boolean> {
+  const res = await read(url);
   if (!res) return false;
   if (res.status === 401 || res.status === 403) return true;
   const list = parseJson(res.body);
@@ -465,7 +469,7 @@ export function discoverLoopbackLlamaServersOnThisMachine(skipPids: readonly num
 const OTHER_HTTP_PROBES: ReadonlyArray<{
   name: DiscoveredLlamaServer["name"];
   ports: readonly number[];
-  probe: (url: string) => Promise<boolean>;
+  probe: (url: string, read: ReadModelList) => Promise<boolean>;
 }> = [
   { name: "BigMoeOnEdge", ports: BIGMOEONEDGE_DEFAULT_PORTS, probe: probeLocalBigMoeOnEdgeServer },
   { name: "Project Maya", ports: PROJECT_MAYA_DEFAULT_PORTS, probe: probeLocalProjectMayaServer },
@@ -483,7 +487,15 @@ export async function discoverLoopbackLlamaServersOnThisMachineAsync(
   skipPids: readonly number[] = [],
   extraPorts: readonly number[] = []
 ): Promise<DiscoveredLlamaServer[]> {
-  const [sockets, strata, others] = await Promise.all([
+  const models = new Map<string, ReturnType<ReadModelList>>();
+  const read: ReadModelList = url => {
+    const cached = models.get(url);
+    if (cached) return cached;
+    const pending = readModelList(url);
+    models.set(url, pending);
+    return pending;
+  };
+  const [sockets, strata, others, extra] = await Promise.all([
     runStepsAsync(listListeningSockets()),
     Promise.all(STRATA_DEFAULT_PORTS.map(async (port) => {
       const url = `http://127.0.0.1:${port}`;
@@ -491,19 +503,22 @@ export async function discoverLoopbackLlamaServersOnThisMachineAsync(
     })),
     Promise.all(OTHER_HTTP_PROBES.flatMap(({ name, ports, probe }) => ports.map(async (port) => {
       const url = `http://127.0.0.1:${port}`;
-      return await probe(url) ? { url, port, name } : undefined;
+      return await probe(url, read) ? { url, port, name } : undefined;
     }))),
+    // Probe each custom port concurrently, preserving the server-name priority.
+    Promise.all(extraPorts.map(async (port) => {
+      const url = `http://127.0.0.1:${port}`;
+      const [known, isStrata, isCompatible] = await Promise.all([
+        Promise.all(OTHER_HTTP_PROBES.map(({ probe }) => probe(url, read))),
+        probeLocalStrataServer(url),
+        probeLocalOpenAiCompatibleServer(url, read),
+      ]);
+      const match = OTHER_HTTP_PROBES[known.indexOf(true)];
+      if (match) return { url, port, name: match.name };
+      if (isStrata) return { url, port, name: "Strata" as const };
+      return isCompatible ? { url, port, name: "OpenAI-compatible server" as const } : undefined;
+    })),
   ]);
-  // Ports the person added: name a known server where its reply says which, else any OpenAI-compatible one.
-  const extra = await Promise.all(extraPorts.map(async (port) => {
-    const url = `http://127.0.0.1:${port}`;
-    for (const { name, probe } of OTHER_HTTP_PROBES) {
-      if (await probe(url)) return { url, port, name };
-    }
-    if (await probeLocalStrataServer(url)) return { url, port, name: "Strata" as const };
-    return await probeLocalOpenAiCompatibleServer(url)
-      ? { url, port, name: "OpenAI-compatible server" as const } : undefined;
-  }));
   const commandLines = new Map<number, string | undefined>();
   for (const pid of new Set((sockets || []).map((sock) => sock.pid))) {
     if (!skipPids.includes(pid)) {

@@ -10,6 +10,8 @@ import { parseLlamaServerFeatures } from "../src/llamaFeatures";
 import { buildServerArgs, serverConfigFingerprint } from "../src/serverArgs";
 import { diffLoadSettings } from "../src/settingsDiff";
 import { classifyGgufFile } from "../src/modelLibrary";
+import { estimateMemory } from "../src/memoryEstimate";
+import { ProcessManager } from "../src/processManager";
 import { normalizeLoadSettings } from "../src/types";
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "llama-aio-lora-"));
@@ -179,4 +181,35 @@ describe("LoRA server settings", () => {
     assert.match(describeLoraLoadError("common_init_: failed to load lora adapter '/l/a.gguf'")!, /could not load/);
     assert.equal(describeLoraLoadError("error: out of memory"), undefined);
   });
+});
+
+it("rejects missing or unsupported adapters on Reload before stopping the server", async t => {
+  const model = write("reload-base.gguf", miniGguf({ "general.architecture": str("qwen35") }));
+  const load = loadSettings({ loraAdapters: [{ path: path.join(dir, "missing.gguf"), enabled: true, scale: 1 }] });
+  t.mock.method(require("../src/launchLock"), "acquireLaunchLock", () => ({ release() {} }));
+  let features = parseLlamaServerFeatures("--ctx-size N");
+  const manager = {
+    store: { getState: () => ({ selectedModelPath: model, loadSettings: load }) },
+    assertLocal() {}, takeLaunch() { return {}; }, releaseLaunch() {},
+    getServerFeatures: async () => features,
+    stopServer: async () => assert.fail("Reload should preserve the running server"),
+  } as unknown as ProcessManager;
+  await assert.rejects(ProcessManager.prototype.reload.call(manager), /build with --lora/);
+  features = parseLlamaServerFeatures("--lora FNAME");
+  await assert.rejects(ProcessManager.prototype.reload.call(manager), /missing\.gguf/);
+});
+
+it("includes disabled adapter files in CPU and GPU weight estimates", () => {
+  const file = adapter("memory-estimate.gguf");
+  const base = denseCaps();
+  const settings = loadSettings({ gpuOffload: 99 });
+  const attached = { ...settings, loraAdapters: [{ path: file, enabled: false, scale: 0 }] };
+  const bytes = fs.statSync(file).size;
+  const gpu = { totalBytes: 48 * 1024 ** 3, name: "Test GPU", source: "test", llamaDeviceId: "CUDA0" };
+  const cpuBase = estimateMemory(base, settings, undefined, { cpuOnly: true })!;
+  const cpuAttached = estimateMemory(base, attached, undefined, { cpuOnly: true })!;
+  assert.equal(cpuAttached.charts.ram.totalBytes - cpuBase.charts.ram.totalBytes, bytes);
+  const gpuBase = estimateMemory(base, settings, gpu)!;
+  const gpuAttached = estimateMemory(base, attached, gpu)!;
+  assert.equal(gpuAttached.charts.vram.totalBytes - gpuBase.charts.vram.totalBytes, bytes);
 });

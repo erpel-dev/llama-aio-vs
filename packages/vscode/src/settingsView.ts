@@ -28,7 +28,7 @@ import {
 import { LlamaInstaller, UiBackend } from "@llama-aio/core";
 import { clampLoadSettingsToModel, computeMemoryView, diffLoadSettings, fittingContextLength, memoryEstimateInputs, mmprojFileSize, resolveDraftCapabilities, shortGpuName, type SettingChange } from "@llama-aio/core";
 import { NO_SERVER_FEATURES, supportedPerformanceSettings, type LlamaServerFeatures } from "@llama-aio/core";
-import { normalizeLoadSettingsForCpuBackend, pickCpuIgnoredFields } from "@llama-aio/core";
+import { normalizeLoadSettings, normalizeLoadSettingsForCpuBackend, pickCpuIgnoredFields } from "@llama-aio/core";
 import { resolveLocalModelModes, resolveModelModes, resolveRemoteModelModes } from "@llama-aio/core";
 import {
   buildLibraryGroupsAsync,
@@ -950,8 +950,12 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     return changes;
   }
 
-  /** Put the sidebar back to what the running server was started with. */
-  private async discardUnappliedChanges(): Promise<void> {
+  /** Restore the running server settings, including live LoRA edits. */
+  private discardUnappliedChanges(): Promise<void> {
+    return this.queueLoraChange(() => this.restoreLaunchedSettings());
+  }
+
+  private async restoreLaunchedSettings(): Promise<void> {
     const launched = this.processManager.getLaunchedConfig();
     if (!launched) {
       return;
@@ -967,9 +971,6 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         ? { ...launched.loadSettings, ...pickCpuIgnoredFields(state.loadSettings) }
         : launched.loadSettings;
       await this.store.updateLoadSettings({ ...restore, plePath: restore.plePath || "", loraAdapters: restore.loraAdapters || [] });
-      // Discard restores the launch-time strengths; a failure here must be seen, not swallowed.
-      await this.processManager.applyLoraScales().catch(e => vscode.window.showErrorMessage(
-        `The running server did not take the restored LoRA strengths: ${e instanceof Error ? e.message : String(e)} Reload to apply them.`));
     }
     const mode = this.processManager.effectiveLaunchMode();
     if (launched.launchMode && launched.launchMode !== mode) {
@@ -1680,11 +1681,28 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
   }
 
   /** Save an adapter change, then send strengths to the running server when no reload is needed. */
-  private async changeLora(change: (list: LoraAdapterSetting[]) => LoraAdapterSetting[]): Promise<void> {
+  private changeLora(change: (list: LoraAdapterSetting[]) => LoraAdapterSetting[]): Promise<void> {
+    const model = this.store.getState().selectedModelPath;
+    return this.queueLoraChange(async () => {
+      if (this.store.getState().selectedModelPath === model) await this.saveLoraChange(change);
+    });
+  }
+
+  private loraChange = Promise.resolve();
+
+  private queueLoraChange(action: () => Promise<void>): Promise<void> {
+    const pending = this.loraChange.then(action);
+    this.loraChange = pending.catch(() => undefined);
+    return pending;
+  }
+
+  private async saveLoraChange(change: (list: LoraAdapterSetting[]) => LoraAdapterSetting[]): Promise<void> {
     if (this.store.isRemote()) return;
-    const before = this.store.getState().loadSettings.loraAdapters;
+    const state = this.store.getState();
+    const before = state.loadSettings.loraAdapters;
+    const next = normalizeLoadSettings({ ...state.loadSettings, loraAdapters: change(before) }).loraAdapters;
     try {
-      await this.store.updateLoadSettings({ loraAdapters: change(before) });
+      await this.store.updateLoadSettings({ loraAdapters: next });
     } catch (e) {
       vscode.window.showErrorMessage(`LoRA adapter: ${e instanceof Error ? e.message : String(e)}`);
       await this.pushState();
@@ -1693,10 +1711,15 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     try {
       await this.processManager.applyLoraScales();
     } catch (e) {
-      // The server kept its old strengths: put the sidebar back so it never shows a state that is not applied.
-      await this.store.updateLoadSettings({ loraAdapters: before }).catch(() => undefined);
+      // Roll back only if the failed edit still owns the current selection.
+      const current = this.store.getState();
+      const canRestore = current.selectedModelPath === state.selectedModelPath &&
+        JSON.stringify(current.loadSettings.loraAdapters) === JSON.stringify(next);
+      if (canRestore) {
+        await this.store.updateLoadSettings({ loraAdapters: before });
+      }
       vscode.window.showErrorMessage(
-        `The running server did not take the LoRA change, so it was undone: ${e instanceof Error ? e.message : String(e)}`);
+        `The running server did not take the LoRA change${canRestore ? ", so it was undone" : ""}: ${e instanceof Error ? e.message : String(e)}`);
     }
     await this.pushState();
   }

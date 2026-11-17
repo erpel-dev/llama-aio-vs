@@ -54,7 +54,7 @@ import {
 } from "./remoteServer";
 import { joinServerUrl, serverJson, serverRequest } from "./serverHttp";
 import { formatCommandDisplay, normalizeLoadSettingsForCpuBackend, performanceFeatureNotes } from "./serverArgs";
-import { describeLoraLoadError, planLoraScales } from "./loraAdapter";
+import { checkLoraAdapter, describeLoraLoadError, planLoraScales } from "./loraAdapter";
 import { NO_SERVER_FEATURES, probeLlamaServerFeatures, probeLlamaServerFeaturesSync, type LlamaServerFeatures } from "./llamaFeatures";
 import { ExtensionState, LlamaLoadSettings, ServerStatus } from "./types";
 import { activeInstallLock } from "./installSwap";
@@ -78,6 +78,27 @@ async function validatePleSelection(
   return caps;
 }
 
+/** Reject invalid adapters before replacing a working server. */
+async function validateLoraSelection(
+  model: string, state: ExtensionState, features: () => Promise<LlamaServerFeatures>
+): Promise<void> {
+  const adapters = state.loadSettings.loraAdapters;
+  if (!adapters.length) return;
+  if (!(await features()).lora) {
+    throw new Error("LoRA adapters need a llama.cpp build with --lora. Update llama.cpp or remove the adapters.");
+  }
+  const caps = readModelCapabilities(model);
+  for (const adapter of adapters) {
+    if (adapter.path.includes(",")) {
+      throw new Error(`LoRA paths cannot contain commas: ${adapter.path}`);
+    }
+    const check = checkLoraAdapter(adapter.path, caps);
+    if (check.fit === "invalid" || check.fit === "wrong-architecture") {
+      throw new Error(`LoRA adapter ${path.basename(adapter.path)}: ${check.message}`);
+    }
+  }
+}
+
 interface LockFile {
   pid: number;
   port: number;
@@ -89,7 +110,7 @@ interface LockFile {
   launchMode?: string;
   /** Fingerprint of model + load settings (+ launch mode) applied at start. */
   configFingerprint?: string;
-  /** Load settings the server was started with (sidebar "what changed" / Discard). */
+  /** Running settings for "what changed" / Discard, including live LoRA strengths. */
   loadSettings?: LlamaLoadSettings;
 }
 
@@ -592,16 +613,39 @@ export class ProcessManager {
    * while added or removed files wait for a reload. Throws when the server
    * does not take the strengths: the caller must not report them as applied.
    */
-  async applyLoraScales(): Promise<void> {
+  applyLoraScales(initialize = false): Promise<void> {
+    const update = this.loraUpdate.then(() => this.applyCurrentLoraScales(initialize));
+    this.loraUpdate = update.catch(() => undefined);
+    return update;
+  }
+
+  private loraUpdate = Promise.resolve();
+
+  private async applyCurrentLoraScales(initialize: boolean): Promise<void> {
     if (this.store.isRemote()) return;
     const launched = this.getLaunchedConfig();
-    const loaded = (launched?.loadSettings?.loraAdapters || []).map(a => a.path);
-    if (!loaded.length) return;
-    const wanted = this.store.getState().loadSettings.loraAdapters;
+    const loaded = launched?.loadSettings?.loraAdapters || [];
+    if (!launched || !loaded.length) return;
+    const state = this.store.getState();
+    const modelMatches = path.resolve(state.selectedModelPath) === path.resolve(launched.modelPath);
+    if (!modelMatches && !initialize) return;
+    const wanted = modelMatches ? state.loadSettings.loraAdapters : loaded;
     const url = joinServerUrl(this.store.getEndpoint(), "/lora-adapters");
     const server = await serverJson<Array<{ id: number; path?: string; scale?: number }>>(url, { timeoutMs: 5000 });
-    const body = planLoraScales(loaded, wanted, server);
+    const current = this.getLaunchedConfig();
+    if (!current || current.startedAt !== launched.startedAt ||
+        this.store.isRemote() || joinServerUrl(this.store.getEndpoint(), "/lora-adapters") !== url) return;
+    const body = planLoraScales(loaded.map(a => a.path), wanted, server);
     await serverJson<unknown>(url, { method: "POST", body, timeoutMs: 5000 });
+
+    // Keep the loaded file list, but remember the live strengths so Discard
+    // can restore pending removals without reverting an already-applied edit.
+    const lock = this.readLock();
+    if (lock?.loadSettings && lock.startedAt === launched.startedAt &&
+        lock.modelPath === launched.modelPath && this.lockPidIsOurs(lock)) {
+      const loraAdapters = loaded.map(a => wanted.find(w => path.resolve(w.path) === path.resolve(a.path)) ?? a);
+      this.writeLock({ ...lock, loadSettings: { ...lock.loadSettings, loraAdapters } });
+    }
   }
 
   /**
@@ -614,7 +658,7 @@ export class ProcessManager {
     for (let attempt = 0; attempt < 3; attempt++) {
       if (attempt) await sleep(500);
       try {
-        await this.applyLoraScales();
+        await this.applyLoraScales(true);
         return;
       } catch (e) {
         last = e;
@@ -810,6 +854,7 @@ export class ProcessManager {
       throw new Error(`Model file not found: ${model}`);
     }
     const attachedCaps = await validatePleSelection(model, state, () => this.getServerFeatures());
+    await validateLoraSelection(model, state, () => this.getServerFeatures());
     const templateProblem = chatTemplateFileProblem(state.loadSettings);
     if (templateProblem) {
       throw new Error(templateProblem);
@@ -1348,6 +1393,8 @@ export class ProcessManager {
       fileLock = acquireLaunchLock("reload");
       const desired = this.store.getState();
       await validatePleSelection(desired.selectedModelPath, desired, () => this.getServerFeatures());
+      await validateLoraSelection(desired.selectedModelPath, desired, () => this.getServerFeatures());
+      this.throwIfCancelled();
       report("Stopping server for reload…");
       await this.stopServer(true);
       await sleep(400);

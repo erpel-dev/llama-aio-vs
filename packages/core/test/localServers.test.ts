@@ -401,9 +401,13 @@ describe("ports the person adds", () => {
 
   it("names a known server on an added port, and offers any other OpenAI-compatible one", async () => {
     const { discoverLoopbackLlamaServersOnThisMachineAsync } = await import("../src/localServers");
+    let modelRequests = 0;
     const servers = [
       createServer((req, res) => { res.end(req.url === "/api/extra/version" ? '{"result":"KoboldCpp","version":"1"}' : '{"object":"list","data":[]}'); }),
-      createServer((req, res) => { res.end(req.url === "/v1/models" ? '{"object":"list","data":[{"id":"x"}]}' : "{}"); }),
+      createServer((req, res) => {
+        if (req.url === "/v1/models") modelRequests++;
+        res.end(req.url === "/v1/models" ? '{"object":"list","data":[{"id":"x"}]}' : "{}");
+      }),
       createServer((_req, res) => { res.end("<html>not a model server</html>"); }),
     ];
     const ports: number[] = [];
@@ -415,6 +419,7 @@ describe("ports the person adds", () => {
       const found = await discoverLoopbackLlamaServersOnThisMachineAsync([], ports);
       const mine = found.filter((s) => ports.includes(s.port)).map((s) => [s.port, s.name]);
       assert.deepEqual(mine, [[ports[0], "KoboldCpp"], [ports[1], "OpenAI-compatible server"]]);
+      assert.equal(modelRequests, 1);
     } finally {
       for (const s of servers) await new Promise<void>((resolve) => s.close(() => resolve()));
     }
