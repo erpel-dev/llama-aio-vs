@@ -1,3 +1,4 @@
+import { sameModelFile } from "./processIdentity";
 import * as path from "path";
 import { effectiveLoraScale, type LoraAdapterSetting } from "./types";
 import { readLoraAdapterInfo, type LoraAdapterInfo, type ModelCapabilities } from "./ggufMetadata";
@@ -80,11 +81,10 @@ export function planLoraScales(
   wanted: LoraAdapterSetting[],
   server: Array<{ id: number; path?: string; scale?: number }>
 ): Array<{ id: number; scale: number }> {
-  const same = (a: string, b: string) => path.resolve(a) === path.resolve(b);
   return loaded.map((loadedPath, index) => {
-    const hit = server.find(s => typeof s.path === "string" && same(s.path, loadedPath)) ?? server[index];
+    const hit = server.find(s => typeof s.path === "string" && sameModelFile(s.path, loadedPath)) ?? server[index];
     if (!hit) throw new Error(`The server did not load ${path.basename(loadedPath)}.`);
-    const want = wanted.find(a => same(a.path, loadedPath));
+    const want = wanted.find(a => sameModelFile(a.path, loadedPath));
     const current = Number(hit.scale);
     return { id: hit.id, scale: want ? effectiveLoraScale(want) : Number.isFinite(current) ? current : 0 };
   });

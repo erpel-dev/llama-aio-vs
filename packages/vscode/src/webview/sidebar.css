@@ -752,6 +752,7 @@ body.remote-mode #setupBox,
 body.remote-mode #stopBtn,
 body.remote-mode .local-only { display: none !important; }
 body:not(.remote-mode) .remote-only { display: none !important; }
+#remoteKeyHint:empty { display: none; }
 body.connect-open #statusLine,
 body.connect-open #srvModel,
 body.connect-open #srvSummary,
@@ -1079,6 +1080,7 @@ button.link-btn:hover { text-decoration: underline; }
 #loraList:empty { display: none; }
 .lora-item { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 2px 6px; padding: 4px 6px; border: 1px solid var(--border); border-radius: 5px; font-size: 11px; }
 .lora-item .lora-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lora-removed-name { grid-column: 1 / -1; overflow-wrap: anywhere; }
 .lora-item .lora-strength { grid-column: 1 / -1; display: flex; align-items: center; gap: 6px; color: var(--muted); }
 .lora-item .lora-strength input { flex: 1; min-width: 0; }
 .lora-item .lora-strength output { width: 2.6em; text-align: right; font-variant-numeric: tabular-nums; color: var(--fg); }

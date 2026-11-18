@@ -627,7 +627,7 @@ export class ProcessManager {
     const loaded = launched?.loadSettings?.loraAdapters || [];
     if (!launched || !loaded.length) return;
     const state = this.store.getState();
-    const modelMatches = path.resolve(state.selectedModelPath) === path.resolve(launched.modelPath);
+    const modelMatches = sameModelFile(state.selectedModelPath, launched.modelPath);
     if (!modelMatches && !initialize) return;
     const wanted = modelMatches ? state.loadSettings.loraAdapters : loaded;
     const url = joinServerUrl(this.store.getEndpoint(), "/lora-adapters");
@@ -643,7 +643,7 @@ export class ProcessManager {
     const lock = this.readLock();
     if (lock?.loadSettings && lock.startedAt === launched.startedAt &&
         lock.modelPath === launched.modelPath && this.lockPidIsOurs(lock)) {
-      const loraAdapters = loaded.map(a => wanted.find(w => path.resolve(w.path) === path.resolve(a.path)) ?? a);
+      const loraAdapters = loaded.map(a => wanted.find(w => sameModelFile(w.path, a.path)) ?? a);
       this.writeLock({ ...lock, loadSettings: { ...lock.loadSettings, loraAdapters } });
     }
   }

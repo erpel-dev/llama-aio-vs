@@ -697,6 +697,14 @@ describe("LoRA adapter controls", () => {
     rows[1].querySelector("[data-act=lora-remove]").click();
     assert.deepEqual({ ...sent.at(-1) }, { type: "removeLora", path: "/l/new-lora.gguf" });
 
+    paint({ lora: { adapters: [], pendingRemovals: [{ path: adapters[0].path, scale: 0.8 }] } });
+    assert.equal(el("loraSum").textContent, "1 active · 1 pending removal");
+    assert.match(el("loraList").textContent, /sql-lora\.gguf.*Active at 0\.80 · Removed on reload/);
+    assert.equal(el("loraList").querySelector("input,button"), null);
+    paint({ lora: { adapters: [], pendingRemovals: [{ path: adapters[0].path, scale: 0 }] } });
+    assert.equal(el("loraSum").textContent, "0 active · 1 pending removal");
+    assert.match(el("loraList").textContent, /Off on server · Removed on reload/);
+
     paint({ lora: { adapters: [], builtIn: { count: 12, rank: 32 }, lineage: { finetune: "Storywriter", baseModelName: "Granite 8B" } } });
     assert.match(el("modelLineage").textContent, /12 built-in adapters · rank 32/);
     assert.match(el("modelLineage").textContent, /Based on Granite 8B \(Storywriter\).*cannot be detected/);
@@ -721,9 +729,36 @@ describe("LoRA adapter controls", () => {
     assert.deepEqual(payload.changes.filter(c => c.key === "loraAdapters"), [
       { key: "loraAdapters", label: "LoRA adapters", from: "a.gguf", to: "none" },
     ]);
+    assert.deepEqual(payload.lora.pendingRemovals, [{ path: "/l/a.gguf", scale: 0 }]);
     await ui.send({ type: "discardChanges" });
     assert.deepEqual(ui.getState().loadSettings.loraAdapters, [{ path: "/l/a.gguf", scale: 0.4, enabled: false }]);
     assert.deepEqual(ui.loraApplied.at(-1), [], "Discard should not reapply launch-time strengths");
+  });
+  it("reports a removed adapter that still applies at its running strength", async () => {
+    const saved = [{ path: "/l/a.gguf", scale: 0.45, enabled: true }];
+    const ui = setup({ loraAdapters: saved }, undefined, lora);
+    await ui.send({ type: "removeLora", path: "/l/a.gguf" });
+    let state = ui.posted.findLast(m => m.type === "state").payload.lora;
+    assert.deepEqual(state.adapters, []);
+    assert.deepEqual(state.pendingRemovals, [{ path: "/l/a.gguf", scale: 0.45 }]);
+    await ui.send({ type: "discardAttachments" });
+    state = ui.posted.findLast(m => m.type === "state").payload.lora;
+    assert.equal(state.adapters[0].scale, 0.45);
+    assert.deepEqual(state.pendingRemovals, []);
+  });
+  it("matches Windows model and adapter paths with different casing", t => {
+    const ui = setup();
+    t.mock.property(process, "platform", "win32");
+    const model = "C:/Models/Main.gguf";
+    const caps = { path: model };
+    const adapter = { path: "C:/Models/Adapter.gguf", scale: 0.45, enabled: true };
+    const launched = { modelPath: model, loadSettings: { loraAdapters: [adapter] } };
+    const state = loraAdapters => ({ selectedModelPath: model.toLowerCase(), loadSettings: { loraAdapters } });
+    const saved = { ...adapter, path: adapter.path.toLowerCase() };
+    assert.equal(ui.provider.loraPayload(state([saved]), caps, launched, false).adapters[0].loaded, true);
+    assert.deepEqual(ui.provider.loraPayload(state([]), caps, launched, false).pendingRemovals, [
+      { path: adapter.path, scale: 0.45 },
+    ]);
   });
   it("discards attachment edits without reverting pending context or thread settings", async () => {
     const saved = [{ path: "/l/a.gguf", scale: 0.4, enabled: true }];
@@ -837,6 +872,115 @@ it("preserves a connection draft and shows explicit scan results while the local
   assert.equal(el("modelReloadBar").classList.contains("hidden"), false);
   assert.match(el("modelReloadText").textContent, /loading first\.gguf/);
   assert.equal(el("modelReloadBtn").disabled, true);
+});
+
+it("keeps draft API keys bound to their origin during preview and connect", async t => {
+  const { JSDOM } = require("jsdom");
+  const html = fs.readFileSync(path.join(__dirname, "../src/webview/sidebar.html"), "utf8").replace(/\{\{\w+\}\}/g, "");
+  const dom = new JSDOM(html, { runScripts: "outside-only" });
+  t.after(() => dom.window.close());
+  const sent = [];
+  dom.window.acquireVsCodeApi = () => ({ postMessage: m => sent.push(m), getState: () => null, setState() {} });
+  const setTimeout = dom.window.setTimeout.bind(dom.window);
+  let scheduledProbe;
+  t.mock.method(dom.window, "setTimeout", (callback, delay, ...args) => {
+    if (delay === 600) {
+      scheduledProbe = callback;
+      return 0;
+    }
+    return setTimeout(callback, delay, ...args);
+  });
+  dom.window.eval(fs.readFileSync(path.join(__dirname, "../out/webview/sidebar.js"), "utf8"));
+  const el = id => dom.window.document.getElementById(id);
+  const post = data => dom.window.dispatchEvent(new dom.window.MessageEvent("message", { data }));
+  const input = (id, value) => {
+    const field = el(id);
+    field.value = value;
+    field.dispatchEvent(new dom.window.Event("input", { bubbles: true }));
+  };
+  post({ type: "openConnect" });
+  const url = "remoteUrlInput";
+  const key = "remoteKeyInput";
+  assert.equal(el(key).disabled, true);
+
+  input(url, "LOCALHOST:18080/path");
+  input(key, "disposable-fixture-key");
+  scheduledProbe();
+  assert.equal(sent.at(-1).apiKey, "disposable-fixture-key");
+
+  input(url, "http://localhost:18080/other-path");
+  scheduledProbe();
+  assert.equal(sent.at(-1).apiKey, "disposable-fixture-key");
+
+  input(url, "http://localhost:18087");
+  assert.equal(el(key).value, "");
+  assert.match(el("remoteKeyHint").textContent, /Server address changed/);
+  scheduledProbe();
+  assert.equal(sent.at(-1).apiKey, "");
+  el("connectBtn").click();
+  assert.equal(sent.at(-1).type, "connectRemote");
+  assert.equal(sent.at(-1).apiKey, "");
+
+  input(key, "new-origin-key");
+  input(url, "http://[");
+  assert.equal(el(key).disabled, true);
+  assert.equal(el(key).value, "");
+
+  input(url, "https://localhost:18087");
+  input(key, "https-key");
+  scheduledProbe();
+  post({ type: "remoteProbe", requestId: sent.at(-1).requestId, label: "Reachable · model ready" });
+  el("connectBtn").click();
+  assert.equal(sent.at(-1).apiKey, "https-key");
+  assert.equal(sent.at(-1).keyOrigin, "https://localhost:18087");
+  assert.equal(el(key).value, "https-key");
+  assert.match(el("probeList").textContent, /Reachable/);
+  post({ type: "remoteConnected" });
+  assert.equal(el(key).value, "");
+  assert.equal(el("probeList").textContent, "");
+});
+
+it("rejects a draft key for the wrong origin before making an HTTP preview request", async t => {
+  const seen = [];
+  const endpoint = http.createServer((req, res) => {
+    if (req.url === "/health") seen.push(req.headers.authorization);
+    res.setHeader("Content-Type", "application/json");
+    res.end(req.url === "/v1/models" ? '{"data":[]}' : '{}');
+  });
+  await new Promise(resolve => endpoint.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise(resolve => endpoint.close(resolve)));
+  const origin = `http://127.0.0.1:${endpoint.address().port}`;
+  const ui = setup();
+  ui.provider.attachApiKeyStore({ load: async () => "stored-for-target" });
+  const probe = { type: "testRemote", url: origin, apiKey: "draft", requestId: 1 };
+  await ui.send({ ...probe, keyOrigin: "http://127.0.0.1:1" });
+  await ui.send({ ...probe, keyOrigin: origin });
+  assert.deepEqual(seen, ["Bearer stored-for-target", "Bearer draft"]);
+});
+
+it("only stores an origin-matched draft key after the Connect prompt is accepted", async t => {
+  const ui = setup();
+  const provider = ui.provider;
+  const writes = [];
+  provider.attachApiKeyStore({ load: async () => undefined, set: async (...entry) => writes.push(entry) });
+  provider.store.setRemoteServer = async () => undefined;
+  provider.processManager.remote.reset = () => undefined;
+  provider.processManager.remote.refresh = async () => undefined;
+  provider.rememberRemoteModel = () => undefined;
+  provider.pushState = async () => undefined;
+  let choice;
+  t.mock.method(require("vscode").window, "showWarningMessage", async () => choice);
+  const origin = "http://127.0.0.1:9123";
+  const connect = { type: "connectRemote", url: origin, apiKey: "draft", keyOrigin: origin };
+  await ui.send(connect);
+  assert.deepEqual(writes, []);
+  assert.equal(ui.posted.some(m => m.type === "remoteConnected"), false);
+  choice = "Keep running";
+  await ui.send({ ...connect, keyOrigin: "http://127.0.0.1:1" });
+  assert.deepEqual(writes, []);
+  await ui.send(connect);
+  assert.deepEqual(writes, [[origin, "draft"]]);
+  assert.equal(ui.posted.at(-1).type, "remoteConnected");
 });
 
 describe("local server scan and the port list", () => {

@@ -6,6 +6,16 @@
   "license": "MIT",
   "main": "./out/index.js",
   "types": "./out/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./out/index.d.ts",
+      "default": "./out/index.js"
+    },
+    "./serverUrl": {
+      "types": "./out/serverUrl.d.ts",
+      "default": "./out/serverUrl.js"
+    }
+  },
   "files": [
     "out",
     "prompt-replacements"

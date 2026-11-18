@@ -745,14 +745,20 @@ export function remoteStateUsable(state: RemoteState | undefined): boolean {
 }
 
 /** Short pill label for the sidebar and status bar. */
-export function remoteStateLabel(state: RemoteState | undefined): string {
+export function remoteStateLabel(
+  state: RemoteState | undefined,
+  preview?: { modelConfirmed: boolean }
+): string {
+  if (preview && !preview.modelConfirmed && (state === "ready" || state === "busy" || state === "limited")) {
+    return "Reachable · model unconfirmed";
+  }
   switch (state) {
     case "ready":
-      return "Connected";
+      return preview ? "Reachable · model ready" : "Connected";
     case "busy":
-      return "Connected · busy";
+      return preview ? "Reachable · busy" : "Connected · busy";
     case "limited":
-      return "Connected · limited";
+      return preview ? "Reachable · limited capabilities" : "Connected · limited";
     case "loading":
       return "Loading model";
     case "no-model":
@@ -762,7 +768,7 @@ export function remoteStateLabel(state: RemoteState | undefined): string {
     case "unreachable":
       return "Not reachable";
     default:
-      return "Connecting…";
+      return preview ? "Checking server…" : "Connecting…";
   }
 }
 

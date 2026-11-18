@@ -59,8 +59,8 @@ export type ToHostMessage =
   | { type: "setDuplicateToolCallGuardEnabled"; payload: { enabled: boolean } }
   // Remote server
   | { type: "refreshRemote" }
-  | { type: "testRemote"; url: string; apiKey?: string; requestId: number }
-  | { type: "connectRemote"; url: string; label?: string; apiKey?: string }
+  | { type: "testRemote"; url: string; apiKey?: string; keyOrigin?: string; requestId: number }
+  | { type: "connectRemote"; url: string; label?: string; apiKey?: string; keyOrigin?: string }
   | { type: "switchToLocal" }
   | { type: "setApiKey" }
   | { type: "forgetApiKey" }
