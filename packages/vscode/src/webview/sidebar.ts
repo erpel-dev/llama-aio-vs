@@ -4,7 +4,7 @@
  * are typed by ./protocol, so a renamed or misspelled message fails the build.
  */
 import { $, vscode } from "./api";
-import { normalizeServerUrl, originOf } from "../../../core/src/serverUrl";
+import { normalizeServerUrl, originOf } from "@llama-aio/core/serverUrl";
 import type { ToWebviewMessage } from "./protocol";
 import { escAttr, escText, fmtBytes, fmtEta, fmtNum, fmtParams, fmtRate, fmtServerRate, fmtTokK, fmtTokShort, fmtUptime, friendlyNetworkError, pickNum, promptEtaSeconds } from "./format";
 import {
@@ -3709,7 +3709,7 @@ function renderLora(p, f, remote) {
   }
   submittedLoraEdits.clear();
   $('loraHint').textContent = !f.lora ? (f.probed ? 'This llama.cpp build has no --lora option. Update llama.cpp to use LoRA adapters.' : 'Available once a runnable llama.cpp build is installed.')
-    : removals.length ? 'Pending removals stay loaded until reload. Use Discard attachments to undo them.'
+    : removals.length ? 'Pending removals stay loaded until reload.'
     : !adapters.length ? 'Add a LoRA adapter (GGUF) trained on this model.'
     : waiting && running ? 'Strength and on/off apply now for loaded adapters. Queued adapters take effect on reload.'
     : running ? 'Strength and on/off apply to the running server at once.'
@@ -3981,29 +3981,28 @@ function clearDraftApiKey() {
   draftApiKeyOrigin = undefined;
 }
 
-function keyForRemoteUrl(url: string): string {
-  return draftApiKeyOrigin && draftApiKeyOrigin === currentRemoteOrigin(url) ? $('remoteKeyInput').value : '';
+function draftCredential(origin: string | undefined) {
+  const apiKey = origin && draftApiKeyOrigin === origin ? $('remoteKeyInput').value : '';
+  return apiKey ? { apiKey, keyOrigin: origin } : { apiKey: '' };
 }
 
-function scheduleProbe() {
+function scheduleProbe(url = $('remoteUrlInput').value.trim(), origin = currentRemoteOrigin(url)) {
   clearScheduledProbe();
   if (!connectOpen) return;
-  const url = $('remoteUrlInput').value.trim();
-  const origin = currentRemoteOrigin(url);
   $('remoteKeyInput').disabled = !origin;
   if (draftApiKeyOrigin && draftApiKeyOrigin !== origin) {
     clearDraftApiKey();
     $('remoteKeyHint').textContent = 'Server address changed. Re-enter the API key if needed.';
   }
   if (url.length < 4) return;
-  const apiKey = keyForRemoteUrl(url);
+  const credential = draftCredential(origin);
   const requestId = probeRequestId;
   probeTimer = setTimeout(function () {
     vscode.postMessage({
       type: 'testRemote',
       requestId,
       url,
-      apiKey,
+      ...credential,
     });
   }, 600);
 }
@@ -4026,20 +4025,19 @@ $('extraPortsBtn').addEventListener('click', () =>
   vscode.postMessage({ type: 'extraServerPorts', requestId: ++connectScanRequestId }));
 $('connectBtn').addEventListener('click', () => {
   const url = $('remoteUrlInput').value;
-  clearScheduledProbe();
   vscode.postMessage({
     type: 'connectRemote', url,
     label: $('remoteLabelInput').value,
-    apiKey: keyForRemoteUrl(url),
+    ...draftCredential(currentRemoteOrigin(url)),
   });
-  clearDraftApiKey();
 });
-$('remoteUrlInput').addEventListener('input', scheduleProbe);
+$('remoteUrlInput').addEventListener('input', () => scheduleProbe());
 $('remoteKeyInput').addEventListener('input', () => {
-  draftApiKeyOrigin = currentRemoteOrigin($('remoteUrlInput').value);
-  if (!draftApiKeyOrigin) clearDraftApiKey();
+  const url = $('remoteUrlInput').value.trim();
+  const origin = currentRemoteOrigin(url);
+  draftApiKeyOrigin = $('remoteKeyInput').value ? origin : undefined;
   $('remoteKeyHint').textContent = '';
-  scheduleProbe();
+  scheduleProbe(url, origin);
 });
 $('remotePrimaryBtn').addEventListener('click', () => {
   const action = $('remotePrimaryBtn').dataset.action;

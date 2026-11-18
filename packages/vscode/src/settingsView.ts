@@ -52,6 +52,7 @@ import {
   readPickerCapabilities,
   removalPathsForQuant,
   sameModelFile,
+  normalizePathForCompare,
   withoutHiddenModels,
   type LibraryGroup,
 } from "@llama-aio/core";
@@ -161,6 +162,11 @@ const TEST_TIMEOUT_RESULT = {
   status: "error",
   error: "No reply within 3 minutes. Try again, or try a smaller model if the server is slow to respond.",
 } as const;
+
+/** Validate the draft credential against the normalized target in the host. */
+function draftKeyForOrigin(apiKey: string, keyOrigin: string | undefined, origin: string | undefined): string {
+  return origin && keyOrigin === origin ? apiKey.trim() : "";
+}
 
 export class SettingsViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = "llamaAio.settingsView";
@@ -521,10 +527,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             await this.pushState();
             break;
           case "testRemote":
-            await this.testRemote(String(msg.url || ""), String(msg.apiKey || ""), msg.requestId);
+            await this.testRemote(String(msg.url || ""), String(msg.apiKey || ""), msg.requestId, msg.keyOrigin);
             break;
           case "connectRemote":
-            await this.connectRemote(String(msg.url || ""), String(msg.label || ""), String(msg.apiKey || ""));
+            await this.connectRemote(String(msg.url || ""), String(msg.label || ""), String(msg.apiKey || ""), msg.keyOrigin);
             break;
           case "switchToLocal":
             await this.switchToLocal();
@@ -950,7 +956,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     const cpu = this.processManager.isCpuBackend();
     const effective = <T extends LlamaLoadSettings | undefined>(s: T): T => (cpu && s ? normalizeLoadSettingsForCpuBackend(s) as T : s);
     const changes = diffLoadSettings(effective(launched.loadSettings), effective(state.loadSettings));
-    if (launched.modelPath && state.selectedModelPath && path.resolve(launched.modelPath) !== path.resolve(state.selectedModelPath)) {
+    if (launched.modelPath && state.selectedModelPath && !sameModelFile(launched.modelPath, state.selectedModelPath)) {
       changes.unshift({
         key: "model",
         label: "model",
@@ -969,8 +975,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     return this.queueLoraChange(async () => {
       const launched = this.processManager.getLaunchedConfig();
       const state = this.store.getState();
-      if (this.store.isRemote() || !launched?.loadSettings || !state.selectedModelPath ||
-        path.resolve(launched.modelPath) !== path.resolve(state.selectedModelPath)) return;
+      if (this.store.isRemote() || !launched?.loadSettings || !sameModelFile(launched.modelPath, state.selectedModelPath)) return;
 
       const loraPending = diffLoadSettings(launched.loadSettings, state.loadSettings).some(change => change.key === "loraAdapters");
       const { mmprojPath, plePath, loraAdapters } = launched.loadSettings;
@@ -1127,7 +1132,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private async testRemote(rawUrl: string, apiKey: string, requestId: number): Promise<void> {
+  private async testRemote(rawUrl: string, apiKey: string, requestId: number, keyOrigin?: string): Promise<void> {
     let url: string;
     try {
       url = normalizeServerUrl(rawUrl);
@@ -1139,7 +1144,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       return;
     }
     const origin = originOf(url);
-    const key = apiKey.trim() || (origin ? await this.apiKeys?.load(origin) : undefined);
+    const key = draftKeyForOrigin(apiKey, keyOrigin, origin) || (origin ? await this.apiKeys?.load(origin) : undefined);
     try {
       const info = await probeRemoteServer(url, { apiKey: key });
       this.post({
@@ -1155,7 +1160,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
   }
 
   /** Save a remote URL and probe it. Confirms plain HTTP to a public address once. */
-  async connectRemote(rawUrl: string, label: string, apiKey: string): Promise<void> {
+  async connectRemote(rawUrl: string, label: string, apiKey: string, keyOrigin?: string): Promise<void> {
     let url: string;
     try {
       url = normalizeServerUrl(rawUrl);
@@ -1174,17 +1179,6 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       }
       await this.store.confirmPlainHttp(url);
     }
-    const typedKey = apiKey.trim();
-    if (typedKey) {
-      if (!this.apiKeys) {
-        void vscode.window.showWarningMessage("API key storage is not available in this window.");
-      } else {
-        await this.apiKeys.set(originOf(url)!, typedKey);
-      }
-    } else {
-      // Reconnecting to a server used before: its key may only be in Secret Storage.
-      await this.apiKeys?.load(originOf(url)!);
-    }
     if (!this.store.isRemote() && this.processManager.getStatus().running) {
       const choice = await vscode.window.showWarningMessage(
         "A local llama-server is still running. Stop it, or leave it running in the background?",
@@ -1198,6 +1192,18 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       if (choice === "Stop") {
         await this.processManager.stop(true);
       }
+    }
+    const origin = originOf(url)!;
+    const typedKey = draftKeyForOrigin(apiKey, keyOrigin, origin);
+    if (typedKey) {
+      if (!this.apiKeys) {
+        void vscode.window.showWarningMessage("API key storage is not available in this window.");
+      } else {
+        await this.apiKeys.set(origin, typedKey);
+      }
+    } else {
+      // Reconnecting to a server used before: its key may only be in Secret Storage.
+      await this.apiKeys?.load(origin);
     }
     await this.store.setRemoteServer(url, label);
     this.processManager.remote.reset();
@@ -1602,11 +1608,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     remote: boolean
   ) {
     const saved = state.loadSettings.loraAdapters;
-    const sameModel = launched && state.selectedModelPath &&
-      path.resolve(launched.modelPath) === path.resolve(state.selectedModelPath);
-    const loaded = sameModel ? launched.loadSettings?.loraAdapters || [] : [];
-    const loadedPaths = new Set(loaded.map(a => path.resolve(a.path)));
-    const savedPaths = new Set(saved.map(a => path.resolve(a.path)));
+    const loaded = sameModelFile(launched?.modelPath, state.selectedModelPath)
+      ? launched?.loadSettings?.loraAdapters || [] : [];
+    const loadedPaths = new Set(loaded.map(a => normalizePathForCompare(a.path)));
+    const savedPaths = new Set(saved.map(a => normalizePathForCompare(a.path)));
     return {
       adapters: remote ? [] : saved.map(a => {
         const check = checkLoraAdapter(a.path, caps);
@@ -1616,10 +1621,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           fit: check.fit, message: check.message,
           activated: !!check.info?.activated,
           // Loaded adapters take strength changes at once; new ones wait for a reload.
-          loaded: loadedPaths.has(path.resolve(a.path)),
+          loaded: loadedPaths.has(normalizePathForCompare(a.path)),
         };
       }),
-      pendingRemovals: remote ? [] : loaded.filter(a => !savedPaths.has(path.resolve(a.path)))
+      pendingRemovals: remote ? [] : loaded.filter(a => !savedPaths.has(normalizePathForCompare(a.path)))
         .map(a => ({ path: a.path, scale: effectiveLoraScale(a) })),
       builtIn: caps?.builtInAdapters ?? null,
       lineage: modelLineage(caps) ?? null,

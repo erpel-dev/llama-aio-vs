@@ -31,6 +31,9 @@ describe("legacyRemoteHostUrl", () => {
 it("uses reachability language for a preview and connection language after connecting", () => {
   assert.equal(remoteStateLabel("ready"), "Connected");
   assert.equal(remoteStateLabel("ready", { modelConfirmed: true }), "Reachable · model ready");
+  for (const state of ["ready", "busy"] as const) {
+    assert.equal(remoteStateLabel(state, { modelConfirmed: false }), "Reachable · model unconfirmed");
+  }
   assert.equal(remoteStateLabel("limited", { modelConfirmed: true }), "Reachable · limited capabilities");
   assert.equal(remoteStateLabel("limited", { modelConfirmed: false }), "Reachable · model unconfirmed");
   assert.equal(remoteStateLabel("auth", { modelConfirmed: false }), "API key required");

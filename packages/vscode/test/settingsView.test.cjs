@@ -746,6 +746,20 @@ describe("LoRA adapter controls", () => {
     assert.equal(state.adapters[0].scale, 0.45);
     assert.deepEqual(state.pendingRemovals, []);
   });
+  it("matches Windows model and adapter paths with different casing", t => {
+    const ui = setup();
+    t.mock.property(process, "platform", "win32");
+    const model = "C:/Models/Main.gguf";
+    const caps = { path: model };
+    const adapter = { path: "C:/Models/Adapter.gguf", scale: 0.45, enabled: true };
+    const launched = { modelPath: model, loadSettings: { loraAdapters: [adapter] } };
+    const state = loraAdapters => ({ selectedModelPath: model.toLowerCase(), loadSettings: { loraAdapters } });
+    const saved = { ...adapter, path: adapter.path.toLowerCase() };
+    assert.equal(ui.provider.loraPayload(state([saved]), caps, launched, false).adapters[0].loaded, true);
+    assert.deepEqual(ui.provider.loraPayload(state([]), caps, launched, false).pendingRemovals, [
+      { path: adapter.path, scale: 0.45 },
+    ]);
+  });
   it("discards attachment edits without reverting pending context or thread settings", async () => {
     const saved = [{ path: "/l/a.gguf", scale: 0.4, enabled: true }];
     const ui = setup({ loraAdapters: saved, mmprojPath: "/m/projector.gguf", plePath: "/m/ple.gguf" }, undefined, lora);
@@ -914,8 +928,59 @@ it("keeps draft API keys bound to their origin during preview and connect", asyn
 
   input(url, "https://localhost:18087");
   input(key, "https-key");
+  scheduledProbe();
+  post({ type: "remoteProbe", requestId: sent.at(-1).requestId, label: "Reachable · model ready" });
   el("connectBtn").click();
   assert.equal(sent.at(-1).apiKey, "https-key");
+  assert.equal(sent.at(-1).keyOrigin, "https://localhost:18087");
+  assert.equal(el(key).value, "https-key");
+  assert.match(el("probeList").textContent, /Reachable/);
+  post({ type: "remoteConnected" });
+  assert.equal(el(key).value, "");
+  assert.equal(el("probeList").textContent, "");
+});
+
+it("rejects a draft key for the wrong origin before making an HTTP preview request", async t => {
+  const seen = [];
+  const endpoint = http.createServer((req, res) => {
+    if (req.url === "/health") seen.push(req.headers.authorization);
+    res.setHeader("Content-Type", "application/json");
+    res.end(req.url === "/v1/models" ? '{"data":[]}' : '{}');
+  });
+  await new Promise(resolve => endpoint.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise(resolve => endpoint.close(resolve)));
+  const origin = `http://127.0.0.1:${endpoint.address().port}`;
+  const ui = setup();
+  ui.provider.attachApiKeyStore({ load: async () => "stored-for-target" });
+  const probe = { type: "testRemote", url: origin, apiKey: "draft", requestId: 1 };
+  await ui.send({ ...probe, keyOrigin: "http://127.0.0.1:1" });
+  await ui.send({ ...probe, keyOrigin: origin });
+  assert.deepEqual(seen, ["Bearer stored-for-target", "Bearer draft"]);
+});
+
+it("only stores an origin-matched draft key after the Connect prompt is accepted", async t => {
+  const ui = setup();
+  const provider = ui.provider;
+  const writes = [];
+  provider.attachApiKeyStore({ load: async () => undefined, set: async (...entry) => writes.push(entry) });
+  provider.store.setRemoteServer = async () => undefined;
+  provider.processManager.remote.reset = () => undefined;
+  provider.processManager.remote.refresh = async () => undefined;
+  provider.rememberRemoteModel = () => undefined;
+  provider.pushState = async () => undefined;
+  let choice;
+  t.mock.method(require("vscode").window, "showWarningMessage", async () => choice);
+  const origin = "http://127.0.0.1:9123";
+  const connect = { type: "connectRemote", url: origin, apiKey: "draft", keyOrigin: origin };
+  await ui.send(connect);
+  assert.deepEqual(writes, []);
+  assert.equal(ui.posted.some(m => m.type === "remoteConnected"), false);
+  choice = "Keep running";
+  await ui.send({ ...connect, keyOrigin: "http://127.0.0.1:1" });
+  assert.deepEqual(writes, []);
+  await ui.send(connect);
+  assert.deepEqual(writes, [[origin, "draft"]]);
+  assert.equal(ui.posted.at(-1).type, "remoteConnected");
 });
 
 describe("local server scan and the port list", () => {

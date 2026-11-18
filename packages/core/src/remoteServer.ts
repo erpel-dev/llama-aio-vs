@@ -749,14 +749,16 @@ export function remoteStateLabel(
   state: RemoteState | undefined,
   preview?: { modelConfirmed: boolean }
 ): string {
+  if (preview && !preview.modelConfirmed && (state === "ready" || state === "busy" || state === "limited")) {
+    return "Reachable · model unconfirmed";
+  }
   switch (state) {
     case "ready":
       return preview ? "Reachable · model ready" : "Connected";
     case "busy":
       return preview ? "Reachable · busy" : "Connected · busy";
     case "limited":
-      if (!preview) return "Connected · limited";
-      return preview.modelConfirmed ? "Reachable · limited capabilities" : "Reachable · model unconfirmed";
+      return preview ? "Reachable · limited capabilities" : "Connected · limited";
     case "loading":
       return "Loading model";
     case "no-model":
