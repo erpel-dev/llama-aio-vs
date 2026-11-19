@@ -84,3 +84,16 @@ else process.stdout.write(${JSON.stringify(help)});`);
     assert.deepEqual(await probeLlamaServerFeatures(launch), { ...all, moeCache: false });
   });
 });
+
+it("detects wrapped FP8 help independently of the V list and MoE CPU share", () => {
+  const features = parseLlamaServerFeatures([
+    "-ctk, --cache-type-k TYPE  key cache",
+    "                          allowed values: f16, q8_0, f8_e4m3",
+    "-ctv, --cache-type-v TYPE  value cache",
+    "                          allowed values: f16, q8_0",
+    "--moe-cache-cpu-share F   expert cache misses on CPU",
+  ].join("\n"));
+  assert.equal(features.fp8CacheK, true);
+  assert.equal(features.fp8CacheV, undefined);
+  assert.equal(features.moeCacheCpuShare, true);
+});

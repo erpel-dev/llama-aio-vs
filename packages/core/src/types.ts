@@ -35,6 +35,7 @@ export type KvCacheType =
   | "f32"
   | "f16"
   | "bf16"
+  | "f8_e4m3"
   | "q8_0"
   | "q5_1"
   | "q5_0"
@@ -50,6 +51,7 @@ export const KV_CACHE_TYPES: readonly KvCacheType[] = [
   "f32",
   "f16",
   "bf16",
+  "f8_e4m3",
   "q8_0",
   "q5_1",
   "q5_0",
@@ -409,6 +411,8 @@ export interface LlamaLoadSettings {
   nCpuMoe: number;
   /** GPU expert-cache budget in MiB (--moe-cache-mib); 0 = off. Requires host MoE experts. */
   moeCacheMiB: number;
+  /** Percentage of full GPU expert cache misses computed on CPU. */
+  moeCacheCpuPercent: number;
   /** Dense: force FFN tensors of first N layers onto CPU (--n-cpu-ffn); MoE models ignore this */
   nCpuFfn: number;
   /** Offload KV cache to GPU (default true; false => --no-kv-offload) */
@@ -576,6 +580,7 @@ export const DEFAULT_LOAD_SETTINGS: LlamaLoadSettings = {
   maxConcurrentPredictions: 1,
   nCpuMoe: 0,
   moeCacheMiB: 0,
+  moeCacheCpuPercent: 0,
   nCpuFfn: 0,
   offloadKvCacheToGpu: true,
   cacheTypeK: "q8_0",
@@ -703,6 +708,7 @@ export function normalizeLoadSettings(raw: Partial<LlamaLoadSettings> | undefine
     maxConcurrentPredictions: int(s.maxConcurrentPredictions, 1, 64, d.maxConcurrentPredictions),
     nCpuMoe: int(s.nCpuMoe, 0, 999, d.nCpuMoe),
     moeCacheMiB: int(s.moeCacheMiB, 0, 1_048_576, d.moeCacheMiB),
+    moeCacheCpuPercent: int(s.moeCacheCpuPercent, 0, 100, d.moeCacheCpuPercent),
     nCpuFfn: int(s.nCpuFfn, 0, 999, d.nCpuFfn),
     offloadKvCacheToGpu: toBoolean(s.offloadKvCacheToGpu, d.offloadKvCacheToGpu),
     cacheTypeK: normalizeKvCacheType(s.cacheTypeK),

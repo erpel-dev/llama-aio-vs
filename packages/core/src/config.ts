@@ -58,6 +58,7 @@ export interface AppPreferences {
    * known servers' defaults. Any OpenAI-compatible server there is offered.
    */
   extraServerPorts: number[];
+  showRouterModels: boolean;
   hfToken: string;
   autoStart: boolean;
   backend: string;
@@ -115,6 +116,7 @@ export const DEFAULT_APP_PREFERENCES: AppPreferences = {
   modelsDir: "",
   extraModelDirs: [],
   extraServerPorts: [],
+  showRouterModels: false,
   hfToken: "",
   autoStart: false,
   backend: "auto",
@@ -208,6 +210,7 @@ function normalizePreferences(raw: Partial<AppPreferences> | undefined): AppPref
       ? src.extraModelDirs.filter((d): d is string => typeof d === "string")
       : [],
     extraServerPorts: normalizeServerPorts(src.extraServerPorts),
+    showRouterModels: src.showRouterModels === true,
     hfToken: str(src.hfToken, ""),
     autoStart: src.autoStart === true,
     backend: str(src.backend, DEFAULT_APP_PREFERENCES.backend) || DEFAULT_APP_PREFERENCES.backend,

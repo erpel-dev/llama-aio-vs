@@ -81,7 +81,9 @@ export type ToHostMessage =
   | { type: "copyText"; text: string }
   | { type: "openCopilotChat" }
   | { type: "openAdvanced" }
-  | { type: "sendTest"; text: string }
+  | { type: "setShowRouterModels"; enabled: boolean }
+  | { type: "sendTest"; text: string; thinking?: boolean }
+  | { type: "finishTestThinking" }
   | { type: "cancelTest" }
   | { type: "dismissSetup" }
   // Hugging Face search and downloads
@@ -138,7 +140,7 @@ export type ToWebviewMessage =
   | { type: "mmprojSelected"; path: string }
   | { type: "openConnect" }
   | { type: "advancedPanel"; open: boolean }
-  | { type: "testResult"; status: "running" | "done" | "error" | "cancelled"; text?: string; error?: string; ms?: number }
+  | { type: "testResult"; status: "running" | "done" | "error" | "cancelled"; canFinishThinking?: boolean; thinkingStatus?: string; text?: string; error?: string; ms?: number }
   | { type: "remoteConnected" }
   | { type: "remoteProbe"; requestId: number; payload?: ViewModel; error?: string; label?: string }
   | { type: "connectScan"; requestId?: number; servers: ViewModel[] }

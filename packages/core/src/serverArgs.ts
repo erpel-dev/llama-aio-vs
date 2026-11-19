@@ -89,6 +89,7 @@ const CPU_IGNORED_FIELDS = {
   draftDevice: "",
   nCpuMoe: 0,
   moeCacheMiB: 0,
+  moeCacheCpuPercent: 0,
   nCpuFfn: 0,
 } satisfies Partial<LlamaLoadSettings>;
 
@@ -218,7 +219,12 @@ export function buildServerArgs(
     args.push("--n-cpu-moe", String(settings.nCpuMoe));
   }
   const moeCache = options?.features?.moeCache ? effectiveMoeCacheMiB(settings, options.caps) : 0;
-  if (moeCache > 0) args.push("--moe-cache-mib", String(moeCache));
+  if (moeCache > 0) {
+    args.push("--moe-cache-mib", String(moeCache));
+    if (options?.features?.moeCacheCpuShare && settings.moeCacheCpuPercent > 0) {
+      args.push("--moe-cache-cpu-share", String(settings.moeCacheCpuPercent / 100));
+    }
+  }
 
   // Dense counterpart to --n-cpu-moe: first N layers' dense FFN tensors stay
   // in system RAM. MoE models reset this to 0 at normalize time. Only sent
@@ -232,8 +238,9 @@ export function buildServerArgs(
   }
 
   // KV cache quantization (default q8_0 — ~½ KV size vs f16, good for long agent ctx).
-  args.push("--cache-type-k", settings.cacheTypeK || "q8_0");
-  args.push("--cache-type-v", settings.cacheTypeV || "q8_0");
+  const cache = supportedPerformanceSettings(settings, options?.features);
+  args.push("--cache-type-k", cache.cacheTypeK || "q8_0");
+  args.push("--cache-type-v", cache.cacheTypeV || "q8_0");
 
   // Unified KV buffer across sequences (-kvu / -no-kvu).
   args.push(settings.unifiedKvCache ? "--kv-unified" : "--no-kv-unified");
@@ -455,6 +462,9 @@ export function effectiveDraftSampling(settings: LlamaLoadSettings): "greedy" | 
 export function supportedPerformanceSettings(settings: LlamaLoadSettings, features?: LlamaServerFeatures): LlamaLoadSettings {
   return { ...settings,
     moeCacheMiB: features?.moeCache ? settings.moeCacheMiB : 0,
+    moeCacheCpuPercent: features?.moeCache && features.moeCacheCpuShare ? settings.moeCacheCpuPercent : 0,
+    cacheTypeK: settings.cacheTypeK === "f8_e4m3" && !features?.fp8CacheK ? "q8_0" : settings.cacheTypeK,
+    cacheTypeV: settings.cacheTypeV === "f8_e4m3" && !features?.fp8CacheV ? "q8_0" : settings.cacheTypeV,
     draftSampling: features?.draftSampling ? settings.draftSampling : "greedy",
     draftBatchSize: features?.draftUbatch ? settings.draftBatchSize : 0,
     cacheRamMiB: features?.cacheRam ? settings.cacheRamMiB : undefined,
@@ -465,6 +475,14 @@ export function supportedPerformanceSettings(settings: LlamaLoadSettings, featur
 
 export function performanceFeatureNotes(settings: LlamaLoadSettings, features: LlamaServerFeatures, caps?: ModelCapabilities): string[] {
   const notes: string[] = [];
+  if ((settings.cacheTypeK === "f8_e4m3" && !features.fp8CacheK) ||
+      (settings.cacheTypeV === "f8_e4m3" && !features.fp8CacheV)) {
+    notes.push("This binary does not advertise FP8 for the selected KV cache. The unsupported selection uses q8_0.");
+  }
+  if (settings.moeCacheCpuPercent > 0 &&
+      (!features.moeCache || !features.moeCacheCpuShare || !effectiveMoeCacheMiB(settings, caps))) {
+    notes.push("Expert cache CPU share requires an active GPU expert cache and --moe-cache-cpu-share support.");
+  }
   if (settings.cacheRamMiB !== undefined && !features.cacheRam) notes.push("Prompt-cache RAM override is inactive: this binary does not advertise --cache-ram.");
   if (settings.mmprojDevice && !features.mmprojDevice) notes.push("Projector device override is inactive: this binary does not advertise --mmproj-device.");
   if (settings.draftDevice && !features.draftDevice) notes.push("Draft device override is inactive: this binary does not advertise --spec-draft-device.");
@@ -543,6 +561,7 @@ export function serverConfigFingerprint(
     maxConcurrentPredictions: settings.maxConcurrentPredictions,
     nCpuMoe: settings.nCpuMoe,
     moeCacheMiB: settings.moeCacheMiB,
+    moeCacheCpuPercent: settings.moeCacheCpuPercent || undefined,
     nCpuFfn: settings.nCpuFfn ?? 0,
     offloadKvCacheToGpu: !!settings.offloadKvCacheToGpu,
     cacheTypeK: settings.cacheTypeK || "q8_0",

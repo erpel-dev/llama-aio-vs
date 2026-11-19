@@ -1166,6 +1166,52 @@ describe("onboarding test message", () => {
     return { provider, results };
   }
 
+  it("finishes thinking on the active completion without cancelling its answer stream", async t => {
+    mockTestModel(t, async () => []);
+    const { provider, results } = captureResults();
+    const http = require("node:http");
+    let complete;
+    let control;
+    let request;
+    const server = http.createServer(async (req, res) => {
+      let body = "";
+      for await (const chunk of req) body += chunk;
+      if (req.url.endsWith("/control")) {
+        control = JSON.parse(body);
+        res.setHeader("Content-Type", "application/json");
+        res.end(JSON.stringify({ success: true }));
+        complete();
+        return;
+      }
+      request = JSON.parse(body);
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      res.write('data: {"id":"chatcmpl-test","choices":[{"delta":{"reasoning_content":"Working"}}]}\n\n');
+      complete = () => res.end('data: {"id":"chatcmpl-test","choices":[{"delta":{"content":"Four"}}]}\n\ndata: [DONE]\n\n');
+    });
+    await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+    t.after(() => { server.closeAllConnections(); server.close(); });
+    provider.store = {
+      isRemote: () => false, getEndpoint: () => `http://127.0.0.1:${server.address().port}`,
+      getState: () => ({ selectedModelPath: "/m/test.gguf", requestSettings: { maxTokens: 100 }, loadSettings: {} }),
+      getSlotContextSize: () => 4096,
+    };
+    provider.processManager = { isHttpReady: async () => true, getStatus: () => ({ configDirty: false }) };
+    let thinking;
+    const startedThinking = new Promise(resolve => { thinking = resolve; });
+    provider.post = result => {
+      results.push(result);
+      if (result.canFinishThinking) thinking();
+    };
+    const run = provider.runTestMessage("Two plus two?", true);
+    await Promise.race([startedThinking, run]);
+    assert.equal(request.reasoning_control, true);
+    assert.equal(results.at(-1).canFinishThinking, true);
+    await provider.finishTestThinking();
+    await run;
+    assert.deepEqual(control, { id: "chatcmpl-test", model: "/m/test.gguf", action: "reasoning_end" });
+    assert.equal(results.at(-1).text, "Four");
+  });
+
   it("offers retry when the stream returns no displayable text", async t => {
     mockTestModel(t, async () => [{
       sendRequest: async () => ({ stream: [new vscode.LanguageModelTextPart("   ")] }),

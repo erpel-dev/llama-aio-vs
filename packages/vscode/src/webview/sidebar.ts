@@ -191,6 +191,8 @@ function renderRemoteModel() {
   if (sub) {
     sub.textContent = info.state === 'auth' ? 'partial' : (lastPayload && lastPayload.remoteLabel) || '';
   }
+  $('showRouterModels').checked = lastPayload?.showRouterModels === true;
+  $('routerModelsHint').textContent = info.isLlamaRouter ? 'Models may load when used for chat.' : 'Applies to llama.cpp router connections.';
   const chips = $('remoteChips');
   if (chips) {
     chips.textContent = '';
@@ -741,6 +743,7 @@ function renderSetup() {
   let disabled = false;
   if (testing) {
     action = 'cancelTest'; label = 'Cancel test';
+    if (testState?.canFinishThinking) secondary.push(setupButton('finishTestThinking', 'Finish thinking'));
   } else if (now === 'runtime') {
     if (st.installFailed) {
       action = 'install'; label = 'Retry install';
@@ -796,6 +799,10 @@ function renderSetupTest(showInput) {
   $('setupTest').classList.toggle('hidden', !showInput && !hasResult);
   $('setupTestPrompt').classList.toggle('hidden', !showInput);
   input.disabled = t?.status === 'running';
+  $('setupTestThinkingOption').classList.toggle('hidden', !showInput);
+  $('setupTestThinking').disabled = t?.status === 'running';
+  $('setupTestThinkingStatus').textContent = t?.thinkingStatus || '';
+  $('setupTestThinkingStatus').classList.toggle('hidden', !t?.thinkingStatus);
   reply.classList.toggle('hidden', !hasResult);
   if (t?.status === 'done') {
     const duration = typeof t.ms === 'number' ? ' · ' + (t.ms / 1000).toFixed(1) + ' s' : '';
@@ -850,7 +857,9 @@ function runSetupAction(action) {
     testDismissed = false;
     testState = { status: 'running' };
     renderSetup();
-    vscode.postMessage({ type: 'sendTest', text: text });
+    vscode.postMessage({ type: 'sendTest', text, ...($('setupTestThinking').checked ? { thinking: true } : {}) });
+  } else if (action === 'finishTestThinking') {
+    vscode.postMessage({ type: 'finishTestThinking' });
   } else if (action === 'cancelTest') {
     vscode.postMessage({ type: 'cancelTest' });
   } else if (action === 'webui') {
@@ -2313,6 +2322,7 @@ const KV_PRECISION_RANK = {
   q4_1: 0.6,
   q5_0: 0.7,
   q5_1: 0.8,
+  f8_e4m3: 1,
   q8_0: 1,
   bf16: 2,
   f16: 2,
@@ -2325,6 +2335,19 @@ function syncFlashAttentionWarning() {
   if (!hint) return;
   const vQuantized = KV_PRECISION_RANK[$('cacheTypeV').value] < 2;
   hint.classList.toggle('hidden', !(vQuantized && $('flashAttention').value === 'off'));
+}
+
+function syncFp8CacheUi(f) {
+  const k = $('cacheTypeK');
+  const v = $('cacheTypeV');
+  const linked = $('kvTypesLinked').checked;
+  k.querySelector('option[value="f8_e4m3"]').disabled = !f.fp8CacheK || (linked && !f.fp8CacheV);
+  v.querySelector('option[value="f8_e4m3"]').disabled = !f.fp8CacheV;
+  const usesFp8 = k.value === 'f8_e4m3' || v.value === 'f8_e4m3';
+  const unavailable = (k.value === 'f8_e4m3' && !f.fp8CacheK) || (v.value === 'f8_e4m3' && !f.fp8CacheV);
+  $('fp8CacheHint').classList.toggle('hidden', !usesFp8);
+  $('fp8CacheHint').textContent = unavailable ? 'FP8 is unavailable on this build. The unsupported cache uses q8_0.'
+    : 'FP8 uses about half the memory of f16. Runtime support depends on the backend and model.';
 }
 
 /** Mirror K onto V while linked; warn when V is kept more precise than K. */
@@ -2344,6 +2367,7 @@ function syncKvLink(propagate) {
     hint.classList.toggle('hidden', linked || !lopsided);
   }
   syncFlashAttentionWarning();
+  syncFp8CacheUi(lastPayload?.serverFeatures || {});
 }
 
 $('cacheTypeK').addEventListener('change', () => {
@@ -2441,7 +2465,7 @@ const loadFieldIds = [
   'chatTemplateName', 'chatTemplateJinja',
   'ropeBaseAuto', 'ropeFreqBase', 'ropeScaleAuto', 'ropeFreqScale',
   'seedRandom', 'seed', 'speculativeMode', 'maxDraftTokens', 'minDraftTokens',
-  'draftProbability', 'draftGpuOffload', 'draftSampling', 'draftBatchSize', 'moeCacheMiB',
+  'draftProbability', 'draftGpuOffload', 'draftSampling', 'draftBatchSize', 'moeCacheMiB', 'moeCacheCpuPercent',
   'ngramVariant', 'ngramSizeN', 'ngramSizeNRange', 'ngramSizeM', 'ngramMinHits',
   'tensorSplitRange', 'splitMode', 'mainGpu'
 ];
@@ -2648,6 +2672,7 @@ function readLoad() {
     maxConcurrentPredictions: Number($('maxConcurrentPredictions').value),
     nCpuMoe: Number($('nCpuMoe').value),
     moeCacheMiB: Number($('moeCacheMiB').value),
+    moeCacheCpuPercent: Number($('moeCacheCpuPercent').value),
     nCpuFfn: Number($('nCpuFfn').value),
     offloadKvCacheToGpu: $('offloadKvCacheToGpu').checked,
     mmprojOffloadToGpu: $('mmprojOffloadToGpu') ? $('mmprojOffloadToGpu').checked : true,
@@ -3010,6 +3035,13 @@ function syncPerformanceFeatureUi() {
   const eligible = modelIsMoe && !cpuOnlyLive() && ngl > 0 &&
     layers > Math.max(0, blocks - (ngl >= 99 ? blocks : ngl)) && split !== 'tensor';
   if (cache) cache.disabled = remote || !f.moeCache || !eligible;
+  const cpuShare = $('moeCacheCpuPercent');
+  const shareSupported = f.moeCache && f.moeCacheCpuShare && eligible && Number(cache.value) > 0;
+  cpuShare.disabled = remote || !shareSupported;
+  $('moeCacheCpuHint').textContent = shareSupported
+    ? '0 = upload all misses to GPU. Higher values compute more misses on CPU once the cache fills.'
+    : 'Requires an active GPU expert cache and a compatible llama.cpp build.';
+  syncFp8CacheUi(f);
   if (cacheHint) cacheHint.textContent = remote ? suffix : !f.moeCache
     ? 'Inactive: requires a compatible llama.cpp GPU build with a usable GPU device.' : !eligible
     ? 'Inactive: requires CPU MoE experts in GPU-assigned layers; Tensor split is unsupported.'
@@ -3346,6 +3378,7 @@ function applyState(payload) {
   setField('maxConcurrentPredictions', L.maxConcurrentPredictions);
   setPair('nCpuMoe', 'nCpuMoeRange', moe);
   setField('moeCacheMiB', L.moeCacheMiB ?? 0);
+  setField('moeCacheCpuPercent', L.moeCacheCpuPercent ?? 0);
   setPair('nCpuFfn', 'nCpuFfnRange', ffn);
   setChecked('offloadKvCacheToGpu', !!L.offloadKvCacheToGpu);
   setChecked('mmprojOffloadToGpu', L.mmprojOffloadToGpu !== false);
@@ -4021,6 +4054,7 @@ $('setApiKeyBtn').addEventListener('click', () => { closeMenu(); vscode.postMess
 $('forgetApiKeyBtn').addEventListener('click', () => { closeMenu(); vscode.postMessage({ type: 'forgetApiKey' }); });
 $('switchLocalBtn').addEventListener('click', () => { closeMenu(); vscode.postMessage({ type: 'switchToLocal' }); });
 $('connectCancelBtn').addEventListener('click', () => setConnectOpen(false));
+$('showRouterModels').addEventListener('change', () => vscode.postMessage({ type: 'setShowRouterModels', enabled: $('showRouterModels').checked }));
 $('extraPortsBtn').addEventListener('click', () =>
   vscode.postMessage({ type: 'extraServerPorts', requestId: ++connectScanRequestId }));
 $('connectBtn').addEventListener('click', () => {
@@ -4227,7 +4261,7 @@ window.addEventListener('message', (event: MessageEvent<ToWebviewMessage>) => {
   const msg = event.data;
   if (msg.type === 'libraryRefreshComplete') $('libraryRefreshBtn').disabled = false;
   if (msg.type === 'testResult' && !testDismissed) {
-    testState = { status: msg.status, text: msg.text, error: msg.error, ms: msg.ms };
+    testState = { ...msg };
     if (msg.status === 'done') sawCompletedReply = true;
     renderSetup();
   }
@@ -4355,6 +4389,7 @@ window.addEventListener('message', (event: MessageEvent<ToWebviewMessage>) => {
         lastPayload.serverMode = p.serverMode;
         lastPayload.remote = p.remote;
         lastPayload.remoteLabel = p.remoteLabel;
+        lastPayload.showRouterModels = p.showRouterModels;
         lastPayload.remoteHint = p.remoteHint;
         lastPayload.nextRetryAt = p.nextRetryAt;
         lastPayload.endpoint = p.endpoint || lastPayload.endpoint;

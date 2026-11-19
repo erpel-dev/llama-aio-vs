@@ -96,7 +96,7 @@ before(async () => {
         res.end(JSON.stringify({ ok: true, backend: { kind: "native" }, engine: {} }));
         return;
       }
-      if (req.url === "/props") {
+      if (req.url === "/props" || req.url.startsWith("/props?model=")) {
         res.writeHead(propsStatus || 200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ default_generation_settings: { n_ctx: 32768 }, total_slots: 1, ...servedProps }));
         return;
@@ -146,7 +146,7 @@ before(async () => {
 });
 after(() => new Promise((resolve) => server.close(() => resolve())));
 
-function setup({ guard = false, remote = false, remoteInfo = {} } = {}) {
+function setup({ guard = false, remote = false, remoteInfo = {}, showRouterModels = false } = {}) {
   const perfCalls = [];
   const state = {
     selectedModelPath: "/m/test.gguf",
@@ -157,6 +157,7 @@ function setup({ guard = false, remote = false, remoteInfo = {} } = {}) {
     getEndpoint: () => endpoint,
     isRemote: () => remote,
     getState: () => state,
+    getConfig: () => ({ get: () => showRouterModels }),
     getServerTarget: () => ({ mode: remote ? "remote" : "local", baseUrl: endpoint, label: "this machine" }),
     getPromptReplacementsFile: () => "",
     isPromptReplacementsEnabled: () => false,
@@ -230,6 +231,26 @@ describe("LlamaAioChatProvider requests", () => {
     assert.equal(running.id, "/m/test.gguf");
     assert.equal(stopped.id, running.id, "Copilot keeps its model selection by id");
     assert.equal(stopped.name, running.name);
+  });
+
+  it("opts in to router models and sends chat and metadata requests to the selected model", async () => {
+    servedModels = { data: [
+      { id: "loaded", owned_by: "llamacpp", status: { value: "loaded" }, meta: { n_ctx: 16384 } },
+      { id: "second model", owned_by: "llamacpp", status: { value: "unloaded" },
+        meta: { n_ctx: 65536 }, architecture: { input_modalities: ["text", "image"] } },
+      { id: "partial", owned_by: "llamacpp", status: { value: "incomplete" } },
+    ] };
+    const { provider } = setup({ remote: true, showRouterModels: true });
+    const token = cancelToken().token;
+    const models = await provider.provideLanguageModelChatInformation({}, token);
+    assert.deepEqual(models.map(model => model.id), ["loaded", "second model"]);
+    assert.equal(models[1].capabilities.imageInput, true);
+    assert.ok(models[1].maxInputTokens > models[0].maxInputTokens);
+    assert.ok(!seenRequests.some(r => r.url.startsWith("/props?")));
+    await provider.provideLanguageModelChatResponse(models[1], [msg(Role.User,
+      new TextPart("Hello"))], {}, { report() {} }, token);
+    assert.equal(lastBody.model, "second model");
+    assert.ok(seenRequests.some(r => r.url === "/props?model=second+model&autoload=false"));
   });
 
   for (const remote of [false, true]) {

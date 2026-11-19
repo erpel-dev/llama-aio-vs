@@ -1,7 +1,7 @@
 import { randomBytes } from "crypto";
 import * as fs from "fs";
 import { estimateRemoteFit, formatBytes } from "@llama-aio/core";
-import { WebUiGateway } from "@llama-aio/core";
+import { ConnectionError, joinServerUrl, openChatStream, parseChatStream, serverJson, WebUiGateway } from "@llama-aio/core";
 import { explainLocalModelModes, explainRemoteModelModes, resolveServerModelModes, serverReasoningLevels, type ModelCapabilities } from "@llama-aio/core";
 import { readLocalApiKey } from "@llama-aio/core";
 import { syncPerfTarget } from "./perfTarget";
@@ -342,6 +342,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               evalBatchSize: d.evalBatchSize,
               physicalBatchSize: d.physicalBatchSize,
               moeCacheMiB: d.moeCacheMiB,
+              moeCacheCpuPercent: d.moeCacheCpuPercent,
               maxConcurrentPredictions: d.maxConcurrentPredictions,
               offloadKvCacheToGpu: d.offloadKvCacheToGpu,
               cacheTypeK: d.cacheTypeK,
@@ -742,8 +743,16 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             }
             break;
           }
+          case "setShowRouterModels":
+            await this.store.getConfig().update("showRouterModels", msg.enabled === true);
+            this.notifyChatModels();
+            await this.pushState();
+            break;
           case "sendTest":
-            await this.runTestMessage(typeof msg.text === "string" ? msg.text : "");
+            await this.runTestMessage(typeof msg.text === "string" ? msg.text : "", msg.thinking === true);
+            break;
+          case "finishTestThinking":
+            await this.finishTestThinking();
             break;
           case "cancelTest":
             this.testCancel?.cancel();
@@ -1101,6 +1110,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       serverMode: remote ? "remote" : "local",
       remoteUrl: this.store.getServerPreferences().remoteUrl,
       remoteLabel: remote ? target.label : "",
+      showRouterModels: this.store.getConfig().get<boolean>("showRouterModels") === true,
       hasApiKey: this.currentHasApiKey(),
       remote: info,
       nextRetryAt: remote ? this.processManager.remote.nextRetryAt() : undefined,
@@ -2434,6 +2444,86 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
   private testCancel?: vscode.CancellationTokenSource;
   private lastTestResult?: TestResult;
   private testResponseInFlight?: Promise<string>;
+  private testThinking?: { endpoint: string; model: string; id?: string; signal: AbortSignal; requested: boolean };
+
+  private async finishTestThinking(): Promise<void> {
+    const run = this.testThinking;
+    if (!run?.id || run.requested || run.signal.aborted || !this.lastTestResult?.canFinishThinking) return;
+    run.requested = true;
+    this.publishTestResult({ type: "testResult", status: "running", thinkingStatus: "Requesting a final answer…" });
+    try {
+      const result = await serverJson<{ success?: boolean; message?: string }>(
+        joinServerUrl(run.endpoint, "/v1/chat/completions/control"), {
+          method: "POST", body: { id: run.id, model: run.model, action: "reasoning_end" },
+          timeoutMs: 5000, signal: run.signal,
+        });
+      if (result.success !== true) throw new Error(result.message || "The server did not end thinking.");
+    } catch (error) {
+      if (this.testThinking !== run || run.signal.aborted || this.lastTestResult?.thinkingStatus !== "Requesting a final answer…") return;
+      const unavailable = error instanceof ConnectionError && (error.status === 404 || error.status === 405);
+      this.publishTestResult({ type: "testResult", status: "running",
+        thinkingStatus: unavailable ? "This llama.cpp build cannot finish thinking on request. The test is still running."
+          : "Could not finish thinking. The test is still running.",
+        canFinishThinking: !unavailable });
+      run.requested = unavailable;
+    }
+  }
+
+  /** The sidebar owns this stream and can control it independently of Copilot. */
+  private async streamThinkingTest(prompt: string, token: vscode.CancellationToken): Promise<string> {
+    if (this.store.isRemote() || !await this.processManager.isHttpReady()) {
+      throw new Error("Start the local llama.cpp server before testing model thinking.");
+    }
+    if (token.isCancellationRequested) return "";
+    if (this.store.isRemote() || this.processManager.getStatus().configDirty) {
+      throw new Error("Use the local server and reload pending changes before testing model thinking.");
+    }
+    const endpoint = this.store.getEndpoint();
+    const state = this.store.getState();
+    const abort = new AbortController();
+    const sub = token.onCancellationRequested(() => abort.abort());
+    const run: NonNullable<typeof this.testThinking> = {
+      endpoint, model: state.selectedModelPath, signal: abort.signal, requested: false,
+    };
+    this.testThinking = run;
+    try {
+      const stream = await openChatStream(endpoint, {
+        model: run.model,
+        messages: [{ role: "user", content: prompt }],
+        stream: true,
+        reasoning_format: "deepseek",
+        chat_template_kwargs: { enable_thinking: true },
+        reasoning_control: true,
+        max_tokens: Math.min(state.requestSettings.maxTokens, Math.floor(this.store.getSlotContextSize(state.loadSettings) / 4)),
+      }, abort.signal);
+      let reply = "";
+      let phase: "waiting" | "thinking" | "answer" = "waiting";
+      try {
+        for await (const part of parseChatStream(stream, {
+          toolsEnabled: false, separateReasoning: true, signal: abort.signal,
+          onCompletionId: id => { run.id = id; },
+        })) {
+          if (part.kind === "reasoning" && phase === "waiting") {
+            phase = "thinking";
+            this.publishTestResult({ type: "testResult", status: "running",
+              canFinishThinking: !!run.id, thinkingStatus: "The model is thinking…" });
+          } else if (part.kind === "text") {
+            if (phase !== "answer") {
+              phase = "answer";
+              this.publishTestResult({ type: "testResult", status: "running", thinkingStatus: "Writing the answer…" });
+            }
+            reply += part.text;
+          }
+        }
+      } finally {
+        stream.destroy();
+      }
+      return reply.trim().slice(0, 1200);
+    } finally {
+      sub.dispose();
+      if (this.testThinking === run) this.testThinking = undefined;
+    }
+  }
 
   private publishTestResult(result: TestResult): void {
     this.lastTestResult = result;
@@ -2441,17 +2531,17 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
   }
 
   /** Send one quick request through the Language Model provider Copilot Chat uses. */
-  private async readTestReply(prompt: string, token: vscode.CancellationToken): Promise<string> {
-    const [model] = await vscode.lm.selectChatModels({ vendor: "llama-aio" });
+  private async readTestReply(prompt: string, token: vscode.CancellationToken, thinking: boolean): Promise<string> {
+    const [model] = thinking ? [] : await vscode.lm.selectChatModels({ vendor: "llama-aio" });
     if (token.isCancellationRequested) return "";
-    if (!model) {
+    if (!model && !thinking) {
       throw new Error("The server is not ready yet. Start it, then try again.");
     }
     // A cancelled model lookup has no server request to drain. Once streaming
     // starts, wait for the previous request to unwind before using the slot.
     if (this.testResponseInFlight) await this.testResponseInFlight.catch(() => undefined);
     if (token.isCancellationRequested) return "";
-    const request = this.streamTestReply(model, prompt, token);
+    const request = model ? this.streamTestReply(model, prompt, token) : this.streamThinkingTest(prompt, token);
     this.testResponseInFlight = request;
     try {
       return await request;
@@ -2473,7 +2563,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     return reply.trim().slice(0, 1200);
   }
 
-  private async runTestMessage(text: string): Promise<void> {
+  private async runTestMessage(text: string, thinking = false): Promise<void> {
     const prompt = text.trim().slice(0, 2000);
     if (!prompt || this.testCancel) return;
 
@@ -2492,7 +2582,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     const timer = setTimeout(() => { timedOut = true; cancel.cancel(); }, TEST_MESSAGE_TIMEOUT_MS);
     this.publishTestResult({ type: "testResult", status: "running" });
     try {
-      const reply = await Promise.race([this.readTestReply(prompt, token), cancelled]);
+      const reply = await Promise.race([this.readTestReply(prompt, token, thinking), cancelled]);
       result = reply
         ? { type: "testResult", status: "done", text: reply, ms: Date.now() - started }
         : { type: "testResult", status: "error", error: "The model returned no text. Try again with a short test message." };

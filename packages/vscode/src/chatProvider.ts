@@ -25,6 +25,7 @@ import {
   parseChatStream,
   PerfStats,
   pickServedModel,
+  isLlamaRouterModel,
   positiveRate,
   ProcessManager,
   remoteSlotContext,
@@ -62,7 +63,11 @@ interface OpenAiModel {
   owned_by?: string;
   alias_of?: string;
   aliases?: unknown;
-  meta?: { label?: string; aliases?: unknown };
+  meta?: { label?: string; aliases?: unknown; n_ctx?: number };
+  max_model_len?: number;
+  context_length?: number;
+  architecture?: { input_modalities?: string[] };
+  memory?: { effective?: { n_ctx?: number } };
   /** llama-server router: `{ value: "loaded" | "unloaded" | "loading" }`. */
   status?: unknown;
 }
@@ -468,10 +473,17 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
     this.modelProbe = undefined;
     this.propsProbe = undefined;
     this.readyProbe = undefined;
+    this.routerCatalog = undefined;
     this._onDidChangeModelInformation.fire();
   }
 
-  private async fetchServerProps(): Promise<ServerProps | undefined> {
+  private async fetchServerProps(routerModel?: string): Promise<ServerProps | undefined> {
+    if (routerModel) {
+      const url = new URL(joinServerUrl(this.store.getEndpoint(), "/props"));
+      url.searchParams.set("model", routerModel);
+      url.searchParams.set("autoload", "false");
+      return serverJson<ServerProps>(url.toString(), { timeoutMs: 3000 }).catch(() => undefined);
+    }
     const endpoint = this.store.getEndpoint();
     const hit = this.propsProbe;
     if (hit && hit.endpoint === endpoint && Date.now() - hit.at < LlamaAioChatProvider.PROBE_TTL_MS) {
@@ -553,22 +565,23 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
   }
 
   /** Count the rendered prompt only for large text requests; optional on compatible servers. */
-  private async countLargePrompt(body: Record<string, unknown>, token: vscode.CancellationToken): Promise<number | undefined> {
-    if ((this.store.isRemote() && this.remoteInfo()?.isLlamaCpp !== true)
+  private async countLargePrompt(body: Record<string, unknown>, token: vscode.CancellationToken, routerModel?: string): Promise<number | undefined> {
+    if ((this.store.isRemote() && this.remoteInfo()?.isLlamaCpp !== true && !routerModel)
       || messagesHaveImageParts(body.messages as OpenAiChatMessage[])) return undefined;
     const abort = new AbortController();
     const sub = token.onCancellationRequested(() => abort.abort());
     if (token.isCancellationRequested) abort.abort();
     const endpoint = this.store.getEndpoint();
     const options = { method: "POST" as const, timeoutMs: 5000, signal: abort.signal };
+    const routing = routerModel ? { model: routerModel } : {};
     try {
       const rendered = await serverJson<{ prompt?: unknown }>(joinServerUrl(endpoint, "/apply-template"), {
-        ...options, body: JSON.stringify({ messages: body.messages, tools: body.tools,
+        ...options, body: JSON.stringify({ ...routing, messages: body.messages, tools: body.tools,
           tool_choice: body.tool_choice, chat_template_kwargs: body.chat_template_kwargs }),
       });
       if (typeof rendered?.prompt !== "string" || !rendered.prompt) return undefined;
       const result = await serverJson<{ tokens?: unknown }>(joinServerUrl(endpoint, "/tokenize"), {
-        ...options, body: JSON.stringify({ content: rendered.prompt, add_special: true, parse_special: true }),
+        ...options, body: JSON.stringify({ ...routing, content: rendered.prompt, add_special: true, parse_special: true }),
       });
       return Array.isArray(result?.tokens) && result.tokens.length > 0 ? result.tokens.length : undefined;
     } catch {
@@ -653,6 +666,56 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
       : undefined;
   }
 
+  private routerCatalog?: { endpoint: string; at: number; models: OpenAiModel[] };
+
+  private async routerModels(): Promise<OpenAiModel[]> {
+    if (!this.store.isRemote() || this.store.getConfig()?.get<boolean>("showRouterModels") !== true) return [];
+    const endpoint = this.store.getEndpoint();
+    if (this.routerCatalog?.endpoint === endpoint &&
+        Date.now() - this.routerCatalog.at < LlamaAioChatProvider.PROBE_TTL_MS) {
+      return this.routerCatalog.models;
+    }
+    try {
+      const listing = await serverJson<OpenAiModelsResponse>(joinServerUrl(endpoint, "/v1/models"), { timeoutMs: 5000 });
+      const byId = new Map<string, OpenAiModel>();
+      for (const entry of Array.isArray(listing?.data) ? listing.data : []) {
+        const status = (entry?.status as { value?: string } | undefined)?.value;
+        if (entry && typeof entry.id === "string" && entry.id.trim() && entry.owned_by === "llamacpp" &&
+            isLlamaRouterModel(entry) && (status === "loaded" || status === "loading" ||
+              status === "unloaded" || status === "sleeping")) {
+          byId.set(entry.id, entry);
+        }
+      }
+      const models = [...byId.values()];
+      if (this.store.getEndpoint() !== endpoint || this.store.getConfig()?.get<boolean>("showRouterModels") !== true) return [];
+      this.routerCatalog = { endpoint, at: Date.now(), models };
+      return models;
+    } catch {
+      return [];
+    }
+  }
+
+  private routerContext(model: OpenAiModel, props?: ServerProps): number {
+    const remote = this.remoteInfo();
+    const context = [props?.default_generation_settings?.n_ctx, model.memory?.effective?.n_ctx, model.max_model_len, model.meta?.n_ctx]
+      .find(n => typeof n === "number" && Number.isFinite(n) && n > 0);
+    if (context) return context;
+    const fallback = remoteSlotContext(remote?.modelId === model.id ? remote : undefined);
+    return typeof model.context_length === "number" && Number.isFinite(model.context_length) && model.context_length > 0
+      ? Math.min(fallback, model.context_length)
+      : fallback;
+  }
+
+  private routerModeSet(model: OpenAiModel, props?: ServerProps): ModelModeSet | undefined {
+    const identity = remoteModelIdentity(model);
+    const profile = resolveRemoteModelModes({
+      ...identity,
+      modelAlias: props?.model_alias ?? identity.modelAlias,
+      modelPath: props?.model_path?.split(/[/\\]/).pop(),
+    });
+    return props?.chat_template_caps ? resolveServerModelModes(profile, props.chat_template_caps) : profile;
+  }
+
   private async cachedModelId(fallback: string): Promise<string> {
     const endpoint = this.store.getEndpoint();
     const hit = this.modelProbe;
@@ -697,6 +760,28 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
     const fallback = remote
       ? remoteInfo?.modelId || this.store.getServerPreferences().lastRemoteModelId || "remote-model"
       : selected || "local-model";
+    const routerModels = ready ? await this.routerModels() : [];
+    if (routerModels.length) {
+      const infos = routerModels.map(model => {
+        const serverSlotCtx = this.routerContext(model);
+        const maxOutput = Math.min(state.requestSettings.maxTokens, Math.floor(serverSlotCtx / 4));
+        const modeSet = this.routerModeSet(model);
+        return {
+          id: model.id,
+          name: `Llama AIO: ${model.id}`,
+          family: "llama-aio",
+          version: "1.0.0",
+          maxInputTokens: Math.max(1024, serverSlotCtx - maxOutput),
+          maxOutputTokens: maxOutput,
+          statusIcon: new vscode.ThemeIcon("llama-aio-model"),
+          detail: `llama.cpp router · ${target.label}`,
+          capabilities: { toolCalling: true, imageInput: model.architecture?.input_modalities?.includes("image") === true },
+          ...(modeSet ? { configurationSchema: buildModeConfigurationSchema(modeSet) } : {}),
+        };
+      });
+      this.announceIfChanged(JSON.stringify(infos.map(info => [info.id, info.maxInputTokens, info.capabilities, info.configurationSchema])));
+      return infos;
+    }
     const modelId = ready ? await this.cachedModelId(fallback) : fallback;
     if (remote && ready && modelId !== "remote-model") {
       void this.store.setLastRemoteModelId(modelId).catch(() => undefined);
@@ -789,8 +874,9 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
     const state = this.store.getState();
     const remoteInfo = this.remoteInfo();
     const serverLabel = this.store.getServerTarget().label;
-    const props = await this.fetchServerProps();
-    const slotCtx = this.slotContext(props);
+    const routerModel = (await this.routerModels()).find(entry => entry.id === model.id);
+    const props = await this.fetchServerProps(routerModel?.id);
+    const slotCtx = routerModel ? this.routerContext(routerModel, props) : this.slotContext(props);
 
     const convertedRaw = toOpenAiMessages(messages);
     let tools =
@@ -854,7 +940,7 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
       body.tool_choice = options.toolMode === vscode.LanguageModelChatToolMode.Required ? "required" : "auto";
     }
 
-    const modeSet = this.modeSetFor(model.id, props);
+    const modeSet = routerModel ? this.routerModeSet(routerModel, props) : this.modeSetFor(model.id, props);
     const Thinking = modeSet?.preserveReasoning ? thinkingPartConstructor() : undefined;
     // VS Code supplies modelConfiguration even for public API calls, filling
     // it from editor defaults. An explicit per-request effort must override
@@ -907,7 +993,7 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
     // Use characters for this trigger: token-dense languages and code can
     // already be near the limit while the four-characters estimate looks low.
     const countedPromptTokens = requestChars >= Math.min(16384, Math.floor(slotCtx / 2))
-      ? await this.countLargePrompt(body, token) : undefined;
+      ? await this.countLargePrompt(body, token, routerModel?.id) : undefined;
     if (token.isCancellationRequested) return;
     const estimatedPromptTokens = countedPromptTokens ?? tokensAfter;
     if (countedPromptTokens !== undefined && countedPromptTokens >= slotCtx) {
@@ -988,7 +1074,7 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
       | undefined;
     // After mode sampling, so a Copilot mode that rewrites temperature does not
     // drop the penalty. Ids are resolved once per model from /tokenize.
-    const skipBias = remote && remoteInfo?.isLlamaCpp === false;
+    const skipBias = !!routerModel || (remote && remoteInfo?.isLlamaCpp === false);
     const markerBias = skipBias
       ? undefined
       : await overthinkingLogitBias(
@@ -1171,7 +1257,7 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
     const chars = typeof text === "string" ? text.length : messageContentChars(messages!);
     const estimate = Math.ceil(chars / 4);
     if (chars < 4096 || token.isCancellationRequested
-      || (this.store.isRemote() && this.remoteInfo()?.isLlamaCpp !== true)
+      || (this.store.isRemote() && (this.remoteInfo()?.isLlamaCpp !== true || this.remoteInfo()?.isLlamaRouter))
       || (messages && messagesHaveImageParts(messages))) return estimate;
     const endpoint = this.store.getEndpoint();
     const key = `${endpoint}|${model.id}|${typeof text === "string" ? "text" : "message"}|${createHash("sha256").update(typeof text === "string" ? text : JSON.stringify(messages)).digest("hex")}`;

@@ -8,6 +8,9 @@ import type { LaunchPlan } from "./nixCompat";
 export interface LlamaServerFeatures {
   probed: boolean;
   moeCache: boolean;
+  moeCacheCpuShare?: boolean;
+  fp8CacheK?: boolean;
+  fp8CacheV?: boolean;
   /** GPU backend of the binary's devices (`vulkan`, `cuda`, …) from --list-devices. */
   gpuBackend?: string;
   draftSampling: boolean;
@@ -29,8 +32,18 @@ export function parseLlamaServerFeatures(help: string): LlamaServerFeatures {
   const plain = help.replace(/\x1b\[[0-9;]*m/g, "");
   const definition = (flag: string): string =>
     plain.match(new RegExp(`^\\s*(?:-[\\w-]+,\\s*)*${flag}(?=[\\s,=]|$)[^\\n]*`, "m"))?.[0] || "";
+  const advertisesFp8 = (flag: string): boolean => {
+    const line = definition(flag);
+    if (!line) return false;
+    const rest = plain.slice(plain.indexOf(line) + line.length);
+    const nextOption = rest.search(/\n[ \t]*-{1,2}[a-z][\w-]*(?=[ ,=\n]|$)/i);
+    return /\bf8_e4m3\b/.test(line + rest.slice(0, nextOption < 0 ? rest.length : nextOption));
+  };
   return {
     probed: true,
+    ...(definition("--moe-cache-cpu-share") ? { moeCacheCpuShare: true } : {}),
+    ...(advertisesFp8("--cache-type-k") ? { fp8CacheK: true } : {}),
+    ...(advertisesFp8("--cache-type-v") ? { fp8CacheV: true } : {}),
     moeCache: !!definition("--moe-cache-mib"),
     draftSampling: /\bprobabilistic\b/.test(definition("--spec-draft-sampling")),
     draftUbatch: !!definition("--spec-draft-n-ubatch"),

@@ -96,6 +96,8 @@ export interface RemoteServerInfo {
   buildInfo?: string;
   vision?: boolean;
   audio?: boolean;
+  /** The model list contains llama.cpp router lifecycle information. */
+  isLlamaRouter?: boolean;
   probes: RemoteProbeRow[];
 }
 
@@ -111,6 +113,12 @@ interface ModelsResponse {
     /** llama-server router: `{ value: "loaded" | "unloaded" | "loading" }`. */
     status?: unknown;
   }>;
+}
+
+export function isLlamaRouterModel(model: { status?: unknown }): boolean {
+  const status = model.status;
+  return !!status && typeof status === "object" && "value" in status &&
+    ["loaded", "loading", "unloaded", "sleeping", "unloading", "downloading", "incomplete"].includes(String(status.value));
 }
 
 /**
@@ -147,6 +155,7 @@ export function remoteModelIdentity(model: {
 }
 
 interface PropsResponse {
+  role?: string;
   chat_template_caps?: ChatTemplateCaps;
   default_generation_settings?: { n_ctx?: number };
   total_slots?: number;
@@ -615,6 +624,7 @@ export async function probeRemoteServer(
       timeoutMs: REMOTE_PROPS_TIMEOUT_MS,
     });
     const first = pickServedModel(models.data);
+    if (Array.isArray(models.data) && models.data.some(m => m?.owned_by === "llamacpp" && isLlamaRouterModel(m))) info.isLlamaRouter = true;
     modelsEmpty = Array.isArray(models.data) && models.data.length === 0;
     strataModel = first?.owned_by === "strata";
     strataInstanceId = typeof first?.meta?.instanceId === "string" ? first.meta.instanceId : undefined;
@@ -645,6 +655,7 @@ export async function probeRemoteServer(
       timeoutMs: REMOTE_PROPS_TIMEOUT_MS,
     });
     info.isLlamaCpp = true;
+    if (props.role === "router") info.isLlamaRouter = true;
     info.slotContext = positive(props.default_generation_settings?.n_ctx);
     info.totalSlots = positive(props.total_slots);
     info.modelPath = typeof props.model_path === "string" && props.model_path ? props.model_path : undefined;

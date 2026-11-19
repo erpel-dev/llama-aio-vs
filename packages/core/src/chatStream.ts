@@ -148,6 +148,7 @@ export function openChatStream(
 }
 
 type SseChunk = {
+  id?: string;
   prompt_progress?: { total?: number; cache?: number; processed?: number; time_ms?: number };
   choices?: Array<{
     finish_reason?: string | null;
@@ -181,7 +182,7 @@ type SseChunk = {
  */
 export async function* parseChatStream(
   chunks: AsyncIterable<Uint8Array | string>,
-  options: { toolsEnabled: boolean; signal?: AbortSignal; separateReasoning?: boolean; onProgress?: (trace: ChatStreamTrace) => void }
+  options: { toolsEnabled: boolean; signal?: AbortSignal; separateReasoning?: boolean; onProgress?: (trace: ChatStreamTrace) => void; onCompletionId?: (id: string) => void }
 ): AsyncGenerator<ChatStreamPart> {
   const { toolsEnabled, signal } = options;
   let assembledText = "";
@@ -207,6 +208,7 @@ export async function* parseChatStream(
   let completionChars = 0;
   let finishReason: string | undefined;
   let lastTraceAt = -Infinity;
+  let reportedCompletionId = false;
 
   for await (const line of decodeSseLines(chunks)) {
     if (signal?.aborted) {
@@ -239,6 +241,10 @@ export async function* parseChatStream(
     const streamError = errorMessageFromSseJson(json);
     if (streamError) {
       throw new SseStreamError(streamError);
+    }
+    if (!reportedCompletionId && options.onCompletionId && typeof json.id === "string" && json.id) {
+      reportedCompletionId = true;
+      options.onCompletionId(json.id);
     }
     if (json.timings) {
       lastTimings = json.timings;

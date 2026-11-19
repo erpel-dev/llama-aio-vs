@@ -590,6 +590,7 @@ export function kvCacheTypeElemBytes(type: KvCacheType | undefined): number {
       return 0.6875; // 22 B / 32 elems
     case "q5_1":
       return 0.75; // 24 B / 32 elems
+    case "f8_e4m3":
     case "q8_0":
       return 1;
     case "bf16":
