@@ -3036,9 +3036,10 @@ function syncPerformanceFeatureUi() {
     layers > Math.max(0, blocks - (ngl >= 99 ? blocks : ngl)) && split !== 'tensor';
   if (cache) cache.disabled = remote || !f.moeCache || !eligible;
   const cpuShare = $('moeCacheCpuPercent');
-  const shareSupported = f.moeCache && f.moeCacheCpuShare && eligible && Number(cache.value) > 0;
-  cpuShare.disabled = remote || !shareSupported;
-  $('moeCacheCpuHint').textContent = shareSupported
+  const shareSupported = f.moeCache && f.moeCacheCpuShare && eligible && Number(cache?.value) > 0;
+  if (cpuShare) cpuShare.disabled = remote || !shareSupported;
+  const cpuShareHint = $('moeCacheCpuHint');
+  if (cpuShareHint) cpuShareHint.textContent = shareSupported
     ? '0 = upload all misses to GPU. Higher values compute more misses on CPU once the cache fills.'
     : 'Requires an active GPU expert cache and a compatible llama.cpp build.';
   syncFp8CacheUi(f);

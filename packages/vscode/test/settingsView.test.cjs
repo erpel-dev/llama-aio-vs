@@ -1166,7 +1166,7 @@ describe("onboarding test message", () => {
     return { provider, results };
   }
 
-  it("finishes thinking on the active completion without cancelling its answer stream", async t => {
+  it("targets the running model with pending settings and enables Finish thinking when the ID arrives late", async t => {
     mockTestModel(t, async () => []);
     const { provider, results } = captureResults();
     const http = require("node:http");
@@ -1185,17 +1185,22 @@ describe("onboarding test message", () => {
       }
       request = JSON.parse(body);
       res.writeHead(200, { "Content-Type": "text/event-stream" });
-      res.write('data: {"id":"chatcmpl-test","choices":[{"delta":{"reasoning_content":"Working"}}]}\n\n');
+      res.write('data: {"choices":[{"delta":{"reasoning_content":"Working"}}]}\n\n');
+      res.write('data: {"id":"chatcmpl-test","choices":[{"delta":{}}]}\n\n');
       complete = () => res.end('data: {"id":"chatcmpl-test","choices":[{"delta":{"content":"Four"}}]}\n\ndata: [DONE]\n\n');
     });
     await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
     t.after(() => { server.closeAllConnections(); server.close(); });
     provider.store = {
       isRemote: () => false, getEndpoint: () => `http://127.0.0.1:${server.address().port}`,
-      getState: () => ({ selectedModelPath: "/m/test.gguf", requestSettings: { maxTokens: 100 }, loadSettings: {} }),
-      getSlotContextSize: () => 4096,
+      getState: () => ({ selectedModelPath: "/m/pending.gguf", requestSettings: { maxTokens: 400 }, loadSettings: { contextLength: 4096 } }),
+      getSlotContextSize: settings => settings.contextLength,
     };
-    provider.processManager = { isHttpReady: async () => true, getStatus: () => ({ configDirty: false }) };
+    provider.processManager = {
+      isHttpReady: async () => true,
+      getStatus: () => ({ configDirty: true }),
+      getLaunchedConfig: () => ({ modelPath: "/m/test.gguf", loadSettings: { contextLength: 1024 } }),
+    };
     let thinking;
     const startedThinking = new Promise(resolve => { thinking = resolve; });
     provider.post = result => {
@@ -1205,7 +1210,9 @@ describe("onboarding test message", () => {
     const run = provider.runTestMessage("Two plus two?", true);
     await Promise.race([startedThinking, run]);
     assert.equal(request.reasoning_control, true);
-    assert.equal(results.at(-1).canFinishThinking, true);
+    assert.equal(request.model, "/m/test.gguf");
+    assert.equal(request.max_tokens, 256);
+    assert.deepEqual(results.slice(1).map(result => result.canFinishThinking), [false, true]);
     await provider.finishTestThinking();
     await run;
     assert.deepEqual(control, { id: "chatcmpl-test", model: "/m/test.gguf", action: "reasoning_end" });

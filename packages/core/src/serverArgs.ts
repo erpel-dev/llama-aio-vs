@@ -218,11 +218,12 @@ export function buildServerArgs(
   if (settings.nCpuMoe > 0) {
     args.push("--n-cpu-moe", String(settings.nCpuMoe));
   }
+  const cache = effectiveServerCacheSettings(settings, options?.features, options?.caps);
   const moeCache = options?.features?.moeCache ? effectiveMoeCacheMiB(settings, options.caps) : 0;
   if (moeCache > 0) {
     args.push("--moe-cache-mib", String(moeCache));
-    if (options?.features?.moeCacheCpuShare && settings.moeCacheCpuPercent > 0) {
-      args.push("--moe-cache-cpu-share", String(settings.moeCacheCpuPercent / 100));
+    if (cache.moeCacheCpuPercent > 0) {
+      args.push("--moe-cache-cpu-share", String(cache.moeCacheCpuPercent / 100));
     }
   }
 
@@ -238,7 +239,6 @@ export function buildServerArgs(
   }
 
   // KV cache quantization (default q8_0 — ~½ KV size vs f16, good for long agent ctx).
-  const cache = supportedPerformanceSettings(settings, options?.features);
   args.push("--cache-type-k", cache.cacheTypeK || "q8_0");
   args.push("--cache-type-v", cache.cacheTypeV || "q8_0");
 
@@ -458,13 +458,32 @@ export function effectiveDraftSampling(settings: LlamaLoadSettings): "greedy" | 
   return "probabilistic";
 }
 
+export type ServerCacheSettings = Pick<LlamaLoadSettings, "cacheTypeK" | "cacheTypeV" | "moeCacheCpuPercent">;
+
+function supportedCacheTypes(settings: LlamaLoadSettings, features?: LlamaServerFeatures) {
+  return {
+    cacheTypeK: settings.cacheTypeK === "f8_e4m3" && !features?.fp8CacheK ? "q8_0" as const : settings.cacheTypeK,
+    cacheTypeV: settings.cacheTypeV === "f8_e4m3" && !features?.fp8CacheV ? "q8_0" as const : settings.cacheTypeV,
+  };
+}
+
+/** The cache settings that can become launch arguments for this binary and model. */
+export function effectiveServerCacheSettings(
+  settings: LlamaLoadSettings, features?: LlamaServerFeatures, caps?: ModelCapabilities
+): ServerCacheSettings {
+  return {
+    ...supportedCacheTypes(settings, features),
+    moeCacheCpuPercent: features?.moeCache && features.moeCacheCpuShare && effectiveMoeCacheMiB(settings, caps) > 0
+      ? settings.moeCacheCpuPercent : 0,
+  };
+}
+
 /** Use for estimates. Keep saved choices intact when an older binary cannot apply them. */
 export function supportedPerformanceSettings(settings: LlamaLoadSettings, features?: LlamaServerFeatures): LlamaLoadSettings {
   return { ...settings,
     moeCacheMiB: features?.moeCache ? settings.moeCacheMiB : 0,
     moeCacheCpuPercent: features?.moeCache && features.moeCacheCpuShare ? settings.moeCacheCpuPercent : 0,
-    cacheTypeK: settings.cacheTypeK === "f8_e4m3" && !features?.fp8CacheK ? "q8_0" : settings.cacheTypeK,
-    cacheTypeV: settings.cacheTypeV === "f8_e4m3" && !features?.fp8CacheV ? "q8_0" : settings.cacheTypeV,
+    ...supportedCacheTypes(settings, features),
     draftSampling: features?.draftSampling ? settings.draftSampling : "greedy",
     draftBatchSize: features?.draftUbatch ? settings.draftBatchSize : 0,
     cacheRamMiB: features?.cacheRam ? settings.cacheRamMiB : undefined,
@@ -541,11 +560,13 @@ export function effectiveMaxDraftTokens(settings: LlamaLoadSettings): number {
 export function serverConfigFingerprint(
   modelPath: string,
   rawSettings: LlamaLoadSettings,
-  launchMode: string = ""
+  launchMode: string = "",
+  cacheSupport?: { features: LlamaServerFeatures; caps?: ModelCapabilities }
 ): string {
   // Normalize first so the fingerprint describes the args we would actually run.
   const settings = normalizeLoadSettings(rawSettings);
   const spec = settings.speculativeMode;
+  const cache = cacheSupport ? effectiveServerCacheSettings(settings, cacheSupport.features, cacheSupport.caps) : settings;
   return JSON.stringify({
     modelPath: (modelPath || "").trim(),
     plePath: settings.plePath,
@@ -561,11 +582,11 @@ export function serverConfigFingerprint(
     maxConcurrentPredictions: settings.maxConcurrentPredictions,
     nCpuMoe: settings.nCpuMoe,
     moeCacheMiB: settings.moeCacheMiB,
-    moeCacheCpuPercent: settings.moeCacheCpuPercent || undefined,
+    moeCacheCpuPercent: cache.moeCacheCpuPercent || undefined,
     nCpuFfn: settings.nCpuFfn ?? 0,
     offloadKvCacheToGpu: !!settings.offloadKvCacheToGpu,
-    cacheTypeK: settings.cacheTypeK || "q8_0",
-    cacheTypeV: settings.cacheTypeV || "q8_0",
+    cacheTypeK: cache.cacheTypeK || "q8_0",
+    cacheTypeV: cache.cacheTypeV || "q8_0",
     keepModelInMemory: !!settings.keepModelInMemory,
     tryMmap: !!settings.tryMmap,
     lazyMode: settings.lazyMode || "auto",

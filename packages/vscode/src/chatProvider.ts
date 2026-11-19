@@ -75,6 +75,8 @@ interface OpenAiModel {
   status?: unknown;
 }
 
+type RouterModel = OpenAiModel & { imageInput?: boolean };
+
 interface OpenAiModelsResponse {
   data?: OpenAiModel[];
 }
@@ -512,18 +514,19 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
     this.modelProbe = undefined;
     this.propsProbe = undefined;
     this.readyProbe = undefined;
-    this.routerCatalog = undefined;
+    if (this.routerCatalog?.endpoint !== this.routerEndpoint()) this.routerCatalog = undefined;
+    else if (this.routerCatalog) this.routerCatalog.at = 0;
+    this.routerCatalogRevision++;
     this._onDidChangeModelInformation.fire();
   }
 
-  private async fetchServerProps(routerModel?: string): Promise<ServerProps | undefined> {
+  private async fetchServerProps(routerModel?: string, endpoint = this.store.getEndpoint()): Promise<ServerProps | undefined> {
     if (routerModel) {
-      const url = new URL(joinServerUrl(this.store.getEndpoint(), "/props"));
+      const url = new URL(joinServerUrl(endpoint, "/props"));
       url.searchParams.set("model", routerModel);
       url.searchParams.set("autoload", "false");
       return serverJson<ServerProps>(url.toString(), { timeoutMs: 3000 }).catch(() => undefined);
     }
-    const endpoint = this.store.getEndpoint();
     const hit = this.propsProbe;
     if (hit && hit.endpoint === endpoint && Date.now() - hit.at < LlamaAioChatProvider.PROBE_TTL_MS) {
       return hit.props;
@@ -705,19 +708,31 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
       : undefined;
   }
 
-  private routerCatalog?: { endpoint: string; at: number; models: OpenAiModel[] };
+  private routerCatalog?: { endpoint: string; at: number; models: RouterModel[] };
+  private routerCatalogRevision = 0;
 
-  private async routerModels(): Promise<OpenAiModel[]> {
-    if (!this.store.isRemote() || this.store.getConfig()?.get<boolean>("showRouterModels") !== true) return [];
-    const endpoint = this.store.getEndpoint();
-    if (this.routerCatalog?.endpoint === endpoint &&
-        Date.now() - this.routerCatalog.at < LlamaAioChatProvider.PROBE_TTL_MS) {
-      return this.routerCatalog.models;
+  private routerEndpoint(): string | undefined {
+    return this.store.isRemote() && this.store.getConfig()?.get<boolean>("showRouterModels") === true
+      ? this.store.getEndpoint()
+      : undefined;
+  }
+
+  private async routerModels(refresh = true): Promise<RouterModel[]> {
+    const endpoint = this.routerEndpoint();
+    if (!endpoint) return [];
+    const cached = this.routerCatalog?.endpoint === endpoint ? this.routerCatalog : undefined;
+    if (!refresh || (cached && Date.now() - cached.at < LlamaAioChatProvider.PROBE_TTL_MS)) {
+      return cached?.models ?? [];
     }
+    const revision = this.routerCatalogRevision;
+    const fallback = () => this.routerEndpoint() === endpoint && this.routerCatalog?.endpoint === endpoint
+      ? this.routerCatalog.models
+      : [];
     try {
       const listing = await serverJson<OpenAiModelsResponse>(joinServerUrl(endpoint, "/v1/models"), { timeoutMs: 5000 });
+      if (!Array.isArray(listing?.data) || this.routerEndpoint() !== endpoint || this.routerCatalogRevision !== revision) return fallback();
       const byId = new Map<string, OpenAiModel>();
-      for (const entry of Array.isArray(listing?.data) ? listing.data : []) {
+      for (const entry of listing.data) {
         const status = (entry?.status as { value?: string } | undefined)?.value;
         if (entry && typeof entry.id === "string" && entry.id.trim() && entry.owned_by === "llamacpp" &&
             isLlamaRouterModel(entry) && (status === "loaded" || status === "loading" ||
@@ -725,12 +740,22 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
           byId.set(entry.id, entry);
         }
       }
-      const models = [...byId.values()];
-      if (this.store.getEndpoint() !== endpoint || this.store.getConfig()?.get<boolean>("showRouterModels") !== true) return [];
+      const knownVision = new Map(cached?.models.map(model => [model.id, model.imageInput]));
+      const remote = this.remoteInfo();
+      const models = await Promise.all([...byId.values()].map(async (model): Promise<RouterModel> => {
+        const modalities = model.architecture?.input_modalities;
+        let imageInput = Array.isArray(modalities) ? modalities.includes("image") : undefined;
+        if (imageInput === undefined && (model.status as { value?: string }).value === "loaded") {
+          const props = await this.fetchServerProps(model.id, endpoint);
+          imageInput = props?.modalities?.vision ?? (remote?.modelId === model.id && remote.vision === true ? true : undefined);
+        }
+        return { ...model, imageInput: imageInput ?? knownVision.get(model.id) };
+      }));
+      if (this.routerEndpoint() !== endpoint || this.routerCatalogRevision !== revision) return fallback();
       this.routerCatalog = { endpoint, at: Date.now(), models };
       return models;
     } catch {
-      return [];
+      return fallback();
     }
   }
 
@@ -799,7 +824,7 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
     const fallback = remote
       ? remoteInfo?.modelId || this.store.getServerPreferences().lastRemoteModelId || "remote-model"
       : selected || "local-model";
-    const routerModels = ready ? await this.routerModels() : [];
+    const routerModels = await this.routerModels(ready);
     if (routerModels.length) {
       const infos = routerModels.map(model => {
         const serverSlotCtx = this.routerContext(model);
@@ -814,7 +839,7 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
           maxOutputTokens: maxOutput,
           statusIcon: new vscode.ThemeIcon("llama-aio-model"),
           detail: `llama.cpp router · ${target.label}`,
-          capabilities: { toolCalling: true, imageInput: model.architecture?.input_modalities?.includes("image") === true },
+          capabilities: { toolCalling: true, imageInput: model.imageInput === true },
           ...(modeSet ? { configurationSchema: buildModeConfigurationSchema(modeSet) } : {}),
         };
       });

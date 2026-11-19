@@ -68,6 +68,8 @@ let servedModelId;
 let servedProps;
 let servedMetadata;
 let propsStatus;
+let scopedProps;
+let modelsStatus;
 let servedNative;
 let servedModels;
 let strataHost;
@@ -103,12 +105,14 @@ before(async () => {
         return;
       }
       if (req.url === "/props" || req.url.startsWith("/props?model=")) {
+        const model = new URL(req.url, "http://127.0.0.1").searchParams.get("model");
+        const props = scopedProps?.get(model) ?? servedProps;
         res.writeHead(propsStatus || 200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ default_generation_settings: { n_ctx: 32768 }, total_slots: 1, ...servedProps }));
+        res.end(JSON.stringify({ default_generation_settings: { n_ctx: 32768 }, total_slots: 1, ...props }));
         return;
       }
       if (req.url === "/v1/models") {
-        res.writeHead(200, { "Content-Type": "application/json" });
+        res.writeHead(modelsStatus || 200, { "Content-Type": "application/json" });
         res.end(JSON.stringify(servedModels || { data: [{ id: servedModelId || "test-model", ...servedMetadata }] }));
         return;
       }
@@ -228,6 +232,8 @@ describe("LlamaAioChatProvider requests", () => {
     servedProps = undefined;
     servedMetadata = undefined;
     propsStatus = undefined;
+    scopedProps = undefined;
+    modelsStatus = undefined;
     servedNative = undefined;
     servedModels = undefined;
     strataHost = false;
@@ -379,7 +385,8 @@ describe("LlamaAioChatProvider requests", () => {
 
   it("opts in to router models and sends chat and metadata requests to the selected model", async () => {
     servedModels = { data: [
-      { id: "loaded", owned_by: "llamacpp", status: { value: "loaded" }, meta: { n_ctx: 16384 } },
+      { id: "loaded", owned_by: "llamacpp", status: { value: "loaded" }, meta: { n_ctx: 16384 },
+        architecture: { input_modalities: ["text"] } },
       { id: "second model", owned_by: "llamacpp", status: { value: "unloaded" },
         meta: { n_ctx: 65536 }, architecture: { input_modalities: ["text", "image"] } },
       { id: "partial", owned_by: "llamacpp", status: { value: "incomplete" } },
@@ -395,6 +402,73 @@ describe("LlamaAioChatProvider requests", () => {
       new TextPart("Hello"))], {}, { report() {} }, token);
     assert.equal(lastBody.model, "second model");
     assert.ok(seenRequests.some(r => r.url === "/props?model=second+model&autoload=false"));
+  });
+
+  it("keeps router model IDs and request routing during an outage or failed catalog refresh", async () => {
+    servedModels = { data: [
+      { id: "one", owned_by: "llamacpp", status: { value: "unloaded" } },
+      { id: "two", owned_by: "llamacpp", status: { value: "unloaded" } },
+    ] };
+    const remoteInfo = { modelId: "one", isLlamaCpp: true, isLlamaRouter: true, state: "ready" };
+    const { provider } = setup({ remote: true, showRouterModels: true, remoteInfo });
+    const token = cancelToken().token;
+    const models = await provider.provideLanguageModelChatInformation({}, token);
+    assert.deepEqual(models.map(m => m.id), ["one", "two"]);
+
+    remoteInfo.state = "unreachable";
+    provider.notifyChanged();
+    seenRequests = [];
+    assert.deepEqual(await provider.provideLanguageModelChatInformation({}, token), models);
+    assert.deepEqual(seenRequests, []);
+
+    remoteInfo.state = "ready";
+    modelsStatus = 503;
+    provider.notifyChanged();
+    assert.deepEqual(await provider.provideLanguageModelChatInformation({}, token), models);
+    await provider.provideLanguageModelChatResponse(models[1], [msg(Role.User, new TextPart("Hello"))],
+      {}, { report() {} }, token);
+    assert.equal(lastBody.model, "two");
+    assert.ok(seenRequests.some(r => r.url === "/props?model=two&autoload=false"));
+    assert.ok(!seenRequests.some(r => r.url === "/props"));
+
+    modelsStatus = 200;
+    servedModels = { data: [servedModels.data[0]] };
+    provider.notifyChanged();
+    assert.deepEqual((await provider.provideLanguageModelChatInformation({}, token)).map(m => m.id), ["one"]);
+
+    const connectedEndpoint = endpoint;
+    try {
+      endpoint += "/llama-proxy";
+      remoteInfo.modelId = "other server";
+      remoteInfo.state = "unreachable";
+      provider.notifyChanged();
+      assert.deepEqual((await provider.provideLanguageModelChatInformation({}, token)).map(m => m.id), ["other server"]);
+    } finally {
+      endpoint = connectedEndpoint;
+    }
+  });
+
+  it("uses scoped props for router vision when a loaded model omits input modalities", async () => {
+    servedModels = { data: [
+      { id: "loaded vision", owned_by: "llamacpp", status: { value: "loaded" } },
+      { id: "loaded text", owned_by: "llamacpp", status: { value: "loaded" } },
+      { id: "unloaded", owned_by: "llamacpp", status: { value: "unloaded" } },
+      { id: "advertised", owned_by: "llamacpp", status: { value: "unloaded" },
+        architecture: { input_modalities: ["text", "image"] } },
+    ] };
+    scopedProps = new Map([["loaded vision", { modalities: { vision: true } }],
+      ["loaded text", { modalities: { vision: false } }]]);
+    const { provider } = setup({ remote: true, showRouterModels: true, remoteInfo: { modelId: "loaded vision", vision: true } });
+    const token = cancelToken().token;
+    const list = await provider.provideLanguageModelChatInformation({}, token);
+    assert.deepEqual(list.map(x => [x.id, x.capabilities.imageInput]),
+      [["loaded vision", true], ["loaded text", false], ["unloaded", false], ["advertised", true]]);
+    assert.deepEqual(seenRequests.filter(x => x.url.startsWith("/props")).map(x => x.url).sort(),
+      ["/props?model=loaded+text&autoload=false", "/props?model=loaded+vision&autoload=false"]);
+
+    servedModels.data[0].status.value = "unloaded";
+    provider.notifyChanged();
+    assert.equal((await provider.provideLanguageModelChatInformation({}, token))[0].capabilities.imageInput, true);
   });
 
   for (const remote of [false, true]) {

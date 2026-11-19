@@ -101,6 +101,21 @@ describe("guarded performance flags", () => {
     assert.equal(saved.moeCacheMiB, 4096);
     assert.equal(normalizeLoadSettingsForCpuBackend(saved).moeCacheMiB, 0);
   });
+  it("fingerprints CPU expert share only when the model and cache can use it", () => {
+    const detected = { ...features, moeCacheCpuShare: true };
+    const fingerprint = (settings = {}, modelCaps = caps) =>
+      serverConfigFingerprint("m", loadSettings(settings), "", { features: detected, caps: modelCaps });
+    for (const [base, modelCaps] of [
+      [{ moeCacheMiB: 0, nCpuMoe: 48 }, caps],
+      [{ moeCacheMiB: 1024, nCpuMoe: 0 }, caps],
+      [{ moeCacheMiB: 1024, nCpuMoe: 48 }, denseCaps()],
+    ] as const) {
+      assert.equal(fingerprint(base, modelCaps), fingerprint({ ...base, moeCacheCpuPercent: 35 }, modelCaps));
+    }
+    const active = { moeCacheMiB: 1024, nCpuMoe: 48 };
+    assert.notEqual(fingerprint(active), fingerprint({ ...active, moeCacheCpuPercent: 35 }));
+  });
+
   it("fingerprints active settings and logs skipped features", () => {
     const original = loadSettings({ speculativeMode: "mtp" });
     for (const patch of [{ moeCacheMiB: 1024 }, { draftSampling: "greedy" as const }, { draftBatchSize: 64 }]) {

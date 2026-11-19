@@ -31,7 +31,7 @@ import {
 } from "@llama-aio/core";
 import { LlamaInstaller, UiBackend } from "@llama-aio/core";
 import { clampLoadSettingsToModel, computeMemoryView, diffLoadSettings, fittingContextLength, memoryEstimateInputs, mmprojFileSize, resolveDraftCapabilities, shortGpuName, type SettingChange } from "@llama-aio/core";
-import { NO_SERVER_FEATURES, supportedPerformanceSettings, type LlamaServerFeatures } from "@llama-aio/core";
+import { effectiveServerCacheSettings, NO_SERVER_FEATURES, supportedPerformanceSettings, type LlamaServerFeatures } from "@llama-aio/core";
 import { normalizeLoadSettings, normalizeLoadSettingsForCpuBackend, pickCpuIgnoredFields } from "@llama-aio/core";
 import { resolveLocalModelModes, resolveModelModes, resolveRemoteModelModes } from "@llama-aio/core";
 import {
@@ -979,8 +979,14 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     // Compare what start would ship: CPU builds ignore the GPU fields, so saved GPU
     // preferences must not show up as "changes" (same rule as the dirty fingerprint).
     const cpu = this.processManager.isCpuBackend();
-    const effective = <T extends LlamaLoadSettings | undefined>(s: T): T => (cpu && s ? normalizeLoadSettingsForCpuBackend(s) as T : s);
-    const changes = diffLoadSettings(effective(launched.loadSettings), effective(state.loadSettings));
+    const running = launched.loadSettings && (cpu ? normalizeLoadSettingsForCpuBackend(launched.loadSettings) : launched.loadSettings);
+    const desired = cpu ? normalizeLoadSettingsForCpuBackend(state.loadSettings) : state.loadSettings;
+    const features = this.serverFeatures.probed ? this.serverFeatures : launched.serverFeatures;
+    const effective = features ? effectiveServerCacheSettings(desired, features, state.modelCapabilities) : undefined;
+    const changes = diffLoadSettings(
+      running && effective && launched.cacheSettings ? { ...running, ...launched.cacheSettings } : running,
+      effective && launched.cacheSettings ? { ...desired, ...effective } : desired,
+    );
     if (launched.modelPath && state.selectedModelPath && !sameModelFile(launched.modelPath, state.selectedModelPath)) {
       changes.unshift({
         key: "model",
@@ -2486,15 +2492,14 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       throw new Error("Start the local llama.cpp server before testing model thinking.");
     }
     if (token.isCancellationRequested) return "";
-    if (this.store.isRemote() || this.processManager.getStatus().configDirty) {
-      throw new Error("Use the local server and reload pending changes before testing model thinking.");
-    }
+    if (this.store.isRemote()) throw new Error("Use the local server to test model thinking.");
     const endpoint = this.store.getEndpoint();
     const state = this.store.getState();
+    const launched = this.processManager.getLaunchedConfig();
     const abort = new AbortController();
     const sub = token.onCancellationRequested(() => abort.abort());
     const run: NonNullable<typeof this.testThinking> = {
-      endpoint, model: state.selectedModelPath, signal: abort.signal, requested: false,
+      endpoint, model: launched?.modelPath || state.selectedModelPath, signal: abort.signal, requested: false,
     };
     this.testThinking = run;
     try {
@@ -2505,14 +2510,20 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         reasoning_format: "deepseek",
         chat_template_kwargs: { enable_thinking: true },
         reasoning_control: true,
-        max_tokens: Math.min(state.requestSettings.maxTokens, Math.floor(this.store.getSlotContextSize(state.loadSettings) / 4)),
+        max_tokens: Math.min(state.requestSettings.maxTokens, Math.floor(this.store.getSlotContextSize(launched?.loadSettings ?? state.loadSettings) / 4)),
       }, abort.signal);
       let reply = "";
       let phase: "waiting" | "thinking" | "answer" = "waiting";
       try {
         for await (const part of parseChatStream(stream, {
           toolsEnabled: false, separateReasoning: true, signal: abort.signal,
-          onCompletionId: id => { run.id = id; },
+          onCompletionId: id => {
+            run.id = id;
+            if (phase === "thinking" && !abort.signal.aborted) {
+              this.publishTestResult({ type: "testResult", status: "running",
+                canFinishThinking: true, thinkingStatus: "The model is thinking…" });
+            }
+          },
         })) {
           if (part.kind === "reasoning" && phase === "waiting") {
             phase = "thinking";
