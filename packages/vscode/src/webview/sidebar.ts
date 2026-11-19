@@ -4257,8 +4257,35 @@ $('libraryDialog').addEventListener('click', function (e) {
   vscode.postMessage({ type: 'removeLibraryQuant', path: filePath, companionPaths: companions });
 });
 
+const finishChatThinking = $('finishChatThinking');
+finishChatThinking.addEventListener('click', () => {
+  const requestId = finishChatThinking.dataset.requestId;
+  if (requestId !== undefined) vscode.postMessage({ type: 'finishChatThinking', requestId: Number(requestId) });
+});
+
+function renderChatThinking(control: Extract<ToWebviewMessage, { type: 'chatThinking' }>['control']) {
+  $('chatThinking').classList.toggle('hidden', !control || VIEW !== 'sidebar');
+  if (!control) {
+    delete finishChatThinking.dataset.requestId;
+    return;
+  }
+  const statuses = {
+    ready: 'Copilot reply is thinking',
+    requesting: 'Requesting a final answer…',
+    requested: 'Waiting for the final answer…',
+    retry: 'Could not finish thinking. The reply is still running.',
+    unavailable: 'This llama.cpp build cannot finish thinking on request. The reply is still running.',
+  };
+  $('chatThinkingModel').textContent = control.model;
+  $('chatThinkingStatus').textContent = statuses[control.status];
+  finishChatThinking.dataset.requestId = String(control.requestId);
+  finishChatThinking.disabled = control.status !== 'ready' && control.status !== 'retry';
+  finishChatThinking.classList.toggle('hidden', control.status === 'unavailable');
+}
+
 window.addEventListener('message', (event: MessageEvent<ToWebviewMessage>) => {
   const msg = event.data;
+  if (msg.type === 'chatThinking') renderChatThinking(msg.control);
   if (msg.type === 'libraryRefreshComplete') $('libraryRefreshBtn').disabled = false;
   if (msg.type === 'testResult' && !testDismissed) {
     testState = { ...msg };

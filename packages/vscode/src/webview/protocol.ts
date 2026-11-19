@@ -9,6 +9,12 @@
 
 type SettingsPatch = Record<string, unknown>;
 
+export type ChatThinkingControl = {
+  requestId: number;
+  model: string;
+  status: "ready" | "requesting" | "requested" | "retry" | "unavailable";
+};
+
 /** Webview → extension host. */
 export type ToHostMessage =
   // Lifecycle
@@ -52,6 +58,7 @@ export type ToHostMessage =
   | { type: "checkUpdates" }
   | { type: "switchBackend"; payload: string }
   // Copilot request helpers
+  | { type: "finishChatThinking"; requestId: number }
   | { type: "viewLastCall" }
   | { type: "viewLastResponse" }
   | { type: "setPromptReplacementsEnabled"; payload: { enabled: boolean } }
@@ -108,6 +115,7 @@ type ViewModel = any;
 
 /** Extension host → webview. */
 export type ToWebviewMessage =
+  | { type: "chatThinking"; control?: ChatThinkingControl }
   | { type: "libraryRefreshComplete" }
   | { type: "state"; payload: ViewModel }
   | { type: "statusPatch"; payload: ViewModel }

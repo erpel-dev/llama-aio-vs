@@ -167,6 +167,8 @@ type SseChunk = {
   usage?: LlamaUsage;
 };
 
+export type ChatStreamPhase = "reasoning" | "answer";
+
 /**
  * Parse an OpenAI-compatible chat SSE stream into text, tool-call, stats and
  * a final trace event.
@@ -182,12 +184,21 @@ type SseChunk = {
  */
 export async function* parseChatStream(
   chunks: AsyncIterable<Uint8Array | string>,
-  options: { toolsEnabled: boolean; signal?: AbortSignal; separateReasoning?: boolean; onProgress?: (trace: ChatStreamTrace) => void; onCompletionId?: (id: string) => void }
+  options: {
+    toolsEnabled: boolean;
+    signal?: AbortSignal;
+    separateReasoning?: boolean;
+    onProgress?: (trace: ChatStreamTrace) => void;
+    onCompletionId?: (id: string) => void;
+    onPhaseChange?: (phase: ChatStreamPhase) => void;
+  }
 ): AsyncGenerator<ChatStreamPart> {
   const { toolsEnabled, signal } = options;
   let assembledText = "";
   let assembledReasoning = "";
-  const liveGate = toolsEnabled || options.separateReasoning ? new LiveTextGate(!!options.separateReasoning) : undefined;
+  const trackPhase = !!options.onPhaseChange;
+  const liveGate = toolsEnabled || options.separateReasoning ? new LiveTextGate(!!options.separateReasoning || trackPhase) : undefined;
+  const phaseGate = trackPhase && !liveGate ? new LiveTextGate(true) : undefined;
   let inlineReasoning = "";
   let emittedReasoning = "";
   let reasoningSource: "inline" | "structured" | undefined;
@@ -209,6 +220,12 @@ export async function* parseChatStream(
   let finishReason: string | undefined;
   let lastTraceAt = -Infinity;
   let reportedCompletionId = false;
+  let phase: ChatStreamPhase | undefined;
+  const reportPhase = (next: ChatStreamPhase) => {
+    if (phase === next || phase === "answer") return;
+    phase = next;
+    options.onPhaseChange?.(next);
+  };
 
   for await (const line of decodeSseLines(chunks)) {
     if (signal?.aborted) {
@@ -269,6 +286,7 @@ export async function* parseChatStream(
     let progressed = false;
 
     if (typeof delta?.reasoning_content === "string" && delta.reasoning_content.length) {
+      reportPhase("reasoning");
       assembledReasoning += delta.reasoning_content;
       completionChars += delta.reasoning_content.length;
       progressed = true;
@@ -290,6 +308,9 @@ export async function* parseChatStream(
       const live = liveGate ? liveGate.push(delta.content) : delta.content;
       const inline = liveGate?.takeReasoning() || "";
       inlineReasoning += inline;
+      const phaseText = phaseGate ? phaseGate.push(delta.content) : live;
+      if (inline || phaseGate?.takeReasoning()) reportPhase("reasoning");
+      if (phaseText.trim() || (phaseGate ?? liveGate)?.isHalted) reportPhase("answer");
       if (options.separateReasoning) {
         const text = reasoningDelta(inline, "inline");
         if (text) yield { kind: "reasoning", text };
@@ -299,7 +320,8 @@ export async function* parseChatStream(
       }
     }
 
-    if (Array.isArray(delta?.tool_calls)) {
+    if (Array.isArray(delta?.tool_calls) && delta.tool_calls.length) {
+      reportPhase("answer");
       for (const tc of delta.tool_calls) {
         const idx = toolCallSlot(toolCalls, tc);
         if (!toolCalls[idx]) {
@@ -318,6 +340,8 @@ export async function* parseChatStream(
         }
       }
     }
+
+    if (finishReason) reportPhase("answer");
 
     // Non-streaming servers answer with one `message` instead of deltas.
     if (choice?.message?.reasoning_content && !assembledReasoning) {
@@ -378,6 +402,8 @@ export async function* parseChatStream(
   if (signal?.aborted) {
     return;
   }
+
+  reportPhase("answer");
 
   // Older reasoning formats put thoughts inside content; legacy servers may
   // also duplicate them in reasoning_content. Emit exactly one thinking part.

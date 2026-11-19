@@ -46,8 +46,12 @@ require.cache.vscode = {
     LanguageModelError,
     ThemeIcon: class {},
     EventEmitter: class {
-      event() {}
-      fire() {}
+      listeners = new Set();
+      event = listener => {
+        this.listeners.add(listener);
+        return { dispose: () => this.listeners.delete(listener) };
+      };
+      fire() { for (const listener of this.listeners) listener(); }
     },
     window: { showWarningMessage: async () => undefined },
   },
@@ -72,6 +76,8 @@ let tokenizerTokens;
 let lastTemplateBody;
 let templateDelay;
 let seenRequests = [];
+let controlCalls = [];
+let controlStatus;
 /** How /v1/chat/completions answers: array of SSE data objects, optional per-event delay. */
 let reply = { events: [], delayMs: 0 };
 
@@ -127,14 +133,26 @@ before(async () => {
         res.end("missing");
         return;
       }
+      if (req.url === "/v1/chat/completions/control") {
+        controlCalls.push(JSON.parse(body));
+        res.writeHead(controlStatus ?? 200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ success: !controlStatus }));
+        return;
+      }
       lastBody = JSON.parse(body);
+      const response = reply;
       res.writeHead(200, { "Content-Type": "text/event-stream" });
-      for (const ev of reply.events) {
+      for (const ev of response.events) {
         if (res.destroyed) return;
         res.write(`data: ${JSON.stringify(ev)}\n\n`);
-        if (reply.delayMs) await new Promise((r) => setTimeout(r, reply.delayMs));
+        if (response.delayMs) await new Promise((r) => setTimeout(r, response.delayMs));
       }
-      if (reply.keepOpen) {
+      if (response.finish) {
+        await response.finish.wait;
+        if (res.destroyed) return;
+        res.write(`data: ${JSON.stringify(delta({ content: "The final answer." }))}\n\n`);
+      }
+      if (response.keepOpen) {
         res.write("data: [DONE]\n\n");
         return;
       }
@@ -218,6 +236,132 @@ describe("LlamaAioChatProvider requests", () => {
     lastTemplateBody = undefined;
     templateDelay = undefined;
     seenRequests = [];
+    controlCalls = [];
+    controlStatus = undefined;
+  });
+
+  for (const status of [undefined, 404, 503]) {
+    it(`controls a live Copilot completion and keeps its reply after HTTP ${status ?? 200}`, { timeout: 4000 }, async t => {
+      controlStatus = status;
+      const { provider } = setup();
+      let release;
+      reply = {
+        events: [{ id: "chatcmpl-copilot", ...delta({ reasoning_content: "Working." }) }],
+        finish: { wait: new Promise(resolve => { release = resolve; }) },
+      };
+      t.signal.addEventListener("abort", () => release(), { once: true });
+      let ready;
+      const shown = new Promise(resolve => { ready = resolve; });
+      const listener = provider.onDidChangeChatThinking(() => {
+        if (provider.chatThinkingControl()?.status === "ready") ready();
+      });
+      const parts = [];
+      const ongoing = provider.provideLanguageModelChatResponse({ id: "/m/test.gguf", name: "Example" },
+        [msg(Role.User, new TextPart("Test"))], {}, { report: part => parts.push(part.value) }, cancelToken().token);
+      try {
+        await Promise.race([shown, ongoing.then(() => assert.fail("Reply ended without showing the control"))]);
+        assert.equal(lastBody.reasoning_control, true);
+        const control = provider.chatThinkingControl();
+        await Promise.all([provider.finishChatThinking(control.requestId), provider.finishChatThinking(control.requestId)]);
+        assert.deepEqual(controlCalls, [{ id: "chatcmpl-copilot", model: "/m/test.gguf", action: "reasoning_end" }]);
+        assert.equal(provider.chatThinkingControl().status, status === 404 ? "unavailable" : status ? "retry" : "requested");
+        release();
+        await ongoing;
+        assert.ok(parts.includes("The final answer."));
+        assert.equal(provider.chatThinkingControl(), undefined);
+        await provider.finishChatThinking(control.requestId);
+        assert.equal(controlCalls.length, 1);
+      } finally {
+        listener.dispose();
+        release();
+        await ongoing.catch(() => undefined);
+      }
+    });
+  }
+
+  it("clears the Copilot control on cancellation", { timeout: 4000 }, async t => {
+    const { provider } = setup();
+    const cancel = cancelToken();
+    let release;
+    reply = {
+      events: [{ id: "chatcmpl-cancelled", ...delta({ reasoning_content: "Working." }) }],
+      finish: { wait: new Promise(resolve => { release = resolve; }) },
+    };
+    t.signal.addEventListener("abort", () => { release(); cancel.cancel(); }, { once: true });
+    const control = new Promise(resolve => provider.onDidChangeChatThinking(() => {
+      if (provider.chatThinkingControl()) resolve(provider.chatThinkingControl());
+    }));
+    const ongoing = provider.provideLanguageModelChatResponse({ id: "m" }, [msg(Role.User, new TextPart("Test"))],
+      {}, { report() {} }, cancel.token);
+    try {
+      const active = await Promise.race([control, ongoing.then(() => assert.fail("No active reply"))]);
+      cancel.cancel();
+      await provider.finishChatThinking(active.requestId);
+      await ongoing;
+      assert.equal(provider.chatThinkingControl(), undefined);
+      assert.deepEqual(controlCalls, []);
+    } finally {
+      release();
+      await ongoing.catch(() => undefined);
+    }
+  });
+
+  it("keeps a sidebar click tied to the reply it displayed when another reply starts reasoning", { timeout: 4000 }, async t => {
+    const { provider } = setup();
+    const sent = [];
+    function openReply(id, modelId) {
+      let release;
+      const cancel = cancelToken();
+      reply = {
+        events: [{ id, ...delta({ reasoning_content: "Working." }) }],
+        finish: { wait: new Promise(resolve => { release = resolve; }) },
+      };
+      const ongoing = provider.provideLanguageModelChatResponse({ id: modelId },
+        [msg(Role.User, new TextPart("Test"))], {}, { report() {} }, cancel.token);
+      const shown = new Promise(resolve => {
+        const subscription = provider.onDidChangeChatThinking(() => {
+          const active = provider.chatThinkingControl();
+          if (active?.model === modelId) { subscription.dispose(); resolve(active); }
+        });
+      });
+      const ready = Promise.race([shown, ongoing.then(() => assert.fail("No reasoning control"))]);
+      sent.push({ release, ongoing, cancel });
+      return ready;
+    }
+    t.signal.addEventListener("abort", () => {
+      for (const { release, cancel } of sent) { release(); cancel.cancel(); }
+    }, { once: true });
+    try {
+      const first = await openReply("chatcmpl-first", "model-first");
+      const second = await openReply("chatcmpl-second", "model-second");
+      assert.equal(provider.chatThinkingControl().requestId, second.requestId);
+      await provider.finishChatThinking(first.requestId);
+      assert.deepEqual(controlCalls, [{ id: "chatcmpl-first", model: "model-first", action: "reasoning_end" }]);
+      assert.equal(provider.chatThinkingControl().status, "ready");
+      sent[1].release();
+      await sent[1].ongoing;
+      assert.equal(provider.chatThinkingControl().status, "requested");
+    } finally {
+      for (const entry of sent) entry.release();
+      await Promise.allSettled(sent.map(entry => entry.ongoing));
+    }
+  });
+
+  it("does not arm reasoning control for older builds, non-llama.cpp servers, or quick tests", async () => {
+    servedProps = { build_info: "b8500-342d6125b" };
+    const cases = [
+      { setupOptions: {}, options: {} },
+      { setupOptions: { remote: true, remoteInfo: { isLlamaCpp: false } }, options: {} },
+      { setupOptions: {}, options: { modelOptions: { llamaAioQuickReply: true } }, buildInfo: "b12541-test" },
+    ];
+    for (const { setupOptions, options, buildInfo } of cases) {
+      if (buildInfo) servedProps.build_info = buildInfo;
+      const { provider } = setup(setupOptions);
+      await provider.provideLanguageModelChatResponse({ id: "m" }, [msg(Role.User, new TextPart("Test"))],
+        options, { report() {} }, cancelToken().token);
+      assert.equal(lastBody.reasoning_control, undefined);
+      assert.equal(provider.chatThinkingControl(), undefined);
+    }
   });
 
   it("keeps the local model id the same whether the server is up, loading or stopped", async () => {

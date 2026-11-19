@@ -1,6 +1,8 @@
 import type * as http from "http";
 import { createHash } from "crypto";
 import { perfTargetKey } from "./perfTarget";
+import { isReasoningControlUnavailable, maySupportReasoningControl, requestReasoningEnd } from "./reasoningControl";
+import type { ChatThinkingControl } from "./webview/protocol";
 import * as path from "path";
 import * as vscode from "vscode";
 import {
@@ -48,6 +50,7 @@ import {
   wikipediaLookupToolDefinition,
   withSystemHints,
   type ChatStreamPart,
+  type ChatStreamPhase,
   type ChatStreamStats,
   type ModelModeSet,
   type PromptReplacement,
@@ -77,6 +80,7 @@ interface OpenAiModelsResponse {
 }
 
 interface ServerProps {
+  build_info?: string;
   chat_template_caps?: ChatTemplateCaps;
   default_generation_settings?: { n_ctx?: number };
   total_slots?: number;
@@ -349,7 +353,9 @@ async function* streamChatCompletions(
   body: Record<string, unknown>,
   token: vscode.CancellationToken,
   extras?: { maxContext?: number; hasImages?: boolean; operatorLabel?: string; separateReasoning?: boolean;
-    onProgress?: (trace: Extract<ChatStreamPart, { kind: "trace" }>) => void }
+    onProgress?: (trace: Extract<ChatStreamPart, { kind: "trace" }>) => void;
+    onCompletionId?: (id: string, signal: AbortSignal) => void;
+    onPhaseChange?: (phase: ChatStreamPhase) => void }
 ): AsyncGenerator<ChatStreamPart> {
   const toolsEnabled = Array.isArray(body.tools) && (body.tools as unknown[]).length > 0;
   const abort = new AbortController();
@@ -366,7 +372,8 @@ async function* streamChatCompletions(
     }
     try {
       yield* parseChatStream(stream, { toolsEnabled, signal: abort.signal, separateReasoning: extras?.separateReasoning,
-        onProgress: extras?.onProgress });
+        onProgress: extras?.onProgress, onPhaseChange: extras?.onPhaseChange,
+        onCompletionId: extras?.onCompletionId ? id => extras.onCompletionId?.(id, abort.signal) : undefined });
     } catch (err) {
       if (abort.signal.aborted) {
         return;
@@ -380,13 +387,45 @@ async function* streamChatCompletions(
     }
   } finally {
     cancelSub.dispose();
+    abort.abort();
   }
 }
+
+type ActiveThinkingReply = {
+  view: ChatThinkingControl;
+  completionId: string;
+  endpoint: string;
+  modelId: string;
+  signal: AbortSignal;
+};
 
 export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
   private readonly tokenCounts = new Map<string, { at: number; value: Promise<number> }>();
   private readonly _onDidChangeModelInformation = new vscode.EventEmitter<void>();
   readonly onDidChangeLanguageModelChatInformation = this._onDidChangeModelInformation.event;
+  private readonly thinkingReplies = new Map<number, ActiveThinkingReply>();
+  private readonly thinkingChange = new vscode.EventEmitter<void>();
+  readonly onDidChangeChatThinking = this.thinkingChange.event;
+
+  chatThinkingControl(): ChatThinkingControl | undefined {
+    return [...this.thinkingReplies.values()].at(-1)?.view;
+  }
+
+  async finishChatThinking(requestId: number): Promise<void> {
+    const reply = this.thinkingReplies.get(requestId);
+    if (!reply || reply.signal.aborted || (reply.view.status !== "ready" && reply.view.status !== "retry")) return;
+    reply.view = { ...reply.view, status: "requesting" };
+    this.thinkingChange.fire();
+    let status: ChatThinkingControl["status"] = "requested";
+    try {
+      await requestReasoningEnd(reply.endpoint, reply.modelId, reply.completionId, reply.signal);
+    } catch (error) {
+      status = isReasoningControlUnavailable(error) ? "unavailable" : "retry";
+    }
+    if (reply.signal.aborted || this.thinkingReplies.get(requestId) !== reply) return;
+    reply.view = { ...reply.view, status };
+    this.thinkingChange.fire();
+  }
 
   constructor(
     private readonly store: SettingsStore,
@@ -1099,13 +1138,39 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
       emptyToChat: !hasVisibleText && emittedToolCallCount <= 0,
       note,
     });
+    const endpoint = this.store.getEndpoint();
+    const controllable = wantsProgress && !quickReply &&
+      maySupportReasoningControl(props?.build_info ?? remoteInfo?.buildInfo);
+    let completion: { id: string; signal: AbortSignal } | undefined;
+    let reasoning = false;
+    const clearThinkingControl = () => {
+      if (this.thinkingReplies.delete(requestId)) this.thinkingChange.fire();
+    };
+    const showThinkingControl = () => {
+      if (!reasoning || !completion || completion.signal.aborted || this.thinkingReplies.has(requestId)) return;
+      this.thinkingReplies.set(requestId, {
+        view: { requestId, model: model.name || model.id, status: "ready" },
+        completionId: completion.id, endpoint, modelId: model.id, signal: completion.signal,
+      });
+      this.thinkingChange.fire();
+    };
+    if (controllable) body.reasoning_control = true;
     recordTrace("Request in progress; waiting for server output.");
     try {
-      for await (const event of streamChatCompletions(this.store.getEndpoint(), body, token, {
+      for await (const event of streamChatCompletions(endpoint, body, token, {
         maxContext: remote ? remoteInfo?.trainedContext : state.modelCapabilities?.maxContextLength,
         hasImages: messagesHaveImageParts(converted),
         operatorLabel: remote ? serverLabel : undefined,
         separateReasoning: !!Thinking,
+        onCompletionId: controllable ? (id, signal) => {
+          completion = { id, signal };
+          showThinkingControl();
+        } : undefined,
+        onPhaseChange: controllable ? phase => {
+          reasoning = phase === "reasoning";
+          if (reasoning) showThinkingControl();
+          else clearThinkingControl();
+        } : undefined,
         onProgress: trace => {
           lastTrace = trace;
           recordTrace("Response in progress; stream has not completed.");
@@ -1245,6 +1310,8 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
         return;
       }
       throw e;
+    } finally {
+      clearThinkingControl();
     }
   }
 

@@ -60,6 +60,8 @@ The llama icon is supplied for both the provider and its models. VS Code 1.142 i
 
 On a remote llama.cpp router, turn on **Show all llama.cpp router models in Copilot** in the sidebar to pick individual models. The setting starts off. Sending a request can load the selected model.
 
+While a Copilot reply from a compatible llama.cpp server is reasoning, **Finish thinking** appears under the server status in the Llama AIO sidebar. It targets the displayed reply and the final answer continues in Copilot Chat. If several replies are reasoning, the sidebar shows the most recent one to start thinking.
+
 In the sidebar test message, select **Use model thinking**. While a compatible local llama.cpp build streams reasoning, **Finish thinking** asks it to start the answer.
 
 ## Good to know

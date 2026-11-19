@@ -1,10 +1,12 @@
 import { randomBytes } from "crypto";
 import * as fs from "fs";
 import { estimateRemoteFit, formatBytes } from "@llama-aio/core";
-import { ConnectionError, joinServerUrl, openChatStream, parseChatStream, serverJson, WebUiGateway } from "@llama-aio/core";
+import { joinServerUrl, openChatStream, parseChatStream, serverJson, WebUiGateway } from "@llama-aio/core";
 import { explainLocalModelModes, explainRemoteModelModes, resolveServerModelModes, serverReasoningLevels, type ModelCapabilities } from "@llama-aio/core";
 import { readLocalApiKey } from "@llama-aio/core";
 import { syncPerfTarget } from "./perfTarget";
+import type { LlamaAioChatProvider } from "./chatProvider";
+import { isReasoningControlUnavailable, requestReasoningEnd } from "./reasoningControl";
 import * as os from "os";
 import * as path from "path";
 import * as vscode from "vscode";
@@ -198,6 +200,16 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
   private discoverLocalServers = discoverLoopbackLlamaServersOnThisMachineAsync;
   private apiKeys?: ApiKeyStore;
   private hfTokens?: HfTokenStore;
+  private chatProvider?: LlamaAioChatProvider;
+
+  bindChatThinking(provider: LlamaAioChatProvider): vscode.Disposable {
+    this.chatProvider = provider;
+    return provider.onDidChangeChatThinking(() => this.postChatThinking());
+  }
+
+  private postChatThinking(from?: vscode.Webview): void {
+    this.post({ type: "chatThinking", control: this.chatProvider?.chatThinkingControl() }, from);
+  }
 
   /** Advanced settings in an editor tab: the same page, `advanced` mode. */
   private advancedPanel?: vscode.WebviewPanel;
@@ -298,6 +310,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       try {
         switch (msg.type) {
           case "ready":
+            this.postChatThinking(from);
             this.libraryReady = true;
             // A (re)created webview starts without badges.
             this.libraryFitsPosted = undefined;
@@ -747,6 +760,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             await this.store.getConfig().update("showRouterModels", msg.enabled === true);
             this.notifyChatModels();
             await this.pushState();
+            break;
+          case "finishChatThinking":
+            await this.chatProvider?.finishChatThinking(msg.requestId);
             break;
           case "sendTest":
             await this.runTestMessage(typeof msg.text === "string" ? msg.text : "", msg.thinking === true);
@@ -2452,15 +2468,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     run.requested = true;
     this.publishTestResult({ type: "testResult", status: "running", thinkingStatus: "Requesting a final answer…" });
     try {
-      const result = await serverJson<{ success?: boolean; message?: string }>(
-        joinServerUrl(run.endpoint, "/v1/chat/completions/control"), {
-          method: "POST", body: { id: run.id, model: run.model, action: "reasoning_end" },
-          timeoutMs: 5000, signal: run.signal,
-        });
-      if (result.success !== true) throw new Error(result.message || "The server did not end thinking.");
+      await requestReasoningEnd(run.endpoint, run.model, run.id, run.signal);
     } catch (error) {
       if (this.testThinking !== run || run.signal.aborted || this.lastTestResult?.thinkingStatus !== "Requesting a final answer…") return;
-      const unavailable = error instanceof ConnectionError && (error.status === 404 || error.status === 405);
+      const unavailable = isReasoningControlUnavailable(error);
       this.publishTestResult({ type: "testResult", status: "running",
         thinkingStatus: unavailable ? "This llama.cpp build cannot finish thinking on request. The test is still running."
           : "Could not finish thinking. The test is still running.",
