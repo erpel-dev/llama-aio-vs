@@ -5,6 +5,8 @@ import * as path from "node:path";
 import { it } from "node:test";
 import { ConfigFile } from "../src/config";
 import { ProcessManager } from "../src/processManager";
+import { getLockPath } from "../src/paths";
+import { serverConfigFingerprint } from "../src/serverArgs";
 import { SettingsStore } from "../src/settings";
 import { argValue, loadSettings, moeCaps } from "./helpers";
 
@@ -27,7 +29,7 @@ for (const modern of [false, true]) {
     fs.writeFileSync(model, "test model");
     const binary = path.join(dir, "llama-server.cjs");
     const argvFile = path.join(dir, "argv.json");
-    const help = modern ? `--moe-cache-mib N\n--spec-draft-sampling {greedy,probabilistic}\n--spec-draft-n-ubatch N` : "--ctx-size N";
+    const help = modern ? `--moe-cache-mib N\n--moe-cache-cpu-share SHARE\n--cache-type-k f16, q8_0, f8_e4m3\n--spec-draft-sampling {greedy,probabilistic}\n--spec-draft-n-ubatch N` : "--ctx-size N";
     fs.writeFileSync(binary, `
 const fs = require('fs');
 const args = process.argv.slice(2);
@@ -62,5 +64,24 @@ require('http').createServer((_req, res) => {
     }
     assert.equal(store.getState().loadSettings.moeCacheMiB, 4096, "unsupported settings remain saved");
     assert.equal(manager.getStatus().configDirty, false);
+    await store.updateLoadSettings({ cacheTypeV: "f8_e4m3" });
+    assert.equal(manager.getStatus().configDirty, false, "unsupported FP8 on V falls back to the running q8_0");
+    await store.updateLoadSettings({ cacheTypeK: "f8_e4m3" });
+    assert.equal(manager.getStatus().configDirty, modern, "FP8 K is reload-relevant only when supported");
+    await store.updateLoadSettings({ cacheTypeK: "q8_0", moeCacheCpuPercent: 35 });
+    assert.equal(manager.getStatus().configDirty, modern, "only an active CPU share changes the launch");
+    assert.equal(store.getState().loadSettings.moeCacheCpuPercent, 35);
+
+    // An already running server may have a lock from before effective cache
+    // values were fingerprinted. Its argv is the source of the applied values.
+    const lockPath = getLockPath();
+    const lock = JSON.parse(fs.readFileSync(lockPath, "utf8"));
+    delete lock.serverFeatures;
+    lock.loadSettings.cacheTypeV = "f8_e4m3";
+    lock.configFingerprint = serverConfigFingerprint(model, lock.loadSettings, lock.launchMode);
+    fs.writeFileSync(lockPath, JSON.stringify(lock));
+    await store.updateLoadSettings({ moeCacheCpuPercent: 0 });
+    assert.equal(manager.getStatus().configDirty, false);
+    assert.equal(manager.getLaunchedConfig()?.cacheSettings?.cacheTypeV, "q8_0");
   });
 }

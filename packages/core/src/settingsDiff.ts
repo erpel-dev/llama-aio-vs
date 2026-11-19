@@ -16,6 +16,7 @@ const LABELS: Partial<Record<keyof LlamaLoadSettings, string>> = {
   maxConcurrentPredictions: "slots",
   nCpuMoe: "CPU MoE",
   moeCacheMiB: "expert cache MiB",
+  moeCacheCpuPercent: "expert cache CPU share (%)",
   nCpuFfn: "CPU FFN",
   offloadKvCacheToGpu: "KV on GPU",
   cacheTypeK: "KV cache K",

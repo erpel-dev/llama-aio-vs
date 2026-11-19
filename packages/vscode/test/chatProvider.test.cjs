@@ -46,8 +46,12 @@ require.cache.vscode = {
     LanguageModelError,
     ThemeIcon: class {},
     EventEmitter: class {
-      event() {}
-      fire() {}
+      listeners = new Set();
+      event = listener => {
+        this.listeners.add(listener);
+        return { dispose: () => this.listeners.delete(listener) };
+      };
+      fire() { for (const listener of this.listeners) listener(); }
     },
     window: { showWarningMessage: async () => undefined },
   },
@@ -64,6 +68,8 @@ let servedModelId;
 let servedProps;
 let servedMetadata;
 let propsStatus;
+let scopedProps;
+let modelsStatus;
 let servedNative;
 let servedModels;
 let strataHost;
@@ -72,6 +78,8 @@ let tokenizerTokens;
 let lastTemplateBody;
 let templateDelay;
 let seenRequests = [];
+let controlCalls = [];
+let controlStatus;
 /** How /v1/chat/completions answers: array of SSE data objects, optional per-event delay. */
 let reply = { events: [], delayMs: 0 };
 
@@ -96,13 +104,15 @@ before(async () => {
         res.end(JSON.stringify({ ok: true, backend: { kind: "native" }, engine: {} }));
         return;
       }
-      if (req.url === "/props") {
+      if (req.url === "/props" || req.url.startsWith("/props?model=")) {
+        const model = new URL(req.url, "http://127.0.0.1").searchParams.get("model");
+        const props = scopedProps?.get(model) ?? servedProps;
         res.writeHead(propsStatus || 200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ default_generation_settings: { n_ctx: 32768 }, total_slots: 1, ...servedProps }));
+        res.end(JSON.stringify({ default_generation_settings: { n_ctx: 32768 }, total_slots: 1, ...props }));
         return;
       }
       if (req.url === "/v1/models") {
-        res.writeHead(200, { "Content-Type": "application/json" });
+        res.writeHead(modelsStatus || 200, { "Content-Type": "application/json" });
         res.end(JSON.stringify(servedModels || { data: [{ id: servedModelId || "test-model", ...servedMetadata }] }));
         return;
       }
@@ -127,14 +137,26 @@ before(async () => {
         res.end("missing");
         return;
       }
+      if (req.url === "/v1/chat/completions/control") {
+        controlCalls.push(JSON.parse(body));
+        res.writeHead(controlStatus ?? 200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ success: !controlStatus }));
+        return;
+      }
       lastBody = JSON.parse(body);
+      const response = reply;
       res.writeHead(200, { "Content-Type": "text/event-stream" });
-      for (const ev of reply.events) {
+      for (const ev of response.events) {
         if (res.destroyed) return;
         res.write(`data: ${JSON.stringify(ev)}\n\n`);
-        if (reply.delayMs) await new Promise((r) => setTimeout(r, reply.delayMs));
+        if (response.delayMs) await new Promise((r) => setTimeout(r, response.delayMs));
       }
-      if (reply.keepOpen) {
+      if (response.finish) {
+        await response.finish.wait;
+        if (res.destroyed) return;
+        res.write(`data: ${JSON.stringify(delta({ content: "The final answer." }))}\n\n`);
+      }
+      if (response.keepOpen) {
         res.write("data: [DONE]\n\n");
         return;
       }
@@ -146,7 +168,7 @@ before(async () => {
 });
 after(() => new Promise((resolve) => server.close(() => resolve())));
 
-function setup({ guard = false, remote = false, remoteInfo = {} } = {}) {
+function setup({ guard = false, remote = false, remoteInfo = {}, showRouterModels = false } = {}) {
   const perfCalls = [];
   const state = {
     selectedModelPath: "/m/test.gguf",
@@ -157,6 +179,7 @@ function setup({ guard = false, remote = false, remoteInfo = {} } = {}) {
     getEndpoint: () => endpoint,
     isRemote: () => remote,
     getState: () => state,
+    getConfig: () => ({ get: () => showRouterModels }),
     getServerTarget: () => ({ mode: remote ? "remote" : "local", baseUrl: endpoint, label: "this machine" }),
     getPromptReplacementsFile: () => "",
     isPromptReplacementsEnabled: () => false,
@@ -209,6 +232,8 @@ describe("LlamaAioChatProvider requests", () => {
     servedProps = undefined;
     servedMetadata = undefined;
     propsStatus = undefined;
+    scopedProps = undefined;
+    modelsStatus = undefined;
     servedNative = undefined;
     servedModels = undefined;
     strataHost = false;
@@ -217,6 +242,132 @@ describe("LlamaAioChatProvider requests", () => {
     lastTemplateBody = undefined;
     templateDelay = undefined;
     seenRequests = [];
+    controlCalls = [];
+    controlStatus = undefined;
+  });
+
+  for (const status of [undefined, 404, 503]) {
+    it(`controls a live Copilot completion and keeps its reply after HTTP ${status ?? 200}`, { timeout: 4000 }, async t => {
+      controlStatus = status;
+      const { provider } = setup();
+      let release;
+      reply = {
+        events: [{ id: "chatcmpl-copilot", ...delta({ reasoning_content: "Working." }) }],
+        finish: { wait: new Promise(resolve => { release = resolve; }) },
+      };
+      t.signal.addEventListener("abort", () => release(), { once: true });
+      let ready;
+      const shown = new Promise(resolve => { ready = resolve; });
+      const listener = provider.onDidChangeChatThinking(() => {
+        if (provider.chatThinkingControl()?.status === "ready") ready();
+      });
+      const parts = [];
+      const ongoing = provider.provideLanguageModelChatResponse({ id: "/m/test.gguf", name: "Example" },
+        [msg(Role.User, new TextPart("Test"))], {}, { report: part => parts.push(part.value) }, cancelToken().token);
+      try {
+        await Promise.race([shown, ongoing.then(() => assert.fail("Reply ended without showing the control"))]);
+        assert.equal(lastBody.reasoning_control, true);
+        const control = provider.chatThinkingControl();
+        await Promise.all([provider.finishChatThinking(control.requestId), provider.finishChatThinking(control.requestId)]);
+        assert.deepEqual(controlCalls, [{ id: "chatcmpl-copilot", model: "/m/test.gguf", action: "reasoning_end" }]);
+        assert.equal(provider.chatThinkingControl().status, status === 404 ? "unavailable" : status ? "retry" : "requested");
+        release();
+        await ongoing;
+        assert.ok(parts.includes("The final answer."));
+        assert.equal(provider.chatThinkingControl(), undefined);
+        await provider.finishChatThinking(control.requestId);
+        assert.equal(controlCalls.length, 1);
+      } finally {
+        listener.dispose();
+        release();
+        await ongoing.catch(() => undefined);
+      }
+    });
+  }
+
+  it("clears the Copilot control on cancellation", { timeout: 4000 }, async t => {
+    const { provider } = setup();
+    const cancel = cancelToken();
+    let release;
+    reply = {
+      events: [{ id: "chatcmpl-cancelled", ...delta({ reasoning_content: "Working." }) }],
+      finish: { wait: new Promise(resolve => { release = resolve; }) },
+    };
+    t.signal.addEventListener("abort", () => { release(); cancel.cancel(); }, { once: true });
+    const control = new Promise(resolve => provider.onDidChangeChatThinking(() => {
+      if (provider.chatThinkingControl()) resolve(provider.chatThinkingControl());
+    }));
+    const ongoing = provider.provideLanguageModelChatResponse({ id: "m" }, [msg(Role.User, new TextPart("Test"))],
+      {}, { report() {} }, cancel.token);
+    try {
+      const active = await Promise.race([control, ongoing.then(() => assert.fail("No active reply"))]);
+      cancel.cancel();
+      await provider.finishChatThinking(active.requestId);
+      await ongoing;
+      assert.equal(provider.chatThinkingControl(), undefined);
+      assert.deepEqual(controlCalls, []);
+    } finally {
+      release();
+      await ongoing.catch(() => undefined);
+    }
+  });
+
+  it("keeps a sidebar click tied to the reply it displayed when another reply starts reasoning", { timeout: 4000 }, async t => {
+    const { provider } = setup();
+    const sent = [];
+    function openReply(id, modelId) {
+      let release;
+      const cancel = cancelToken();
+      reply = {
+        events: [{ id, ...delta({ reasoning_content: "Working." }) }],
+        finish: { wait: new Promise(resolve => { release = resolve; }) },
+      };
+      const ongoing = provider.provideLanguageModelChatResponse({ id: modelId },
+        [msg(Role.User, new TextPart("Test"))], {}, { report() {} }, cancel.token);
+      const shown = new Promise(resolve => {
+        const subscription = provider.onDidChangeChatThinking(() => {
+          const active = provider.chatThinkingControl();
+          if (active?.model === modelId) { subscription.dispose(); resolve(active); }
+        });
+      });
+      const ready = Promise.race([shown, ongoing.then(() => assert.fail("No reasoning control"))]);
+      sent.push({ release, ongoing, cancel });
+      return ready;
+    }
+    t.signal.addEventListener("abort", () => {
+      for (const { release, cancel } of sent) { release(); cancel.cancel(); }
+    }, { once: true });
+    try {
+      const first = await openReply("chatcmpl-first", "model-first");
+      const second = await openReply("chatcmpl-second", "model-second");
+      assert.equal(provider.chatThinkingControl().requestId, second.requestId);
+      await provider.finishChatThinking(first.requestId);
+      assert.deepEqual(controlCalls, [{ id: "chatcmpl-first", model: "model-first", action: "reasoning_end" }]);
+      assert.equal(provider.chatThinkingControl().status, "ready");
+      sent[1].release();
+      await sent[1].ongoing;
+      assert.equal(provider.chatThinkingControl().status, "requested");
+    } finally {
+      for (const entry of sent) entry.release();
+      await Promise.allSettled(sent.map(entry => entry.ongoing));
+    }
+  });
+
+  it("does not arm reasoning control for older builds, non-llama.cpp servers, or quick tests", async () => {
+    servedProps = { build_info: "b8500-342d6125b" };
+    const cases = [
+      { setupOptions: {}, options: {} },
+      { setupOptions: { remote: true, remoteInfo: { isLlamaCpp: false } }, options: {} },
+      { setupOptions: {}, options: { modelOptions: { llamaAioQuickReply: true } }, buildInfo: "b12541-test" },
+    ];
+    for (const { setupOptions, options, buildInfo } of cases) {
+      if (buildInfo) servedProps.build_info = buildInfo;
+      const { provider } = setup(setupOptions);
+      await provider.provideLanguageModelChatResponse({ id: "m" }, [msg(Role.User, new TextPart("Test"))],
+        options, { report() {} }, cancelToken().token);
+      assert.equal(lastBody.reasoning_control, undefined);
+      assert.equal(provider.chatThinkingControl(), undefined);
+    }
   });
 
   it("keeps the local model id the same whether the server is up, loading or stopped", async () => {
@@ -230,6 +381,94 @@ describe("LlamaAioChatProvider requests", () => {
     assert.equal(running.id, "/m/test.gguf");
     assert.equal(stopped.id, running.id, "Copilot keeps its model selection by id");
     assert.equal(stopped.name, running.name);
+  });
+
+  it("opts in to router models and sends chat and metadata requests to the selected model", async () => {
+    servedModels = { data: [
+      { id: "loaded", owned_by: "llamacpp", status: { value: "loaded" }, meta: { n_ctx: 16384 },
+        architecture: { input_modalities: ["text"] } },
+      { id: "second model", owned_by: "llamacpp", status: { value: "unloaded" },
+        meta: { n_ctx: 65536 }, architecture: { input_modalities: ["text", "image"] } },
+      { id: "partial", owned_by: "llamacpp", status: { value: "incomplete" } },
+    ] };
+    const { provider } = setup({ remote: true, showRouterModels: true });
+    const token = cancelToken().token;
+    const models = await provider.provideLanguageModelChatInformation({}, token);
+    assert.deepEqual(models.map(model => model.id), ["loaded", "second model"]);
+    assert.equal(models[1].capabilities.imageInput, true);
+    assert.ok(models[1].maxInputTokens > models[0].maxInputTokens);
+    assert.ok(!seenRequests.some(r => r.url.startsWith("/props?")));
+    await provider.provideLanguageModelChatResponse(models[1], [msg(Role.User,
+      new TextPart("Hello"))], {}, { report() {} }, token);
+    assert.equal(lastBody.model, "second model");
+    assert.ok(seenRequests.some(r => r.url === "/props?model=second+model&autoload=false"));
+  });
+
+  it("keeps router model IDs and request routing during an outage or failed catalog refresh", async () => {
+    servedModels = { data: [
+      { id: "one", owned_by: "llamacpp", status: { value: "unloaded" } },
+      { id: "two", owned_by: "llamacpp", status: { value: "unloaded" } },
+    ] };
+    const remoteInfo = { modelId: "one", isLlamaCpp: true, isLlamaRouter: true, state: "ready" };
+    const { provider } = setup({ remote: true, showRouterModels: true, remoteInfo });
+    const token = cancelToken().token;
+    const models = await provider.provideLanguageModelChatInformation({}, token);
+    assert.deepEqual(models.map(m => m.id), ["one", "two"]);
+
+    remoteInfo.state = "unreachable";
+    provider.notifyChanged();
+    seenRequests = [];
+    assert.deepEqual(await provider.provideLanguageModelChatInformation({}, token), models);
+    assert.deepEqual(seenRequests, []);
+
+    remoteInfo.state = "ready";
+    modelsStatus = 503;
+    provider.notifyChanged();
+    assert.deepEqual(await provider.provideLanguageModelChatInformation({}, token), models);
+    await provider.provideLanguageModelChatResponse(models[1], [msg(Role.User, new TextPart("Hello"))],
+      {}, { report() {} }, token);
+    assert.equal(lastBody.model, "two");
+    assert.ok(seenRequests.some(r => r.url === "/props?model=two&autoload=false"));
+    assert.ok(!seenRequests.some(r => r.url === "/props"));
+
+    modelsStatus = 200;
+    servedModels = { data: [servedModels.data[0]] };
+    provider.notifyChanged();
+    assert.deepEqual((await provider.provideLanguageModelChatInformation({}, token)).map(m => m.id), ["one"]);
+
+    const connectedEndpoint = endpoint;
+    try {
+      endpoint += "/llama-proxy";
+      remoteInfo.modelId = "other server";
+      remoteInfo.state = "unreachable";
+      provider.notifyChanged();
+      assert.deepEqual((await provider.provideLanguageModelChatInformation({}, token)).map(m => m.id), ["other server"]);
+    } finally {
+      endpoint = connectedEndpoint;
+    }
+  });
+
+  it("uses scoped props for router vision when a loaded model omits input modalities", async () => {
+    servedModels = { data: [
+      { id: "loaded vision", owned_by: "llamacpp", status: { value: "loaded" } },
+      { id: "loaded text", owned_by: "llamacpp", status: { value: "loaded" } },
+      { id: "unloaded", owned_by: "llamacpp", status: { value: "unloaded" } },
+      { id: "advertised", owned_by: "llamacpp", status: { value: "unloaded" },
+        architecture: { input_modalities: ["text", "image"] } },
+    ] };
+    scopedProps = new Map([["loaded vision", { modalities: { vision: true } }],
+      ["loaded text", { modalities: { vision: false } }]]);
+    const { provider } = setup({ remote: true, showRouterModels: true, remoteInfo: { modelId: "loaded vision", vision: true } });
+    const token = cancelToken().token;
+    const list = await provider.provideLanguageModelChatInformation({}, token);
+    assert.deepEqual(list.map(x => [x.id, x.capabilities.imageInput]),
+      [["loaded vision", true], ["loaded text", false], ["unloaded", false], ["advertised", true]]);
+    assert.deepEqual(seenRequests.filter(x => x.url.startsWith("/props")).map(x => x.url).sort(),
+      ["/props?model=loaded+text&autoload=false", "/props?model=loaded+vision&autoload=false"]);
+
+    servedModels.data[0].status.value = "unloaded";
+    provider.notifyChanged();
+    assert.equal((await provider.provideLanguageModelChatInformation({}, token))[0].capabilities.imageInput, true);
   });
 
   for (const remote of [false, true]) {
