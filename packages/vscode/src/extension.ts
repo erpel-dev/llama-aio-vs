@@ -46,6 +46,7 @@ import * as path from "path";
 import * as fs from "fs";
 import * as vscode from "vscode";
 import { LlamaAioChatProvider } from "./chatProvider";
+import { registerInlineAutocomplete } from "./inlineAutocomplete";
 import { promptUseInCopilotChat } from "./copilotChatPrompt";
 import {
   copyServerCommandLine,
@@ -60,6 +61,7 @@ import { WikipediaLookupTool, syncWikipediaLookupContext, WIKIPEDIA_LOOKUP_TOOL_
 let chatProvider: LlamaAioChatProvider | undefined;
 
 export function activate(context: vscode.ExtensionContext): void {
+  registerInlineAutocomplete(context);
   // Configuration lives in ~/.llama-aio-vs/config.json, shared with the TUI.
   const configFile = new ConfigFile();
   void configFile.ensureExists().catch(() => undefined);
