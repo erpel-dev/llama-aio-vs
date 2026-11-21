@@ -49,7 +49,7 @@ Module._resolveFilename = function (name, ...args) {
 };
 require.cache.vscode = { id: "vscode", filename: "vscode", loaded: true, exports: vscode };
 const {
-  registerInlineAutocomplete, autocompleteProblem, isLoopbackAddress, isClosingOnly, prefixWindowStart, shapeSuggestion,
+  registerInlineAutocomplete, autocompleteKey, autocompleteProblem, isLoopbackAddress, isClosingOnly, prefixWindowStart, shapeSuggestion,
   stopSequences, wholeCharacters,
 } = require("../out-harness/inlineAutocomplete.js");
 const core = require("@llama-aio/core");
@@ -64,7 +64,7 @@ function document(text, languageId = "javascript") {
   };
 }
 
-async function setup(t, reply, storedKey = "test-key") {
+async function setup(t, reply, storedKey = "test-key", managed = undefined, memento = new Map()) {
   warnings.length = 0;
   const requests = [];
   const server = http.createServer(async (req, res) => {
@@ -79,7 +79,6 @@ async function setup(t, reply, storedKey = "test-key") {
   const lookups = [];
   config = { enabled: true, endpoint: origin + "/coder", delayMs: 0 };
   quickPick = inputBox = activeEditor = undefined;
-  const memento = new Map();
   registerInlineAutocomplete({
     subscriptions: [],
     globalState: { get: key => memento.get(key), update: async (key, value) => { memento.set(key, value); } },
@@ -87,7 +86,7 @@ async function setup(t, reply, storedKey = "test-key") {
       lookups.push(name);
       return name.endsWith(origin) ? storedKey : undefined;
     } },
-  });
+  }, () => (managed ? { endpoint: managed.endpoint ?? origin, key: () => managed.key } : undefined));
 
   return {
     requests, lookups, origin,
@@ -318,7 +317,14 @@ it("helpers: loopback addresses, window start, stops, shaping, surrogates and pr
   assert.deepEqual(stopSequences("  const x = add(", ");"), ["\n\n"]);
   assert.deepEqual(stopSequences("  const x = 1;", "\nnext"), ["\n\n"]);
   assert.deepEqual(stopSequences("a\n    ", "b"), ["\n\n"]);
-  assert.deepEqual(shapeSuggestion("bar()", "foo(", ")"), { text: "bar()", replaceChars: 1 });
+  assert.deepEqual(shapeSuggestion("bar()", "foo(", ")"), { text: "bar()", replaceChars: 0 },
+    "the reply's ) closes bar(, so the existing ) stays for foo(");
+  // Review finding: `outer(|);` with `inner();` must not consume the outer call's `);`.
+  assert.deepEqual(shapeSuggestion("inner();", "outer(", ");"), { text: "inner()", replaceChars: 0 }, "outer(inner());");
+  assert.deepEqual(shapeSuggestion("inner()", "outer(", ");"), { text: "inner()", replaceChars: 0 });
+  assert.deepEqual(shapeSuggestion("inner(x));", "outer(", ");"), { text: "inner(x));", replaceChars: 2 }, "outer(inner(x));");
+  assert.deepEqual(shapeSuggestion("a[0]", "f(xs[", "]);"), { text: "a[0]", replaceChars: 0 }, "f(xs[a[0]]);");
+  assert.deepEqual(shapeSuggestion("\"x\" + y);", "log(", ");"), { text: "\"x\" + y);", replaceChars: 2 });
   assert.deepEqual(shapeSuggestion("x", "foo(", ");"), { text: "x", replaceChars: 0 });
   assert.deepEqual(shapeSuggestion("a, b)", "foo(", ") + c"), { text: "a, b", replaceChars: 0 }, "not closing-only: trim the overlap");
   assert.deepEqual(shapeSuggestion("\n    return a + b;\n}\nconsole.log(1);\n", "function add(a, b) {", "\n}\n"),
@@ -338,4 +344,39 @@ it("helpers: loopback addresses, window start, stops, shaping, surrogates and pr
   assert.equal(autocompleteProblem(new core.ConnectionError("refused", "no")), undefined);
   assert.equal(autocompleteProblem(new Error("x")), undefined);
   assert.equal(autocompleteProblem(new core.ConnectionError("http", "x", 501)).action, "Open Settings");
+});
+
+it("sends Llama AIO's own key only to Llama AIO's own server", async t => {
+  // Review finding: a separate service on another local port must not get the managed key.
+  const own = await setup(t, res => res.end(JSON.stringify({ content: "x" })), null, { key: "managed-key" });
+  await own.invoke(document("code"), 4);
+  assert.equal(own.requests[0].key, "Bearer managed-key", "endpoint is the managed server");
+  const other = await setup(t, res => res.end(JSON.stringify({ content: "x" })), null,
+    { endpoint: "http://127.0.0.1:8742", key: "managed-key" });
+  await other.invoke(document("code"), 4);
+  assert.equal(other.requests[0].key, undefined, "another local port gets no key");
+  assert.equal(autocompleteKey("http://localhost:8742", undefined, { endpoint: "http://127.0.0.1:8742", key: () => "k" }), "k",
+    "localhost and 127.0.0.1 on the same port are the same server");
+  assert.equal(autocompleteKey("http://127.0.0.1:8743", undefined, { endpoint: "http://127.0.0.1:8742", key: () => "k" }), "");
+  assert.equal(autocompleteKey("http://127.0.0.1:8742", "stored", { endpoint: "http://127.0.0.1:8742", key: () => "k" }), "stored");
+});
+
+it("'Until VS Code restarts' ends with the extension host; timed snoozes are kept", async t => {
+  // Review finding: the restart option used to be saved as 24 hours.
+  const memento = new Map();
+  const fixture = await setup(t, res => res.end(JSON.stringify({ content: "x" })), "test-key", undefined, memento);
+  quickPick = items => items.find(i => /restarts/.test(i.label));
+  await vscode.commands.executeCommand("llamaAio.inlineAutocomplete.snooze");
+  assert.match(statusItem.text, /Snoozed$/);
+  assert.match(statusItem.tooltip, /until VS Code restarts/);
+  assert.deepEqual(await fixture.invoke(document("code"), 4), []);
+  // A new extension host (VS Code restarted) with the same saved state.
+  const restarted = await setup(t, res => res.end(JSON.stringify({ content: "x" })), "test-key", undefined, memento);
+  assert.doesNotMatch(statusItem.text, /Snoozed/);
+  await restarted.invoke(document("code"), 4);
+  assert.equal(restarted.requests.length, 1);
+  quickPick = items => items.find(i => i.minutes === 30);
+  await vscode.commands.executeCommand("llamaAio.inlineAutocomplete.snooze");
+  await setup(t, res => res.end("{}"), "test-key", undefined, memento);
+  assert.match(statusItem.text, /Snoozed 30 min/, "a timed snooze survives a restart");
 });

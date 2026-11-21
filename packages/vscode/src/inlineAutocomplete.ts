@@ -3,6 +3,7 @@ import {
   ConnectionError,
   joinServerUrl,
   normalizeServerUrl,
+  registeredApiKeyForUrl,
   serverJson,
 } from "@llama-aio/core";
 import * as vscode from "vscode";
@@ -61,6 +62,40 @@ function completionEndpoint(configured = settings().endpoint): string {
     throw new SetupError("Use HTTPS for an autocomplete server outside this machine.");
   }
   return endpoint;
+}
+
+/** Llama AIO's own server, whose key may be reused for autocomplete. */
+export interface ManagedServer {
+  endpoint: string;
+  key: () => string | undefined;
+}
+
+const defaultPort = (url: URL) => url.port || (url.protocol === "https:" ? "443" : "80");
+
+/** Two loopback URLs on the same port reach the same server (`localhost:8742` = `127.0.0.1:8742`). */
+function sameLocalServer(a: string, b: string): boolean {
+  try {
+    const x = new URL(a), y = new URL(b);
+    return x.protocol === y.protocol && defaultPort(x) === defaultPort(y) &&
+      isLoopbackAddress(x.hostname) && isLoopbackAddress(y.hostname);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The key to send: the autocomplete key stored for this origin, else the key
+ * the sidebar saved for this origin, else Llama AIO's own key, but only when
+ * the endpoint is Llama AIO's own server. Another service on a different
+ * local port gets no key. An empty string stops the transport from adding
+ * its loopback key.
+ */
+export function autocompleteKey(endpoint: string, stored: string | undefined, managed: ManagedServer | undefined): string {
+  if (stored) return stored;
+  const registered = registeredApiKeyForUrl(endpoint);
+  if (registered) return registered;
+  if (managed && sameLocalServer(endpoint, managed.endpoint)) return managed.key() || "";
+  return "";
 }
 
 function secretName(endpoint: string): string {
@@ -182,22 +217,56 @@ export function shapeSuggestion(content: string, prefix: string, suffix: string)
       ((nextLine !== undefined && line.trimEnd() === nextLine) || indentOf(line) < base));
     if (at > 0) text = lines.slice(0, at).join("\n").replace(/\s+$/, "");
   }
+  // Every candidate must leave the line's brackets and quotes as balanced as
+  // they were. That tells the outer call's `)` from an inner call's, so
+  // `inner();` at `outer(|);` gives `outer(inner());`, not `outer(inner();`.
+  const original = bracketState(linePrefix + lineSuffix);
+  const fits = (line: string) => original !== undefined && bracketState(line) === original;
   if (lineSuffix.trim() && isClosingOnly(lineSuffix)) {
     // The replaced characters end the line, so trailing whitespace after them would add a blank line.
-    if (inOrder(lineSuffix, text)) return { text: text.replace(/\s+$/, ""), replaceChars: lineSuffix.length };
-    // VS Code shows a multi-line suggestion before text on the same line only
-    // when the suggestion contains that text. Close the block with it, on its
-    // own line at the cursor line's indentation: `{|}` -> `{\n  body\n}`.
+    const replaced = text.replace(/\s+$/, "");
+    if (inOrder(lineSuffix, replaced) && fits(linePrefix + replaced)) return { text: replaced, replaceChars: lineSuffix.length };
+    // VS Code needs the text after the cursor inside a multi-line suggestion
+    // to place it. Close the block with it, on its own line at the cursor
+    // line's indentation: `{|}` -> `{\n  body\n}`.
     if (text.includes("\n")) {
-      const body = text.replace(/\s+$/, "");
-      if (!body.trim()) return { text: "", replaceChars: 0 };
-      return { text: body + "\n" + linePrefix.slice(0, indentOf(linePrefix)) + lineSuffix.trimStart(), replaceChars: lineSuffix.length };
+      if (!replaced.trim()) return { text: "", replaceChars: 0 };
+      const closed = replaced + "\n" + linePrefix.slice(0, indentOf(linePrefix)) + lineSuffix.trimStart();
+      if (fits(linePrefix + closed)) return { text: closed, replaceChars: lineSuffix.length };
     }
   }
-  for (let k = Math.min(text.length, lineSuffix.length); k > 0; k--) {
-    if (text.endsWith(lineSuffix.slice(0, k))) return { text: text.slice(0, -k), replaceChars: 0 };
+  // Drop closing characters at the end of the reply that the text after the
+  // cursor already supplies: `a, b)` at `foo(|) + c` -> `a, b`.
+  if (lineSuffix.trim()) {
+    const tail = /[\s)\]}>"'`;,]*$/.exec(text)?.[0] ?? "";
+    for (let j = 1; j <= tail.length; j++) {
+      const dropped = text.slice(text.length - j);
+      if (dropped.trim() && inOrder(dropped, lineSuffix) && fits(linePrefix + text.slice(0, -j) + lineSuffix)) {
+        return { text: text.slice(0, -j), replaceChars: 0 };
+      }
+    }
   }
+  // Ambiguous: keep the text after the cursor as it is.
   return { text, replaceChars: 0 };
+}
+
+const PAIRS: Record<string, string> = { ")": "(", "]": "[", "}": "{" };
+
+/**
+ * Open brackets and odd quotes left by `line`, or undefined when a closing
+ * bracket has no match. Quotes are counted without parsing strings, which is
+ * enough to compare a line with and without a suggestion.
+ */
+function bracketState(line: string): string | undefined {
+  const stack: string[] = [];
+  const odd = { "\"": false, "'": false, "`": false } as Record<string, boolean>;
+  for (const c of line) {
+    if (c === "(" || c === "[" || c === "{") stack.push(c);
+    else if (PAIRS[c]) {
+      if (stack.pop() !== PAIRS[c]) return undefined;
+    } else if (c in odd) odd[c] = !odd[c];
+  }
+  return stack.join("") + "|" + Object.values(odd).map(v => (v ? 1 : 0)).join("");
 }
 
 type Status =
@@ -211,7 +280,10 @@ type Status =
   | { kind: "problem"; message: string };
 
 /** Supply native VS Code ghost text from a FIM model without changing the chat target. */
-export function registerInlineAutocomplete(context: vscode.ExtensionContext): void {
+export function registerInlineAutocomplete(
+  context: vscode.ExtensionContext,
+  managedServer: () => ManagedServer | undefined = () => undefined
+): void {
   let pending: AbortController | undefined;
   /** Problems already shown, per endpoint, until the settings or the key change. */
   const reported = new Set<string>();
@@ -226,7 +298,10 @@ export function registerInlineAutocomplete(context: vscode.ExtensionContext): vo
   statusItem.name = "Llama AIO Autocomplete";
   statusItem.command = "llamaAio.inlineAutocomplete.menu";
 
+  /** "Until VS Code restarts" lives only in this extension host, so a restart ends it. */
+  let snoozedForSession = false;
   const snoozedUntil = () => {
+    if (snoozedForSession) return Infinity;
     const until = Number(context.globalState?.get<number>(SNOOZE_KEY)) || 0;
     return until > Date.now() ? until : 0;
   };
@@ -249,6 +324,11 @@ export function registerInlineAutocomplete(context: vscode.ExtensionContext): vo
         statusItem.tooltip = `Llama AIO autocomplete is off.\nEndpoint: ${where}\nClick for options.`;
         break;
       case "snoozed": {
+        if (shown.until === Infinity) {
+          statusItem.text = `${icon} Snoozed`;
+          statusItem.tooltip = "Llama AIO autocomplete is snoozed until VS Code restarts.\nClick to resume or for other options.";
+          break;
+        }
         const minutes = Math.max(1, Math.ceil((shown.until - Date.now()) / 60000));
         statusItem.text = `${icon} Snoozed ${minutes} min`;
         statusItem.tooltip = `Llama AIO autocomplete is snoozed for ${minutes} more min.\nClick to resume or for other options.`;
@@ -304,20 +384,24 @@ export function registerInlineAutocomplete(context: vscode.ExtensionContext): vo
     if (snoozeTimer) clearTimeout(snoozeTimer);
     const until = snoozedUntil();
     snoozeTimer = undefined;
-    if (!until) return;
+    if (!until || until === Infinity) return;
     // Refresh the minutes shown, and switch back on when the snooze ends.
     snoozeTimer = setTimeout(() => {
       render();
       scheduleSnoozeEnd();
     }, Math.min(60000, until - Date.now() + 50));
+    // Only refreshes the label: never keep the extension host (or a test run) alive.
+    (snoozeTimer as { unref?: () => void }).unref?.();
   };
 
   const update = async (key: string, value: unknown) =>
     vscode.workspace.getConfiguration(CONFIG).update(key, value, vscode.ConfigurationTarget.Global);
 
+  /** Minutes to snooze; 0 resumes, Infinity snoozes until VS Code restarts. */
   const snooze = async (minutes: number) => {
     pending?.abort();
-    await context.globalState?.update(SNOOZE_KEY, minutes > 0 ? Date.now() + minutes * 60000 : 0);
+    snoozedForSession = minutes === Infinity;
+    await context.globalState?.update(SNOOZE_KEY, minutes > 0 && minutes !== Infinity ? Date.now() + minutes * 60000 : 0);
     scheduleSnoozeEnd();
     render();
   };
@@ -394,7 +478,7 @@ export function registerInlineAutocomplete(context: vscode.ExtensionContext): vo
         [
           { label: "30 minutes", minutes: 30 },
           { label: "1 hour", minutes: 60 },
-          { label: "Until VS Code restarts", minutes: 24 * 60 },
+          { label: "Until VS Code restarts", minutes: Infinity },
         ],
         { title: "Snooze Llama AIO autocomplete" }
       );
@@ -462,9 +546,7 @@ export function registerInlineAutocomplete(context: vscode.ExtensionContext): vo
             const started = Date.now();
             timeout = AbortSignal.timeout(warm.has(endpoint) ? REQUEST_TIMEOUT_MS : COLD_REQUEST_TIMEOUT_MS);
             const reply = await serverJson<{ content?: string }>(joinServerUrl(endpoint, "/infill"), {
-              // No stored autocomplete key: fall back to the key registered for this
-              // origin, or this machine's own key for a loopback server.
-              apiKey: apiKey || undefined,
+              apiKey: autocompleteKey(endpoint, apiKey, managedServer()),
               signal: AbortSignal.any([request.signal, timeout]),
               body: {
                 input_prefix: prefix,

@@ -31,6 +31,8 @@ import {
   PerfStats,
   ProcessManager,
   SettingsStore,
+  localEndpoint,
+  readLocalApiKey,
   chatTemplateFileProblem,
   recommendedMaxDraftTokens,
   speculativeUsesMtp,
@@ -61,13 +63,17 @@ import { WikipediaLookupTool, syncWikipediaLookupContext, WIKIPEDIA_LOOKUP_TOOL_
 let chatProvider: LlamaAioChatProvider | undefined;
 
 export function activate(context: vscode.ExtensionContext): void {
-  registerInlineAutocomplete(context);
   // Configuration lives in ~/.llama-aio-vs/config.json, shared with the TUI.
   const configFile = new ConfigFile();
   void configFile.ensureExists().catch(() => undefined);
   context.subscriptions.push(configFile.watch(), { dispose: () => configFile.dispose() });
 
   const store = new SettingsStore(configFile);
+  // Autocomplete may reuse Llama AIO's key only for Llama AIO's own server.
+  registerInlineAutocomplete(context, () => ({
+    endpoint: localEndpoint(store.getHost(), store.getPort()),
+    key: readLocalApiKey,
+  }));
   const config = store.getConfig();
   ensureDirs(getInstallDir(config), getModelsDir(config), getLockDir());
 
