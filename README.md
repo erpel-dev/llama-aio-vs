@@ -63,10 +63,14 @@ The llama icon is supplied for both the provider and its models. VS Code 1.142 i
 Use a fill-in-the-middle (FIM) GGUF such as **Qwen2.5-Coder-1.5B Base** to get ghost-text suggestions in the editor. Autocomplete is off by default, and the chat model and endpoint can be configured independently.
 
 1. Start a llama.cpp server with the FIM model. To keep your chat model loaded, run a second instance on a spare port. For example, run `llama-server -m /path/to/coder-base.gguf --host 127.0.0.1 --port 8012 -c 4096`.
-2. In VS Code Settings, search for `llamaAio.inlineAutocomplete`. Set **Endpoint** to the server's base URL, such as `http://127.0.0.1:8012`, and turn on **Enabled**. Use HTTPS for a non-loopback server. If the server requires authentication, run **Llama AIO: Set Autocomplete API Key…**. For a server managed by the Llama AIO sidebar, use its **Copy local API key** action to obtain the key.
-3. Type in a file to trigger a suggestion and press **Tab** to accept it. Keep **Editor: Inline Suggest Enabled** on. To compare providers, disable inline suggestions from other extensions.
+2. Run **Llama AIO: Turn Autocomplete On or Off** and enter the server's base URL, such as `http://127.0.0.1:8012`. Use HTTPS for a server on another machine. If the server requires a key, run **Llama AIO: Set Autocomplete API Key…**. Without a stored key, Llama AIO sends the key it already has for that server, including its own key for a server on this machine.
+3. Type in a file, an untitled file or a notebook cell, and press **Tab** to accept a suggestion. Keep **Editor: Inline Suggest Enabled** on. To compare providers, disable inline suggestions from other extensions.
 
-When enabled, VS Code sends a bounded snippet around your cursor to the configured endpoint. The endpoint and opt-in setting are machine-level, and the optional key is stored per origin in VS Code Secret Storage.
+The **Autocomplete** item in the status bar shows whether autocomplete is on, snoozed or working, how long the last suggestion took, and when the server is not reachable. Click it to turn autocomplete off, snooze it, turn it off for the current language, change the endpoint or set the key. A wrong endpoint or a rejected key is also reported once as a notification.
+
+Settings, under `llamaAio.inlineAutocomplete`: **Enabled**, **Endpoint**, **Disabled Languages**, **Max Tokens** (suggestion length, default 32) and **Delay Ms** (pause after typing, default 120).
+
+When enabled, VS Code sends 4,000 to about 5,500 characters before the cursor and 1,000 after it to the configured endpoint. The window's start moves in steps along line boundaries, so the server can reuse its prompt cache while you type. The endpoint and opt-in setting are machine-level, and the optional key is stored per origin in VS Code Secret Storage.
 
 ## Good to know
 
