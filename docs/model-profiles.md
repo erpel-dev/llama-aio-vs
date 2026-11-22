@@ -28,6 +28,7 @@ presets are likewise scenario recipes, not an effort ladder.
 | Spark X2.5 | **Think**, No Think | Temperature 1, top-p .95, no top-k filtering |
 | Spark X2.6 1.7B / 4B | **High**, Low, No Think | Same sampler; only high/low reasoning efforts are valid |
 | GPT-OSS 20B / 120B | High, **Medium**, Low | Temperature 1, unfiltered top-p/k; requires Harmony support |
+| Inkling 2 Mini | Max, **High**, Medium, Low, Minimal | Temperature 1, top-p 1, no top-k or min-p filtering; preserve reasoning across tool turns |
 | GLM-5.3-Flash | **Max**, High, Low | Temperature 1, top-p .95; clear old thinking on each turn |
 | GLM-5.3 full | **Max**, High, Low | Same controls and sampler as Flash; requires a compatible large-model server |
 | DeepSeek V4.1 Flash / 1017 | Max, **High**, Low, No Think | Temperature 1, top-p 1; numeric budgets 100/75/50 |
@@ -79,6 +80,19 @@ or server sampler defaults from silently changing a selected recipe. GPT-OSS
 has no numeric sampler prescribed in its generation config: its unfiltered
 recipe is an extension choice. Nemotron's No Think preset uses the tool-calling
 sampler; Ornith's No Think sampler follows its Qwen base recipe.
+
+The [Inkling 2 Mini GGUF template](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF)
+defaults to High. Max and XHigh both map to 0.99, so the picker shows Max.
+The [model card](https://huggingface.co/thinkingmachines/Inkling-2-Mini) says
+the model still reasons at its lowest setting, so the picker offers Minimal
+as its lowest preset. Llama AIO applies the profile to named Inkling 2 Mini
+checkpoints on local and remote connections. The root GGUFs require an
+[Unsloth build](https://unsloth.ai/docs/models/inkling-2-mini#run-inkling-2-mini-in-llama-cpp).
+For stock llama.cpp, use the [Mainline Support GGUFs](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF/tree/main/Mainline_Support)
+and a build containing [the looped-layer scale fix](https://github.com/ggml-org/llama.cpp/pull/32704).
+The `UD-IQ1_S` GGUF was smoke-tested on CPU with Unsloth `b12588-mix-c0c3de8`.
+The server rendered all five modes and a tool history, and streamed a text
+completion in Minimal mode with reasoning in a separate field.
 
 Groot profiles target the 261023 releases: [19B](https://huggingface.co/GrootTeam/Groot-19B-A3B-261023),
 [65B](https://huggingface.co/GrootTeam/Groot-65B-A6B-261023),
