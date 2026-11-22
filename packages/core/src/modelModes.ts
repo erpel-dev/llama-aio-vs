@@ -308,6 +308,11 @@ SPARK26_MODES.preserveReasoning = true;
 SPARK26_MODES.modes["No Think"] = { ...SPARK_SAMPLING, chat_template_kwargs: { enable_thinking: false } };
 
 const GPT_OSS_MODES = effortModes("GPT-OSS", ["high", "medium", "low"], "medium", OPEN_SAMPLING);
+// The GGUF maps Max and XHigh to the same effort (0.99). Match llama.cpp's
+// template probe, which reports Max for that pair. The template defaults to High.
+const INKLING_2_MINI_MODES = effortModes("Inkling 2 Mini", ["max", "high", "medium", "low", "minimal"], "high",
+  { ...OPEN_SAMPLING, top_k: 0 });
+INKLING_2_MINI_MODES.preserveReasoning = true;
 const GLM53_MODES = effortModes("GLM-5.3-Flash", ["max", "high", "low"], "max",
   { ...OPEN_SAMPLING, top_p: 0.95 }, { clear_thinking: true });
 const GLM53_FULL_MODES: ModelModeSet = { ...GLM53_MODES, familyLabel: "GLM-5.3" };
@@ -523,6 +528,7 @@ function namedProfile(h: string): ModelModeSet | undefined {
   if (/\bspark[-_ ]?x?2[._]6(?=$|[-_.\s/\\])/.test(h)) return SPARK26_MODES;
   if (/\bspark[-_ ]?x?2[._]5(?=$|[-_.\s/\\])/.test(h)) return SPARK25_MODES;
   if (/\bgpt[-_ ]oss(?:\b|_)/.test(h)) return GPT_OSS_MODES;
+  if (/\binkling[- ]?2[- ]mini(?=$|[\s:]|\.gguf(?:$|\s)|-(?:gguf\b|(?:ud-)?(?:iq|q|fp|bf|mxfp|nvfp)\d))/.test(h)) return INKLING_2_MINI_MODES;
   if (/\bglm[-_ ]?5[._]3[-_ ]flash(?:\b|_)/.test(h)) return GLM53_MODES;
   if (/\bglm[-_ ]?5[._]3(?=$|[.\s]|[-_](?:gguf|(?:ud[-_ ])?(?:iq|q|fp|bf|mxfp)[\w.-]*)(?:$|[-_.\s]))/.test(h)) return GLM53_FULL_MODES;
   if (/\b(?:ternary[-_ ])?bonsai[-_ ]?2[-_ ]27b(?:\b|_)/.test(h)) return BONSAI2_MODES;

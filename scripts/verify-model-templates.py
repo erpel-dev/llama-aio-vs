@@ -187,6 +187,13 @@ def main():
                 assert outputs[mode, "plain"].rstrip().endswith("<think></think>" if mode == "No Think" else "<think>")
             context.update(messages=history[:-1], **profile["modes"]["Think (General)"]["chat_template_kwargs"])
             assert "I need the file." in compiled.render(**context), "current tool-turn reasoning must survive"
+        if source["id"] == "unsloth/Inkling-2-Mini-GGUF":
+            efforts = {"Max": "0.99", "High": "0.9", "Medium": "0.7", "Low": "0.2", "Minimal": "0.1"}
+            for level, effort in efforts.items():
+                mode = f"Think ({level})"
+                assert f"Thinking effort level: {effort}<|end_message|>" in outputs[mode, "plain"]
+                assert "<|content_thinking|>I need the file." in outputs[mode, "tools"]
+                assert '<|content_invoke_tool_json|>{"name":"read_file","args":{"path":"README.md"}}' in outputs[mode, "tools"]
         digest = hashlib.sha256(template.encode()).hexdigest()[:12]
         print(f'{source["id"]}@{source["revision"][:12]} template={digest}: {len(modes)} modes OK', flush=True)
     print(f"PASS: {count} template renders across {len(sources)} checkpoints")
