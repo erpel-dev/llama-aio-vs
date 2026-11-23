@@ -2,7 +2,7 @@
   "name": "llama-aio-vs",
   "displayName": "Llama AIO",
   "description": "All-in-one local llama.cpp for VS Code: install, HF models, LM Studio-style settings, shared server, Copilot Chat provider.",
-  "version": "0.3.14",
+  "version": "0.3.15",
   "publisher": "erpel-dev",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -40,7 +40,62 @@
   ],
   "main": "./out/extension.js",
   "contributes": {
+    "configuration": {
+      "title": "Llama AIO",
+      "properties": {
+        "llamaAio.inlineAutocomplete.enabled": {
+          "type": "boolean",
+          "default": false,
+          "scope": "machine",
+          "markdownDescription": "Show inline code suggestions from the configured llama.cpp server. Sends nearby text from the current file when suggestions are requested."
+        },
+        "llamaAio.inlineAutocomplete.endpoint": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "markdownDescription": "Base URL of a llama.cpp server running a fill-in-the-middle (FIM) model. Use loopback HTTP or HTTPS. For a protected server, run **Llama AIO: Set Autocomplete API Key…**."
+        },
+        "llamaAio.inlineAutocomplete.disabledLanguages": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "markdownDescription": "Language IDs without suggestions, such as `markdown` or `plaintext`. Toggle the current language from the status bar menu."
+        },
+        "llamaAio.inlineAutocomplete.maxTokens": {
+          "type": "integer",
+          "default": 32,
+          "minimum": 8,
+          "maximum": 256,
+          "markdownDescription": "Longest suggestion, in tokens. Longer suggestions take longer to appear."
+        },
+        "llamaAio.inlineAutocomplete.delayMs": {
+          "type": "integer",
+          "default": 120,
+          "minimum": 0,
+          "maximum": 2000,
+          "markdownDescription": "Pause after typing before a suggestion is requested, in milliseconds."
+        }
+      }
+    },
     "commands": [
+      {
+        "command": "llamaAio.setInlineAutocompleteApiKey",
+        "title": "Llama AIO: Set Autocomplete API Key…"
+      },
+      {
+        "command": "llamaAio.inlineAutocomplete.toggle",
+        "title": "Llama AIO: Turn Autocomplete On or Off"
+      },
+      {
+        "command": "llamaAio.inlineAutocomplete.snooze",
+        "title": "Llama AIO: Snooze Autocomplete…"
+      },
+      {
+        "command": "llamaAio.inlineAutocomplete.menu",
+        "title": "Llama AIO: Autocomplete Options…"
+      },
       {
         "command": "llamaAio.openSettings",
         "title": "Llama AIO: Open Settings",

@@ -31,6 +31,8 @@ import {
   PerfStats,
   ProcessManager,
   SettingsStore,
+  localEndpoint,
+  readLocalApiKey,
   chatTemplateFileProblem,
   recommendedMaxDraftTokens,
   speculativeUsesMtp,
@@ -46,6 +48,7 @@ import * as path from "path";
 import * as fs from "fs";
 import * as vscode from "vscode";
 import { LlamaAioChatProvider } from "./chatProvider";
+import { registerInlineAutocomplete } from "./inlineAutocomplete";
 import { promptUseInCopilotChat } from "./copilotChatPrompt";
 import {
   copyServerCommandLine,
@@ -66,6 +69,11 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(configFile.watch(), { dispose: () => configFile.dispose() });
 
   const store = new SettingsStore(configFile);
+  // Autocomplete may reuse Llama AIO's key only for Llama AIO's own server.
+  registerInlineAutocomplete(context, () => ({
+    endpoint: localEndpoint(store.getHost(), store.getPort()),
+    key: readLocalApiKey,
+  }));
   const config = store.getConfig();
   ensureDirs(getInstallDir(config), getModelsDir(config), getLockDir());
 

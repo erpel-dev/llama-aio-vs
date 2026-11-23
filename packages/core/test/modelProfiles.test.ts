@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { denseCaps } from "./helpers";
-import { resolveServerModelModes, applyModeToRequestBody, buildModeConfigurationSchema, resolveModeParams, resolveModelModes, resolveLocalModelModes, resolveRemoteModelModes } from "../src/modelModes";
+import { resolveServerModelModes, applyModeToRequestBody, buildModeConfigurationSchema, quickestModeName, resolveModeParams, resolveModelModes, resolveLocalModelModes, resolveRemoteModelModes } from "../src/modelModes";
 
 describe("reasoning discovery from server templates", () => {
   it("discovers only valid effort values without changing free sampling", () => {
@@ -33,6 +33,8 @@ describe("reasoning discovery from server templates", () => {
 
 // Contract expectations taken from the author recipes linked in docs/model-profiles.md.
 const cases: Array<[string, string, string, string[]]> = [
+  ["thinkingmachines/Inkling-2-Mini", "Inkling 2 Mini", "Think (High)",
+    ["Think (Max)", "Think (High)", "Think (Medium)", "Think (Low)", "Think (Minimal)"]],
   ["GrootTeam/Groot-19B-A3B-261023", "Groot 19B-A3B", "Think (General)", ["Think (General)", "Think (Coding)", "No Think"]],
   ["bartowski/GrootTeam_Groot-19B-A3B-261023-IQ2_S.gguf", "Groot 19B-A3B", "Think (General)", ["Think (General)", "Think (Coding)", "No Think"]],
   ["Groot-65B-A6B-261023-Q4_K_M-00001-of-00004.gguf", "Groot 65B-A6B", "Think (XHigh)", ["Think (XHigh)", "Think (Medium)", "Think (Low)", "No Think"]],
@@ -115,7 +117,7 @@ describe("author profile contracts and Copilot effort compatibility", () => {
       assert.deepEqual(Object.keys(set.modes), modes);
       const schema = buildModeConfigurationSchema(set).properties.reasoningEffort as { enum: string[]; default: string };
       assert.equal(new Set(schema.enum).size, modes.length);
-      assert.ok(schema.enum.every(v => ["none", "low", "medium", "high", "xhigh", "max"].includes(v)));
+      assert.ok(schema.enum.every(v => ["none", "minimal", "low", "medium", "high", "xhigh", "max"].includes(v)));
       assert.equal(resolveModeParams(set, { reasoningEffort: schema.default }).modeName, defaultMode);
       for (let n = 0; n < modes.length; n++) {
         const selected = resolveModeParams(set, { reasoningEffort: schema.enum[n] });
@@ -143,6 +145,37 @@ function params(id: string, mode?: string) {
 }
 
 describe("model-specific sampler and reasoning differences", () => {
+  it("matches Inkling 2 Mini in both GGUF layouts and on remote connections", () => {
+    const root = "/models/Inkling-2-Mini-UD-IQ3_XXS.gguf";
+    const mainline = "/models/Mainline_Support/Inkling-2-Mini-UD-Q3_K_XL.gguf";
+    for (const [path, architecture] of [[root, "inkling2"], [mainline, "inkling2_loop"]]) {
+      assert.equal(resolveLocalModelModes(denseCaps({ path, architecture }), undefined, path)?.familyLabel, "Inkling 2 Mini");
+    }
+    assert.equal(resolveLocalModelModes(denseCaps({ path: "/models/custom.gguf", name: "Inkling 2 Mini" }), undefined)?.familyLabel,
+      "Inkling 2 Mini");
+    for (const identity of [{ modelId: "unsloth/Inkling-2-Mini-GGUF" }, { modelId: "Inkling-2-Mini:UD-IQ3_XXS" },
+      { modelId: "opaque", modelPath: mainline }, { modelId: "opaque", modelAlias: "Inkling 2 Mini" }]) {
+      assert.equal(resolveRemoteModelModes(identity)?.familyLabel, "Inkling 2 Mini");
+    }
+    for (const id of ["Inkling-2-Small", "Inkling-2-Mini-Base", "dspark-Inkling-2-Mini-Q8_0.gguf", "mmproj-Inkling-2-Mini-F16.gguf"]) {
+      assert.equal(resolveModelModes(undefined, id), undefined, id);
+    }
+  });
+  it("uses Inkling's sampling and effort in both normal and quick requests", () => {
+    const profile = resolveModelModes(undefined, "Inkling-2-Mini")!;
+    const discovered = resolveServerModelModes(profile, { reasoning_effort_levels: ["minimal", "low", "medium", "high", "max"] });
+    assert.deepEqual(discovered, profile);
+    assert.equal(profile.preserveReasoning, true);
+    assert.equal(quickestModeName(profile), "Think (Minimal)");
+    for (const [selection, effort] of [[undefined, "high"], ["minimal", "minimal"], ["Think (Max)", "max"]]) {
+      const { params } = resolveModeParams(profile, { reasoningEffort: selection });
+      const body = {};
+      applyModeToRequestBody(body, params);
+      assert.deepEqual(body, { temperature: 1, top_p: 1, top_k: 0, min_p: 0, repeat_penalty: 1,
+        presence_penalty: 0, frequency_penalty: 0, chat_template_kwargs: { reasoning_effort: effort } });
+    }
+  });
+
   it("uses Groot-specific sampling and the correct template controls", () => {
     const small = params("Groot-19B-A3B-261023");
     assert.deepEqual([small.temperature, small.top_p, small.top_k, small.presence_penalty], [1, 0.95, 20, 1.5]);

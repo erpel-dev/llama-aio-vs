@@ -81,6 +81,11 @@
     "revision": "2a247be0c0aec895ccb0ac7ca92229ec6df37288"
   },
   {
+    "id": "unsloth/Inkling-2-Mini-GGUF",
+    "revision": "ae9327c5fbc7333116ba32eee78bb5d2bbefae4f",
+    "gguf": "Inkling-2-Mini-UD-IQ1_S.gguf"
+  },
+  {
     "id": "XHToken/Spark-X2.5-1.7B",
     "revision": "14d6e83c13c7add2b62a7c39b2131f4ed1cddcf8"
   },

@@ -47,6 +47,12 @@ export function setServerApiKeyProvider(provider: ApiKeyProvider | undefined): v
   apiKeyProvider = provider ?? (() => undefined);
 }
 
+/** The key registered for `url`'s origin only, without the loopback fallback. */
+export function registeredApiKeyForUrl(url: string): string | undefined {
+  const origin = originOf(url);
+  return origin ? apiKeyProvider(origin) : undefined;
+}
+
 export function apiKeyForUrl(url: string): string | undefined {
   const origin = originOf(url);
   if (!origin) {

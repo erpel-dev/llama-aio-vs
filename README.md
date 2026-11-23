@@ -64,6 +64,20 @@ While a Copilot reply from a compatible llama.cpp server is reasoning, **Finish 
 
 In the sidebar test message, select **Use model thinking**. While a compatible local llama.cpp build streams reasoning, **Finish thinking** asks it to start the answer.
 
+## Inline autocomplete
+
+Use a fill-in-the-middle (FIM) GGUF such as **Qwen2.5-Coder-1.5B Base** to get ghost-text suggestions in the editor. Autocomplete is off by default, and the chat model and endpoint can be configured independently.
+
+1. Start a llama.cpp server with the FIM model. To keep your chat model loaded, run a second instance on a spare port. For example, run `llama-server -m /path/to/coder-base.gguf --host 127.0.0.1 --port 8012 -c 4096`.
+2. Run **Llama AIO: Turn Autocomplete On or Off** and enter the server's base URL, such as `http://127.0.0.1:8012`. Use HTTPS for a server on another machine. If the server requires a key, run **Llama AIO: Set Autocomplete API Key…**. Without a stored key, Llama AIO sends the key it already has for that server, including its own key for a server on this machine.
+3. Type in a file, an untitled file or a notebook cell, and press **Tab** to accept a suggestion. Keep **Editor: Inline Suggest Enabled** on. To compare providers, disable inline suggestions from other extensions.
+
+The **Autocomplete** item in the status bar shows whether autocomplete is on, snoozed or working, how long the last suggestion took, and when the server is not reachable. Click it to turn autocomplete off, snooze it, turn it off for the current language, change the endpoint or set the key. A wrong endpoint or a rejected key is also reported once as a notification.
+
+Settings, under `llamaAio.inlineAutocomplete`: **Enabled**, **Endpoint**, **Disabled Languages**, **Max Tokens** (suggestion length, default 32) and **Delay Ms** (pause after typing, default 120).
+
+When enabled, VS Code sends 4,000 to about 5,500 characters before the cursor and 1,000 after it to the configured endpoint. The window's start moves in steps along line boundaries, so the server can reuse its prompt cache while you type. The endpoint and opt-in setting are machine-level, and the optional key is stored per origin in VS Code Secret Storage.
+
 ## Good to know
 
 - **Strata:** the sidebar detects Desktop's public API on `47831`, the standalone server on `8095`, the launcher on `8080`, and the source-run host on `8791`, then offers **Connect**. Other ports are discovered when process information is available. Served model names, canonical aliases, and Desktop model labels select the matching chat profile, including Swift 1.5 and short IDs such as `q2_0` for Qwen3.8 Flash-Next. Desktop chooses a different free port if `47831` is occupied.
