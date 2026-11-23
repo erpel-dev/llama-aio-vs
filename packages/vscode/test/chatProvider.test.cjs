@@ -448,6 +448,54 @@ describe("LlamaAioChatProvider requests", () => {
     }
   });
 
+  it("keeps router models listed while the router swaps them", async () => {
+    servedModels = { data: [
+      { id: "A", owned_by: "llamacpp", status: { value: "loaded" }, meta: { n_ctx: 16384 } },
+      { id: "B", owned_by: "llamacpp", status: { value: "unloaded" } },
+    ] };
+    const { provider } = setup({ remote: true, showRouterModels: true });
+    const token = cancelToken().token;
+    assert.deepEqual((await provider.provideLanguageModelChatInformation({}, token)).map(m => m.id), ["A", "B"]);
+    // Picking B unloads A: A must not leave the list, or Copilot drops a chat's selection.
+    servedModels = { data: [
+      { id: "A", owned_by: "llamacpp", status: { value: "unloading" } },
+      { id: "B", owned_by: "llamacpp", status: { value: "loading" } },
+      { id: "C", owned_by: "llamacpp", status: { value: "downloading" } },
+    ] };
+    provider.notifyChanged();
+    assert.deepEqual((await provider.provideLanguageModelChatInformation({}, token)).map(m => m.id), ["A", "B"],
+      "an unloading model stays; a model never listed is not offered while it downloads");
+    servedModels = { data: [
+      { id: "A", owned_by: "llamacpp", status: { value: "incomplete" } },
+      { id: "B", owned_by: "llamacpp", status: { value: "loaded" } },
+    ] };
+    provider.notifyChanged();
+    assert.deepEqual((await provider.provideLanguageModelChatInformation({}, token)).map(m => m.id), ["A", "B"],
+      "a model listed before keeps its place while it is incomplete");
+  });
+
+  it("does not re-announce router models when only their context changes on load", async () => {
+    servedModels = { data: [
+      { id: "A", owned_by: "llamacpp", status: { value: "unloaded" } },
+      { id: "B", owned_by: "llamacpp", status: { value: "unloaded" } },
+    ] };
+    const { provider } = setup({ remote: true, showRouterModels: true });
+    const token = cancelToken().token;
+    const before = await provider.provideLanguageModelChatInformation({}, token);
+    servedModels = { data: [
+      { id: "A", owned_by: "llamacpp", status: { value: "loaded" }, memory: { effective: { n_ctx: 8192 } } },
+      { id: "B", owned_by: "llamacpp", status: { value: "unloaded" } },
+    ] };
+    provider.notifyChanged();
+    // Count only what the list refresh announces (notifyChanged above fires once by itself).
+    const announcements = [];
+    provider._onDidChangeModelInformation.fire = () => announcements.push("changed");
+    const after = await provider.provideLanguageModelChatInformation({}, token);
+    assert.notEqual(after[0].maxInputTokens, before[0].maxInputTokens, "the context did change");
+    await new Promise(resolve => setTimeout(resolve, 10));
+    assert.deepEqual(announcements, []);
+  });
+
   it("uses scoped props for router vision when a loaded model omits input modalities", async () => {
     servedModels = { data: [
       { id: "loaded vision", owned_by: "llamacpp", status: { value: "loaded" } },
@@ -1431,5 +1479,26 @@ describe("LlamaAioChatProvider requests", () => {
     const trace = perfCalls.findLast(([name]) => name === "recordResponseTrace")[1][0];
     assert.equal(trace.assembledText, "par");
     assert.match(trace.note, /slot crashed/);
+  });
+});
+
+describe("reasoning control", () => {
+  it("reports a reply without llama.cpp's success field plainly", async () => {
+    const { requestReasoningEnd } = require("../out-harness/reasoningControl.js");
+    let reply = "";
+    const srv = http.createServer((req, res) => { req.resume(); req.on("end", () => { res.writeHead(200); res.end(reply); }); });
+    await new Promise(resolve => srv.listen(0, "127.0.0.1", resolve));
+    const url = `http://127.0.0.1:${srv.address().port}`;
+    try {
+      await assert.rejects(requestReasoningEnd(url, "m", "id"), /did not end thinking|Expected JSON/);
+      reply = "null";
+      await assert.rejects(requestReasoningEnd(url, "m", "id"), /^Error: The server did not end thinking\.$/);
+      reply = JSON.stringify({ success: false, message: "no such completion" });
+      await assert.rejects(requestReasoningEnd(url, "m", "id"), /no such completion/);
+      reply = JSON.stringify({ success: true });
+      await requestReasoningEnd(url, "m", "id");
+    } finally {
+      await new Promise(resolve => srv.close(resolve));
+    }
   });
 });

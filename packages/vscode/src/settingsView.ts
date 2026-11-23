@@ -2488,11 +2488,11 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
 
   /** The sidebar owns this stream and can control it independently of Copilot. */
   private async streamThinkingTest(prompt: string, token: vscode.CancellationToken): Promise<string> {
-    if (this.store.isRemote() || !await this.processManager.isHttpReady()) {
+    if (this.store.isRemote()) throw new Error("Model thinking can only be tested on this machine's llama.cpp server.");
+    if (!await this.processManager.isHttpReady()) {
       throw new Error("Start the local llama.cpp server before testing model thinking.");
     }
     if (token.isCancellationRequested) return "";
-    if (this.store.isRemote()) throw new Error("Use the local server to test model thinking.");
     const endpoint = this.store.getEndpoint();
     const state = this.store.getState();
     const launched = this.processManager.getLaunchedConfig();

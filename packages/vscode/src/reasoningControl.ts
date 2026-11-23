@@ -18,5 +18,7 @@ export async function requestReasoningEnd(
     joinServerUrl(endpoint, "/v1/chat/completions/control"), {
       method: "POST", body: { id, model, action: "reasoning_end" }, timeoutMs: 5000, signal,
     });
-  if (result.success !== true) throw new Error(result.message || "The server did not end thinking.");
+  // llama.cpp answers {"success": bool, "message"?}. Anything else (an empty
+  // body from a proxy, say) is reported plainly rather than as a TypeError.
+  if (result?.success !== true) throw new Error(result?.message || "The server did not end thinking.");
 }

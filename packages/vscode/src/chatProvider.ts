@@ -732,11 +732,16 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
       const listing = await serverJson<OpenAiModelsResponse>(joinServerUrl(endpoint, "/v1/models"), { timeoutMs: 5000 });
       if (!Array.isArray(listing?.data) || this.routerEndpoint() !== endpoint || this.routerCatalogRevision !== revision) return fallback();
       const byId = new Map<string, OpenAiModel>();
+      // A model in transition stays listed, or Copilot drops a chat's selection
+      // while the router swaps models: an unloading model is still available,
+      // and one listed before keeps its place while it re-downloads.
+      const listedBefore = new Set(cached?.models.map(model => model.id));
       for (const entry of listing.data) {
         const status = (entry?.status as { value?: string } | undefined)?.value;
         if (entry && typeof entry.id === "string" && entry.id.trim() && entry.owned_by === "llamacpp" &&
             isLlamaRouterModel(entry) && (status === "loaded" || status === "loading" ||
-              status === "unloaded" || status === "sleeping")) {
+              status === "unloaded" || status === "sleeping" || status === "unloading" ||
+              ((status === "downloading" || status === "incomplete") && listedBefore.has(entry.id)))) {
           byId.set(entry.id, entry);
         }
       }
@@ -843,7 +848,9 @@ export class LlamaAioChatProvider implements vscode.LanguageModelChatProvider {
           ...(modeSet ? { configurationSchema: buildModeConfigurationSchema(modeSet) } : {}),
         };
       });
-      this.announceIfChanged(JSON.stringify(infos.map(info => [info.id, info.maxInputTokens, info.capabilities, info.configurationSchema])));
+      // Identity only, as for a single model: the context comes from the loaded
+      // model and changes whenever the router loads or unloads one.
+      this.announceIfChanged(JSON.stringify(infos.map(info => [info.id, info.capabilities, info.configurationSchema])));
       return infos;
     }
     const modelId = ready ? await this.cachedModelId(fallback) : fallback;
