@@ -14,6 +14,21 @@ const build = (over = {}, detected: LlamaServerFeatures | undefined = features, 
   buildServerArgs("test.gguf", "127.0.0.1", 8742, loadSettings(over), { features: detected, caps: modelCaps });
 
 describe("guarded performance flags", () => {
+  it("applies FP8 per cache side and the MoE CPU share only when advertised", () => {
+    const settings = loadSettings({
+      cacheTypeK: "f8_e4m3", cacheTypeV: "f8_e4m3", nCpuMoe: 48, moeCacheMiB: 1024, moeCacheCpuPercent: 35,
+    });
+    const detected = { ...features, fp8CacheK: true, moeCacheCpuShare: true };
+    const args = build(settings, detected);
+    assert.equal(argValue(args, "--cache-type-k"), "f8_e4m3");
+    assert.equal(argValue(args, "--cache-type-v"), "q8_0");
+    assert.equal(argValue(args, "--moe-cache-cpu-share"), "0.35");
+    assert.ok(!build({ ...settings, moeCacheMiB: 0 }, detected).includes("--moe-cache-cpu-share"));
+    assert.ok(!build(settings).includes("--moe-cache-cpu-share"));
+    assert.equal(supportedPerformanceSettings(settings, NO_SERVER_FEATURES).cacheTypeK, "q8_0");
+    assert.equal(settings.cacheTypeK, "f8_e4m3");
+  });
+
   for (const detected of [undefined, { ...NO_SERVER_FEATURES }, { ...NO_SERVER_FEATURES, probed: true }]) {
     it(`omits all new flags without advertised support (${JSON.stringify(detected)})`, () => {
       // Pass undefined directly: the helper otherwise defaults to supported.
@@ -86,6 +101,21 @@ describe("guarded performance flags", () => {
     assert.equal(saved.moeCacheMiB, 4096);
     assert.equal(normalizeLoadSettingsForCpuBackend(saved).moeCacheMiB, 0);
   });
+  it("fingerprints CPU expert share only when the model and cache can use it", () => {
+    const detected = { ...features, moeCacheCpuShare: true };
+    const fingerprint = (settings = {}, modelCaps = caps) =>
+      serverConfigFingerprint("m", loadSettings(settings), "", { features: detected, caps: modelCaps });
+    for (const [base, modelCaps] of [
+      [{ moeCacheMiB: 0, nCpuMoe: 48 }, caps],
+      [{ moeCacheMiB: 1024, nCpuMoe: 0 }, caps],
+      [{ moeCacheMiB: 1024, nCpuMoe: 48 }, denseCaps()],
+    ] as const) {
+      assert.equal(fingerprint(base, modelCaps), fingerprint({ ...base, moeCacheCpuPercent: 35 }, modelCaps));
+    }
+    const active = { moeCacheMiB: 1024, nCpuMoe: 48 };
+    assert.notEqual(fingerprint(active), fingerprint({ ...active, moeCacheCpuPercent: 35 }));
+  });
+
   it("fingerprints active settings and logs skipped features", () => {
     const original = loadSettings({ speculativeMode: "mtp" });
     for (const patch of [{ moeCacheMiB: 1024 }, { draftSampling: "greedy" as const }, { draftBatchSize: 64 }]) {

@@ -9,6 +9,12 @@
 
 type SettingsPatch = Record<string, unknown>;
 
+export type ChatThinkingControl = {
+  requestId: number;
+  model: string;
+  status: "ready" | "requesting" | "requested" | "retry" | "unavailable";
+};
+
 /** Webview → extension host. */
 export type ToHostMessage =
   // Lifecycle
@@ -52,6 +58,7 @@ export type ToHostMessage =
   | { type: "checkUpdates" }
   | { type: "switchBackend"; payload: string }
   // Copilot request helpers
+  | { type: "finishChatThinking"; requestId: number }
   | { type: "viewLastCall" }
   | { type: "viewLastResponse" }
   | { type: "setPromptReplacementsEnabled"; payload: { enabled: boolean } }
@@ -81,7 +88,9 @@ export type ToHostMessage =
   | { type: "copyText"; text: string }
   | { type: "openCopilotChat" }
   | { type: "openAdvanced" }
-  | { type: "sendTest"; text: string }
+  | { type: "setShowRouterModels"; enabled: boolean }
+  | { type: "sendTest"; text: string; thinking?: boolean }
+  | { type: "finishTestThinking" }
   | { type: "cancelTest" }
   | { type: "dismissSetup" }
   // Hugging Face search and downloads
@@ -106,6 +115,7 @@ type ViewModel = any;
 
 /** Extension host → webview. */
 export type ToWebviewMessage =
+  | { type: "chatThinking"; control?: ChatThinkingControl }
   | { type: "libraryRefreshComplete" }
   | { type: "state"; payload: ViewModel }
   | { type: "statusPatch"; payload: ViewModel }
@@ -138,7 +148,7 @@ export type ToWebviewMessage =
   | { type: "mmprojSelected"; path: string }
   | { type: "openConnect" }
   | { type: "advancedPanel"; open: boolean }
-  | { type: "testResult"; status: "running" | "done" | "error" | "cancelled"; text?: string; error?: string; ms?: number }
+  | { type: "testResult"; status: "running" | "done" | "error" | "cancelled"; canFinishThinking?: boolean; thinkingStatus?: string; text?: string; error?: string; ms?: number }
   | { type: "remoteConnected" }
   | { type: "remoteProbe"; requestId: number; payload?: ViewModel; error?: string; label?: string }
   | { type: "connectScan"; requestId?: number; servers: ViewModel[] }

@@ -53,7 +53,7 @@ import {
   REMOTE_HEALTH_TIMEOUT_MS,
 } from "./remoteServer";
 import { joinServerUrl, serverJson, serverRequest } from "./serverHttp";
-import { formatCommandDisplay, normalizeLoadSettingsForCpuBackend, performanceFeatureNotes } from "./serverArgs";
+import { formatCommandDisplay, normalizeLoadSettingsForCpuBackend, performanceFeatureNotes, type ServerCacheSettings } from "./serverArgs";
 import { checkLoraAdapter, describeLoraLoadError, planLoraScales } from "./loraAdapter";
 import { NO_SERVER_FEATURES, probeLlamaServerFeatures, probeLlamaServerFeaturesSync, type LlamaServerFeatures } from "./llamaFeatures";
 import { ExtensionState, LlamaLoadSettings, ServerStatus } from "./types";
@@ -112,6 +112,7 @@ interface LockFile {
   configFingerprint?: string;
   /** Running settings for "what changed" / Discard, including live LoRA strengths. */
   loadSettings?: LlamaLoadSettings;
+  serverFeatures?: LlamaServerFeatures;
 }
 
 /** Model + settings of the running server, as recorded in the lock at start. */
@@ -131,6 +132,21 @@ export interface LaunchedConfig {
   loadSettings?: LlamaLoadSettings;
   launchMode?: string;
   startedAt: string;
+  cacheSettings?: ServerCacheSettings;
+  serverFeatures?: LlamaServerFeatures;
+}
+
+function appliedCacheSettings(args?: readonly string[]): ServerCacheSettings | undefined {
+  if (!Array.isArray(args)) return undefined;
+  const read = (flag: string): string | undefined => {
+    const index = args.indexOf(flag);
+    return index < 0 ? undefined : args[index + 1];
+  };
+  const cacheTypeK = read("--cache-type-k") as ServerCacheSettings["cacheTypeK"] | undefined;
+  const cacheTypeV = read("--cache-type-v") as ServerCacheSettings["cacheTypeV"] | undefined;
+  if (!cacheTypeK || !cacheTypeV) return undefined;
+  const share = Number(read("--moe-cache-cpu-share"));
+  return { cacheTypeK, cacheTypeV, moeCacheCpuPercent: Number.isFinite(share) ? Math.round(share * 100) : 0 };
 }
 
 function sleep(ms: number): Promise<void> {
@@ -557,7 +573,7 @@ export class ProcessManager {
   }
 
   /** Current model + load + launch fingerprint (CPU-normalized like start). */
-  private currentConfigFingerprint(modelPath?: string): string {
+  private currentConfigFingerprint(modelPath?: string, features?: LlamaServerFeatures): string {
     const state = this.store.getState();
     const model = (modelPath ?? state.selectedModelPath ?? "").trim();
     let loadSettings = state.loadSettings;
@@ -565,7 +581,7 @@ export class ProcessManager {
       loadSettings = normalizeLoadSettingsForCpuBackend(loadSettings);
     }
     const launchMode = this.effectiveLaunchMode();
-    return serverConfigFingerprint(model, loadSettings, launchMode);
+    return serverConfigFingerprint(model, loadSettings, launchMode, features ? { features, caps: state.modelCapabilities } : undefined);
   }
 
   /**
@@ -581,11 +597,12 @@ export class ProcessManager {
     const remapped = lock?.loadSettings ? remapLegacyGpuOrder(lock.loadSettings, gpus) : undefined;
     if (lock?.loadSettings && remapped && this.lockPidIsOurs(lock)) {
       const loadSettings = { ...lock.loadSettings, ...remapped };
+      const applied = lock.serverFeatures ? appliedCacheSettings(lock.args) : undefined;
       this.writeLock({
         ...lock,
         loadSettings,
         configFingerprint: lock.configFingerprint
-          ? serverConfigFingerprint(lock.modelPath, loadSettings, lock.launchMode)
+          ? serverConfigFingerprint(lock.modelPath, { ...loadSettings, ...applied }, lock.launchMode)
           : undefined,
       });
     }
@@ -603,6 +620,8 @@ export class ProcessManager {
       loadSettings: lock.loadSettings,
       launchMode: lock.launchMode,
       startedAt: lock.startedAt,
+      cacheSettings: appliedCacheSettings(lock.args),
+      serverFeatures: lock.serverFeatures,
     };
   }
 
@@ -678,7 +697,19 @@ export class ProcessManager {
   /** True when the lock describes the server we would start now. */
   private lockMatchesDesired(lock: LockFile, modelPath?: string): boolean {
     if (lock.configFingerprint) {
-      return lock.configFingerprint === this.currentConfigFingerprint(modelPath);
+      const features = this.lastProbedServerFeatures ?? lock.serverFeatures;
+      const desired = this.currentConfigFingerprint(modelPath, features);
+      if (lock.serverFeatures || !features) return lock.configFingerprint === desired;
+      // Older locks fingerprinted the saved cache choices. Their args record
+      // what actually launched. Keep other fingerprint values, e.g. PLE stamps.
+      const applied = appliedCacheSettings(lock.args);
+      if (!applied) return lock.configFingerprint === desired;
+      try {
+        return JSON.stringify({ ...JSON.parse(lock.configFingerprint), ...applied,
+          moeCacheCpuPercent: applied.moeCacheCpuPercent || undefined }) === desired;
+      } catch {
+        return false;
+      }
     }
     const selected = (modelPath ?? this.store.getState().selectedModelPath ?? "").trim();
     return sameModelFile(lock.modelPath, selected);
@@ -742,16 +773,24 @@ export class ProcessManager {
     });
   }
 
+  private lastProbedServerFeatures?: LlamaServerFeatures;
+
   async getServerFeatures(): Promise<LlamaServerFeatures> {
     if (this.store.isRemote() || activeInstallLock()) return { ...NO_SERVER_FEATURES };
-    try { return await probeLlamaServerFeatures(this.resolveLaunch()); }
-    catch { return { ...NO_SERVER_FEATURES }; }
+    try {
+      const features = await probeLlamaServerFeatures(this.resolveLaunch());
+      if (features.probed) this.lastProbedServerFeatures = features;
+      return features;
+    } catch { return { ...NO_SERVER_FEATURES }; }
   }
 
   getServerFeaturesSync(): LlamaServerFeatures {
     if (this.store.isRemote() || activeInstallLock()) return { ...NO_SERVER_FEATURES };
-    try { return probeLlamaServerFeaturesSync(this.resolveLaunch()); }
-    catch { return { ...NO_SERVER_FEATURES }; }
+    try {
+      const features = probeLlamaServerFeaturesSync(this.resolveLaunch());
+      if (features.probed) this.lastProbedServerFeatures = features;
+      return features;
+    } catch { return { ...NO_SERVER_FEATURES }; }
   }
 
   /**
@@ -958,6 +997,7 @@ export class ProcessManager {
       loadSettings = { ...loadSettings, mainGpu: migrated.mainGpu, tensorSplit: migrated.tensorSplit };
     }
     const features = await probeLlamaServerFeatures(launch);
+    this.lastProbedServerFeatures = features;
     const args = buildServerArgs(model, host, port, loadSettings, {
       gpus,
       // Ship request sampling defaults as CLI flags so raw clients pointing at
@@ -967,7 +1007,7 @@ export class ProcessManager {
       features,
     });
     const launchMode = this.effectiveLaunchMode();
-    const configFingerprint = serverConfigFingerprint(model, loadSettings, launchMode);
+    const configFingerprint = serverConfigFingerprint(model, loadSettings, launchMode, { features, caps });
 
     // Last exit before anything is spawned: Stop may have landed during the awaits above.
     this.throwIfCancelled();
@@ -1059,6 +1099,7 @@ export class ProcessManager {
       launchMode,
       configFingerprint,
       loadSettings,
+      serverFeatures: features,
     });
 
     // Wait for HTTP readiness. Log is tailed from the last offset; port scans
@@ -1106,6 +1147,7 @@ export class ProcessManager {
           launchMode,
           configFingerprint,
           loadSettings,
+          serverFeatures: features,
         };
         this.writeLock(finalLock);
         // We just watched this pid answer on our port — no need to re-inspect it.

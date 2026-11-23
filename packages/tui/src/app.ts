@@ -926,6 +926,7 @@ export async function runApp(services: AppServices): Promise<void> {
         "cpuThreads",
         "nCpuMoe",
         "moeCacheMiB",
+        "moeCacheCpuPercent",
         "nCpuFfn",
         "flashAttention",
         "lazyMode",
@@ -1150,6 +1151,7 @@ export async function runApp(services: AppServices): Promise<void> {
     if (field.key === "maxConcurrentPredictions") return load.maxConcurrentPredictions;
     if (field.key === "nCpuMoe") return load.nCpuMoe;
     if (field.key === "moeCacheMiB") return load.moeCacheMiB;
+    if (field.key === "moeCacheCpuPercent") return load.moeCacheCpuPercent;
     if (field.key === "nCpuFfn") return load.nCpuFfn;
     if (field.key === "evalBatchSize") return load.evalBatchSize;
     if (field.key === "physicalBatchSize") return load.physicalBatchSize;

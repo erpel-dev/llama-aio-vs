@@ -821,7 +821,8 @@ export function activate(context: vscode.ExtensionContext): void {
 
   chatProvider = new LlamaAioChatProvider(store, processManager, perf, context.extensionPath);
   context.subscriptions.push(
-    vscode.lm.registerLanguageModelChatProvider("llama-aio", chatProvider)
+    vscode.lm.registerLanguageModelChatProvider("llama-aio", chatProvider),
+    settingsView.bindChatThinking(chatProvider)
   );
   try {
     context.subscriptions.push(

@@ -58,6 +58,12 @@ Profiles also cover Spark X2.5/X2.6 (including X2.6 1.7B), GPT-OSS, GLM-5.3/Flas
 
 The llama icon is supplied for both the provider and its models. VS Code 1.142 ignores the provider icon, and its Copilot CLI bridge does not carry custom model icons into CLI sessions, so those surfaces show VS Code's generic icon. The extension cannot override those host controls.
 
+On a remote llama.cpp router, turn on **Show all llama.cpp router models in Copilot** in the sidebar to pick individual models. The setting starts off. Sending a request can load the selected model.
+
+While a Copilot reply from a compatible llama.cpp server is reasoning, **Finish thinking** appears under the server status in the Llama AIO sidebar. It targets the displayed reply and the final answer continues in Copilot Chat. If several replies are reasoning, the sidebar shows the most recent one to start thinking.
+
+In the sidebar test message, select **Use model thinking**. While a compatible local llama.cpp build streams reasoning, **Finish thinking** asks it to start the answer.
+
 ## Inline autocomplete
 
 Use a fill-in-the-middle (FIM) GGUF such as **Qwen2.5-Coder-1.5B Base** to get ghost-text suggestions in the editor. Autocomplete is off by default, and the chat model and endpoint can be configured independently.
@@ -82,6 +88,8 @@ When enabled, VS Code sends 4,000 to about 5,500 characters before the cursor an
 - **One shared server** at `http://127.0.0.1:8742` for all VS Code windows. It starts in an external terminal (logs visible) or in the background, and always requires a per-user API key (`~/.llama-aio-vs/runtime/local-api.key`, created on first launch) so loopback stays a transport detail, not an authentication boundary. The extension and TUI send the key automatically.
 - **Backends:** Vulkan (default, good for AMD), CUDA (NVIDIA), CPU, or a `llama-server` already on your `PATH`. Upgrades are swapped in only after a successful download; pin a release tag or install from an archive if you need to.
 - **Licences:** the Hugging Face picker shows each model's licence and warns before downloading anything that isn't clearly permissive.
+- **FP8 KV cache:** select **f8_e4m3** for K, V or both in the **Advanced settings** editor. Llama AIO estimates one byte per element and uses **q8_0** for a cache side when the detected build lacks FP8 support.
+- **Expert cache CPU share:** after enabling the GPU expert cache for a MoE model, set **Expert cache CPU share (%)** to control the share of misses computed on the CPU once the cache fills on supported builds.
 - **Vision:** attach an `mmproj` projector to send images (added automatically when one sits next to the model).
 - **PLE tables:** for a model with per-layer embeddings, use **PLE table → Choose…** to pick from the PLE-only GGUFs found in your model folders (fitting tables first) or browse for one, then **Reload**. **Clear** restores the built-in table; a PLE-less backbone needs an attachment. Requires llama.cpp b12233 or a compatible build with `--shard` / `--ple`. Use a table from the same checkpoint; its precision may differ from the backbone. Memory estimates include the replacement table once. See [PLE settings](docs/performance-settings.md#external-ple-tables).
 - **LoRA adapters:** under **Model → LoRA adapters**, **Add…** lists the LoRA adapter GGUFs found in your model folders and next to the model, best match first, and attaches the one you choose; **Browse for a file…** opens any other GGUF. Adding or removing a file needs **Reload**; strength and on/off apply to the running server at once. An adapter made for a different model family is refused, one that does not name its base model gets a warning, and llama-server makes the final check when it loads. Adapters are cleared when you switch models. Adapter files are kept out of the model list. Files in `.safetensors` format must be converted to GGUF with llama.cpp first. The Model card also notes adapters built into a model file, and the base model a file names for itself; a LoRA that was merged into a model's weights cannot be detected.
